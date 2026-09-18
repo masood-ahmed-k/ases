@@ -68,6 +68,22 @@ wall-clock time), 4 on OpenRouter.
    key on OpenRouter's dashboard once testing is done. Going forward, file checks confirm
    presence/format only (e.g. `grep -c`), never dump full secret files.
 
+## OpenCode Free: ruled out entirely
+
+Tried `nemotron-3-ultra-free` via `opencode-free` for the Lead role (a strong candidate on paper: 1M
+context, built for agent/coding orchestration). Got a hard, definitive server-side rejection:
+
+> HTTP 403: "OpenCode's free tier can only be used from within OpenCode"
+
+This is OpenCode Zen refusing any client that isn't their own product, independent of which model is
+requested -- confirmed this is a blanket policy, not a per-model gate, so there's no value in retrying
+other `opencode-free` models (`mimo-v2.5-free`, `ling-3.0-flash-fin-free`, `big-pickle`, etc.) expecting
+a different outcome. **`opencode-free` is not currently usable through Hermes at all**, contradicting
+blueprint section 5.3/17.4's assumption that it's just "keyless, no pool to build" -- keyless turned out
+to also mean "blocked outside their own client." Marked `status: blocked` in `config/models.yaml`.
+
+This leaves the two working providers (UnoRouter, OpenRouter) as the only real options for version 1.
+
 ## Requested decision
 
 Accept `qwen3.8-27b:free` (UnoRouter, `--reasoning medium`) as Lead and `cohere/north-mini-code:free`

@@ -37,6 +37,10 @@ providers:
     limits: {}
     data_policy: unknown
     verified_on: "2026-09-17"
+    status: blocked                 # 2026-09-18: HTTP 403 "OpenCode's free tier can only be used
+                                     # from within OpenCode" -- confirmed against nemotron-3-ultra-free.
+                                     # Server-side client check, not a per-model issue; do not retry
+                                     # other opencode-free models expecting a different result.
 
 models:
   - provider: unorouter
