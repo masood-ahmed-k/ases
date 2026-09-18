@@ -70,7 +70,8 @@ requirements:
   section: '6.2'
   verified_by: '22.2'
   status: covered
-  note: hermes project create --board binds the Phase 3 test project (p_36370687) to board ases-phase3.
+  note: 'Real proof: cards landed on project p_36370687 (project_id set correctly on every card) once
+    config/swarm.yaml''s board: field was corrected -- see the caught bug below.'
 - id: ASES-ARC-07
   requirement: In WSL the gateway runs in the foreground under controller supervision
   section: '6.2'
@@ -222,15 +223,17 @@ requirements:
   section: '7'
   verified_by: '22.2'
   status: covered
-  note: 'plan.py + controller.create_cards_from_plan: one work + one merge card per task. Unit-tested.'
+  note: 'Real proof 2026-09-18: swarm approve against the actual ases-phase3 board created 4 real cards
+    (T1/T2 work+merge). Previously unit-tested only.'
 - id: ASES-TSK-02
   requirement: Dependencies link a child's work card to the parent's merge card; done on a merge card
     means merged
   section: '7'
   verified_by: 22.5, 22.8
   status: covered
-  note: 'controller.py: a child task''s work card is parented to its dependency''s MERGE card, not work
-    card. Unit-tested (test_controller.py).'
+  note: 'Real proof: T2''s work card (depends_on T1) sits in real Hermes status ''todo'' because it''s
+    parented to T1''s MERGE card, which is still ''blocked'' -- confirmed on the live board, not just
+    asserted in a mock.'
 - id: ASES-TSK-03
   requirement: Every implementation task has testable criteria, touches and a gate profile
   section: '7.3'
@@ -385,7 +388,9 @@ requirements:
   section: '12.4'
   verified_by: '22.15'
   status: covered
-  note: controller.create_cards_from_plan uses --idempotency-key ases-work-<project>-<key> / ases-merge-<project>-<key>.
+  note: 'Real proof: running swarm approve twice against the live board returned identical card IDs and
+    an identical Gate P commit SHA both times -- true idempotency, not just idempotency-key plumbing that
+    was never actually exercised.'
 - id: ASES-LED-03
   requirement: Cards proposed by agents land in triage and are validated before promotion
   section: '12.4'
@@ -624,10 +629,9 @@ requirements:
   section: 7, 12.4
   verified_by: 22.2, 22.14
   status: covered
-  note: 'controller.publish_plan commits docs/ases/ to the integration branch and returns that SHA; cmd_approve
-    calls it before create_cards_from_plan. Unit-tested: commits, idempotent on rerun, rejects the wrong
-    branch. Simplified vs. a full separate-planning-worktree flow (Phase 3''s swarm plan writes straight
-    into the primary checkout).'
+  note: 'Real proof: Gate P published commit a96791af... to the test repo''s integration branch before
+    any card was created; the second approve run correctly found nothing new to commit and returned the
+    same SHA.'
 - id: ASES-TSK-04
   requirement: Final integration security and smoke gates are controller lifecycle operations, not a worker
     role or task assignee

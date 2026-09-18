@@ -15,7 +15,7 @@ project:
   data_class: public
   workspace_root: C:/Users/masoo/ases-workspaces
   ases_home: C:/Users/masoo/ases/data
-  board: default                   # Hermes kanban board slug -- wired up in Phase 3
+  board: ases-phase3               # Hermes kanban board; project p_36370687 is bound to it (Phase 3)
   integration_branch: integration
 
 roles:                             # plan task role -> Hermes profile (ASES-ROL-01/09: Phase 3 core three)

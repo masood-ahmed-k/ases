@@ -50,6 +50,19 @@ toolsets restricted (reviewer has no terminal/code_execution/browser, kanban ena
 models pinned per the Phase 2 report. Board `ases-phase3` + project `p_36370687` bound to
 `C:\Users\masoo\ases-workspaces\test-repo-phase3` (throwaway, for acceptance test 22.2 only).
 
+## A real bug caught by actually running the system (not just unit tests)
+
+`config/swarm.yaml`'s `project.board` was left at its Phase 0 placeholder value (`default`) after the
+real `ases-phase3` board and `p_36370687` project were created. Every unit test used a fake/mocked
+`hermes` module with an arbitrary board string, so nothing caught it -- the code was "correct" by every
+test that existed. Only running `swarm approve` for real against the live board surfaced it: cards were
+silently landing on the `default` board instead. Fixed (`board: ases-phase3`), stale rows cleared, and
+re-verified: T1/T2 work+merge cards now land correctly, T2 sits in real `todo` status because it's
+parented to T1's *merge* card (not work card, per ASES-TSK-02), and running `swarm approve` twice
+returns identical card IDs and an identical Gate P commit SHA -- real idempotency, not just plumbing
+that compiled. This is why Phase 3 kept alternating unit tests with real, free (no-LLM-call) CLI runs
+against the actual board rather than trusting mocks alone for the deterministic layer.
+
 ## A real finding, not a hypothetical
 
 `policy.check_data_class` enforces section 21.2 for real: **neither UnoRouter nor OpenRouter's

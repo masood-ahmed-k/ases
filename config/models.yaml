@@ -64,8 +64,16 @@ models:
     model: "qwen3.8-27b:free"
     context_length: null            # UNVERIFIED (ASES-MOD-02) -- not yet checked against live catalog
     tool_calling: true               # verified 2026-09-18
-    role_class: lead_alternative
-    pinned: false
+    role_class: coder                # its real Phase 3 job (coder-1 profile). Also passed E1/E9/E10
+                                      # as a lead candidate in the Phase 2 report -- kept as a
+                                      # documented fallback there, but this row's role_class reflects
+                                      # what it's actually deployed as today, since policy.py's
+                                      # profile_provider() does an exact-match lookup by role for
+                                      # budget/data-class checks (a plan task's role: "coder" found
+                                      # nothing here before this fix -- its budget was silently never
+                                      # checked in Gate P. Real bug, caught by actually running
+                                      # `swarm approve` for real, not just unit tests with fakes).
+    pinned: true
     requires:
       reasoning_effort: medium       # default reasoning_effort 400s: "invalid Qwen3.8 reasoning_effort"
 
