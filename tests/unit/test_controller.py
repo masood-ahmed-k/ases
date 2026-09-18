@@ -148,6 +148,59 @@ def test_create_cards_from_plan_persists_to_db(tmp_path, monkeypatch):
     assert [(r["task_key"], r["role"]) for r in rows] == [("T1", "coder"), ("T2", "reviewer")]
 
 
+MODELS_CONFIG = {
+    "providers": {
+        "openrouter": {"limits": {"per_day_default": 50, "per_day_after_credits": 1000}, "credits_purchased": False},
+    },
+    "models": [
+        {"provider": "openrouter", "model": "cohere/north-mini-code:free", "role_class": "reviewer", "pinned": True},
+    ],
+}
+
+
+def test_process_budget_gate_parks_unaffordable_ready_card(tmp_path, monkeypatch):
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    monkeypatch.setattr(hermes, "kanban_create", lambda board, title, **kw: {"id": counter.next_id("t"), **kw})
+    pairs = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    from ases import ledger
+    ledger.record_usage(conn, "openrouter", "any-model", n=50)  # exhaust the daily cap
+
+    reviewer_work_id = pairs[1].work_card_id  # T2 is the reviewer-role task
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": reviewer_work_id, "status": "ready"}] if status == "ready" else []
+    ))
+    scheduled = []
+    monkeypatch.setattr(hermes, "kanban_schedule", lambda b, cid, reason: scheduled.append((cid, reason)))
+
+    parked = controller.process_budget_gate("b", plan, MODELS_CONFIG, conn=conn, budgets={})
+
+    assert parked == ["T2"]
+    assert scheduled[0][0] == reviewer_work_id
+
+
+def test_process_budget_gate_leaves_affordable_cards_alone(tmp_path, monkeypatch):
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    monkeypatch.setattr(hermes, "kanban_create", lambda board, title, **kw: {"id": counter.next_id("t"), **kw})
+    pairs = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    reviewer_work_id = pairs[1].work_card_id
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": reviewer_work_id, "status": "ready"}] if status == "ready" else []
+    ))
+    scheduled = []
+    monkeypatch.setattr(hermes, "kanban_schedule", lambda b, cid, reason: scheduled.append((cid, reason)))
+
+    parked = controller.process_budget_gate("b", plan, MODELS_CONFIG, conn=conn, budgets={})
+
+    assert parked == []
+    assert scheduled == []
+
+
 def test_all_merge_cards_done_false_when_one_pending(tmp_path, monkeypatch):
     plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
     conn = db.connect(tmp_path / "ases.db")

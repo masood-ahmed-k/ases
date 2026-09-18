@@ -115,6 +115,35 @@ def _work_card_body(task: plan_mod.PlanTask) -> str:
     return "\n".join(lines)
 
 
+def process_budget_gate(
+    board: str, plan: plan_mod.Plan, models_config: dict, *, conn, budgets: dict,
+) -> list[str]:
+    """ASES-CAP-03, ongoing case: a card affordable at Gate P time may not be affordable anymore by
+    the time it's actually about to run (other real-world usage, a quota reset that hasn't happened
+    yet). Checked every pass, not just once at approval -- parks with `hermes kanban schedule` rather
+    than failing outright; a scheduled card is picked back up once the reset time genuinely arrives
+    (the reset itself is a human/cron action in Phase 3; auto-unblock-on-reset is a later refinement)."""
+    parked = []
+    for card in hermes_mod.kanban_list(board, status="ready"):
+        row = conn.execute(
+            "SELECT task_key FROM plan_tasks WHERE work_card_id = ?", (card["id"],)
+        ).fetchone()
+        if row is None:
+            continue
+        task = plan.task(row["task_key"])
+        pp = policy.profile_provider(task.role, models_config)
+        if pp is None:
+            continue
+        afford = policy.check_budget(
+            conn, models_config["providers"], pp.provider, task.estimated_requests, budgets=budgets,
+        )
+        if not afford.can_afford:
+            hermes_mod.kanban_schedule(board, card["id"], f"budget: {afford.reason}")
+            parked.append(task.key)
+            events.record(conn, "card_parked_for_budget", {"task_key": task.key, "reason": afford.reason})
+    return parked
+
+
 def process_review_lane(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn,
 ) -> list[str]:
@@ -223,12 +252,17 @@ def all_merge_cards_done(board: str, plan: plan_mod.Plan, *, conn) -> bool:
     return True
 
 
-def run_pass(board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn) -> dict:
-    """One full controller iteration: dispatch, review-lane policing, merge queue.
+def run_pass(
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig,
+    models_config: dict, *, conn,
+) -> dict:
+    """One full controller iteration: budget gate, dispatch, review-lane policing, merge queue.
     Returns a small summary dict for logging -- this is what a bounded `swarm run` loop calls
     repeatedly (section 9.2's pseudocode), sleeping between calls to respect provider pacing."""
+    parked = process_budget_gate(board, plan, models_config, conn=conn, budgets=project.budgets)
     dispatch_result = hermes_mod.kanban_dispatch(board)
     sent_back = process_review_lane(board, repo, plan, conn=conn)
     merged = process_merge_queue(board, repo, plan, project, conn=conn)
     finished = all_merge_cards_done(board, plan, conn=conn)
-    return {"dispatch": dispatch_result, "sent_back": sent_back, "merged": merged, "finished": finished}
+    return {"parked": parked, "dispatch": dispatch_result, "sent_back": sent_back, "merged": merged,
+            "finished": finished}

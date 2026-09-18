@@ -196,8 +196,10 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: covered
-  note: cmd_approve sums estimated_requests per provider across the whole plan and calls ledger.can_afford
-    before Gate P publication; refuses the plan outright if any provider can't cover it today.
+  note: 'Two layers: cmd_approve checks the whole plan''s budget upfront at Gate P (refuses outright if
+    unaffordable then), AND controller.process_budget_gate re-checks every ''ready'' card on every run_pass
+    and parks it with hermes kanban schedule if the budget has since been exhausted -- the ongoing case,
+    not just the upfront one. Unit-tested both ways.'
 - id: ASES-CAP-04
   requirement: Gate P shows estimated requests per provider and the calendar time
   section: '5.4'

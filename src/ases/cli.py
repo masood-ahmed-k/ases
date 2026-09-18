@@ -178,10 +178,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"{len(findings)} inconsistency(ies) found on start -- see above. Continuing; "
               f"none of these are auto-repaired yet (Phase 3 scope).")
 
+    models_config = _load_models_config()
     for i in range(args.max_iterations):
-        summary = controller_mod.run_pass(project.board, repo, plan, project, conn=conn)
-        print(f"[pass {i + 1}] merged={summary['merged']} sent_back={summary['sent_back']} "
-              f"finished={summary['finished']}")
+        summary = controller_mod.run_pass(project.board, repo, plan, project, models_config, conn=conn)
+        print(f"[pass {i + 1}] parked={summary['parked']} merged={summary['merged']} "
+              f"sent_back={summary['sent_back']} finished={summary['finished']}")
         if summary["finished"]:
             print("all merge cards done")
             return 0

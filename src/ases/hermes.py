@@ -207,6 +207,14 @@ def kanban_block(board: str, card_id: str, reason: str) -> None:
     _kanban(board, ["block", card_id, reason])
 
 
+def kanban_schedule(board: str, card_id: str, reason: str) -> None:
+    _kanban(board, ["schedule", card_id, reason])
+
+
+def kanban_unblock(board: str, card_id: str) -> None:
+    _kanban(board, ["unblock", card_id])
+
+
 def kanban_reclaim(board: str, card_id: str, *, reason: str | None = None) -> None:
     args = ["reclaim", card_id]
     if reason:

@@ -43,6 +43,8 @@ blueprint first; this is the "where did that requirement end up in code" index.
 | `reconcile.py` | startup consistency checks: card IDs resolve, a done merge has a matching record, nothing reads done-but-reverted | ASES-REC-04 |
 | `policy.check_data_class` | enforced in `cmd_approve` before Gate P; raises rather than returning a bool | ASES-PRV-01/02/03 |
 | `gates.scan_for_secrets` | runs on every merge candidate's full diff before Gate 3; a planted secret blocks the merge | ASES-SEC-01 |
+| `controller.process_budget_gate` | re-checks every ready card's affordability on *every* pass (not just once at Gate P) and parks it with `hermes kanban schedule` if the budget's since run out | ASES-CAP-03 |
+| `hermes.kanban_schedule` / `kanban_unblock` | added for the parking flow above | - |
 | `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + Gate P publish + budget check + card creation), `swarm run` (bounded loop, reconciles on start), `swarm stop`/`resume` (kill switch) | - |
 
 Real Hermes profiles `lead`/`coder-1`/`reviewer` created fresh (no `--clone-from`, per ASES-ROL-10),
