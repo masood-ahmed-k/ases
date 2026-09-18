@@ -66,6 +66,13 @@ def merge_task(
             return MergeOutcome(False, None, None, None, f"nothing to commit: {commit.stdout}{commit.stderr}")
 
         candidate_sha = _head_sha(candidate)
+
+        diff = _git(["diff", f"{base_sha}..{candidate_sha}"], candidate).stdout
+        secret_findings = gates_mod.scan_for_secrets(diff)
+        if secret_findings:
+            return MergeOutcome(False, candidate_sha, None, None,
+                                 "secret scan failed (ASES-SEC-01): " + "; ".join(secret_findings))
+
         gate_result = gates_mod.run_gate(
             candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key,
         )

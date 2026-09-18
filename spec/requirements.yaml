@@ -558,8 +558,10 @@ requirements:
   requirement: Secret scanning in Gates 1 and 3 and on outgoing card bodies and plan files
   section: '21.1'
   verified_by: '22.10'
-  status: not_covered
-  note: ''
+  status: covered
+  note: gates.scan_for_secrets (reuses events.py's redaction patterns) runs inside mergeq.merge_task on
+    the full diff before Gate 3 -- a planted secret blocks the merge and never reaches the integration
+    branch. Unit-tested end to end (test_merge_blocks_on_a_planted_secret) and at the pattern level.
 - id: ASES-SEC-02
   requirement: Sensitive paths are denied through the sandbox mount list
   section: '21.1'
@@ -595,20 +597,27 @@ requirements:
   requirement: A data class per project is enforced before any other routing rule
   section: '21.2'
   verified_by: '22.16'
-  status: not_covered
-  note: ''
+  status: covered
+  note: policy.check_data_class is called for every task's resolved provider in cmd_approve, before Gate
+    P publication -- enforced before card creation, not after. Unit-tested (public/private/confidential
+    x safe/unsafe policies).
 - id: ASES-PRV-02
   requirement: The default class is private; no run without a declared class
   section: '21.2'
   verified_by: '22.16'
-  status: not_covered
-  note: ''
+  status: covered
+  note: config.py already requires project.data_class to be one of public/private/confidential; no default
+    beyond what swarm.yaml states explicitly (this project's own swarm.yaml documents WHY it's set to
+    public).
 - id: ASES-PRV-03
   requirement: The controller never relaxes the data class to keep work flowing
   section: '21.2'
   verified_by: '22.16'
-  status: not_covered
-  note: ''
+  status: covered
+  note: check_data_class raises rather than returning a bool -- there is no code path that silently downgrades
+    the requirement to keep a plan moving. test_current_real_providers_are_not_yet_safe_for_private pins
+    today's actual state so a future loosening of _SAFE_FOR_PRIVATE without a real policy change would
+    be caught.
 - id: ASES-ARC-09
   requirement: After Gate P approval, the controller publishes approved planning artifacts to the integration
     branch before implementation cards become ready

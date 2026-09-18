@@ -37,6 +37,44 @@ def profile_provider(role: str, models_config: dict) -> ProfileProvider | None:
     return None
 
 
+# A provider is safe for a data class only if its declared policy says so explicitly (section 21.2).
+# Absence of a safe marker means "not confirmed safe", not "assumed safe" -- ASES-PRV-01/03: the
+# controller never relaxes this to keep work flowing. Neither UnoRouter nor OpenRouter's current
+# declared policies qualify for "private" (both say upstream/some endpoints may train); that's a
+# real, current fact, not a bug in this check -- see docs/architecture.md's known-gaps section.
+_SAFE_FOR_PRIVATE = frozenset({"no_training", "local_only", "zero_data_retention"})
+_SAFE_FOR_CONFIDENTIAL = frozenset({"local_only"})
+
+
+class DataPolicyViolation(Exception):
+    pass
+
+
+def check_data_class(data_class: str, provider: str, provider_data_policy: str | None) -> None:
+    """ASES-PRV-01/02: enforced before any other routing rule. Raises DataPolicyViolation with a
+    clear reason rather than returning a bool -- a silently-ignored False here is exactly the failure
+    mode ASES-PRV-03 exists to prevent."""
+    policy = (provider_data_policy or "unknown").lower()
+    if data_class == "public":
+        return
+    if data_class == "private":
+        if policy not in _SAFE_FOR_PRIVATE:
+            raise DataPolicyViolation(
+                f"provider '{provider}' (data_policy={policy!r}) is not confirmed safe for "
+                f"data_class=private; needs one of {sorted(_SAFE_FOR_PRIVATE)}, or use a local model"
+            )
+        return
+    if data_class == "confidential":
+        if policy not in _SAFE_FOR_CONFIDENTIAL:
+            raise DataPolicyViolation(
+                f"provider '{provider}' (data_policy={policy!r}) is not approved for "
+                f"data_class=confidential; needs {sorted(_SAFE_FOR_CONFIDENTIAL)} or explicit "
+                f"written user approval for this project"
+            )
+        return
+    raise DataPolicyViolation(f"unknown data_class {data_class!r}")
+
+
 def check_budget(
     conn, provider_limits: dict, provider: str, estimated_requests: int, *, budgets: dict
 ) -> ledger.Affordability:

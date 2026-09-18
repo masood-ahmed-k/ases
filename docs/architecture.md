@@ -41,12 +41,25 @@ blueprint first; this is the "where did that requirement end up in code" index.
 | `controller.py` | `create_cards_from_plan` (work+merge pairs, deps wired to MERGE cards per ASES-TSK-02), `run_pass` (one dispatch+review+merge iteration) | ASES-TSK-01, -02 |
 | `integrity.py` | touches-path checking (`paths_outside_touches`), worktree before/after snapshots | ASES-GIT-12, -13 |
 | `reconcile.py` | startup consistency checks: card IDs resolve, a done merge has a matching record, nothing reads done-but-reverted | ASES-REC-04 |
+| `policy.check_data_class` | enforced in `cmd_approve` before Gate P; raises rather than returning a bool | ASES-PRV-01/02/03 |
+| `gates.scan_for_secrets` | runs on every merge candidate's full diff before Gate 3; a planted secret blocks the merge | ASES-SEC-01 |
 | `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + Gate P publish + budget check + card creation), `swarm run` (bounded loop, reconciles on start), `swarm stop`/`resume` (kill switch) | - |
 
 Real Hermes profiles `lead`/`coder-1`/`reviewer` created fresh (no `--clone-from`, per ASES-ROL-10),
 toolsets restricted (reviewer has no terminal/code_execution/browser, kanban enabled for verdicts only),
 models pinned per the Phase 2 report. Board `ases-phase3` + project `p_36370687` bound to
 `C:\Users\masoo\ases-workspaces\test-repo-phase3` (throwaway, for acceptance test 22.2 only).
+
+## A real finding, not a hypothetical
+
+`policy.check_data_class` enforces section 21.2 for real: **neither UnoRouter nor OpenRouter's
+currently declared data policy qualifies as safe for `data_class: private`** (both say upstream
+providers or some endpoints may train on inputs). Gate P will correctly *refuse* to approve any plan
+under `private` until a provider with a confirmed no-training/local policy is added. This project's own
+`config/swarm.yaml` is set to `public` for exactly this reason -- it's throwaway test scaffold content,
+not real code, so that's an honest, deliberate choice, not a workaround. A real future project MUST set
+its own data class deliberately and will hit this same refusal under `private` until that gap is closed
+(most likely by adding a provider with `data_collection: deny` + `zdr: true` verified, or a local model).
 
 ## Known gaps (tracked, not hidden)
 

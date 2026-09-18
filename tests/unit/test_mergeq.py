@@ -112,6 +112,22 @@ def test_candidate_worktree_cleaned_up_after_merge(repo):
     assert len(lines) == 1, f"expected only the primary checkout, got:\n{result.stdout}"
 
 
+def test_merge_blocks_on_a_planted_secret(repo, tmp_path):
+    _git_ok("checkout", "-q", "-b", "swarm/secret", cwd=repo)
+    (repo / "config.py").write_text("API_KEY = 'sk-or-v1-1234567890abcdefghij'\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "oops", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/secret", "T7", ["echo ok"])
+
+    assert outcome.merged is False
+    assert "secret scan failed" in outcome.detail
+    after = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    assert after == before
+
+
 def test_revert_merge_creates_a_new_commit(repo):
     _make_work_branch(repo, "swarm/t6", "new.txt", "x\n")
     outcome = mergeq.merge_task(repo, "integration", "swarm/t6", "T6", ["echo ok"])

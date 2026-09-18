@@ -125,11 +125,18 @@ def cmd_approve(args: argparse.Namespace) -> int:
     print(f"Gate 0 passed: {len(plan.tasks)} tasks")
 
     models_config = _load_models_config()
+    provider_policies = {name: p.get("data_policy") for name, p in models_config["providers"].items()}
     per_provider: dict[str, int] = {}
     for task in plan.tasks:
         pp = policy_mod.profile_provider(task.role, models_config)
-        if pp is not None:
-            per_provider[pp.provider] = per_provider.get(pp.provider, 0) + task.estimated_requests
+        if pp is None:
+            continue
+        try:
+            policy_mod.check_data_class(project.data_class, pp.provider, provider_policies.get(pp.provider))
+        except policy_mod.DataPolicyViolation as exc:
+            print(f"Gate P REFUSED (ASES-PRV-01): {exc}", file=sys.stderr)
+            return 1
+        per_provider[pp.provider] = per_provider.get(pp.provider, 0) + task.estimated_requests
     unaffordable = []
     for provider, total in per_provider.items():
         afford = policy_mod.check_budget(conn, models_config["providers"], provider, total, budgets=project.budgets)

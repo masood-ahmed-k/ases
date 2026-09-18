@@ -68,6 +68,19 @@ def test_gate_worktree_cleaned_up(repo):
     assert "wt" not in result.stdout
 
 
+@pytest.mark.parametrize("diff,should_flag", [
+    ("+api_key = 'sk-or-v1-1234567890abcdefghij'\n", True),
+    ("+token = \"ghp_1234567890abcdefghij\"\n", True),
+    ("+GITHUB_TOKEN=ghp_abcdefghij1234567890\n", True),
+    ("+print('hello world')\n", False),
+    ("-api_key = 'sk-or-v1-1234567890abcdefghij'\n", False),  # removed, not added
+    ("+x = 1\n+y = 2\n", False),
+])
+def test_scan_for_secrets(diff, should_flag):
+    findings = gates.scan_for_secrets(diff)
+    assert bool(findings) == should_flag
+
+
 @pytest.mark.parametrize("diff,expected_hit", [
     ("-    def test_something():\n-        assert True\n", "deleted"),
     ("+    @pytest.mark.skip\n+    def test_x(): pass\n", "skip"),

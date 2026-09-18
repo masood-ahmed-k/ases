@@ -92,6 +92,21 @@ def last_gate_result(conn, task_key: str, gate: str, commit_sha: str) -> str | N
     return row["result"] if row else None
 
 
+def scan_for_secrets(diff_text: str) -> list[str]:
+    """ASES-SEC-01: secret scan before merge. Reuses events.py's pattern set (one place that defines
+    what a secret looks like) plus a couple of diff-specific shapes events.py doesn't need."""
+    from . import events as events_mod
+
+    findings = []
+    for line in diff_text.splitlines():
+        if not line.startswith("+"):
+            continue
+        redacted = events_mod.redact({"line": line})["line"]
+        if redacted != line:
+            findings.append(f"possible secret added: {line.strip()[:80]}")
+    return findings
+
+
 def detect_tamper(diff_text: str) -> list[str]:
     """Cheap heuristics for ASES-QG-03: deleted/skipped tests, unconditional passes, weakened
     assertions. Not a substitute for a real diff-aware checker; flags for a human/reviewer to confirm."""

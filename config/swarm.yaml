@@ -6,7 +6,13 @@ project:
   # Decision D1 (blueprint v1.1/v1.2 section 2.4 and 17.2): environment is "native" or "wsl2".
   # Chosen 2026-09-18: native, on top of the existing working Hermes install. [ASES-ENV-01]
   environment: native
-  data_class: private              # public | private | confidential -- section 21.2. Default is private.
+  # public | private | confidential -- section 21.2. Set to public for THIS project deliberately:
+  # C:\Users\masoo\ases-workspaces\test-repo-phase3 is throwaway scaffold content (README/AGENTS.md),
+  # not real code. Neither UnoRouter nor OpenRouter's current declared data_policy qualifies as safe
+  # for "private" (policy.py's _SAFE_FOR_PRIVATE) -- Gate P will correctly REFUSE to approve any plan
+  # under data_class: private until a provider with a confirmed no-training/local policy is added.
+  # A real project MUST set this deliberately, not inherit this file's value by accident.
+  data_class: public
   workspace_root: C:/Users/masoo/ases-workspaces
   ases_home: C:/Users/masoo/ases/data
   board: default                   # Hermes kanban board slug -- wired up in Phase 3
