@@ -149,15 +149,17 @@ requirements:
   requirement: Lead, Reviewer and Debugger use pinned model IDs; routers are for workers only
   section: '5.2'
   verified_by: '22.1'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: Evaluation done, pins proposed (qwen3.8-27b:free Lead, cohere/north-mini-code:free Reviewer) but
+    not yet written to config/models.yaml pending user acceptance of the Phase 2 report.
 - id: ASES-MOD-04
   requirement: A smoke test through the real Hermes path precedes first use of a model
   section: '5.2'
   verified_by: '22.1'
-  status: in_progress
-  note: record_smoke_test() and the registry columns exist and are tested; no real smoke test has been
-    run yet -- that's Phase 2
+  status: covered
+  note: 'Real smoke tests run 2026-09-18: glm-5.3-thinking:free FAILED (tool_call_count=0, x2), qwen3.8-27b:free
+    and cohere/north-mini-code:free PASSED. See docs/phase2-evaluation-report.md. Awaiting user acceptance
+    before config/models.yaml is updated.'
 - id: ASES-MOD-05
   requirement: Provider health is passive; no timer-based probing
   section: '5.2'
