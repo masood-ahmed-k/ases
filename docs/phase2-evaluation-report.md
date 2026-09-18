@@ -4,25 +4,30 @@ Date: 2026-09-18. Exit criterion (blueprint section 16): "Evaluation report acce
 Evals are E1 (requirements -> assumptions), E9 (tool use), E10 (review -> seeded bug), from Appendix D.
 Raw transcripts and `--usage-file` output are under `C:\Users\masoo\ases-workspaces\_eval\`.
 
-## Headline finding
+## Headline finding (revised -- GLM fixed, see below)
 
-**The currently-configured Lead model, `glm-5.3-thinking:free` via UnoRouter, fails the E9 tool-use
-smoke test.** Confirmed twice, cleanly: `tool_call_count: 0` in both session transcripts (sessions
-`20260918_150057_55158c` and `20260918_152259_c9aac4`), the second run with an explicit absolute path
-and an instruction not to rely on cwd. Both times it "thought" for 2-4 minutes, produced nothing or an
-empty turn, then fabricated an answer ("0") with no tool ever invoked. Per ASES-MOD-04, a model that
-fails its smoke test is not fit to pin. **Recommendation: do not pin glm-5.3-thinking:free for Lead.**
+The currently-configured Lead model, `glm-5.3-thinking:free` via UnoRouter, initially failed the E9
+tool-use smoke test twice, cleanly: `tool_call_count: 0`, the model "thinking" for 2-4 minutes and then
+fabricating an answer with no tool ever invoked. Per the user's request this was investigated further
+rather than dropped. **Root cause found and fixed**: the model needs BOTH `reasoning_effort: low` AND an
+explicit "you must verify with tools, never guess" instruction, or it narrates an intent to act
+("I should use ls to...") and stops without ever calling anything. Isolation-tested: each change alone
+still fails (sessions `20260918_174528_85c275` and `20260918_174922_472f95`); both together pass
+reliably (session `20260918_174223_9af615` and the full E1/E9/E10 re-run below).
+**Recommendation: pin glm-5.3-thinking:free for Lead, with this exact recipe encoded into its profile
+config and SOUL.md -- not left as a CLI flag someone forgets.**
 
-A same-provider, same-endpoint alternative works cleanly: **`qwen3.8-27b:free` via UnoRouter passes all
-three evals** and needs no new setup (no new key, no new provider). One quirk: it 400s with the default
-reasoning effort ("invalid Qwen3.8 reasoning_effort") and needs `--reasoning medium` pinned explicitly.
+`qwen3.8-27b:free` via UnoRouter also passes all three evals cleanly with no special prompt needed
+(just `--reasoning medium`, or it 400s). Kept in `config/models.yaml` as `role_class:
+lead_alternative`, unpinned -- a documented fallback if GLM's recipe ever proves unreliable at scale.
 
 ## Results
 
 | Model | Role | E1 | E9 (tool use) | E10 (bug review) | Recommendation |
 |---|---|---|---|---|---|
-| `glm-5.3-thinking:free` (UnoRouter) | Lead (current config) | not run | **FAIL** x2 (tool_call_count=0) | not run | Do not pin |
-| `qwen3.8-27b:free` (UnoRouter) | Lead (proposed) | Pass -- thorough, security-conscious plan | **Pass** -- correct answer, 2 api_calls | Pass -- exact bug, worked example, scoped when it manifests | **Pin this** |
+| `glm-5.3-thinking:free` (UnoRouter), default settings | Lead, as originally configured | not run | **FAIL** x2 (tool_call_count=0) | not run | Needs the recipe below |
+| `glm-5.3-thinking:free` (UnoRouter), `reasoning_effort: low` + verify-don't-guess instruction | Lead (proposed, final) | Pass -- clear assumptions + plan, session invalidation noted | **Pass** -- tool_call_count=1, correct answer, 2 api_calls | Pass -- exact bug, worked example, correct fix | **Pin this** |
+| `qwen3.8-27b:free` (UnoRouter), `reasoning_effort: medium`, no special prompt | Lead alternative | Pass -- thorough, security-conscious plan | **Pass** -- correct answer, 2 api_calls | Pass -- exact bug, worked example, scoped when it manifests | Keep as documented fallback |
 | `cohere/north-mini-code:free` (OpenRouter) | Reviewer (proposed) | Pass -- clear assumptions + plan | **Pass** -- correct answer, 2 api_calls | Pass -- exact bug, worked example | **Pin this** |
 
 Reviewer diversity (ASES-ROL-05): Cohere North Mini Code is a different model family on a different
@@ -84,8 +89,13 @@ to also mean "blocked outside their own client." Marked `status: blocked` in `co
 
 This leaves the two working providers (UnoRouter, OpenRouter) as the only real options for version 1.
 
-## Requested decision
+## Decision: accepted, GLM pinned
 
-Accept `qwen3.8-27b:free` (UnoRouter, `--reasoning medium`) as Lead and `cohere/north-mini-code:free`
-(OpenRouter) as Reviewer, superseding the glm-5.3-thinking:free default? If yes, `config/models.yaml`
-gets updated and both get marked `pinned: true`, closing out Phase 2.
+`config/models.yaml` now pins `glm-5.3-thinking:free` (UnoRouter, `reasoning_effort: low` + the
+verify-don't-guess instruction) as Lead and `cohere/north-mini-code:free` (OpenRouter) as Reviewer.
+`qwen3.8-27b:free` stays in the registry, unpinned, as `role_class: lead_alternative`.
+
+**Carries forward to Phase 3, not optional:** the `lead` profile's `config.yaml` must set
+`agent.reasoning_effort: low`, and its `SOUL.md` must include the verify-don't-guess instruction
+verbatim. Without both, this regresses to the original failure. `hermes.py`'s profile-creation helper
+should assert both are present before letting a `lead`-role profile go live.

@@ -149,9 +149,10 @@ requirements:
   requirement: Lead, Reviewer and Debugger use pinned model IDs; routers are for workers only
   section: '5.2'
   verified_by: '22.1'
-  status: in_progress
-  note: Evaluation done, pins proposed (qwen3.8-27b:free Lead, cohere/north-mini-code:free Reviewer) but
-    not yet written to config/models.yaml pending user acceptance of the Phase 2 report.
+  status: covered
+  note: 'Pinned in config/models.yaml 2026-09-18: glm-5.3-thinking:free (Lead, requires reasoning_effort=low
+    + verify-don''t-guess system prompt addition) and cohere/north-mini-code:free (Reviewer, different
+    family/provider). qwen3.8-27b:free kept unpinned as a documented fallback. See docs/phase2-evaluation-report.md.'
 - id: ASES-MOD-04
   requirement: A smoke test through the real Hermes path precedes first use of a model
   section: '5.2'

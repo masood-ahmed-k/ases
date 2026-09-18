@@ -50,6 +50,29 @@ models:
                                      # Hermes likely auto-detected something via its own probing tiers
                                      # -- but auto-detected is not the same as declared. Confirm and
                                      # set this explicitly once verified (ASES-MOD-02).
-    tool_calling: null               # unverified: no smoke test run yet (ASES-MOD-04, Phase 2)
+    tool_calling: true               # verified 2026-09-18, but ONLY with the exact recipe below
     role_class: lead
     pinned: true
+    requires:                        # 2026-09-18: without BOTH of these, tool_call_count=0 -- the
+                                      # model narrates an intent to act ("I should use ls to...") and
+                                      # then stops. Isolation-tested: each alone fails.
+      reasoning_effort: low          # hermes -p lead ... needs agent.reasoning_effort: low in config.yaml
+      system_prompt_addition: >-
+        You must verify facts using your tools before answering - never answer from memory or guess.
+
+  - provider: unorouter
+    model: "qwen3.8-27b:free"
+    context_length: null            # UNVERIFIED (ASES-MOD-02) -- not yet checked against live catalog
+    tool_calling: true               # verified 2026-09-18
+    role_class: lead_alternative
+    pinned: false
+    requires:
+      reasoning_effort: medium       # default reasoning_effort 400s: "invalid Qwen3.8 reasoning_effort"
+
+  - provider: openrouter
+    model: "cohere/north-mini-code:free"
+    context_length: 256000
+    tool_calling: true               # verified 2026-09-18
+    role_class: reviewer
+    pinned: true
+    data_policy: some_free_endpoints_train
