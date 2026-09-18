@@ -1,0 +1,654 @@
+source_docx: ASES_Swarm_Implementation_Blueprint_v1.2.docx
+requirements:
+- id: ASES-ENV-01
+  requirement: ASES runs inside WSL2 Ubuntu (decision D1)
+  section: '17.2'
+  verified_by: '22.1'
+  status: covered
+  note: config.py validates project.environment; doctor.py checks it and reports the D1 decision
+- id: ASES-ENV-02
+  requirement: The Ubuntu distro is opened explicitly, never the docker-desktop default
+  section: '17.2'
+  verified_by: '22.1'
+  status: not_applicable
+  note: only applies to the WSL2 path; D1=native was chosen 2026-09-18
+- id: ASES-ENV-03
+  requirement: Repositories, worktrees, boards and databases live on the Linux filesystem, never under
+    /mnt/c or OneDrive
+  section: '17.2'
+  verified_by: '22.1'
+  status: covered
+  note: config.py refuses to load a config whose workspace_root/ases_home resolve under OneDrive; doctor.py
+    also checks the repo root itself
+- id: ASES-ENV-04
+  requirement: Hermes is installed inside WSL after a backup; secrets are re-entered, not copied; the
+    Windows install stays untouched
+  section: '17.2'
+  verified_by: '22.1'
+  status: not_applicable
+  note: only applies to the WSL2 install/migration path; native build reuses the existing verified Hermes
+    install instead
+- id: ASES-ARC-01
+  requirement: ASES uses the Hermes features listed in section 1.2 instead of re-implementing them
+  section: '1.2'
+  verified_by: Design inspection
+  status: not_covered
+  note: ''
+- id: ASES-ARC-02
+  requirement: The controller never claims cards, spawns workers or keeps its own copy of task status
+  section: '3.2'
+  verified_by: 22.2, 22.7
+  status: not_covered
+  note: ''
+- id: ASES-ARC-03
+  requirement: ASES records are keyed by card ID and commit SHA; the controller reconciles on start
+  section: '3.2'
+  verified_by: 22.7, 22.15
+  status: not_covered
+  note: ''
+- id: ASES-ARC-04
+  requirement: One Hermes wrapper module, JSON or REST over text parsing, pinned Hermes version, no updates
+    during a project
+  section: '3.2'
+  verified_by: '22.1'
+  status: in_progress
+  note: hermes.py is the sole module that shells out to hermes; version pinning and doctor-gating are
+    done. hermes doctor itself has no --json flag (checked via --help), so its output is parsed as text
+    by design -- true JSON preference applies once Phase 3 needs kanban/board calls, which do have --json
+- id: ASES-ARC-05
+  requirement: Only the gateway dispatcher runs; the deprecated standalone daemon never runs next to it
+  section: '6.2'
+  verified_by: '22.1'
+  status: not_covered
+  note: ''
+- id: ASES-ARC-06
+  requirement: One board per project, bound to the repository through a Hermes project
+  section: '6.2'
+  verified_by: '22.2'
+  status: not_covered
+  note: ''
+- id: ASES-ARC-07
+  requirement: In WSL the gateway runs in the foreground under controller supervision
+  section: '6.2'
+  verified_by: 22.1, 22.13
+  status: not_covered
+  note: ''
+- id: ASES-ARC-08
+  requirement: Kanban limits are set explicitly and no default assignee exists
+  section: '6.2'
+  verified_by: 22.1, 22.5
+  status: not_covered
+  note: ''
+- id: ASES-ROL-01
+  requirement: Phase 3 starts with three core profiles; tester and other roles are added only after measured
+    evaluation
+  section: 4.1, 16
+  verified_by: 22.17 at level L2
+  status: not_covered
+  note: ''
+- id: ASES-ROL-02
+  requirement: Profiles are created by cloning from the default profile, with a description
+  section: '4.2'
+  verified_by: '22.1'
+  status: not_covered
+  note: ''
+- id: ASES-ROL-03
+  requirement: Role prompts live in SOUL.md and are versioned under prompts/
+  section: '4.2'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-ROL-04
+  requirement: One process per profile; parallel coders use separate profiles
+  section: '4.2'
+  verified_by: '22.5'
+  status: not_covered
+  note: ''
+- id: ASES-ROL-05
+  requirement: 'The Reviewer is independent: different model family and provider, no shared project memory,
+    and no product-file write or command-execution tools; Kanban verdict tools remain allowed'
+  section: '4.2'
+  verified_by: 22.1, 22.6
+  status: not_covered
+  note: ''
+- id: ASES-ROL-06
+  requirement: Least-privilege toolsets per role
+  section: '4.2'
+  verified_by: 22.6, 22.11
+  status: not_covered
+  note: ''
+- id: ASES-ROL-07
+  requirement: Worker memory is disabled or scoped per project
+  section: '4.2'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-ROL-08
+  requirement: Concurrency starts at 3, is raised only after the recovery tests pass, and never exceeds
+    6
+  section: '4.3'
+  verified_by: 22.5, 22.9
+  status: not_covered
+  note: ''
+- id: ASES-MOD-01
+  requirement: Model IDs are discovered, and a capability record is kept per model
+  section: '5'
+  verified_by: '22.1'
+  status: covered
+  note: models.py registry + config/models.yaml sync, exercised by tests/unit/test_models.py
+- id: ASES-MOD-02
+  requirement: Every model used through a custom endpoint has a declared context length of at least 64K
+    before first use
+  section: '5.1'
+  verified_by: '22.4'
+  status: in_progress
+  note: 'the check mechanism is built and doctor correctly WARNs today: glm-5.3-thinking:free has no declared
+    context_length in config/models.yaml yet, so it is not yet fit to pin (see config/models.yaml''s note
+    on this)'
+- id: ASES-MOD-03
+  requirement: Lead, Reviewer and Debugger use pinned model IDs; routers are for workers only
+  section: '5.2'
+  verified_by: '22.1'
+  status: not_covered
+  note: ''
+- id: ASES-MOD-04
+  requirement: A smoke test through the real Hermes path precedes first use of a model
+  section: '5.2'
+  verified_by: '22.1'
+  status: in_progress
+  note: record_smoke_test() and the registry columns exist and are tested; no real smoke test has been
+    run yet -- that's Phase 2
+- id: ASES-MOD-05
+  requirement: Provider health is passive; no timer-based probing
+  section: '5.2'
+  verified_by: '22.9'
+  status: covered
+  note: doctor.py never calls a provider; model health is read from stored smoke-test state only, never
+    probed on a timer
+- id: ASES-CAP-01
+  requirement: swarm doctor shows the limits in use and their sources
+  section: '5.3'
+  verified_by: '22.1'
+  status: covered
+  note: doctor prints every provider's limits and verified_on date from config/models.yaml
+- id: ASES-CAP-02
+  requirement: A persisted request ledger per provider, model and UTC day
+  section: '5.4'
+  verified_by: 22.7, 22.9
+  status: covered
+  note: ledger.py + requests_ledger table, keyed by provider/model/UTC day; tests/unit/test_ledger.py
+- id: ASES-CAP-03
+  requirement: No card becomes ready without budget for it plus a review reserve; otherwise it is parked
+  section: '5.4'
+  verified_by: '22.9'
+  status: covered
+  note: ledger.can_afford() implements the reserve-percent + flat-reserve budget check; tested
+- id: ASES-CAP-04
+  requirement: Gate P shows estimated requests per provider and the calendar time
+  section: '5.4'
+  verified_by: '22.14'
+  status: not_covered
+  note: ''
+- id: ASES-CAP-05
+  requirement: Credit purchases are a user decision; ASES works without them
+  section: '5.4'
+  verified_by: '22.9'
+  status: covered
+  note: credits_purchased defaults false in config/models.yaml; ledger.daily_limit() only uses the 1000/day
+    figure once a human flips it
+- id: ASES-CAP-06
+  requirement: Capacity should come from provider diversity, each addition evaluated
+  section: '5.4'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-TSK-01
+  requirement: Each plan task becomes a work card and a merge card
+  section: '7'
+  verified_by: '22.2'
+  status: not_covered
+  note: ''
+- id: ASES-TSK-02
+  requirement: Dependencies link a child's work card to the parent's merge card; done on a merge card
+    means merged
+  section: '7'
+  verified_by: 22.5, 22.8
+  status: not_covered
+  note: ''
+- id: ASES-TSK-03
+  requirement: Every implementation task has testable criteria, touches and a gate profile
+  section: '7.3'
+  verified_by: '22.14'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-01
+  requirement: One worktree per work card, branched from the exact integration HEAD
+  section: '8'
+  verified_by: 22.2, 22.5
+  status: not_covered
+  note: ''
+- id: ASES-GIT-02
+  requirement: Only the merge queue writes to the integration branch
+  section: '8.1'
+  verified_by: 22.2, 22.11
+  status: not_covered
+  note: ''
+- id: ASES-GIT-03
+  requirement: Merge eligibility needs a green Gate 1 record and a reviewer PASS for the same commit
+  section: '8.1'
+  verified_by: '22.6'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-04
+  requirement: 'One merge at a time: squash candidate on the integration HEAD, Gate 3, fast-forward, complete
+    the merge card'
+  section: '8.1'
+  verified_by: 22.5, 22.8
+  status: not_covered
+  note: ''
+- id: ASES-GIT-05
+  requirement: The integration branch stays runnable; post-merge failures are reverted
+  section: '8.1'
+  verified_by: '22.8'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-06
+  requirement: Squash merge only, one commit per plan task with the card ID
+  section: '8.1'
+  verified_by: '22.2'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-07
+  requirement: No generated artifacts or secrets in commits; secret scan in Gates 1 and 3
+  section: '8.1'
+  verified_by: '22.10'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-08
+  requirement: Tasks with overlapping touches and no dependency path are serialized by Gate 0
+  section: '8.2'
+  verified_by: '22.8'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-09
+  requirement: Conflicts become fix or reconciliation cards, never an argument between the two workers
+  section: '8.2'
+  verified_by: '22.8'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-10
+  requirement: An empty repository gets an initial commit and the integration branch
+  section: '8.3'
+  verified_by: '22.2'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-11
+  requirement: Greenfield projects start with one serialized scaffold task
+  section: '8.3'
+  verified_by: Plan inspection, 22.17
+  status: not_covered
+  note: ''
+- id: ASES-GIT-12
+  requirement: Integrity snapshots around every worker run; changes outside the worktree fail the card
+  section: '8.4'
+  verified_by: 22.5, 22.11
+  status: not_covered
+  note: ''
+- id: ASES-GIT-13
+  requirement: Diffs outside the declared touches block review
+  section: '8.4'
+  verified_by: '22.12'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-14
+  requirement: Per-card ports, compose project, database and temp directory; locks for singletons
+  section: '8.4'
+  verified_by: '22.5'
+  status: not_covered
+  note: ''
+- id: ASES-GIT-15
+  requirement: Contracts, decisions and AGENTS.md live in the repository
+  section: '8.5'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-CTL-01
+  requirement: Finished is defined, and the global bounds in section 9.3 are enforced
+  section: '9.3'
+  verified_by: 22.6, 22.9, 22.14
+  status: not_covered
+  note: ''
+- id: ASES-CFG-01
+  requirement: Secrets never enter source control, card bodies, logs or reports
+  section: '10'
+  verified_by: '22.10'
+  status: in_progress
+  note: events.py redacts credential-shaped keys and known token patterns before any write; full discipline
+    (no secrets in card bodies/plan files) applies once those exist in Phase 3
+- id: ASES-CFG-02
+  requirement: Prefer one key per provider plus several legitimate providers; same-account key pools do
+    not create extra quota on the configured free paths
+  section: '10.2'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-CFG-03
+  requirement: No account creation or rotation to get around limits
+  section: '10.2'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-CFG-04
+  requirement: No provider key is visible inside a worker terminal
+  section: '10.2'
+  verified_by: '22.10'
+  status: not_covered
+  note: ''
+- id: ASES-RTE-01
+  requirement: No hidden fallback; the provider and model actually used are recorded
+  section: '11.2'
+  verified_by: '22.3'
+  status: not_covered
+  note: ''
+- id: ASES-LED-01
+  requirement: The plan is a schema-validated file checked by Gate 0, with one repair round
+  section: '12.4'
+  verified_by: '22.14'
+  status: not_covered
+  note: ''
+- id: ASES-LED-02
+  requirement: The controller creates cards from the approved plan with idempotency keys
+  section: '12.4'
+  verified_by: '22.15'
+  status: not_covered
+  note: ''
+- id: ASES-LED-03
+  requirement: Cards proposed by agents land in triage and are validated before promotion
+  section: '12.4'
+  verified_by: '22.15'
+  status: not_covered
+  note: ''
+- id: ASES-REV-01
+  requirement: Plan critique and diff review are done by the independent Reviewer profile
+  section: '13'
+  verified_by: '22.1'
+  status: not_covered
+  note: ''
+- id: ASES-REV-02
+  requirement: A plan goes back to the Lead at most twice
+  section: '13.1'
+  verified_by: '22.14'
+  status: not_covered
+  note: ''
+- id: ASES-REV-03
+  requirement: The user approves plan, budget and calendar time before any implementation card exists
+  section: '13.1'
+  verified_by: '22.14'
+  status: not_covered
+  note: ''
+- id: ASES-REV-04
+  requirement: Review requests carry handoff evidence
+  section: '13.2'
+  verified_by: '22.6'
+  status: not_covered
+  note: ''
+- id: ASES-REV-05
+  requirement: The controller re-runs Gate 1 when a card enters review
+  section: '13.2'
+  verified_by: 22.6, 22.12
+  status: not_covered
+  note: ''
+- id: ASES-REV-06
+  requirement: The verdict is a tool call with schema-checked metadata stored by commit
+  section: '13.2'
+  verified_by: '22.6'
+  status: not_covered
+  note: ''
+- id: ASES-QG-01
+  requirement: The controller believes only its own gate records
+  section: '14.2'
+  verified_by: '22.12'
+  status: not_covered
+  note: ''
+- id: ASES-QG-02
+  requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
+  section: '14.3'
+  verified_by: '22.12'
+  status: not_covered
+  note: ''
+- id: ASES-QG-03
+  requirement: The tamper check fails deleted or skipped tests, unconditional passes and weakened assertions
+  section: '14.3'
+  verified_by: '22.12'
+  status: not_covered
+  note: ''
+- id: ASES-QG-04
+  requirement: Gates run in a clean checkout of the exact commit inside the sandbox
+  section: '14.3'
+  verified_by: '22.12'
+  status: not_covered
+  note: ''
+- id: ASES-QG-05
+  requirement: Acceptance tests come from the contract and should precede the implementation
+  section: '14.3'
+  verified_by: Plan inspection, 22.17
+  status: not_covered
+  note: ''
+- id: ASES-TST-01
+  requirement: The controller test suite runs on fakes and never touches a real provider
+  section: '14.4'
+  verified_by: CI without network
+  status: not_covered
+  note: ''
+- id: ASES-TST-02
+  requirement: Acceptance tests 22.1 to 22.16 are repeatable and cost no quota
+  section: '22'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-OBS-01
+  requirement: The Hermes dashboard is not rebuilt; ASES adds a project report
+  section: '15'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-OBS-02
+  requirement: Transcripts and logs stay local under a retention setting
+  section: '15.2'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-DOC-01
+  requirement: Requirement IDs are quoted before a work package is built
+  section: '2.3'
+  verified_by: Phase changelogs
+  status: covered
+  note: every module and test cites the requirement IDs it satisfies inline
+- id: ASES-DOC-02
+  requirement: spec/requirements.yaml mirrors this register, with a drift check
+  section: '2.3'
+  verified_by: CI check
+  status: covered
+  note: spec/check_requirements.py extracts the live Appendix F table and fails on ID-set drift; this
+    file was regenerated from it
+- id: ASES-DOC-03
+  requirement: Phases are built in order and each closes on its exit tests
+  section: '16'
+  verified_by: Phase changelogs
+  status: not_covered
+  note: ''
+- id: ASES-DOC-04
+  requirement: The stop condition is honored
+  section: '16'
+  verified_by: Inspection
+  status: not_covered
+  note: ''
+- id: ASES-REC-01
+  requirement: Infrastructure failures resume; capability failures restart fresh with the failure bundle
+    and then a new model
+  section: '19.2'
+  verified_by: 22.3, 22.6
+  status: not_covered
+  note: ''
+- id: ASES-REC-02
+  requirement: Review rounds, fix cards and requests are budgeted per plan task lineage
+  section: '19.3'
+  verified_by: '22.6'
+  status: not_covered
+  note: ''
+- id: ASES-REC-03
+  requirement: Card creation is idempotent
+  section: '19.4'
+  verified_by: '22.15'
+  status: not_covered
+  note: ''
+- id: ASES-REC-04
+  requirement: Reconcile-on-start repairs what is safe and blocks the rest
+  section: '19.4'
+  verified_by: '22.7'
+  status: not_covered
+  note: ''
+- id: ASES-REC-05
+  requirement: Questions block cards and are answered through the CLI; they never time out into guesses
+  section: '19.5'
+  verified_by: '22.2'
+  status: not_covered
+  note: ''
+- id: ASES-REC-06
+  requirement: swarm stop halts everything within 30 seconds
+  section: '19.6'
+  verified_by: '22.13'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-01
+  requirement: Secret scanning in Gates 1 and 3 and on outgoing card bodies and plan files
+  section: '21.1'
+  verified_by: '22.10'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-02
+  requirement: Sensitive paths are denied through the sandbox mount list
+  section: '21.1'
+  verified_by: '22.10'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-03
+  requirement: From Phase 5 workers use the Docker terminal backend with only the worktree mounted
+  section: '21.3'
+  verified_by: '22.11'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-04
+  requirement: Content that agents read is treated as data, never as instructions
+  section: '21.3'
+  verified_by: '22.11'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-05
+  requirement: Sandbox network access is disabled by default and only enabled through explicit task-scoped
+    exceptions
+  section: '21.3'
+  verified_by: '22.11'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-06
+  requirement: Provider keys stay outside the sandbox; the egress proxy is optional and user-approved
+  section: '21.3'
+  verified_by: '22.10'
+  status: not_covered
+  note: ''
+- id: ASES-PRV-01
+  requirement: A data class per project is enforced before any other routing rule
+  section: '21.2'
+  verified_by: '22.16'
+  status: not_covered
+  note: ''
+- id: ASES-PRV-02
+  requirement: The default class is private; no run without a declared class
+  section: '21.2'
+  verified_by: '22.16'
+  status: not_covered
+  note: ''
+- id: ASES-PRV-03
+  requirement: The controller never relaxes the data class to keep work flowing
+  section: '21.2'
+  verified_by: '22.16'
+  status: not_covered
+  note: ''
+- id: ASES-ARC-09
+  requirement: After Gate P approval, the controller publishes approved planning artifacts to the integration
+    branch before implementation cards become ready
+  section: 7, 12.4
+  verified_by: 22.2, 22.14
+  status: not_covered
+  note: ''
+- id: ASES-TSK-04
+  requirement: Final integration security and smoke gates are controller lifecycle operations, not a worker
+    role or task assignee
+  section: '18.2'
+  verified_by: '22.2'
+  status: not_covered
+  note: ''
+- id: ASES-ROL-09
+  requirement: Phase 3 uses lead, coder and reviewer; tester becomes the fourth core profile after the
+    L2 gate
+  section: 4.1, 16
+  verified_by: '22.17'
+  status: not_covered
+  note: ''
+- id: ASES-ROL-10
+  requirement: Worker profiles are fresh by default; clone operations are opt-in and cloned credentials/memory
+    are reviewed or cleared
+  section: '4.2'
+  verified_by: 22.1, Inspection
+  status: not_covered
+  note: ''
+- id: ASES-ROL-11
+  requirement: Reviewer retains Kanban lifecycle tools but has no product-file write or command-execution
+    tools
+  section: '4.2'
+  verified_by: '22.6'
+  status: not_covered
+  note: ''
+- id: ASES-MOD-06
+  requirement: Dynamic free routing is not used for Lead, Reviewer or Debugger; worker routers require
+    post-route capability validation
+  section: '5.2'
+  verified_by: 22.4, 22.5
+  status: not_covered
+  note: ''
+- id: ASES-GIT-16
+  requirement: ASES worktrees start from the exact local integration HEAD; worktree_sync is disabled or
+    manual creation is used
+  section: '8'
+  verified_by: 22.2, 22.5
+  status: not_covered
+  note: ''
+- id: ASES-CFG-05
+  requirement: UnoRouter custom-endpoint credentials use Hermes custom-endpoint secret handling; do not
+    export provider keys into worker shells
+  section: 10, 17.4
+  verified_by: '22.10'
+  status: not_covered
+  note: ''
+- id: ASES-SEC-07
+  requirement: Docker worker network is disabled by default; network exceptions are explicit and task-scoped
+  section: '21.3'
+  verified_by: '22.11'
+  status: not_covered
+  note: ''
+- id: ASES-PRV-04
+  requirement: Private/confidential projects require an explicitly verified provider data policy; data-class
+    rules are never relaxed to keep work flowing
+  section: '21.2'
+  verified_by: '22.16'
+  status: not_covered
+  note: ''
+- id: ASES-VER-01
+  requirement: Externally changing provider/Hermes facts carry a source URL and verification date and
+    are rechecked by swarm doctor
+  section: 5.3, Appendix E
+  verified_by: '22.1'
+  status: in_progress
+  note: config/models.yaml records verified_on per provider and doctor displays it; the source URLs from
+    Appendix E are not yet echoed into the doctor report itself

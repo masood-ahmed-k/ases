@@ -1,0 +1,32 @@
+# ASES project configuration. This is ASES's own config, separate from Hermes's config.yaml.
+# See docs/architecture.md for what each field does and which requirement ID it satisfies.
+
+project:
+  name: ases
+  # Decision D1 (blueprint v1.1/v1.2 section 2.4 and 17.2): environment is "native" or "wsl2".
+  # Chosen 2026-09-18: native, on top of the existing working Hermes install. [ASES-ENV-01]
+  environment: native
+  data_class: private              # public | private | confidential -- section 21.2. Default is private.
+  workspace_root: C:/Users/masoo/ases-workspaces
+  ases_home: C:/Users/masoo/ases/data
+  board: default                   # Hermes kanban board slug -- wired up in Phase 3
+  integration_branch: integration
+
+concurrency:
+  max_in_progress: 3               # written to Hermes kanban.max_in_progress in Phase 3
+  per_profile: 1                   # written to Hermes kanban.max_in_progress_per_profile
+  hard_max: 6                      # ASES-ROL-08
+
+budgets:                           # section 9.3 global bounds
+  attempts_per_card: 3
+  review_rounds_per_task: 3
+  fix_cards_per_task: 2
+  replans_per_project: 2
+  max_cards: 40
+  card_runtime_minutes: 45
+  daily_reserve_percent: 10        # ASES-CAP-03: never plan to use the last 10% of a day's quota
+  review_reserve_requests: 20      # requests held back for the review pass on every card
+
+hermes:
+  tested_version: "0.21.3"
+  native_home: "C:/Users/masoo/AppData/Local/hermes"

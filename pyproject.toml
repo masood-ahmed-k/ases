@@ -1,0 +1,28 @@
+[project]
+name = "ases"
+version = "0.1.0"
+description = "AI Software Engineering Swarm: policy, gates, and merge queue on top of Hermes Agent"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "python-docx>=1.1",
+]
+
+[project.scripts]
+swarm = "ases.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

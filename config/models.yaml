@@ -1,0 +1,51 @@
+# Provider limits and model declarations. Section 5.3 of the blueprint: these numbers were read from
+# the providers' own pages and the installed Hermes source on 17-18 September 2026. They change --
+# re-verify before trusting them for real capacity planning, and update verified_on when you do.
+#
+# context_length: null means undeclared/unverified (ASES-MOD-02). swarm doctor WARNs on every such row
+# until a smoke test or an explicit number here confirms the Hermes floor of 65536 tokens.
+
+providers:
+  unorouter:
+    type: openai_compatible
+    base_url: https://api.unorouter.com/v1
+    key_env: HERMES_CUSTOM_UNOROUTER_API_KEY   # Hermes's real generated name for this custom provider,
+                                                # not the illustrative "UNOROUTER_API_KEY" in Appendix B.
+    limits:
+      per_model_rpm: 1
+    quota_endpoint: null
+    data_policy: forwards_to_upstreams_that_may_train
+    verified_on: "2026-09-17"
+
+  openrouter:
+    type: openrouter
+    key_env: OPENROUTER_API_KEY
+    credits_purchased: false        # ASES-CAP-05: flip this only after the user makes that purchase
+    limits:
+      rpm: 20
+      per_day_default: 50           # credits_purchased: false
+      per_day_after_credits: 1000   # credits_purchased: true
+    quota_endpoint: /api/v1/key
+    require_parameters: true
+    data_policy: some_free_endpoints_train
+    verified_on: "2026-09-17"
+
+  opencode_free:
+    type: hermes_provider
+    provider_id: opencode-free
+    key_env: null                   # served anonymously: no key, no credential pool
+    limits: {}
+    data_policy: unknown
+    verified_on: "2026-09-17"
+
+models:
+  - provider: unorouter
+    model: "glm-5.3-thinking:free"
+    context_length: null            # UNVERIFIED. Native config.yaml's model: block has no explicit
+                                     # context_length, and hermes doctor did not warn at startup, so
+                                     # Hermes likely auto-detected something via its own probing tiers
+                                     # -- but auto-detected is not the same as declared. Confirm and
+                                     # set this explicitly once verified (ASES-MOD-02).
+    tool_calling: null               # unverified: no smoke test run yet (ASES-MOD-04, Phase 2)
+    role_class: lead
+    pinned: true
