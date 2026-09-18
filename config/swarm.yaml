@@ -12,6 +12,11 @@ project:
   board: default                   # Hermes kanban board slug -- wired up in Phase 3
   integration_branch: integration
 
+roles:                             # plan task role -> Hermes profile (ASES-ROL-01/09: Phase 3 core three)
+  lead: lead
+  coder: coder-1
+  reviewer: reviewer
+
 concurrency:
   max_in_progress: 3               # written to Hermes kanban.max_in_progress in Phase 3
   per_profile: 1                   # written to Hermes kanban.max_in_progress_per_profile

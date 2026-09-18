@@ -204,18 +204,67 @@ def _check_model_registry(conn) -> list[DoctorCheck]:
     return checks
 
 
-def _check_role_profiles() -> DoctorCheck:
+def _check_role_profiles(project: ases_config.ProjectConfig) -> DoctorCheck:
+    profiles_root = project.hermes_native_home / "profiles"
+    missing = []
+    unconfigured = []
+    for role, profile in project.roles.items():
+        cfg = profiles_root / profile / "config.yaml"
+        if not cfg.exists():
+            missing.append(profile)
+            continue
+        text = cfg.read_text(encoding="utf-8")
+        if "provider:" not in text or "default:" not in text:
+            unconfigured.append(profile)
+    if missing:
+        return DoctorCheck("role_profiles", "fail", f"missing profiles: {missing}", ("ASES-ROL-02",))
+    if unconfigured:
+        return DoctorCheck("role_profiles", "warn", f"profiles with no model configured: {unconfigured}",
+                            ("ASES-ROL-02",))
     return DoctorCheck(
-        "role_profiles", "pending",
-        "lead/coder/tester/reviewer Hermes profiles are created in Phase 3, not before",
+        "role_profiles", "pass",
+        f"all {len(project.roles)} role profiles exist and have a model configured: "
+        f"{sorted(project.roles.values())}",
         ("ASES-ROL-02",),
     )
 
 
-def _check_reviewer_diversity() -> DoctorCheck:
+def _profile_model(project: ases_config.ProjectConfig, profile: str) -> tuple[str | None, str | None]:
+    """(provider, model) as declared in that profile's config.yaml, or (None, None) if unreadable."""
+    cfg_path = project.hermes_native_home / "profiles" / profile / "config.yaml"
+    if not cfg_path.exists():
+        return None, None
+    provider = model = None
+    for line in cfg_path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("provider:") and provider is None:
+            provider = s.split(":", 1)[1].strip()
+        elif s.startswith("default:") and model is None:
+            model = s.split(":", 1)[1].strip()
+    return provider, model
+
+
+def _check_reviewer_diversity(project: ases_config.ProjectConfig) -> DoctorCheck:
+    lead_profile = project.roles.get("lead")
+    reviewer_profile = project.roles.get("reviewer")
+    if not lead_profile or not reviewer_profile:
+        return DoctorCheck("reviewer_diversity", "pending", "lead or reviewer role not mapped yet",
+                            ("ASES-ROL-05",))
+    lead_provider, lead_model = _profile_model(project, lead_profile)
+    rev_provider, rev_model = _profile_model(project, reviewer_profile)
+    if lead_provider is None or rev_provider is None:
+        return DoctorCheck("reviewer_diversity", "warn", "could not read one or both profiles' config.yaml",
+                            ("ASES-ROL-05",))
+    if lead_provider == rev_provider:
+        return DoctorCheck(
+            "reviewer_diversity", "fail",
+            f"lead ({lead_model} on {lead_provider}) and reviewer ({rev_model} on {rev_provider}) "
+            "share the same provider -- ASES-ROL-05 wants a different provider, not just a different model",
+            ("ASES-ROL-05",),
+        )
     return DoctorCheck(
-        "reviewer_diversity", "pending",
-        "depends on role_profiles (Phase 3); today only UnoRouter is configured, so this cannot pass yet",
+        "reviewer_diversity", "pass",
+        f"lead={lead_model}@{lead_provider}, reviewer={rev_model}@{rev_provider} -- different providers",
         ("ASES-ROL-05",),
     )
 
@@ -257,8 +306,8 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> Doctor
         _check_gateway_dispatcher(),
         _check_docker_sandbox(),
         *_check_model_registry(conn),
-        _check_role_profiles(),
-        _check_reviewer_diversity(),
+        _check_role_profiles(project),
+        _check_reviewer_diversity(project),
         _check_limits_table(models_config),
     ]
     # The secrets check needs to see everything decided above it, so it runs last, over the detail text

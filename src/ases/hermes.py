@@ -9,11 +9,22 @@ where JSON exists, later phases must prefer it.
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 import shutil
 import subprocess
 
 _VERSION_RE = re.compile(r"Hermes Agent v(\d+\.\d+\.\d+)")
+
+
+class HermesCommandError(Exception):
+    """A `hermes` subcommand exited non-zero. Carries stdout+stderr for the caller to inspect."""
+
+    def __init__(self, args: list[str], returncode: int, output: str):
+        self.args = args
+        self.returncode = returncode
+        self.output = output
+        super().__init__(f"hermes {' '.join(args)} exited {returncode}: {output[:500]}")
 
 
 class HermesNotFound(Exception):
@@ -90,3 +101,105 @@ def gateway_status(timeout: int = 20) -> GatewayStatus:
     raw = result.stdout + result.stderr
     running = "not running" not in raw.lower() and "✗" not in raw
     return GatewayStatus(running, raw)
+
+
+# ---------------------------------------------------------------------------------------------
+# Kanban (Phase 3). Every one of these prefers --json (ASES-ARC-04); the two commands that don't
+# support it (dispatch's dry-run summary, and plain status changes) fall back to exit-code +
+# stdout text, documented per function.
+# ---------------------------------------------------------------------------------------------
+
+
+def _kanban(board: str, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    result = _run(["kanban", "--board", board, *args], timeout=timeout)
+    if result.returncode != 0:
+        raise HermesCommandError(["kanban", "--board", board, *args], result.returncode,
+                                  result.stdout + result.stderr)
+    return result
+
+
+def _kanban_json(board: str, args: list[str], timeout: int = 30):
+    result = _kanban(board, [*args, "--json"], timeout=timeout)
+    return json.loads(result.stdout)
+
+
+def kanban_init(board: str) -> None:
+    _kanban(board, ["init"])
+
+
+def kanban_create(
+    board: str, title: str, *, assignee: str | None = None, parent: list[str] | None = None,
+    workspace: str = "scratch", branch: str | None = None, project: str | None = None,
+    body: str | None = None, idempotency_key: str | None = None, max_retries: int | None = None,
+    max_runtime: str | None = None, initial_status: str | None = None,
+) -> dict:
+    args = ["create", title, "--workspace", workspace]
+    if assignee:
+        args += ["--assignee", assignee]
+    for p in parent or []:
+        args += ["--parent", p]
+    if branch:
+        args += ["--branch", branch]
+    if project:
+        args += ["--project", project]
+    if body:
+        args += ["--body", body]
+    if idempotency_key:
+        args += ["--idempotency-key", idempotency_key]
+    if max_retries is not None:
+        args += ["--max-retries", str(max_retries)]
+    if max_runtime:
+        args += ["--max-runtime", max_runtime]
+    if initial_status:
+        args += ["--initial-status", initial_status]
+    return _kanban_json(board, args)
+
+
+def kanban_show(board: str, card_id: str) -> dict:
+    return _kanban_json(board, ["show", card_id])
+
+
+def kanban_list(board: str, *, status: str | None = None, assignee: str | None = None) -> list[dict]:
+    args = ["list"]
+    if status:
+        args += ["--status", status]
+    if assignee:
+        args += ["--assignee", assignee]
+    return _kanban_json(board, args)
+
+
+def kanban_link(board: str, parent_id: str, child_id: str) -> None:
+    _kanban(board, ["link", parent_id, child_id])
+
+
+def kanban_dispatch(board: str, *, dry_run: bool = False, max_spawns: int | None = None) -> dict:
+    args = ["dispatch"]
+    if dry_run:
+        args += ["--dry-run"]
+    if max_spawns is not None:
+        args += ["--max", str(max_spawns)]
+    return _kanban_json(board, args)
+
+
+def kanban_request_changes(board: str, card_id: str, reason: str) -> None:
+    _kanban(board, ["request-changes", card_id, reason])
+
+
+def kanban_complete(board: str, card_id: str, *, result: str | None = None, metadata: dict | None = None) -> None:
+    args = ["complete", card_id]
+    if result:
+        args += ["--result", result]
+    if metadata is not None:
+        args += ["--metadata", json.dumps(metadata)]
+    _kanban(board, args)
+
+
+def kanban_block(board: str, card_id: str, reason: str) -> None:
+    _kanban(board, ["block", card_id, reason])
+
+
+def kanban_reclaim(board: str, card_id: str, *, reason: str | None = None) -> None:
+    args = ["reclaim", card_id]
+    if reason:
+        args += ["--reason", reason]
+    _kanban(board, args)

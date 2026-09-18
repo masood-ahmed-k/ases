@@ -17,6 +17,10 @@ project:
   ases_home: C:/Users/x/ases/data
   board: default
   integration_branch: integration
+roles:
+  lead: lead
+  coder: coder-1
+  reviewer: reviewer
 concurrency:
   max_in_progress: 3
   per_profile: 1

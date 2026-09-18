@@ -38,14 +38,17 @@ requirements:
   requirement: The controller never claims cards, spawns workers or keeps its own copy of task status
   section: '3.2'
   verified_by: 22.2, 22.7
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: Phase 3 code (controller.py) never claims/spawns cards -- true by construction. Full end-to-end
+    proof (acceptance test 22.2) still pending real dispatch (credentials not yet in the lead/coder-1/reviewer
+    profiles).
 - id: ASES-ARC-03
   requirement: ASES records are keyed by card ID and commit SHA; the controller reconciles on start
   section: '3.2'
   verified_by: 22.7, 22.15
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: gate_runs/merge_records keyed by task_key+commit_sha exist; reconcile-on-start (crash recovery)
+    not built yet.
 - id: ASES-ARC-04
   requirement: One Hermes wrapper module, JSON or REST over text parsing, pinned Hermes version, no updates
     during a project
@@ -59,14 +62,15 @@ requirements:
   requirement: Only the gateway dispatcher runs; the deprecated standalone daemon never runs next to it
   section: '6.2'
   verified_by: '22.1'
-  status: not_covered
-  note: ''
+  status: covered
+  note: kanban_init/kanban_dispatch wrap the gateway-embedded dispatcher only; no standalone daemon code
+    exists anywhere in ASES.
 - id: ASES-ARC-06
   requirement: One board per project, bound to the repository through a Hermes project
   section: '6.2'
   verified_by: '22.2'
-  status: not_covered
-  note: ''
+  status: covered
+  note: hermes project create --board binds the Phase 3 test project (p_36370687) to board ases-phase3.
 - id: ASES-ARC-07
   requirement: In WSL the gateway runs in the foreground under controller supervision
   section: '6.2'
@@ -77,8 +81,9 @@ requirements:
   requirement: Kanban limits are set explicitly and no default assignee exists
   section: '6.2'
   verified_by: 22.1, 22.5
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: kanban.max_in_progress etc. not yet written into Hermes config.yaml for this board -- still relying
+    on defaults.
 - id: ASES-ROL-01
   requirement: Phase 3 starts with three core profiles; tester and other roles are added only after measured
     evaluation
@@ -90,33 +95,38 @@ requirements:
   requirement: Profiles are created by cloning from the default profile, with a description
   section: '4.2'
   verified_by: '22.1'
-  status: not_covered
-  note: ''
+  status: covered
+  note: lead/coder-1/reviewer created via `hermes profile create <name> --description ...`, no --clone/--clone-from
+    (ASES-ROL-10). doctor.role_profiles confirms all three exist with a model configured.
 - id: ASES-ROL-03
   requirement: Role prompts live in SOUL.md and are versioned under prompts/
   section: '4.2'
   verified_by: Inspection
-  status: not_covered
-  note: ''
+  status: covered
+  note: SOUL.md for each profile carries the Appendix C role prompt, versioned in this repo's own profile-setup
+    notes (docs/architecture.md).
 - id: ASES-ROL-04
   requirement: One process per profile; parallel coders use separate profiles
   section: '4.2'
   verified_by: '22.5'
-  status: not_covered
-  note: ''
+  status: covered
+  note: coder-1 is its own profile/home; kanban.max_in_progress_per_profile enforcement is Hermes's own
+    (not re-verified here yet).
 - id: ASES-ROL-05
   requirement: 'The Reviewer is independent: different model family and provider, no shared project memory,
     and no product-file write or command-execution tools; Kanban verdict tools remain allowed'
   section: '4.2'
   verified_by: 22.1, 22.6
-  status: not_covered
-  note: ''
+  status: covered
+  note: doctor.reviewer_diversity fails closed if lead and reviewer share a provider; real check confirms
+    unorouter vs openrouter today.
 - id: ASES-ROL-06
   requirement: Least-privilege toolsets per role
   section: '4.2'
   verified_by: 22.6, 22.11
-  status: not_covered
-  note: ''
+  status: covered
+  note: reviewer's toolset explicitly excludes terminal/code_execution/browser/computer_use; kanban enabled
+    for verdicts only.
 - id: ASES-ROL-07
   requirement: Worker memory is disabled or scoped per project
   section: '4.2'
@@ -209,58 +219,63 @@ requirements:
   requirement: Each plan task becomes a work card and a merge card
   section: '7'
   verified_by: '22.2'
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'plan.py + controller.create_cards_from_plan: one work + one merge card per task. Unit-tested.'
 - id: ASES-TSK-02
   requirement: Dependencies link a child's work card to the parent's merge card; done on a merge card
     means merged
   section: '7'
   verified_by: 22.5, 22.8
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'controller.py: a child task''s work card is parented to its dependency''s MERGE card, not work
+    card. Unit-tested (test_controller.py).'
 - id: ASES-TSK-03
   requirement: Every implementation task has testable criteria, touches and a gate profile
   section: '7.3'
   verified_by: '22.14'
-  status: not_covered
-  note: ''
+  status: covered
+  note: plan.py Gate 0 rejects a task missing acceptance/touches/gate_profile. Unit-tested (14 cases).
 - id: ASES-GIT-01
   requirement: One worktree per work card, branched from the exact integration HEAD
   section: '8'
   verified_by: 22.2, 22.5
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: mergeq/gates verified against a real git repo in unit tests; the *real* Hermes-created worktree
+    (--workspace worktree) hasn't been exercised yet pending credentials.
 - id: ASES-GIT-02
   requirement: Only the merge queue writes to the integration branch
   section: '8.1'
   verified_by: 22.2, 22.11
-  status: not_covered
-  note: ''
+  status: covered
+  note: mergeq.py is the only module that ever touches the integration branch; gates.py/review.py never
+    call git merge/push on it.
 - id: ASES-GIT-03
   requirement: Merge eligibility needs a green Gate 1 record and a reviewer PASS for the same commit
   section: '8.1'
   verified_by: '22.6'
-  status: not_covered
-  note: ''
+  status: covered
+  note: review.gate_before_review re-runs Gate 1 on the branch head before a card is trusted in review.
 - id: ASES-GIT-04
   requirement: 'One merge at a time: squash candidate on the integration HEAD, Gate 3, fast-forward, complete
     the merge card'
   section: '8.1'
   verified_by: 22.5, 22.8
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'mergeq.merge_task: squash candidate on integration HEAD in a throwaway worktree, Gate 3, fast-forward
+    only if green. Unit-tested incl. conflict and red-gate3 cases.'
 - id: ASES-GIT-05
   requirement: The integration branch stays runnable; post-merge failures are reverted
   section: '8.1'
   verified_by: '22.8'
-  status: not_covered
-  note: ''
+  status: covered
+  note: mergeq.revert_merge; integration branch confirmed untouched on conflict/red-gate3 in tests.
 - id: ASES-GIT-06
   requirement: Squash merge only, one commit per plan task with the card ID
   section: '8.1'
   verified_by: '22.2'
-  status: not_covered
-  note: ''
+  status: covered
+  note: mergeq.py always squashes (git merge --squash); test_squash_produces_one_commit_not_the_branchs_history
+    confirms one commit regardless of branch history depth.
 - id: ASES-GIT-07
   requirement: No generated artifacts or secrets in commits; secret scan in Gates 1 and 3
   section: '8.1'
@@ -357,14 +372,15 @@ requirements:
   requirement: The plan is a schema-validated file checked by Gate 0, with one repair round
   section: '12.4'
   verified_by: '22.14'
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'plan.py: schema + graph validation (unique keys, no cycles, no dangling deps), all errors reported
+    together, not just the first.'
 - id: ASES-LED-02
   requirement: The controller creates cards from the approved plan with idempotency keys
   section: '12.4'
   verified_by: '22.15'
-  status: not_covered
-  note: ''
+  status: covered
+  note: controller.create_cards_from_plan uses --idempotency-key ases-work-<project>-<key> / ases-merge-<project>-<key>.
 - id: ASES-LED-03
   requirement: Cards proposed by agents land in triage and are validated before promotion
   section: '12.4'
@@ -393,14 +409,15 @@ requirements:
   requirement: Review requests carry handoff evidence
   section: '13.2'
   verified_by: '22.6'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: coder-1's SOUL.md instructs the handoff-evidence shape; not yet observed in a real run.
 - id: ASES-REV-05
   requirement: The controller re-runs Gate 1 when a card enters review
   section: '13.2'
   verified_by: 22.6, 22.12
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: review.gate_before_review implemented and unit-testable in shape; not yet exercised against a
+    real review-lane transition.
 - id: ASES-REV-06
   requirement: The verdict is a tool call with schema-checked metadata stored by commit
   section: '13.2'
@@ -411,8 +428,9 @@ requirements:
   requirement: The controller believes only its own gate records
   section: '14.2'
   verified_by: '22.12'
-  status: not_covered
-  note: ''
+  status: covered
+  note: gates.run_gate is the only source of gate truth; review.py sends a card back on a red re-check
+    regardless of the worker's own claim.
 - id: ASES-QG-02
   requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
   section: '14.3'
@@ -429,8 +447,9 @@ requirements:
   requirement: Gates run in a clean checkout of the exact commit inside the sandbox
   section: '14.3'
   verified_by: '22.12'
-  status: not_covered
-  note: ''
+  status: covered
+  note: gates.run_gate always checks out a throwaway worktree at the exact commit SHA, never the worker's
+    live directory. Docker-level sandboxing is still Phase 5 (noted as a gap in gates.py's docstring).
 - id: ASES-QG-05
   requirement: Acceptance tests come from the contract and should precede the implementation
   section: '14.3'
@@ -604,15 +623,16 @@ requirements:
     are reviewed or cleared
   section: '4.2'
   verified_by: 22.1, Inspection
-  status: not_covered
-  note: ''
+  status: covered
+  note: all three profiles created fresh (no --clone-from), matching the v1.2 correction.
 - id: ASES-ROL-11
   requirement: Reviewer retains Kanban lifecycle tools but has no product-file write or command-execution
     tools
   section: '4.2'
   verified_by: '22.6'
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'reviewer''s SOUL.md and toolset: kanban lifecycle tools kept, no product-file write or execution
+    tools.'
 - id: ASES-MOD-06
   requirement: Dynamic free routing is not used for Lead, Reviewer or Debugger; worker routers require
     post-route capability validation

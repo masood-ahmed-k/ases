@@ -11,7 +11,7 @@ import pathlib
 import sqlite3
 import threading
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -47,6 +47,42 @@ CREATE TABLE IF NOT EXISTS events (
     ts TEXT NOT NULL,
     kind TEXT NOT NULL,
     payload TEXT NOT NULL          -- JSON, secret-redacted before write (ASES-SEC-01)
+);
+
+-- Phase 3: one plan task becomes a work card (W) and a merge card (M) (ASES-TSK-01).
+CREATE TABLE IF NOT EXISTS plan_tasks (
+    project TEXT NOT NULL,
+    task_key TEXT NOT NULL,        -- plan.json task key, e.g. 'T1'
+    work_card_id TEXT,             -- Hermes kanban card id, once created
+    merge_card_id TEXT,
+    role TEXT NOT NULL,
+    touches TEXT,                  -- JSON list of path globs
+    gate_profile TEXT,
+    estimated_requests INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    fix_cards INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (project, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS gate_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key TEXT NOT NULL,
+    gate TEXT NOT NULL,            -- 'gate1' | 'gate3' | ...
+    commit_sha TEXT,
+    result TEXT NOT NULL,          -- 'pass' | 'fail'
+    detail TEXT,
+    ran_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS merge_records (
+    task_key TEXT PRIMARY KEY,
+    candidate_sha TEXT,
+    gate3_result TEXT,
+    squash_commit TEXT,
+    reverted INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT
 );
 """
 

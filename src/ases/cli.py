@@ -7,17 +7,23 @@ yet, see section 16" message instead of argparse silently accepting an unimpleme
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
+import subprocess
 import sys
+import time
 
 from . import config as ases_config
+from . import controller as controller_mod
 from . import db as ases_db
 from . import doctor as ases_doctor
+from . import hermes as hermes_mod
 from . import models as models_mod
+from . import plan as plan_mod
 
 _GLYPH = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "pending": "[PEND]"}
 _NOT_BUILT_YET = {
-    "init", "run", "plan", "approve", "status", "questions", "answer", "stop", "resume", "eval", "report",
+    "init", "status", "questions", "answer", "stop", "resume", "eval", "report",
 }
 
 
@@ -62,6 +68,94 @@ def cmd_models(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Invoke the lead profile to write docs/ases/plan.json into the target repo.
+
+    Deliberately not --in / cwd-dependent (the environment bug from Phase 2): the prompt names the
+    exact absolute repo path and tells the model not to rely on any inherited working directory.
+    """
+    project = _load_project()
+    repo = pathlib.Path(args.repo).resolve()
+    request = args.request
+    prompt = (
+        f"Repository (use this exact absolute path in every tool call, do not rely on any "
+        f"current/working directory): {repo}\n\n"
+        f"Project request: {request}\n\n"
+        f"Inspect the repository at that path, then write docs/ases/plan.json (absolute path: "
+        f"{repo / 'docs' / 'ases' / 'plan.json'}) with this exact top-level shape: "
+        f'{{"project": "<slug>", "integration_branch": "{project.integration_branch}", '
+        f'"gate_profiles": {{"<name>": ["<shell command>", ...]}}, "tasks": [{{"key": "T1", '
+        f'"title": "...", "role": "coder"|"reviewer", "depends_on": ["<task key>", ...], '
+        f'"touches": ["<path glob>", ...], "acceptance": ["<criterion>", ...], '
+        f'"gate_profile": "<name>", "estimated_requests": <int>}}]}}. '
+        f"Keep it small: 2 to 4 tasks. Every task's role must be exactly 'coder' or 'reviewer'. "
+        f"Use a trivial, fast gate_profile command since this is a throwaway test repo. "
+        f"After writing the file, reply with just the word done."
+    )
+    result = subprocess.run(
+        [hermes_mod.hermes_path(), "-p", "lead", "-z", prompt],
+        capture_output=True, text=True, timeout=600, encoding="utf-8", errors="replace",
+    )
+    print(result.stdout.strip() or result.stderr.strip())
+    plan_path = repo / "docs" / "ases" / "plan.json"
+    if not plan_path.exists():
+        print(f"lead did not write {plan_path}", file=sys.stderr)
+        return 1
+    print(f"wrote {plan_path}")
+    return 0 if result.returncode == 0 else 1
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    """Gate 0 on docs/ases/plan.json, then create work+merge card pairs (ASES-LED-01/02)."""
+    project = _load_project()
+    conn = ases_db.connect(ases_config.db_path(project))
+    repo = pathlib.Path(args.repo).resolve()
+    plan_path = repo / "docs" / "ases" / "plan.json"
+
+    try:
+        plan = plan_mod.load_plan_file(
+            plan_path, known_roles=set(project.roles), max_cards=project.budgets.get("max_cards", 40)
+        )
+    except plan_mod.PlanError as exc:
+        print("Gate 0 FAILED:")
+        for e in exc.errors:
+            print(f"  - {e}")
+        return 1
+    print(f"Gate 0 passed: {len(plan.tasks)} tasks")
+
+    pairs = controller_mod.create_cards_from_plan(
+        project.board, args.project_id, repo, plan, project, conn=conn
+    )
+    for p in pairs:
+        print(f"  {p.task_key}: work={p.work_card_id} merge={p.merge_card_id}")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Bounded controller loop (section 9.2): dispatch, review-lane policing, merge queue, repeat
+    until every merge card is done or max-iterations is hit."""
+    project = _load_project()
+    conn = ases_db.connect(ases_config.db_path(project))
+    repo = pathlib.Path(args.repo).resolve()
+    plan_path = repo / "docs" / "ases" / "plan.json"
+    plan = plan_mod.load_plan_file(
+        plan_path, known_roles=set(project.roles), max_cards=project.budgets.get("max_cards", 40)
+    )
+
+    for i in range(args.max_iterations):
+        summary = controller_mod.run_pass(project.board, repo, plan, conn=conn)
+        print(f"[pass {i + 1}] merged={summary['merged']} sent_back={summary['sent_back']} "
+              f"finished={summary['finished']}")
+        if summary["finished"]:
+            print("all merge cards done")
+            return 0
+        time.sleep(args.sleep_seconds)
+
+    print(f"stopped after {args.max_iterations} passes without finishing (not a failure -- "
+          f"just the bound; re-run swarm run to continue polling)")
+    return 1
+
+
 def cmd_not_built_yet(args: argparse.Namespace) -> int:
     print(f"`swarm {args.command}` is not built yet. See section 16 (implementation phases) for when it lands.")
     return 2
@@ -77,6 +171,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("models", help="List the model registry and its declared capabilities").set_defaults(
         func=cmd_models
     )
+
+    p_plan = sub.add_parser("plan", help="Invoke the lead profile to write docs/ases/plan.json")
+    p_plan.add_argument("--repo", required=True, help="Absolute path to the target repository")
+    p_plan.add_argument("--request", required=True, help="The project request, in plain language")
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_approve = sub.add_parser("approve", help="Gate 0 the plan, then create work+merge cards")
+    p_approve.add_argument("--repo", required=True)
+    p_approve.add_argument("--project-id", required=True, help="Hermes project id (see `hermes project list`)")
+    p_approve.set_defaults(func=cmd_approve)
+
+    p_run = sub.add_parser("run", help="Bounded controller loop: dispatch, review, merge, repeat")
+    p_run.add_argument("--repo", required=True)
+    p_run.add_argument("--max-iterations", type=int, default=30)
+    p_run.add_argument("--sleep-seconds", type=int, default=20)
+    p_run.set_defaults(func=cmd_run)
+
     for name in sorted(_NOT_BUILT_YET):
         sub.add_parser(name, help="(not built yet)").set_defaults(func=cmd_not_built_yet)
 

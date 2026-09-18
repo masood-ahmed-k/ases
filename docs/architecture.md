@@ -29,6 +29,23 @@ blueprint first; this is the "where did that requirement end up in code" index.
 | `fakes/provider.py` | Scripted fake OpenAI-compatible HTTP server for tests, stdlib only | ASES-TST-01 |
 | `spec/check_requirements.py` | Extracts Appendix F from the live docx, diffs against `requirements.yaml` | ASES-DOC-02 |
 
+## Module map additions (Phase 3)
+
+| Module | What it does | Requirement IDs |
+|---|---|---|
+| `plan.py` | plan.json schema + Gate 0 (unique keys, no cycles, no dangling deps, criteria/touches/gate_profile present) | ASES-LED-01, -TSK-03 |
+| `policy.py` | role -> Hermes profile resolution (config/swarm.yaml `roles:`), budget-gate wrapper over ledger.py | - |
+| `gates.py` | runs a gate profile's commands in a throwaway worktree at an exact commit SHA; tamper heuristics | ASES-QG-01, -04 |
+| `review.py` | re-runs Gate 1 when a card enters `review`, before trusting it; the reviewer's verdict IS the resulting Hermes status transition, nothing else to parse | ASES-REV-05 |
+| `mergeq.py` | squash candidate on integration HEAD -> Gate 3 -> fast-forward; revert on a later failure | ASES-GIT-04, -05, -06 |
+| `controller.py` | `create_cards_from_plan` (work+merge pairs, deps wired to MERGE cards per ASES-TSK-02), `run_pass` (one dispatch+review+merge iteration) | ASES-TSK-01, -02 |
+| `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + card creation), `swarm run` (bounded loop) | - |
+
+Real Hermes profiles `lead`/`coder-1`/`reviewer` created fresh (no `--clone-from`, per ASES-ROL-10),
+toolsets restricted (reviewer has no terminal/code_execution/browser, kanban enabled for verdicts only),
+models pinned per the Phase 2 report. Board `ases-phase3` + project `p_36370687` bound to
+`C:\Users\masoo\ases-workspaces\test-repo-phase3` (throwaway, for acceptance test 22.2 only).
+
 ## Known gaps (tracked, not hidden)
 
 - `glm-5.3-thinking:free`'s context length is **not declared** in `config/models.yaml` -- native
@@ -46,7 +63,14 @@ blueprint first; this is the "where did that requirement end up in code" index.
   `--clone-from`) rather than cloned, with any deliberate clone's memory/credentials reviewed before
   use (ASES-ROL-10).
 - Gate P plan publication (ASES-ARC-09) and pinned-worktree creation (ASES-GIT-16, `worktree_sync:
-  false`) are new v1.2 requirements with no code yet -- they land with Phase 3/4.
+  false`) are new v1.2 requirements with no code yet.
+- The real end-to-end run (acceptance test 22.2) hasn't executed yet -- waiting on the UnoRouter/
+  OpenRouter credentials being copied into the `lead`/`coder-1`/`reviewer` profiles' own `.env` files
+  (they don't inherit the default profile's, by design). Everything upstream of real dispatch (plan
+  schema, card creation, gate running, merge queue) is unit-tested against real git repos and passes;
+  only the live multi-agent dispatch is unproven so far.
+- Gate 1/3 run directly on the host, not inside Docker (Phase 5 requirement, not built). Documented in
+  `gates.py`'s own docstring so this isn't quietly assumed to be sandboxed.
 
 ## Running things
 

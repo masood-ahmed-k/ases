@@ -11,6 +11,7 @@ project:
   ases_home: {home}
   board: default
   integration_branch: integration
+roles: {{lead: lead, coder: coder-1, reviewer: reviewer}}
 concurrency: {{max_in_progress: 3, per_profile: 1, hard_max: 6}}
 budgets:
   attempts_per_card: 3
@@ -62,12 +63,22 @@ def test_model_context_check_warns_when_undeclared(tmp_path, monkeypatch):
     assert "ASES-MOD-02" in by_name["context_length[unorouter/glm-5.3-thinking:free]"].requirement_ids
 
 
+def _make_profile(home: object, name: str, provider: str, model: str) -> None:
+    import pathlib
+    d = pathlib.Path(str(home)) / "profiles" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.yaml").write_text(f"model:\n  default: {model}\n  provider: {provider}\n", encoding="utf-8")
+
+
 def test_report_is_healthy_when_only_warn_and_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
     monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))
     monkeypatch.setattr(hermes, "gateway_status", lambda **_: hermes.GatewayStatus(False, "not running"))
 
     project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
     conn = db.connect(config.db_path(project))
     models.sync_from_config(conn, MODELS_CONFIG)
 
@@ -75,7 +86,53 @@ def test_report_is_healthy_when_only_warn_and_pending(tmp_path, monkeypatch):
     assert report.ok is True
     assert report.exit_code == 0
     assert any(c.status == "warn" for c in report.checks)   # the undeclared context length
-    assert any(c.status == "pending" for c in report.checks)  # role profiles, gateway, etc.
+    assert any(c.status == "pending" for c in report.checks)  # gateway not running, etc.
+
+
+def test_role_profiles_fail_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
+    monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))
+    monkeypatch.setattr(hermes, "gateway_status", lambda **_: hermes.GatewayStatus(False, ""))
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+
+    report = doctor.run(project, MODELS_CONFIG, conn)
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["role_profiles"].status == "fail"
+    assert report.ok is False
+
+
+def test_reviewer_diversity_fails_when_same_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
+    monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))
+    monkeypatch.setattr(hermes, "gateway_status", lambda **_: hermes.GatewayStatus(False, ""))
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "unorouter", "glm-5.3-flash-thinking:free")
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+
+    report = doctor.run(project, MODELS_CONFIG, conn)
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["reviewer_diversity"].status == "fail"
+
+
+def test_reviewer_diversity_passes_when_different_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
+    monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))
+    monkeypatch.setattr(hermes, "gateway_status", lambda **_: hermes.GatewayStatus(False, ""))
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+
+    report = doctor.run(project, MODELS_CONFIG, conn)
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["reviewer_diversity"].status == "pass"
 
 
 def test_report_fails_when_hermes_doctor_is_unhealthy(tmp_path, monkeypatch):

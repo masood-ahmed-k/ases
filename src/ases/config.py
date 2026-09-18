@@ -28,6 +28,7 @@ class ProjectConfig:
     ases_home: pathlib.Path
     board: str
     integration_branch: str
+    roles: dict
     concurrency: dict
     budgets: dict
     hermes_tested_version: str
@@ -78,6 +79,7 @@ def load_swarm_config(path: str | pathlib.Path) -> ProjectConfig:
         ases_home=ases_home,
         board=_require(raw, "project.board"),
         integration_branch=_require(raw, "project.integration_branch"),
+        roles=_require(raw, "roles"),
         concurrency=_require(raw, "concurrency"),
         budgets=_require(raw, "budgets"),
         hermes_tested_version=_require(raw, "hermes.tested_version"),
