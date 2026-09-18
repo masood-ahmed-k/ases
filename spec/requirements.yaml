@@ -540,9 +540,9 @@ requirements:
   verified_by: '22.7'
   status: in_progress
   note: reconcile.py checks card IDs still resolve, a done merge has a matching merge_records row, and
-    nothing reads done-but-reverted; wired into swarm run's startup. Unit-tested (6 cases). Findings are
-    reported, not yet auto-repaired -- that's the remaining Phase 3/4 work (orphan-worker termination
-    and crash-mid-merge repair need a real crash scenario to exercise honestly).
+    nothing reads done-but-reverted; wired into swarm run's startup. Unit-tested (6 cases) AND real-verified
+    against the live board after fixing kanban_show's return shape (was crashing with KeyError on real
+    data -- see docs/architecture.md). Findings are reported, not yet auto-repaired.
 - id: ASES-REC-05
   requirement: Questions block cards and are answered through the CLI; they never time out into guesses
   section: '19.5'

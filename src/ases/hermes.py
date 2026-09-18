@@ -156,7 +156,16 @@ def kanban_create(
 
 
 def kanban_show(board: str, card_id: str) -> dict:
-    return _kanban_json(board, ["show", card_id])
+    """Returns the flat task dict (same shape as list/create's entries). The raw CLI response wraps
+    it as {"task": {...}, "parents": [...], "children": [...], "comments": [...], "events": [...],
+    "runs": [...]} -- real shape, confirmed against a live card, not the flat shape this wrongly
+    assumed at first (every module that calls kanban_show()["status"] depends on this unwrap)."""
+    raw = _kanban_json(board, ["show", card_id])
+    task = dict(raw["task"])
+    task["_children"] = raw.get("children", [])
+    task["_parents"] = raw.get("parents", [])
+    task["_runs"] = raw.get("runs", [])
+    return task
 
 
 def kanban_list(board: str, *, status: str | None = None, assignee: str | None = None) -> list[dict]:

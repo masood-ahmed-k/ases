@@ -50,6 +50,23 @@ toolsets restricted (reviewer has no terminal/code_execution/browser, kanban ena
 models pinned per the Phase 2 report. Board `ases-phase3` + project `p_36370687` bound to
 `C:\Users\masoo\ases-workspaces\test-repo-phase3` (throwaway, for acceptance test 22.2 only).
 
+## Two more real bugs, same lesson
+
+1. **`hermes kanban show`'s real JSON is nested** (`{"task": {...}, "parents": [...], "children": [...],
+   "comments": [...], "events": [...], "runs": [...]}`), not the flat shape `list`/`create` return.
+   Every caller (`review.py`, `reconcile.py`, `controller.py`) was written assuming flat access
+   (`result["status"]`) -- and every unit test's fake `kanban_show` matched that same wrong
+   assumption, so nothing caught it until `reconcile.check` crashed with a real `KeyError` against a
+   real card. Fixed by unwrapping inside `hermes.kanban_show` itself, so no caller needed to change.
+2. **The dispatcher is already live** (a multiplexed gateway the user runs for other purposes also
+   polls this board) and had already tried dispatching T1 twice, failing both times on
+   `git worktree add`: the deterministic branch name `swarm/T1-coder` collided with a *stale* worktree
+   left over from an earlier, since-archived card on the misconfigured board (archiving a Hermes card
+   does not clean up its worktree/branch -- that's `hermes worktree prune`'s job, by design). Cleaned
+   up the stale worktree and branches, promoted T1 back to `ready`, then deliberately blocked it again
+   pending real credentials so the live dispatcher doesn't burn through its failure-limit budget on
+   auth errors before the real test can run.
+
 ## A real bug caught by actually running the system (not just unit tests)
 
 `config/swarm.yaml`'s `project.board` was left at its Phase 0 placeholder value (`default`) after the
