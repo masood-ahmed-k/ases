@@ -15,14 +15,16 @@ import pathlib
 
 from . import gates as gates_mod
 from . import hermes as hermes_mod
+from . import integrity
 
 
 def gate_before_review(
-    board: str, card_id: str, repo: pathlib.Path, branch: str, gate1_commands: list[str], *,
-    conn, task_key: str,
+    board: str, card_id: str, repo: pathlib.Path, branch: str, gate1_commands: list[str],
+    touches: list[str], *, conn, task_key: str,
 ) -> bool:
-    """ASES-REV-05. Returns True if Gate 1 passed (card stays in review for the reviewer),
-    False if it sent the card back with the failure output (a failed attempt, not a review round)."""
+    """ASES-REV-05 (Gate 1 re-check) + ASES-GIT-13 (touches-path check). Returns True if both pass
+    (card stays in review for the reviewer), False if it sent the card back (a failed attempt, not a
+    review round)."""
     import subprocess
 
     head = subprocess.run(
@@ -32,6 +34,19 @@ def gate_before_review(
         hermes_mod.kanban_request_changes(board, card_id, f"could not resolve branch {branch}")
         return False
 
+    base = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "integration", branch], capture_output=True, text=True,
+    ).stdout.strip()
+    changed = integrity.changed_paths(repo, head) if not base else _changed_since(repo, base, head)
+    out_of_scope = integrity.paths_outside_touches(changed, touches)
+    if out_of_scope:
+        hermes_mod.kanban_request_changes(
+            board, card_id,
+            f"diff touches paths outside the card's declared touches ({touches}): {out_of_scope}. "
+            "Either the task needs widening or these changes need to come out.",
+        )
+        return False
+
     result = gates_mod.run_gate(repo, head, "gate1", gate1_commands, conn=conn, task_key=task_key)
     if not result.passed:
         hermes_mod.kanban_request_changes(
@@ -39,6 +54,15 @@ def gate_before_review(
         )
         return False
     return True
+
+
+def _changed_since(repo: pathlib.Path, base: str, head: str) -> list[str]:
+    import subprocess
+    result = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-only", f"{base}..{head}"],
+        capture_output=True, text=True,
+    )
+    return [ln for ln in result.stdout.splitlines() if ln.strip()]
 
 
 def card_status(board: str, card_id: str) -> str:

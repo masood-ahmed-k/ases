@@ -20,6 +20,7 @@ from . import doctor as ases_doctor
 from . import hermes as hermes_mod
 from . import models as models_mod
 from . import plan as plan_mod
+from . import policy as policy_mod
 
 _GLYPH = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "pending": "[PEND]"}
 _NOT_BUILT_YET = {
@@ -122,6 +123,23 @@ def cmd_approve(args: argparse.Namespace) -> int:
             print(f"  - {e}")
         return 1
     print(f"Gate 0 passed: {len(plan.tasks)} tasks")
+
+    models_config = _load_models_config()
+    per_provider: dict[str, int] = {}
+    for task in plan.tasks:
+        pp = policy_mod.profile_provider(task.role, models_config)
+        if pp is not None:
+            per_provider[pp.provider] = per_provider.get(pp.provider, 0) + task.estimated_requests
+    unaffordable = []
+    for provider, total in per_provider.items():
+        afford = policy_mod.check_budget(conn, models_config["providers"], provider, total, budgets=project.budgets)
+        print(f"  budget[{provider}]: needs {total}, {afford.reason}")
+        if not afford.can_afford:
+            unaffordable.append(provider)
+    if unaffordable:
+        print(f"Gate P REFUSED: cannot afford this plan today on {unaffordable} (ASES-CAP-03). "
+              f"Wait for the quota reset or shrink the plan.")
+        return 1
 
     publish_sha = controller_mod.publish_plan(repo, plan.integration_branch)
     print(f"Gate P: published approved plan at {publish_sha}")

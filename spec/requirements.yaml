@@ -195,13 +195,15 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: covered
-  note: ledger.can_afford() implements the reserve-percent + flat-reserve budget check; tested
+  note: cmd_approve sums estimated_requests per provider across the whole plan and calls ledger.can_afford
+    before Gate P publication; refuses the plan outright if any provider can't cover it today.
 - id: ASES-CAP-04
   requirement: Gate P shows estimated requests per provider and the calendar time
   section: '5.4'
   verified_by: '22.14'
-  status: not_covered
-  note: ''
+  status: covered
+  note: cmd_approve prints each provider's budget line (needed vs. affordability reason) as part of the
+    Gate P output.
 - id: ASES-CAP-05
   requirement: Credit purchases are a user decision; ASES works without them
   section: '5.4'
@@ -310,14 +312,17 @@ requirements:
   requirement: Integrity snapshots around every worker run; changes outside the worktree fail the card
   section: '8.4'
   verified_by: 22.5, 22.11
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: integrity.py has snapshot()/diff_snapshots() fully unit-tested (HEAD-move and unexpected-dirty-file
+    detection). Not yet wired into a real dispatched run (needs before/after snapshots around an actual
+    worker spawn) -- that wiring lands once the credentials are in and the real end-to-end test runs.
 - id: ASES-GIT-13
   requirement: Diffs outside the declared touches block review
   section: '8.4'
   verified_by: '22.12'
-  status: not_covered
-  note: ''
+  status: covered
+  note: review.gate_before_review checks the diff against declared touches BEFORE Gate 1 even runs; out-of-scope
+    changes are sent back with the exact offending paths. Unit-tested incl. empty-touches-means-nothing-allowed.
 - id: ASES-GIT-14
   requirement: Per-card ports, compose project, database and temp directory; locks for singletons
   section: '8.4'

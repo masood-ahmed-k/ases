@@ -131,7 +131,9 @@ def process_review_lane(
         task = plan.task(task_key)
         gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
         branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
-        ok = review_mod.gate_before_review(board, card["id"], repo, branch, gate_cmds, conn=conn, task_key=task_key)
+        ok = review_mod.gate_before_review(
+            board, card["id"], repo, branch, gate_cmds, list(task.touches), conn=conn, task_key=task_key,
+        )
         if not ok:
             sent_back.append(task_key)
             events.record(conn, "gate1_recheck_failed", {"task_key": task_key})
