@@ -163,6 +163,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         plan_path, known_roles=set(project.roles), max_cards=project.budgets.get("max_cards", 40)
     )
 
+    from . import reconcile as reconcile_mod
+    findings = reconcile_mod.check(project.board, plan.project, conn=conn)
+    for f in findings:
+        print(f"[RECONCILE] {f.task_key} {f.kind}: {f.detail}")
+    if findings:
+        print(f"{len(findings)} inconsistency(ies) found on start -- see above. Continuing; "
+              f"none of these are auto-repaired yet (Phase 3 scope).")
+
     for i in range(args.max_iterations):
         summary = controller_mod.run_pass(project.board, repo, plan, project, conn=conn)
         print(f"[pass {i + 1}] merged={summary['merged']} sent_back={summary['sent_back']} "

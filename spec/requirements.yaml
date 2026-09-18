@@ -533,8 +533,11 @@ requirements:
   requirement: Reconcile-on-start repairs what is safe and blocks the rest
   section: '19.4'
   verified_by: '22.7'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: reconcile.py checks card IDs still resolve, a done merge has a matching merge_records row, and
+    nothing reads done-but-reverted; wired into swarm run's startup. Unit-tested (6 cases). Findings are
+    reported, not yet auto-repaired -- that's the remaining Phase 3/4 work (orphan-worker termination
+    and crash-mid-merge repair need a real crash scenario to exercise honestly).
 - id: ASES-REC-05
   requirement: Questions block cards and are answered through the CLI; they never time out into guesses
   section: '19.5'

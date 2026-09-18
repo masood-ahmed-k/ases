@@ -39,7 +39,9 @@ blueprint first; this is the "where did that requirement end up in code" index.
 | `review.py` | re-runs Gate 1 when a card enters `review`, before trusting it; the reviewer's verdict IS the resulting Hermes status transition, nothing else to parse | ASES-REV-05 |
 | `mergeq.py` | squash candidate on integration HEAD -> Gate 3 -> fast-forward; revert on a later failure | ASES-GIT-04, -05, -06 |
 | `controller.py` | `create_cards_from_plan` (work+merge pairs, deps wired to MERGE cards per ASES-TSK-02), `run_pass` (one dispatch+review+merge iteration) | ASES-TSK-01, -02 |
-| `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + card creation), `swarm run` (bounded loop) | - |
+| `integrity.py` | touches-path checking (`paths_outside_touches`), worktree before/after snapshots | ASES-GIT-12, -13 |
+| `reconcile.py` | startup consistency checks: card IDs resolve, a done merge has a matching record, nothing reads done-but-reverted | ASES-REC-04 |
+| `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + Gate P publish + budget check + card creation), `swarm run` (bounded loop, reconciles on start), `swarm stop`/`resume` (kill switch) | - |
 
 Real Hermes profiles `lead`/`coder-1`/`reviewer` created fresh (no `--clone-from`, per ASES-ROL-10),
 toolsets restricted (reviewer has no terminal/code_execution/browser, kanban enabled for verdicts only),
