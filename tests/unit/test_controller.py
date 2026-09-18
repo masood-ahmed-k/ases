@@ -1,4 +1,12 @@
+import subprocess
+
 from ases import config, controller, db, hermes, plan as plan_mod
+
+
+def _git_ok(*args, cwd):
+    result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return result
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
 
@@ -31,6 +39,52 @@ class _FakeCounter:
     def next_id(self, prefix):
         self.n += 1
         return f"{prefix}_{self.n}"
+
+
+def _plain_repo(tmp_path, name="repo"):
+    r = tmp_path / name
+    r.mkdir()
+    _git_ok("init", "-q", "-b", "integration", cwd=r)
+    _git_ok("config", "user.email", "t@t", cwd=r)
+    _git_ok("config", "user.name", "t", cwd=r)
+    (r / "README.md").write_text("hi\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=r)
+    _git_ok("commit", "-q", "-m", "init", cwd=r)
+    return r
+
+
+def test_publish_plan_commits_docs_ases_to_integration(tmp_path):
+    repo = _plain_repo(tmp_path)
+    (repo / "docs" / "ases").mkdir(parents=True)
+    (repo / "docs" / "ases" / "plan.json").write_text("{}", encoding="utf-8")
+    before = _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+    sha = controller.publish_plan(repo, "integration")
+
+    after = _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip()
+    assert sha == after
+    assert sha != before
+    log = _git_ok("log", "-1", "--format=%s", cwd=repo).stdout
+    assert "Gate P" in log
+
+
+def test_publish_plan_is_idempotent_on_rerun(tmp_path):
+    repo = _plain_repo(tmp_path)
+    (repo / "docs" / "ases").mkdir(parents=True)
+    (repo / "docs" / "ases" / "plan.json").write_text("{}", encoding="utf-8")
+    first = controller.publish_plan(repo, "integration")
+    second = controller.publish_plan(repo, "integration")
+    assert first == second  # nothing new staged the second time -- no empty commit
+
+
+def test_publish_plan_rejects_wrong_branch(tmp_path):
+    repo = _plain_repo(tmp_path)
+    _git_ok("checkout", "-q", "-b", "not-integration", cwd=repo)
+    (repo / "docs" / "ases").mkdir(parents=True)
+    (repo / "docs" / "ases" / "plan.json").write_text("{}", encoding="utf-8")
+    import pytest
+    with pytest.raises(RuntimeError, match="integration"):
+        controller.publish_plan(repo, "integration")
 
 
 def test_create_cards_from_plan_wires_dependencies_on_merge_cards(tmp_path, monkeypatch):
@@ -114,3 +168,138 @@ def test_all_merge_cards_done_true_when_all_done(tmp_path, monkeypatch):
 
     monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: {"status": "done"})
     assert controller.all_merge_cards_done("b", plan, conn=conn) is True
+
+
+# ---------------------------------------------------------------------------------------------
+# process_merge_queue: real git conflicts, fix-card creation, budget escalation.
+# ---------------------------------------------------------------------------------------------
+
+ONE_TASK_PLAN = {
+    "project": "t3", "integration_branch": "integration",
+    "gate_profiles": {"trivial": ["echo ok"]},
+    "tasks": [
+        {"key": "T1", "title": "scaffold", "role": "coder", "depends_on": [], "touches": ["base.txt"],
+         "acceptance": ["exists"], "gate_profile": "trivial", "estimated_requests": 10},
+    ],
+}
+
+
+def _repo_with_conflict(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    _git_ok("init", "-q", "-b", "integration", cwd=r)
+    _git_ok("config", "user.email", "t@t", cwd=r)
+    _git_ok("config", "user.name", "t", cwd=r)
+    (r / "base.txt").write_text("base\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=r)
+    _git_ok("commit", "-q", "-m", "init", cwd=r)
+    _git_ok("checkout", "-q", "-b", "swarm/T1-coder", cwd=r)
+    (r / "base.txt").write_text("branch version\n", encoding="utf-8")
+    _git_ok("commit", "-aqm", "branch edit", cwd=r)
+    _git_ok("checkout", "-q", "integration", cwd=r)
+    (r / "base.txt").write_text("integration version\n", encoding="utf-8")
+    _git_ok("commit", "-aqm", "diverged", cwd=r)
+    return r
+
+
+def _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=2):
+    plan = plan_mod.parse_and_validate(ONE_TASK_PLAN, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    project = config.ProjectConfig(
+        name="t3", environment="native", data_class="public",
+        workspace_root=tmp_path / "ws", ases_home=tmp_path / "home", board="b",
+        integration_branch="integration", roles=ROLES, concurrency={},
+        budgets={"fix_cards_per_task": fix_cards_per_task}, hermes_tested_version="0.21.3",
+        hermes_native_home=tmp_path / "hermes",
+    )
+    counter = _FakeCounter()
+    created = []
+
+    def fake_create(board, title, **kw):
+        card = {"id": counter.next_id("t"), "title": title, "status": "todo", **kw}
+        created.append(card)
+        return card
+
+    monkeypatch.setattr(hermes, "kanban_create", fake_create)
+    pairs = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, project, conn=conn)
+    return plan, conn, project, pairs[0], created
+
+
+def test_merge_conflict_creates_a_fix_card_not_a_block_only(tmp_path, monkeypatch):
+    repo = _repo_with_conflict(tmp_path)
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+
+    def fake_show(board, cid):
+        if cid == pair.work_card_id:
+            return {"status": "done", "branch_name": "swarm/T1-coder"}
+        return {"status": "blocked"}
+
+    monkeypatch.setattr(hermes, "kanban_show", fake_show)
+    links = []
+    monkeypatch.setattr(hermes, "kanban_link", lambda board, parent, child: links.append((parent, child)))
+    blocked = []
+    monkeypatch.setattr(hermes, "kanban_block", lambda board, cid, reason: blocked.append((cid, reason)))
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert len(fix_cards) == 1
+    assert fix_cards[0]["parent"] == [pair.work_card_id]
+    assert links == [(fix_cards[0]["id"], pair.merge_card_id)]  # fix card linked as EXTRA parent of merge
+    assert blocked == []  # not yet at budget -- a fix card was created instead of blocking
+    row = conn.execute("SELECT fix_cards FROM plan_tasks WHERE task_key='T1'").fetchone()
+    assert row["fix_cards"] == 1
+
+
+def test_fix_card_budget_exhausted_escalates_to_block(tmp_path, monkeypatch):
+    repo = _repo_with_conflict(tmp_path)
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=0)
+
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"status": "done", "branch_name": "swarm/T1-coder"} if cid == pair.work_card_id
+        else {"status": "blocked"}
+    ))
+    monkeypatch.setattr(hermes, "kanban_link", lambda *a: None)
+    blocked = []
+    monkeypatch.setattr(hermes, "kanban_block", lambda board, cid, reason: blocked.append((cid, reason)))
+
+    controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert len(blocked) == 1
+    assert blocked[0][0] == pair.merge_card_id
+    assert "budget" in blocked[0][1].lower()
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []  # budget was 0 -- no fix card, straight to escalation
+
+
+def test_successful_merge_needs_no_fix_card(tmp_path, monkeypatch):
+    from ases import mergeq
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_ok("init", "-q", "-b", "integration", cwd=repo)
+    _git_ok("config", "user.email", "t@t", cwd=repo)
+    _git_ok("config", "user.name", "t", cwd=repo)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "init", cwd=repo)
+    _git_ok("checkout", "-q", "-b", "swarm/T1-coder", cwd=repo)
+    (repo / "new.txt").write_text("x\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "add file", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"status": "done", "branch_name": "swarm/T1-coder"} if cid == pair.work_card_id
+        else {"status": "blocked"}
+    ))
+    completed = []
+    monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: completed.append(cid))
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == ["T1"]
+    assert completed == [pair.merge_card_id]
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []

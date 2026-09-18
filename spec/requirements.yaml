@@ -602,8 +602,11 @@ requirements:
     branch before implementation cards become ready
   section: 7, 12.4
   verified_by: 22.2, 22.14
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'controller.publish_plan commits docs/ases/ to the integration branch and returns that SHA; cmd_approve
+    calls it before create_cards_from_plan. Unit-tested: commits, idempotent on rerun, rejects the wrong
+    branch. Simplified vs. a full separate-planning-worktree flow (Phase 3''s swarm plan writes straight
+    into the primary checkout).'
 - id: ASES-TSK-04
   requirement: Final integration security and smoke gates are controller lifecycle operations, not a worker
     role or task assignee

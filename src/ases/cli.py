@@ -123,6 +123,9 @@ def cmd_approve(args: argparse.Namespace) -> int:
         return 1
     print(f"Gate 0 passed: {len(plan.tasks)} tasks")
 
+    publish_sha = controller_mod.publish_plan(repo, plan.integration_branch)
+    print(f"Gate P: published approved plan at {publish_sha}")
+
     pairs = controller_mod.create_cards_from_plan(
         project.board, args.project_id, repo, plan, project, conn=conn
     )
@@ -143,7 +146,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     for i in range(args.max_iterations):
-        summary = controller_mod.run_pass(project.board, repo, plan, conn=conn)
+        summary = controller_mod.run_pass(project.board, repo, plan, project, conn=conn)
         print(f"[pass {i + 1}] merged={summary['merged']} sent_back={summary['sent_back']} "
               f"finished={summary['finished']}")
         if summary["finished"]:

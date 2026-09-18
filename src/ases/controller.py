@@ -31,6 +31,40 @@ class CardPair:
     merge_card_id: str
 
 
+def publish_plan(repo: pathlib.Path, integration_branch: str) -> str:
+    """ASES-ARC-09 (v1.2): commit docs/ases/ to the integration branch and return that commit's SHA,
+    BEFORE any implementation card is created. A worktree cut after this point sees the approved plan;
+    one cut before it wouldn't. The repo's checked-out branch must already be integration_branch --
+    Phase 3's `swarm plan` writes straight into the primary checkout, so this is a plain commit, not a
+    merge from a separate planning worktree (a real multi-worktree planning flow is a later refinement)."""
+    current = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"], capture_output=True, text=True,
+    ).stdout.strip()
+    if current != integration_branch:
+        raise RuntimeError(
+            f"publish_plan expected {repo} to be on {integration_branch!r}, found {current!r}"
+        )
+    subprocess.run(["git", "-C", str(repo), "add", "docs/ases"], check=True, capture_output=True)
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--", "docs/ases"],
+        capture_output=True, text=True,
+    ).stdout
+    if not status.strip():
+        # Nothing staged -- plan.json was already committed (e.g. a re-run of `swarm approve`).
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+        ).stdout.strip()
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "ASES: publish approved plan (Gate P)"],
+        capture_output=True, text=True,
+    )
+    if commit.returncode != 0:
+        raise RuntimeError(f"could not commit the approved plan: {commit.stdout}{commit.stderr}")
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+
+
 def create_cards_from_plan(
     board: str, project_id: str, repo_path: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig,
     *, conn,
@@ -105,14 +139,22 @@ def process_review_lane(
 
 
 def process_merge_queue(
-    board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn,
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn,
 ) -> list[str]:
     """One pass: for every DONE work card whose merge card is still blocked/ready, run the merge.
-    Serialized -- one merge_task call at a time, in task order, matching ASES-GIT-04."""
+    Serialized -- one merge_task call at a time, in task order, matching ASES-GIT-04.
+
+    On conflict or a red Gate 3 (ASES-GIT-09, ASES-REC-01/02): open a fix card for the same role,
+    fresh worktree, the failure bundle attached, and link it as an EXTRA parent of the merge card --
+    never send the two original cards back to argue with each other. Bounded by
+    budgets.fix_cards_per_task; past that, escalate by blocking the merge card for the user instead
+    of creating another fix card."""
     merged = []
+    fix_limit = project.budgets.get("fix_cards_per_task", 2)
+
     for key in plan_mod.topological_order(plan):
         row = conn.execute(
-            "SELECT work_card_id, merge_card_id FROM plan_tasks WHERE project = ? AND task_key = ?",
+            "SELECT work_card_id, merge_card_id, fix_cards FROM plan_tasks WHERE project = ? AND task_key = ?",
             (plan.project, key),
         ).fetchone()
         if row is None:
@@ -135,9 +177,34 @@ def process_merge_queue(
             )
             merged.append(key)
             events.record(conn, "merged", {"task_key": key, "sha": outcome.squash_commit})
-        else:
-            hermes_mod.kanban_block(board, row["merge_card_id"], f"merge failed: {outcome.detail[:500]}")
-            events.record(conn, "merge_failed", {"task_key": key, "detail": outcome.detail[:500]})
+            continue
+
+        events.record(conn, "merge_failed", {"task_key": key, "detail": outcome.detail[:500]})
+        if row["fix_cards"] >= fix_limit:
+            hermes_mod.kanban_block(
+                board, row["merge_card_id"],
+                f"fix-card budget ({fix_limit}) exhausted for {key}; needs a human decision. "
+                f"Last failure: {outcome.detail[:500]}",
+            )
+            events.record(conn, "fix_card_budget_exhausted", {"task_key": key})
+            continue
+
+        assignee = policy.resolve_assignee(task.role, project.roles)
+        fix_branch = f"swarm/{key}-fix{row['fix_cards'] + 1}"
+        fix_card = hermes_mod.kanban_create(
+            board, f"{key}: fix (round {row['fix_cards'] + 1})", assignee=assignee,
+            workspace="worktree", branch=fix_branch, project=project.name,
+            body=(f"Merge attempt for {key} failed. Fix in a fresh worktree.\n\n"
+                  f"Failure detail:\n{outcome.detail[:1500]}"),
+            parent=[row["work_card_id"]],
+            idempotency_key=f"ases-fix-{plan.project}-{key}-{row['fix_cards'] + 1}",
+        )
+        hermes_mod.kanban_link(board, fix_card["id"], row["merge_card_id"])
+        conn.execute(
+            "UPDATE plan_tasks SET fix_cards = fix_cards + 1 WHERE project = ? AND task_key = ?",
+            (plan.project, key),
+        )
+        events.record(conn, "fix_card_created", {"task_key": key, "fix_card_id": fix_card["id"]})
     return merged
 
 
@@ -154,12 +221,12 @@ def all_merge_cards_done(board: str, plan: plan_mod.Plan, *, conn) -> bool:
     return True
 
 
-def run_pass(board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn) -> dict:
+def run_pass(board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn) -> dict:
     """One full controller iteration: dispatch, review-lane policing, merge queue.
     Returns a small summary dict for logging -- this is what a bounded `swarm run` loop calls
     repeatedly (section 9.2's pseudocode), sleeping between calls to respect provider pacing."""
     dispatch_result = hermes_mod.kanban_dispatch(board)
     sent_back = process_review_lane(board, repo, plan, conn=conn)
-    merged = process_merge_queue(board, repo, plan, conn=conn)
+    merged = process_merge_queue(board, repo, plan, project, conn=conn)
     finished = all_merge_cards_done(board, plan, conn=conn)
     return {"dispatch": dispatch_result, "sent_back": sent_back, "merged": merged, "finished": finished}
