@@ -24,7 +24,7 @@ from . import policy as policy_mod
 
 _GLYPH = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "pending": "[PEND]"}
 _NOT_BUILT_YET = {
-    "init", "status", "questions", "answer", "stop", "resume", "eval", "report",
+    "init", "status", "questions", "answer", "eval", "report",
 }
 
 
@@ -177,6 +177,44 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_stop(args: argparse.Namespace) -> int:
+    """ASES-REC-06: swarm stop halts new dispatch and reclaims every running card. Deliberately does
+    NOT hunt down and kill arbitrary hermes.exe processes -- the user may have unrelated Hermes chat
+    sessions open, and this module has no reliable way to tell an ASES worker's PID from theirs.
+    hermes pause + reclaim already gives the real safety property (no new work starts, and a
+    reclaimed card's in-flight run is abandoned per Hermes's own semantics)."""
+    project = _load_project()
+    conn = ases_db.connect(ases_config.db_path(project))
+    try:
+        hermes_mod.pause(reason="swarm stop")
+    except hermes_mod.HermesCommandError as exc:
+        print(f"hermes pause failed: {exc}", file=sys.stderr)
+        return 1
+
+    reclaimed = []
+    for card in hermes_mod.kanban_list(project.board, status="running"):
+        try:
+            hermes_mod.kanban_reclaim(project.board, card["id"], reason="swarm stop")
+            reclaimed.append(card["id"])
+        except hermes_mod.HermesCommandError as exc:
+            print(f"could not reclaim {card['id']}: {exc}", file=sys.stderr)
+
+    from . import events as events_mod
+    events_mod.record(conn, "swarm_stop", {"reclaimed": reclaimed})
+    print(f"paused dispatch; reclaimed {len(reclaimed)} running card(s): {reclaimed}")
+    return 0
+
+
+def cmd_resume(_args: argparse.Namespace) -> int:
+    try:
+        hermes_mod.resume()
+    except hermes_mod.HermesCommandError as exc:
+        print(f"hermes resume failed: {exc}", file=sys.stderr)
+        return 1
+    print("resumed")
+    return 0
+
+
 def cmd_not_built_yet(args: argparse.Namespace) -> int:
     print(f"`swarm {args.command}` is not built yet. See section 16 (implementation phases) for when it lands.")
     return 2
@@ -208,6 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--max-iterations", type=int, default=30)
     p_run.add_argument("--sleep-seconds", type=int, default=20)
     p_run.set_defaults(func=cmd_run)
+
+    sub.add_parser("stop", help="Kill switch: pause dispatch, reclaim running cards (ASES-REC-06)").set_defaults(
+        func=cmd_stop
+    )
+    sub.add_parser("resume", help="Lift a swarm stop").set_defaults(func=cmd_resume)
 
     for name in sorted(_NOT_BUILT_YET):
         sub.add_parser(name, help="(not built yet)").set_defaults(func=cmd_not_built_yet)

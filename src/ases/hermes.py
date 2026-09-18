@@ -203,3 +203,20 @@ def kanban_reclaim(board: str, card_id: str, *, reason: str | None = None) -> No
     if reason:
         args += ["--reason", reason]
     _kanban(board, args)
+
+
+def pause(reason: str | None = None, timeout: int = 20) -> None:
+    """ASES-REC-06: halts NEW dispatch/cron/gateway turns. Never kills work already in flight --
+    that's Hermes's own documented behavior for `hermes pause`, not a gap here."""
+    args = ["pause"]
+    if reason:
+        args += ["--reason", reason]
+    result = _run(args, timeout=timeout)
+    if result.returncode != 0:
+        raise HermesCommandError(args, result.returncode, result.stdout + result.stderr)
+
+
+def resume(timeout: int = 20) -> None:
+    result = _run(["resume"], timeout=timeout)
+    if result.returncode != 0:
+        raise HermesCommandError(["resume"], result.returncode, result.stdout + result.stderr)

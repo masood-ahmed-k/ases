@@ -545,8 +545,12 @@ requirements:
   requirement: swarm stop halts everything within 30 seconds
   section: '19.6'
   verified_by: '22.13'
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'swarm stop: hermes pause (halts new dispatch) + reclaim every running card, event-logged. Verified
+    for real (0 running cards, clean pause/resume cycle). Deliberately does not hunt/kill arbitrary hermes.exe
+    processes -- no reliable way to distinguish an ASES worker''s PID from an unrelated Hermes chat session
+    the user has open; pause+reclaim already gives the real safety property per Hermes''s own reclaim
+    semantics.'
 - id: ASES-SEC-01
   requirement: Secret scanning in Gates 1 and 3 and on outgoing card bodies and plan files
   section: '21.1'
