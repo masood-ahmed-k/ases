@@ -336,13 +336,16 @@ requirements:
     fix card when one is created, so the merge queue waits for the fix card to reach done, merges the FIX
     card''s branch, and process_review_lane and process_budget_gate can see it; fix cards are created
     under the original card''s real Hermes project_id (not the ASES-internal label); and a benign
-    fast-forward race (Gate 3 passed, integration moved) no longer costs a fix card. Covered by a
-    real-git lifecycle test (conflict, fix card, fix done, fix branch merges) plus a two-round chain
-    test. Left partial, not covered: never exercised against a real Hermes dispatch, and two open design
-    decisions are recorded in docs/architecture.md -- (1) the race branch also swallows any persistent
-    ff-only refusal (dirty or wrong-branch primary checkout) into silent retries, and (2) a re-approve
-    resets the repoint. The lifecycle is otherwise consistent, but note plan_tasks no longer records the
-    original work card id once a fix exists (it survives in the cards_created event).'
+    fast-forward race (Gate 3 passed, integration moved) no longer costs a fix card. The two design
+    decisions that review left open were then implemented the same day: (1) the race branch is exact, only
+    a git-verified move of the integration tip earns the free retry, a non-race ff-only refusal (dirty
+    checkout, unverifiable lookup) takes the ordinary failure path bounded by fix_cards_per_task, and
+    merge_task refuses to run unless the primary checkout is on the integration branch; (2) a re-approve
+    no longer resets the repoint (create_cards_from_plan keeps work_card_id once fix_cards is above zero).
+    Covered by a real-git lifecycle test (conflict, fix card, fix done, fix branch merges), a two-round
+    chain test, real-race and dirty-checkout tests, and three re-approve tests. Left partial, not covered:
+    never exercised against a real Hermes dispatch. Note plan_tasks no longer records the original work
+    card id once a fix exists (it survives in the cards_created event).'
 - id: ASES-GIT-10
   requirement: An empty repository gets an initial commit and the integration branch
   section: '8.3'

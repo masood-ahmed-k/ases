@@ -198,6 +198,110 @@ def test_create_cards_from_plan_persists_to_db(tmp_path, monkeypatch):
     assert [(r["task_key"], r["role"]) for r in rows] == [("T1", "coder"), ("T2", "reviewer")]
 
 
+def _idempotent_kanban_create(monkeypatch):
+    """A fake hermes.kanban_create that returns the SAME card for a repeated idempotency_key, like real
+    Hermes. The plain fakes above mint a fresh id on every call, so calling create_cards_from_plan a
+    second time against them is not a re-approve at all: only an idempotent fake hands back the ORIGINAL
+    work card the way the real board does, which is what the re-approve tests below depend on."""
+    counter = _FakeCounter()
+    by_key = {}
+
+    def fake_create(board, title, **kwargs):
+        key = kwargs.get("idempotency_key")
+        if key is not None and key in by_key:
+            return dict(by_key[key])
+        card = {"id": counter.next_id("t"), "title": title, **kwargs}
+        if key is not None:
+            by_key[key] = card
+        return dict(card)
+
+    monkeypatch.setattr(hermes, "kanban_create", fake_create)
+
+
+def _set_plan_task(conn, plan, task_key, *, work_card_id, fix_cards):
+    """Put one plan_tasks row in a chosen state: what process_merge_queue leaves behind after a failed
+    merge (fix_cards=1, work_card_id repointed at the fix card), or a stale id with fix_cards=0 so that a
+    refresh on re-approve is visible."""
+    conn.execute(
+        "UPDATE plan_tasks SET work_card_id = ?, fix_cards = ? WHERE project = ? AND task_key = ?",
+        (work_card_id, fix_cards, plan.project, task_key),
+    )
+
+
+def _plan_task_row(conn, plan, task_key):
+    return conn.execute(
+        "SELECT work_card_id, merge_card_id, fix_cards FROM plan_tasks WHERE project = ? AND task_key = ?",
+        (plan.project, task_key),
+    ).fetchone()
+
+
+def test_reapprove_keeps_the_fix_card_repoint(tmp_path, monkeypatch):
+    """Real bug (2026-09-19): process_merge_queue repoints plan_tasks.work_card_id at a fix card, so the
+    column means the task's CURRENT card. A re-approve (also how gate configuration is changed,
+    ASES-QG-02) calls create_cards_from_plan again; kanban_create is idempotent by key, so it hands back
+    the ORIGINAL work card, and the upsert used to reset work_card_id to it while fix_cards kept its
+    count. The live fix card was forgotten: the merge queue went back to merging the original,
+    still-broken branch, and the review and budget lanes stopped seeing the fix card."""
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    _idempotent_kanban_create(monkeypatch)
+    first = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+    t1 = next(p for p in first if p.task_key == "T1")
+    _set_plan_task(conn, plan, "T1", work_card_id="fix_card_1", fix_cards=1)  # a fix card was opened
+
+    again = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    assert again == first  # premise: the re-approve got the ORIGINAL cards back, not fresh ones
+    row = _plan_task_row(conn, plan, "T1")
+    assert row["work_card_id"] == "fix_card_1"
+    assert row["work_card_id"] != t1.work_card_id  # not reset to the original work card
+    assert row["fix_cards"] == 1
+    assert row["merge_card_id"] == t1.merge_card_id  # the merge card never moves, and is still the right one
+
+
+def test_reapprove_with_no_fix_cards_still_refreshes_work_card_id(tmp_path, monkeypatch):
+    """Guard against over-correcting the fix above: the column is only held once a fix card has been
+    spent. A task that never needed one has its work_card_id refreshed to the (idempotent) work card on
+    a re-approve, exactly as before, so a stale id is still healed."""
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    _idempotent_kanban_create(monkeypatch)
+    first = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+    t1 = next(p for p in first if p.task_key == "T1")
+    _set_plan_task(conn, plan, "T1", work_card_id="stale_card", fix_cards=0)
+
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    row = _plan_task_row(conn, plan, "T1")
+    assert row["work_card_id"] == t1.work_card_id  # the stale id was reset to the idempotent work card
+    assert row["fix_cards"] == 0
+    assert row["merge_card_id"] == t1.merge_card_id
+
+
+def test_reapprove_guard_is_per_task(tmp_path, monkeypatch):
+    """The hold keys on each task's OWN fix_cards, not on the plan having had a fix anywhere: T1 spent a
+    fix card and keeps its repoint, while T2 (never fixed, and given a stale id so that a refresh is
+    visible) is refreshed normally by the very same re-approve."""
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    _idempotent_kanban_create(monkeypatch)
+    first = {
+        p.task_key: p
+        for p in controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+    }
+    _set_plan_task(conn, plan, "T1", work_card_id="fix_card_1", fix_cards=1)
+    _set_plan_task(conn, plan, "T2", work_card_id="stale_card", fix_cards=0)
+
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    t1_row = _plan_task_row(conn, plan, "T1")
+    t2_row = _plan_task_row(conn, plan, "T2")
+    assert (t1_row["work_card_id"], t1_row["fix_cards"]) == ("fix_card_1", 1)  # held: T1 spent a fix card
+    assert (t2_row["work_card_id"], t2_row["fix_cards"]) == (first["T2"].work_card_id, 0)  # T2 never did
+    assert t1_row["merge_card_id"] == first["T1"].merge_card_id
+    assert t2_row["merge_card_id"] == first["T2"].merge_card_id
+
+
 MODELS_CONFIG = {
     "providers": {
         "openrouter": {"limits": {"per_day_default": 50, "per_day_after_credits": 1000}, "credits_purchased": False},
@@ -519,6 +623,16 @@ _RED_GATE3 = mergeq.MergeOutcome(
 _FF_RACE = mergeq.MergeOutcome(
     merged=False, candidate_sha="cand1", squash_commit=None, gate3_result="pass",
     detail="fast-forward refused, integration branch moved: fatal: Not possible to fast-forward, aborting.",
+    integration_moved=True,
+)
+# Same gate3_result="pass" shape as _FF_RACE, but mergeq found the integration tip had NOT moved (the real
+# text git prints for a dirty primary checkout), so the free retry must not apply (2026-09-19 fix).
+_FF_REFUSED_NOT_A_RACE = mergeq.MergeOutcome(
+    merged=False, candidate_sha="cand1", squash_commit=None, gate3_result="pass",
+    detail=("fast-forward refused although the integration branch did NOT move (still 0123456789ab); this is "
+            "not a race, a dirty or wrong-branch primary checkout is the likely cause: error: Your local "
+            "changes to the following files would be overwritten by merge:\n\tbase.txt\nAborting"),
+    integration_moved=False,
 )
 _MERGED = mergeq.MergeOutcome(
     merged=True, candidate_sha="cand1", squash_commit="cand1", gate3_result="pass", detail="merged",
@@ -712,11 +826,12 @@ def test_fix_card_is_created_under_the_original_cards_real_hermes_project_id(tmp
 
 
 def test_benign_fast_forward_race_retries_next_poll_without_a_fix_card(tmp_path, monkeypatch):
-    """Real bug (2026-09-19): mergeq.merge_task returns merged=False with gate3_result="pass" when Gate 3
-    was green but the fast-forward was refused because the integration branch moved underneath the
-    candidate. That is not a failure of the branch, yet process_merge_queue treated it like one: a real
-    fix card (a wasted coder turn) and one unit of fix-card budget. It now costs nothing and is simply
-    retried on the next poll."""
+    """Real bug (2026-09-19): mergeq.merge_task returns merged=False with gate3_result="pass" and
+    integration_moved=True when Gate 3 was green but the fast-forward was refused because the integration
+    branch verifiably moved underneath the candidate. That is not a failure of the branch, yet
+    process_merge_queue treated it like one: a real fix card (a wasted coder turn) and one unit of
+    fix-card budget. It now costs nothing and is simply retried on the next poll. (The free retry keys on
+    integration_moved, not gate3_result; the tests below pin what happens when it is False.)"""
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
     _board_state(monkeypatch, pair)
     actions = _record_card_actions(monkeypatch)
@@ -741,9 +856,10 @@ def test_benign_fast_forward_race_retries_next_poll_without_a_fix_card(tmp_path,
 
 
 def test_red_gate3_still_opens_a_fix_card(tmp_path, monkeypatch):
-    """Guard for the race fix above: the benign-race branch keys on gate3_result == "pass", so a RED
-    Gate 3 (gate3_result == "fail") is still a genuine failure of the branch and must still open a fix
-    card and spend budget. (The conflict shape, gate3_result None, is already covered by
+    """Guard for the race fix above: the benign-race branch keys on integration_moved, which only a
+    Gate-3-green outcome whose fast-forward was refused can carry, so a RED Gate 3 (gate3_result ==
+    "fail") is still a genuine failure of the branch and must still open a fix card and spend budget.
+    (The conflict shape, gate3_result None, is already covered by
     test_merge_conflict_creates_a_fix_card_not_a_block_only.)"""
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
     _board_state(monkeypatch, pair)
@@ -757,6 +873,87 @@ def test_red_gate3_still_opens_a_fix_card(tmp_path, monkeypatch):
     assert actions["block"] == []
     kinds = [e["kind"] for e in events.recent(conn)]
     assert "merge_failed" in kinds and "merge_race_retrying" not in kinds
+
+
+def test_ff_refusal_with_the_integration_tip_unmoved_is_a_real_failure_not_a_free_retry(tmp_path, monkeypatch):
+    """Real bug (2026-09-19), the flip side of the race test above. The free retry used to key on
+    gate3_result == "pass" alone, but git also refuses a fast-forward while the integration tip has NOT
+    moved (a dirty primary checkout, a wrong-branch checkout, an index.lock). Those are refused again on
+    every poll, so they retried silently, bounded only by --max-iterations, instead of surfacing. mergeq
+    now reports whether the tip verifiably moved; with integration_moved False, a Gate-3-green refusal is
+    an ordinary failure again: a merge_failed event, a fix card, one unit of fix budget spent."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _FF_REFUSED_NOT_A_RACE)  # gate3_result == "pass", integration_moved False
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
+
+    (fix_card,) = _fix_cards(created)
+    row = _task_row(conn)
+    assert row["fix_cards"] == 1  # budget spent, exactly like any other failure
+    assert row["work_card_id"] == fix_card["id"]
+    assert actions["link"] == [(fix_card["id"], pair.merge_card_id)]
+    assert actions["block"] == []  # the first failure opens a fix card; a block comes once the budget is spent
+    recent = events.recent(conn)
+    kinds = [e["kind"] for e in recent]
+    assert "merge_failed" in kinds and "fix_card_created" in kinds
+    assert "merge_race_retrying" not in kinds
+    failed = next(e for e in recent if e["kind"] == "merge_failed")
+    assert "did NOT move" in failed["payload"]  # git's own diagnosis is what surfaces, in the event...
+    assert "did NOT move" in fix_card["body"]  # ...and in the fix card's body
+
+
+def test_ff_refusal_with_the_integration_tip_unmoved_blocks_once_the_fix_budget_is_spent(tmp_path, monkeypatch):
+    """The end of that same path: with no fix budget left, a refusal that is not a race escalates to a
+    block carrying git's own text for a human, rather than being retried for free."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=0)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _FF_REFUSED_NOT_A_RACE)
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
+
+    assert _fix_cards(created) == []
+    ((blocked_id, reason),) = actions["block"]
+    assert blocked_id == pair.merge_card_id
+    assert "budget" in reason.lower() and "did NOT move" in reason
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "merge_failed" in kinds and "fix_card_budget_exhausted" in kinds
+    assert "merge_race_retrying" not in kinds
+
+
+def test_dirty_primary_checkout_is_a_real_failure_end_to_end_not_a_silent_retry(tmp_path, monkeypatch):
+    """Real git and the real mergeq.merge_task, nothing scripted: an uncommitted edit in the primary
+    checkout to a file the merge changes makes git refuse the fast-forward with the integration tip
+    unmoved. That used to be swallowed as a 'race' and retried silently on every poll; it must now come
+    out of process_merge_queue as an ordinary failure, and integration must be left exactly as it was."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_ok("init", "-q", "-b", "integration", cwd=repo)
+    _git_ok("config", "user.email", "t@t", cwd=repo)
+    _git_ok("config", "user.name", "t", cwd=repo)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "init", cwd=repo)
+    _git_ok("checkout", "-q", "-b", "swarm/T1-coder", cwd=repo)
+    (repo / "base.txt").write_text("branch version\n", encoding="utf-8")
+    _git_ok("commit", "-aqm", "branch edit", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    (repo / "base.txt").write_text("uncommitted local edit\n", encoding="utf-8")  # dirty, tip unmoved
+    tip = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+
+    assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == []
+
+    (fix_card,) = _fix_cards(created)
+    assert _task_row(conn)["fix_cards"] == 1
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "merge_failed" in kinds and "merge_race_retrying" not in kinds
+    assert "did NOT move" in fix_card["body"]
+    assert _git_ok("rev-parse", "integration", cwd=repo).stdout.strip() == tip
 
 
 def test_review_lane_finds_and_polices_a_fix_card_after_the_repoint(tmp_path, monkeypatch):

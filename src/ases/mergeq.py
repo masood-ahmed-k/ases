@@ -30,6 +30,10 @@ class MergeOutcome:
     squash_commit: str | None
     gate3_result: str | None
     detail: str
+    # True ONLY when merge_task verified in git that the integration branch moved underneath the candidate
+    # between building it and the fast-forward: a genuine race, the one refusal the controller may retry for
+    # free (2026-09-19 fix). Every other outcome, including every other refused fast-forward, leaves it False.
+    integration_moved: bool = False
 
 
 def _git(args: list[str], cwd: pathlib.Path, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -40,13 +44,48 @@ def _head_sha(repo: pathlib.Path) -> str:
     return _git(["rev-parse", "HEAD"], repo).stdout.strip()
 
 
+def _resolve(repo: pathlib.Path, rev: str) -> str:
+    """The full SHA `rev` names in `repo`, or "" when git can't resolve it. Checks the exit code and uses
+    --verify because a bare `git rev-parse <bad-rev>` echoes the bad argument on stdout while failing, so
+    "non-empty output" alone would mistake a failed lookup for an answer."""
+    result = _git(["rev-parse", "--verify", "-q", rev], repo)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def merge_task(
     repo: pathlib.Path, integration_branch: str, work_branch: str, task_key: str,
     gate3_commands: list[str], *, conn=None, commit_message: str | None = None,
 ) -> MergeOutcome:
     """ASES-GIT-04: squash candidate on integration HEAD -> Gate 3 -> fast-forward -> done.
     A merge conflict or a red Gate 3 leaves the integration branch untouched and returns merged=False;
-    the caller (review.py / the controller loop) is responsible for opening a fix card."""
+    the caller (review.py / the controller loop) is responsible for opening a fix card.
+
+    The primary checkout must be ON integration_branch itself (2026-09-19 fix): `git merge --ff-only`
+    advances whatever branch is checked out, so from any other branch (or a detached HEAD) it could
+    fast-forward THAT branch, report merged=True, and leave integration where it was. That is refused up
+    front, before any worktree exists.
+
+    A refused fast-forward returns gate3_result="pass" with `integration_moved` decided from git, not
+    assumed: True only if the integration tip is no longer the candidate's parent (a real race, safe for
+    the caller to retry for free). git also refuses a fast-forward while the tip has NOT moved (a dirty or
+    wrong-branch primary checkout, an index.lock); that is integration_moved=False and a real failure."""
+    # Before mkdtemp and before any worktree, so refusing here leaves nothing behind to clean up.
+    head = _git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
+    current_branch = head.stdout.strip() if head.returncode == 0 else ""
+    if current_branch != integration_branch:
+        if head.returncode == 0:
+            where = f"branch '{current_branch}'"
+        elif head.returncode == 1:  # `symbolic-ref -q` exits 1, silently, on a detached HEAD
+            where = "a detached HEAD (no branch)"
+        else:
+            where = f"an unreadable HEAD ({head.stderr.strip()})"
+        return MergeOutcome(
+            False, None, None, None,
+            f"primary checkout {repo} is on {where}, not the integration branch '{integration_branch}': "
+            f"ASES refuses to merge into a checkout that isn't on it (git merge --ff-only would advance "
+            f"whatever branch is checked out, not '{integration_branch}')",
+        )
+
     tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="ases-merge-"))
     candidate = tmp_root / "candidate"
     try:
@@ -89,10 +128,27 @@ def merge_task(
 
         ff = _git(["merge", "--ff-only", candidate_sha], repo)
         if ff.returncode != 0:
-            # The integration branch moved under us between base_sha and now (concurrent merge that
-            # shouldn't happen if the queue is truly serialized, but fail safe rather than force).
-            return MergeOutcome(False, candidate_sha, None, "pass",
-                                 f"fast-forward refused, integration branch moved: {ff.stderr}")
+            # Fail safe rather than force. But "refused" alone does not mean the tip moved (2026-09-19 fix):
+            # git also refuses --ff-only over a dirty primary checkout whose uncommitted changes the merge
+            # would overwrite, or an index.lock, with the tip exactly where it was. The candidate was
+            # squashed onto the integration tip as of worktree creation, so its parent IS that tip; the
+            # branch moved iff it is somewhere else now. Only that evidence earns the free retry, so if
+            # either lookup fails the answer is "not moved".
+            parent = _resolve(repo, f"{candidate_sha}^")
+            tip_now = _resolve(repo, integration_branch)
+            moved = bool(parent) and bool(tip_now) and tip_now != parent
+            if moved:
+                detail = (f"fast-forward refused, integration branch moved ('{integration_branch}' was "
+                          f"{parent[:12]} when the candidate was built, is now {tip_now[:12]}): {ff.stderr}")
+            elif parent and tip_now:
+                detail = (f"fast-forward refused although the integration branch did NOT move (still "
+                          f"{tip_now[:12]}); this is not a race, a dirty or wrong-branch primary checkout "
+                          f"is the likely cause: {ff.stderr}")
+            else:
+                detail = (f"fast-forward refused and git could not confirm whether the integration branch "
+                          f"moved (treated as NOT moved, so no free retry); a dirty or wrong-branch primary "
+                          f"checkout is a likely cause: {ff.stderr}")
+            return MergeOutcome(False, candidate_sha, None, "pass", detail, integration_moved=moved)
 
         if conn is not None:
             conn.execute(

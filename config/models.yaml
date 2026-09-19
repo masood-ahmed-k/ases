@@ -112,8 +112,8 @@ models:
     model: "qwen/qwen3-coder-plus:free"   # xKiro's own catalog: 1.05M context, purpose-built for coding.
     context_length: 1050000               # xKiro's own catalog page, 2026-09-19; not independently
                                            # confirmed against a real Hermes context-probe yet.
-    tool_calling: true                    # xKiro's own catalog lists function calling; not yet verified
-                                           # against the real coder-1 profile (needs the user's key).
+    tool_calling: true                    # verified 2026-09-19: real terminal tool call on the real
+                                           # coder-1 profile, and a real kanban card completed (below).
     role_class: coder
     pinned: true
     data_policy: router_ztr_upstream_varies   # see the xkiro provider block's note near the top of this
@@ -123,9 +123,37 @@ models:
     # given UnoRouter's accumulated real flakiness above. Picked the coding-specialized free model
     # (qwen3-coder-plus) over reusing lead's qwen3.8-max:free, on the theory that a model actually
     # marketed for code generation is a better fit for the coder role specifically than a general
-    # flagship-reasoning model -- not yet verified against a real dispatch, needs its own key (coder-1
-    # and lead deliberately use separate xKiro keys, matching the UnoRouter-era per-profile isolation
-    # pattern, not because xKiro is known to need it the way UnoRouter's per-model-rpm did).
+    # flagship-reasoning model. Own key, separate from lead's (per-profile isolation habit, not a
+    # known xKiro requirement). Result, stated precisely: with that key it claimed the real T1 card
+    # (07:42:47), found hello.py already committed on the branch by an EARLIER UnoRouter-era attempt
+    # (commit c23b684, authored 00:00, one file, inside the card's touches), ran `python hello.py` to
+    # verify it, and completed the card at 07:43:51. So it has verified and completed real work on a real
+    # card; it has NOT yet written and committed real work on one (only the scratch slugify task below
+    # shows it writing code in this harness).
+
+  # Coding candidates evaluated 2026-09-19 at the user's suggestion ("minimax could be better option when
+  # it comes to coding and development"). One identical real task (write a slugify() function to a spec,
+  # verify it with the terminal tool) run once per model through coder-1's existing key with -m, graded by
+  # a hidden 10-case check run afterwards: qwen3-coder-plus 10/10 in 142s, minimax-m3 10/10 in 133s,
+  # minimax-m2.5 10/10 in 194s (and it answered with a summary when told to reply with just "done").
+  # Verdict: MiniMax works in this harness (real tool calls, correct code) and nothing here separates the
+  # three -- n=1 on an easy task can't rank models. Not pinned, not promoted; compare on something harder
+  # (a fix card, a multi-file task) before switching a role. No separate key is needed: xKiro keys are not
+  # model-scoped (the same key has served several different models tonight).
+  - provider: xkiro
+    model: "minimax/minimax-m3:free"
+    context_length: 1000000               # xKiro's dashboard, 2026-09-19: "1M context ... for frontier
+                                           # coding and agentic tasks"; not independently confirmed.
+    tool_calling: true                    # verified 2026-09-19, see the evaluation note above.
+    role_class: coder_candidate
+    pinned: false
+
+  - provider: xkiro
+    model: "minimax/minimax-m2.5:free"
+    context_length: 204000                # xKiro's dashboard, 2026-09-19 (listed as 204K).
+    tool_calling: true                    # verified 2026-09-19, see the evaluation note above.
+    role_class: coder_candidate
+    pinned: false
 
   - provider: openrouter
     model: "cohere/north-mini-code:free"

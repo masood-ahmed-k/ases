@@ -71,7 +71,13 @@ def create_cards_from_plan(
 ) -> list[CardPair]:
     """ASES-LED-02/ASES-TSK-01/02: one work + one merge card per task, idempotent by plan key, work
     cards depend on their prerequisites' MERGE cards (not work cards) so a dependent never starts
-    before its parent is actually merged."""
+    before its parent is actually merged.
+
+    Safe to re-run on an in-flight plan (2026-09-19 fix): once a task has spent a fix card,
+    process_merge_queue has repointed plan_tasks.work_card_id at it, and a re-approve (also how gate
+    configuration is changed, ASES-QG-02) gets the ORIGINAL work card back from the idempotent create
+    below. The upsert used to reset the column to that original card, forgetting the live fix card, so
+    it now leaves work_card_id alone for any task with fix_cards > 0."""
     pairs: dict[str, CardPair] = {}
     order = plan_mod.topological_order(plan)
 
@@ -94,10 +100,16 @@ def create_cards_from_plan(
             idempotency_key=f"ases-merge-{plan.project}-{key}",
         )
         pairs[key] = CardPair(key, work["id"], merge["id"])
+        # work_card_id is the task's CURRENT card: process_merge_queue repoints it at each fix card it
+        # opens and bumps fix_cards in the same statement. A re-approve must not undo that, and it gets
+        # the ORIGINAL work card id back from the idempotent create above, so the incoming id is only
+        # taken while no fix card has been spent for this task (2026-09-19 fix).
         conn.execute(
             "INSERT INTO plan_tasks (project, task_key, work_card_id, merge_card_id, role, touches, "
             "gate_profile, estimated_requests, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
-            "ON CONFLICT(project, task_key) DO UPDATE SET work_card_id=excluded.work_card_id, "
+            "ON CONFLICT(project, task_key) DO UPDATE SET "
+            "work_card_id=CASE WHEN plan_tasks.fix_cards > 0 THEN plan_tasks.work_card_id "
+            "ELSE excluded.work_card_id END, "
             "merge_card_id=excluded.merge_card_id",
             (plan.project, key, work["id"], merge["id"], task.role,
              __import__("json").dumps(list(task.touches)), task.gate_profile, task.estimated_requests),
@@ -252,9 +264,15 @@ def process_merge_queue(
     that card's real Hermes project_id: `project.name` is config/swarm.yaml's own ASES-internal label,
     not a Hermes project id.
 
-    A merge whose Gate 3 PASSED but whose fast-forward was refused (the integration branch moved
-    underneath the candidate) is a benign race, not a failure: it gets a free retry on the next pass,
-    with no fix card, no fix budget spent, and the merge card left exactly as it was."""
+    A merge whose fast-forward was refused because the integration branch VERIFIABLY moved underneath
+    the candidate (`outcome.integration_moved`, which mergeq.merge_task sets only after comparing the
+    candidate's parent with the branch tip in git) is a benign race, not a failure: it gets a free retry
+    on the next pass, with no fix card, no fix budget spent, and the merge card left exactly as it was.
+    A fast-forward refused with the tip NOT moved (a dirty or wrong-branch primary checkout, an
+    index.lock) is not a race and would only be refused again, so it takes the ordinary failure path
+    below (2026-09-19 fix): a merge_failed event carrying git's own text, a fix card bounded by
+    fix_cards_per_task, then a block for a human. Keying the free retry on gate3_result == "pass" alone
+    would have retried those silently on every poll."""
     merged = []
     fix_limit = project.budgets.get("fix_cards_per_task", 2)
 
@@ -284,12 +302,15 @@ def process_merge_queue(
             merged.append(key)
             events.record(conn, "merged", {"task_key": key, "sha": outcome.squash_commit})
             continue
-        elif outcome.gate3_result == "pass":
-            # Gate 3 was green on this exact candidate; only the fast-forward was refused, because the
-            # integration branch moved underneath it (mergeq.merge_task's "moved under us" outcome).
-            # Nothing is wrong with the branch, so there is nothing for a fix card to fix: leave the
-            # merge card exactly as it is and let the next poll retry for free (2026-09-19 fix -- this
-            # used to cost a real coder turn and one unit of fix-card budget).
+        elif outcome.integration_moved:
+            # Only the fast-forward was refused, and mergeq verified in git that the integration branch
+            # moved underneath the candidate (its parent is no longer the branch tip), so Gate 3's verdict
+            # on that exact candidate still stands. Nothing is wrong with the branch, so there is nothing
+            # for a fix card to fix: leave the merge card exactly as it is and let the next poll retry for
+            # free (2026-09-19 fix -- this used to cost a real coder turn and one unit of fix-card budget).
+            # Keyed on integration_moved, NOT on gate3_result == "pass": git also refuses a fast-forward
+            # with the tip unmoved (dirty or wrong-branch primary checkout, index.lock), and treating that
+            # as a race retried it silently on every poll instead of letting it surface below.
             events.record(conn, "merge_race_retrying", {"task_key": key, "detail": outcome.detail[:500]})
             continue
 

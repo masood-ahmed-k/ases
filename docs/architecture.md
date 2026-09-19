@@ -284,8 +284,9 @@ Two separate user decisions, same session:
   `qwen3.8-max:free` on the theory that a model actually marketed for code generation suits the coder
   role better than a general flagship-reasoning one. Deliberately given its **own** xKiro key, separate
   from lead's, matching the UnoRouter-era per-profile key isolation habit -- not because xKiro is known
-  to need it the way UnoRouter's `per_model_rpm: 1` did, just consistency. Not yet smoke-tested for real;
-  `swarm doctor`'s `smoke_test[xkiro/qwen/qwen3-coder-plus:free]` stays `[PEND]` until the key lands.
+  to need it the way UnoRouter's `per_model_rpm: 1` did, just consistency. (Smoke-tested for real the same
+  day once that key landed: a real terminal tool call on the real profile, recorded as a pass in the
+  registry. See "coder-1's first run on xKiro, and a MiniMax comparison" below for what it then did.)
 - **"you can push and store in this repo"** -- `https://github.com/masood-ahmed-k/ases` (already
   created, empty, public). Before touching anything remote-facing: scanned the *entire* git history
   (`git log --all -p`, every commit, not just HEAD) and the full working tree for the project's own
@@ -397,20 +398,35 @@ restored the source byte-for-byte:
   not defaulted to `"integration"`, which would just re-mask the same bug), tested against a repo whose
   branch is named `main-line`.
 
-### Two decisions the build agent surfaced, verified with throwaway probes, NOT implemented
+### Two decisions the build agent surfaced (implemented afterwards, same day, on the user's "go")
 
-1. **The race branch can hide a persistent failure.** `merge_task` returns the identical outcome for any
-   `git merge --ff-only` refusal, not just a real race: a dirty primary checkout produced exactly that
-   outcome although the integration tip never moved, and a primary checkout on the wrong branch would too.
-   That now retries silently every poll, bounded only by `--max-iterations`; before the fix it opened fix
-   cards and then blocked for a human with the git error text. Two options: compare the integration tip
-   with `base_sha` inside `mergeq` before reporting the benign shape (exact, no arbitrary cap), or cap
-   consecutive race retries per task and then block. The first is the more precise one.
-2. **A re-approve resets the repoint.** Re-running `create_cards_from_plan` upserts `work_card_id` back to
-   the original card while `fix_cards` keeps its count. Bounded to one extra fix round, and arguably
-   correct when the re-approve is a gate-config change (the sanctioned path since ASES-QG-02) but wrong
-   otherwise. A guard, validated on SQLite 3.45: `work_card_id = CASE WHEN plan_tasks.fix_cards > 0 THEN
-   plan_tasks.work_card_id ELSE excluded.work_card_id END`.
+1. **The race branch could hide a persistent failure -- fixed.** `merge_task` returned the identical
+   outcome for any `git merge --ff-only` refusal, not just a real race: a dirty primary checkout produced
+   exactly that outcome although the integration tip never moved, and it retried silently every poll,
+   bounded only by `--max-iterations`. Now `MergeOutcome` carries `integration_moved`, decided from git:
+   after a refused fast-forward, `merge_task` compares the candidate's parent (the tip it was squashed
+   onto) with the integration tip, and only a tip that verifiably moved earns the free retry. Both
+   lookups use `rev-parse --verify -q` plus an exit-code check, because a bare `git rev-parse <bad-rev>`
+   echoes its argument on stdout while failing; if either lookup fails the answer is "not moved". A
+   refusal with the tip unmoved takes the ordinary failure path (`merge_failed` event with git's own text
+   and a "did NOT move" explanation, a fix card, then a block). Adjacent and included: `merge_task` now
+   refuses up front, before any worktree exists, to run when the primary checkout isn't on
+   `integration_branch` (or is detached), because `--ff-only` advances whatever branch is checked out and
+   from another branch whose tip happened to equal integration's it would have reported `merged=True`
+   while integration never advanced. Known trade-offs: a dirty-checkout refusal still opens a fix card
+   that no coder can fix (the dirty tree is the operator's), which is bounded by `fix_cards_per_task` and
+   surfaces at the block, costing a coder turn or two first; and `symbolic-ref --short` prints
+   `heads/integration` if a tag is named like the branch, so that pathological case fails closed with a
+   confusing message rather than merging. Tested with real git (a genuine race, a genuinely dirty
+   checkout, a wrong branch and a detached HEAD); each bug was re-introduced in the main session to
+   confirm the tests go red.
+2. **A re-approve reset the repoint -- fixed.** Re-running `create_cards_from_plan` upserted
+   `work_card_id` back to the original card while `fix_cards` kept its count. The upsert is now
+   `work_card_id = CASE WHEN plan_tasks.fix_cards > 0 THEN plan_tasks.work_card_id ELSE
+   excluded.work_card_id END`, so a re-approve (also how gate configuration changes, ASES-QG-02) can't
+   undo a live fix card. Cosmetic leftovers: the `swarm approve` printout and the `cards_created` event
+   still show the original card id for such a task while the database holds the fix card. Same
+   bug-reintroduction check as above.
 
 ### Behaviour changes from the repoint worth knowing
 
@@ -442,9 +458,9 @@ the last-commit-only check -- now reachable only through misconfiguration. New e
   `mergeq`'s git calls, and no timeout at all on `review.py`'s. No exception handling around
   `kanban_show`/`plan.task` in `process_review_lane`, `process_merge_queue` and `all_merge_cards_done`, so
   one bad card kills the whole polling loop. Worktree teardown ignores `git worktree remove`'s exit code
-  and then force-deletes the directory, leaving orphaned registrations nothing prunes. Nothing verifies
-  the primary checkout is actually on `integration_branch` before mutating it. The `fix_cards`
-  read/create/increment sequence isn't atomic across two `swarm run` processes.
+  and then force-deletes the directory, leaving orphaned registrations nothing prunes. (The old
+  "nothing verifies the primary checkout is on `integration_branch`" gap is closed, see above.) The
+  `fix_cards` read/create/increment sequence isn't atomic across two `swarm run` processes.
 - **Minor.** Any nonzero `git merge --squash` is labelled "merge conflict:"; a re-approve leaves
   role/touches/gate_profile/estimated_requests stale (the upsert only refreshes card ids); Hermes's own
   live dispatcher can spawn the reviewer the moment a card enters `review`, before ASES's Gate-1 re-check,
@@ -453,6 +469,44 @@ the last-commit-only check -- now reachable only through misconfiguration. New e
 Method notes: an independent nemotron cross-check was attempted by several agents and returned 403 every
 time (the known key problem), so every conclusion here rests on direct reading of source, tests, and
 throwaway probes rather than a second model's opinion.
+
+## coder-1's first run on xKiro, and a MiniMax comparison (2026-09-19)
+
+**What the first xKiro run actually did (and a correction).** With coder-1's own xKiro key in place, the
+smoke test passed (a real terminal tool call on the real profile) and T1 was unblocked. The new run
+(run 20) was claimed and spawned at 07:42:47 and called `kanban_complete` at 07:43:51. It did not author
+the work. `hello.py` was already committed on the task branch as `c23b684`, authored at 00:00:50 during
+the earlier UnoRouter-era attempt (T1 had `gave_up` at 02:02:57 and runs 18 and 19 ended `crashed`). The
+xKiro run found that commit, ran `python hello.py` (output `Hello, world!`, exit 0) and completed the card.
+An earlier status message in this build described that as coder-1 having "written and committed"
+`hello.py`; that was wrong, checked against the commit's author time and the card's event log, and is
+corrected here and in `config/models.yaml`.
+
+What it does show: `xkiro/qwen/qwen3-coder-plus:free` drives Hermes's kanban tools (`kanban_show`,
+`kanban_complete`) and terminal tool correctly on a real card, on a key that had never run a real
+dispatch before. What it does not show: this model writing and committing new work on a real card. That
+is still untested on a real card, and there is a latent reason it might go wrong: T1's card body never
+tells the worker to commit its changes, so the run only succeeded because a commit already existed. Watch
+for that on the first card that starts from an empty branch.
+
+**MiniMax, suggested by the user ("minimax could be better option when it comes to coding").** The user's
+xKiro dashboard capture lists `minimax/minimax-m3:free` (1M context) and `minimax/minimax-m2.5:free` (204K).
+No new key was needed: xKiro keys are not model-scoped (one key has served several different models
+tonight). One identical real task was run once per model through coder-1's profile with `-m`: write a
+`slugify()` function to a written spec and verify it with the terminal tool, then graded afterwards by a
+hidden 10-case check the models never saw.
+
+| model | hidden check | wall time |
+| ------ | ------ | ------ |
+| `qwen/qwen3-coder-plus:free` | 10/10 | 142 s |
+| `minimax/minimax-m3:free` | 10/10 | 133 s |
+| `minimax/minimax-m2.5:free` | 10/10 | 194 s |
+
+Also noted: m2.5, asked to reply with just "done", answered with a summary instead. Verdict: MiniMax works
+in this harness (real tool calls, correct code), and nothing here separates the three. One run of an easy
+task cannot rank models, and this file does not claim MiniMax is better or worse. Both MiniMax models are
+recorded in `config/models.yaml` as `role_class: coder_candidate`, `pinned: false`, and no role was
+switched. Compare them on something harder (a fix card, a multi-file task) before changing a role.
 
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
