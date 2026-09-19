@@ -203,7 +203,10 @@ def process_review_lane(
     task keys that were sent back this pass.
 
     Scoped to `plan.project`, same reasoning as `process_budget_gate` above -- a "review" card from a
-    different project sharing this board must not be matched against this run's plan by task key alone."""
+    different project sharing this board must not be matched against this run's plan by task key alone.
+
+    A fix card counts as its task's work card here once `process_merge_queue` has repointed
+    plan_tasks.work_card_id at it, so its diff is policed like any other card's."""
     sent_back = []
     for card in hermes_mod.kanban_list(board, status="review"):
         row = conn.execute(
@@ -217,7 +220,8 @@ def process_review_lane(
         gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
         branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
         ok = review_mod.gate_before_review(
-            board, card["id"], repo, branch, gate_cmds, list(task.touches), conn=conn, task_key=task_key,
+            board, card["id"], repo, branch, plan.integration_branch, gate_cmds, list(task.touches),
+            conn=conn, task_key=task_key,
         )
         if not ok:
             sent_back.append(task_key)
@@ -235,7 +239,22 @@ def process_merge_queue(
     fresh worktree, the failure bundle attached, and link it as an EXTRA parent of the merge card --
     never send the two original cards back to argue with each other. Bounded by
     budgets.fix_cards_per_task; past that, escalate by blocking the merge card for the user instead
-    of creating another fix card."""
+    of creating another fix card.
+
+    Creating a fix card also repoints plan_tasks.work_card_id at it (2026-09-19 fix), so "the work
+    card" below, and in process_review_lane and process_budget_gate, always means the task's CURRENT
+    card: the original, or the latest fix card. Before this, a fix card was created and then forgotten.
+    The merge queue kept re-deriving the original, still-broken branch from work_card_id, so it never
+    saw the fix card's output and re-merged the broken branch on every poll while the fix was still in
+    flight (burning the fix budget before the fix could even run), and process_review_lane's
+    work_card_id lookup could never find the fix card, so Gate 1 never policed its diff. The fix card
+    is still parented to the card it replaces (fix2 to fix1 to the original), and is created under
+    that card's real Hermes project_id: `project.name` is config/swarm.yaml's own ASES-internal label,
+    not a Hermes project id.
+
+    A merge whose Gate 3 PASSED but whose fast-forward was refused (the integration branch moved
+    underneath the candidate) is a benign race, not a failure: it gets a free retry on the next pass,
+    with no fix card, no fix budget spent, and the merge card left exactly as it was."""
     merged = []
     fix_limit = project.budgets.get("fix_cards_per_task", 2)
 
@@ -265,6 +284,14 @@ def process_merge_queue(
             merged.append(key)
             events.record(conn, "merged", {"task_key": key, "sha": outcome.squash_commit})
             continue
+        elif outcome.gate3_result == "pass":
+            # Gate 3 was green on this exact candidate; only the fast-forward was refused, because the
+            # integration branch moved underneath it (mergeq.merge_task's "moved under us" outcome).
+            # Nothing is wrong with the branch, so there is nothing for a fix card to fix: leave the
+            # merge card exactly as it is and let the next poll retry for free (2026-09-19 fix -- this
+            # used to cost a real coder turn and one unit of fix-card budget).
+            events.record(conn, "merge_race_retrying", {"task_key": key, "detail": outcome.detail[:500]})
+            continue
 
         events.record(conn, "merge_failed", {"task_key": key, "detail": outcome.detail[:500]})
         if row["fix_cards"] >= fix_limit:
@@ -278,9 +305,12 @@ def process_merge_queue(
 
         assignee = policy.resolve_assignee(task.role, project.roles)
         fix_branch = f"swarm/{key}-fix{row['fix_cards'] + 1}"
+        # project= is the real Hermes project id, read off the card being fixed (`work_card`, fetched
+        # above and not yet repointed), never `project.name` (2026-09-19 fix). parent= is likewise the
+        # card being replaced, so this is created BEFORE work_card_id is repointed below.
         fix_card = hermes_mod.kanban_create(
             board, f"{key}: fix (round {row['fix_cards'] + 1})", assignee=assignee,
-            workspace="worktree", branch=fix_branch, project=project.name,
+            workspace="worktree", branch=fix_branch, project=work_card.get("project_id"),
             body=(f"Merge attempt for {key} failed. Fix in a fresh worktree.\n\n"
                   f"Failure detail:\n{outcome.detail[:1500]}"),
             parent=[row["work_card_id"]],
@@ -288,9 +318,12 @@ def process_merge_queue(
             max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
         )
         hermes_mod.kanban_link(board, fix_card["id"], row["merge_card_id"])
+        # Spend the fix budget and repoint work_card_id in ONE statement: the next pass then waits for
+        # the fix card to reach done, merges the fix card's branch, and the review lane can find it.
         conn.execute(
-            "UPDATE plan_tasks SET fix_cards = fix_cards + 1 WHERE project = ? AND task_key = ?",
-            (plan.project, key),
+            "UPDATE plan_tasks SET fix_cards = fix_cards + 1, work_card_id = ? "
+            "WHERE project = ? AND task_key = ?",
+            (fix_card["id"], plan.project, key),
         )
         events.record(conn, "fix_card_created", {"task_key": key, "fix_card_id": fix_card["id"]})
     return merged

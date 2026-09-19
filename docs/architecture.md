@@ -58,6 +58,7 @@ blueprint first; this is the "where did that requirement end up in code" index.
 | `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + Gate P publish + budget check + card creation), `swarm run` (bounded loop, reconciles on start), `swarm stop`/`resume` (kill switch) | - |
 | `policy.estimate_calendar_minutes` | pacing estimate (not a budget decision) from a provider's rpm limit; `cmd_approve` prints it and then blocks on an interactive confirmation before publishing the plan or creating any card | ASES-CAP-04, ASES-REV-03 |
 | `gates.hash_gate_profiles` / `controller.pin_gate_profiles` / `verify_gate_pin` | pins a project's approved gate commands by content hash at `swarm approve`; `swarm run` refuses if they've since changed without a fresh approve | ASES-QG-02 (partial) |
+| `controller.process_merge_queue` (fix-card lifecycle) | on a conflict or red Gate 3, opens a fix card and repoints `plan_tasks.work_card_id` at it (that column now means the task's *current* card: the original, or the latest fix card); a benign fast-forward race records `merge_race_retrying` and retries free; `review.gate_before_review` now takes `integration_branch` as a required parameter | ASES-GIT-09 (partial), ASES-GIT-13 |
 
 Real Hermes profiles `lead`/`coder-1`/`reviewer` created fresh (no `--clone-from`, per ASES-ROL-10),
 toolsets restricted (reviewer has no terminal/code_execution/browser, kanban enabled for verdicts only),
@@ -356,6 +357,102 @@ pin no longer matches). 9 new tests. The build agent reported 2 pre-existing tes
 its change -- re-verified directly afterward in the main session's own shell: 147/147 pass cleanly.
 That's a PATH difference in the agent's own sandboxed subprocess environment, not a real regression in
 this codebase; recorded here so it isn't mistaken for one later.
+
+## Pre-flight adversarial review of the never-yet-live pipeline (2026-09-19)
+
+Lead works, but coder-1 is still waiting on its own key, so `review.py`, `process_review_lane`,
+`mergeq.py` and `process_merge_queue` had only ever run under mocks and scripted git repos -- never
+against a real Hermes-dispatched worker. Four review agents (merge queue and gates; review lane;
+controller orchestration and idempotency; reconcile and integrity wiring) read the real code hunting for
+the class of bug a fake can't show, and every finding then went to an independent verifier told to
+refute it and to check for an existing test. **25 survived as real and untested** (24 distinct: two
+agents independently found the hardcoded `"integration"` literal): 11 high, 11 medium, 3 low.
+
+### Fixed the same day (7 findings, 6 distinct)
+
+One build agent, then a line-by-line diff review and a full-suite run in the main session (160 passing).
+The agent re-introduced each original bug into the source and confirmed the new tests go red, then
+restored the source byte-for-byte:
+
+- **The fix-card lifecycle was broken (3 findings).** A fix card was created and then forgotten:
+  `process_merge_queue` kept re-deriving the original, still-broken branch from `plan_tasks.work_card_id`,
+  so it never saw the fix card's output; it re-merged that broken branch on every poll while the fix card
+  was still running (burning the fix budget before the fix could even start); and `process_review_lane`
+  could never find the fix card (its id was never in `plan_tasks`), so Gate 1 never policed its diff.
+  Fixed with one change: creating a fix card also repoints `plan_tasks.work_card_id` at it, so "the
+  task's work card" now always means its *current* card. The next pass waits for the fix card to reach
+  done, merges the fix branch, and the review and budget lanes can see it. Fix cards are still parented to
+  the card they replace (fix2 to fix1 to the original).
+- **Fix cards were created under the wrong Hermes project.** `project=project.name` passes
+  `config/swarm.yaml`'s own ASES-internal label ("ases"), not a Hermes project id. Now read off the card
+  being fixed (`work_card["project_id"]`).
+- **A benign fast-forward race was treated as a real failure.** `mergeq.merge_task` already returned a
+  distinct outcome (Gate 3 passed, fast-forward refused, integration moved) but the controller only ever
+  branched on `outcome.merged`, so a race that needed a free retry cost a real coder turn and a unit of
+  fix budget. Now records `merge_race_retrying` and retries next pass.
+- **`review.py` hardcoded the branch name `"integration"`** in its merge-base call (found independently by
+  two review agents). It only worked because `config/swarm.yaml` happens to spell it that way; under any
+  other name the lookup failed and the touches check silently degraded to inspecting only the branch's
+  last commit. `gate_before_review` now takes `integration_branch` as a required parameter (deliberately
+  not defaulted to `"integration"`, which would just re-mask the same bug), tested against a repo whose
+  branch is named `main-line`.
+
+### Two decisions the build agent surfaced, verified with throwaway probes, NOT implemented
+
+1. **The race branch can hide a persistent failure.** `merge_task` returns the identical outcome for any
+   `git merge --ff-only` refusal, not just a real race: a dirty primary checkout produced exactly that
+   outcome although the integration tip never moved, and a primary checkout on the wrong branch would too.
+   That now retries silently every poll, bounded only by `--max-iterations`; before the fix it opened fix
+   cards and then blocked for a human with the git error text. Two options: compare the integration tip
+   with `base_sha` inside `mergeq` before reporting the benign shape (exact, no arbitrary cap), or cap
+   consecutive race retries per task and then block. The first is the more precise one.
+2. **A re-approve resets the repoint.** Re-running `create_cards_from_plan` upserts `work_card_id` back to
+   the original card while `fix_cards` keeps its count. Bounded to one extra fix round, and arguably
+   correct when the re-approve is a gate-config change (the sanctioned path since ASES-QG-02) but wrong
+   otherwise. A guard, validated on SQLite 3.45: `work_card_id = CASE WHEN plan_tasks.fix_cards > 0 THEN
+   plan_tasks.work_card_id ELSE excluded.work_card_id END`.
+
+### Behaviour changes from the repoint worth knowing
+
+The review lane now holds fix cards to the *original* task's `touches` globs (a fix that must edit an
+out-of-scope file bounces until the plan is widened); the budget gate now parks fix cards, which it
+couldn't see before; a fix card stuck in a non-done state stalls its task silently like any regular work
+card (before, it looped into budget exhaustion and then blocked for a human); both
+`branch_name or f"swarm/{key}-{role}"` fallbacks only know the original naming, so a fix card that ever
+lacked `branch_name` would send the queue back to the original broken branch; `plan_tasks` no longer
+records the original work card id once a fix exists (it survives in the `cards_created` event and as the
+fix card's Hermes parent); and if `integration_branch` doesn't resolve, `review.py` still falls back to
+the last-commit-only check -- now reachable only through misconfiguration. New event kind:
+`merge_race_retrying`.
+
+### Still open (18 findings), by theme
+
+- **Built and unit-tested, but never wired into the real pipeline.** `ledger.record_usage()` has no
+  production caller, so the budget gate can never see real usage (ASES-CAP-03 downgraded to `partial`);
+  `gates.detect_tamper` (ASES-QG-03) is never called; `integrity.snapshot`/`diff_snapshots` (ASES-GIT-12)
+  are never called; `mergeq.revert_merge` (ASES-GIT-05, downgraded to `partial`) is never called.
+- **Cross-project isolation, the same class as the `process_budget_gate`/`process_review_lane` fix but in
+  other places.** `merge_records` and `gate_runs` are keyed on `task_key` alone with no project column
+  (`mergeq` writes them, `reconcile` reads them), and `run_pass`'s `kanban_dispatch(board)` is board-wide
+  with no project filter, so it can dispatch a sibling project's card.
+- **Crash and robustness.** An unprotected window between the fast-forward landing in git and
+  `kanban_complete` running: interrupted there, the branch has the commit but the Hermes card never
+  reads done, `reconcile.check` has no check for git-ahead-of-board, and the next pass treats the
+  already-merged task as a failure and opens a spurious fix card. No `TimeoutExpired` handling on
+  `mergeq`'s git calls, and no timeout at all on `review.py`'s. No exception handling around
+  `kanban_show`/`plan.task` in `process_review_lane`, `process_merge_queue` and `all_merge_cards_done`, so
+  one bad card kills the whole polling loop. Worktree teardown ignores `git worktree remove`'s exit code
+  and then force-deletes the directory, leaving orphaned registrations nothing prunes. Nothing verifies
+  the primary checkout is actually on `integration_branch` before mutating it. The `fix_cards`
+  read/create/increment sequence isn't atomic across two `swarm run` processes.
+- **Minor.** Any nonzero `git merge --squash` is labelled "merge conflict:"; a re-approve leaves
+  role/touches/gate_profile/estimated_requests stale (the upsert only refreshes card ids); Hermes's own
+  live dispatcher can spawn the reviewer the moment a card enters `review`, before ASES's Gate-1 re-check,
+  which contradicts `review.py`'s own docstring.
+
+Method notes: an independent nemotron cross-check was attempted by several agents and returned 403 every
+time (the known key problem), so every conclusion here rests on direct reading of source, tests, and
+throwaway probes rather than a second model's opinion.
 
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 

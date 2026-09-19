@@ -19,12 +19,20 @@ from . import integrity
 
 
 def gate_before_review(
-    board: str, card_id: str, repo: pathlib.Path, branch: str, gate1_commands: list[str],
-    touches: list[str], *, conn, task_key: str,
+    board: str, card_id: str, repo: pathlib.Path, branch: str, integration_branch: str,
+    gate1_commands: list[str], touches: list[str], *, conn, task_key: str,
 ) -> bool:
     """ASES-REV-05 (Gate 1 re-check) + ASES-GIT-13 (touches-path check). Returns True if both pass
     (card stays in review for the reviewer), False if it sent the card back (a failed attempt, not a
-    review round)."""
+    review round).
+
+    integration_branch is the plan's configured integration branch (the same value mergeq.merge_task
+    and the rest of ASES already receive as a parameter); the touches check diffs `branch` against its
+    merge-base with it. That used to be a hardcoded "integration" literal (2026-09-19 fix), which only
+    worked because config/swarm.yaml's integration_branch happens to be spelled exactly that. Under any
+    other name the merge-base lookup failed, `base` came back empty, and the check silently fell back
+    to inspecting only the branch's LAST commit -- so an out-of-scope path in any earlier commit was
+    never seen."""
     import subprocess
 
     head = subprocess.run(
@@ -35,7 +43,7 @@ def gate_before_review(
         return False
 
     base = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "integration", branch], capture_output=True, text=True,
+        ["git", "-C", str(repo), "merge-base", integration_branch, branch], capture_output=True, text=True,
     ).stdout.strip()
     changed = integrity.changed_paths(repo, head) if not base else _changed_since(repo, base, head)
     out_of_scope = integrity.paths_outside_touches(changed, touches)

@@ -196,11 +196,19 @@ requirements:
   requirement: No card becomes ready without budget for it plus a review reserve; otherwise it is parked
   section: '5.4'
   verified_by: '22.9'
-  status: covered
-  note: 'Two layers: cmd_approve checks the whole plan''s budget upfront at Gate P (refuses outright if
-    unaffordable then), AND controller.process_budget_gate re-checks every ''ready'' card on every run_pass
-    and parks it with hermes kanban schedule if the budget has since been exhausted -- the ongoing case,
-    not just the upfront one. Unit-tested both ways.'
+  status: partial
+  note: 'Two layers exist and are unit-tested: cmd_approve checks the whole plan''s budget upfront at
+    Gate P (refuses outright if unaffordable then), and controller.process_budget_gate re-checks every
+    ''ready'' card on every run_pass and parks it with hermes kanban schedule if the budget has since
+    been exhausted. Downgraded from covered 2026-09-19 by an adversarial pipeline review, independently
+    verified against the real source: ledger.record_usage() -- the only function that would ever
+    increment requests_ledger -- has zero production callers anywhere in src/ases (grepped; only its own
+    unit test calls it). Both layers above check affordability correctly against whatever the ledger
+    currently says, but nothing ever tells the ledger a real request happened, so in the live system the
+    ledger permanently reads zero usage and every card looks affordable regardless of real spend. This
+    needs a real design decision (where in the real dispatch lifecycle a request actually gets counted,
+    and whether Hermes exposes a per-card/session request count to count from) before it can be wired
+    in -- not yet attempted.'
 - id: ASES-CAP-04
   requirement: Gate P shows estimated requests per provider and the calendar time
   section: '5.4'
@@ -291,8 +299,13 @@ requirements:
   requirement: The integration branch stays runnable; post-merge failures are reverted
   section: '8.1'
   verified_by: '22.8'
-  status: covered
-  note: mergeq.revert_merge; integration branch confirmed untouched on conflict/red-gate3 in tests.
+  status: partial
+  note: 'Downgraded from covered 2026-09-19 by an adversarial pipeline review, independently verified
+    against the real source. The "stays runnable" half is genuinely covered: merge_task''s conflict and
+    red-Gate-3 paths return before touching the real integration branch, confirmed in tests. The
+    "post-merge failures are reverted" half is not: mergeq.revert_merge exists and has its own unit
+    test, but nothing in src/ases ever calls it -- controller.process_merge_queue only calls merge_task,
+    so a merge that lands and is later found broken has no automatic trigger for the revert.'
 - id: ASES-GIT-06
   requirement: Squash merge only, one commit per plan task with the card ID
   section: '8.1'
@@ -316,8 +329,20 @@ requirements:
   requirement: Conflicts become fix or reconciliation cards, never an argument between the two workers
   section: '8.2'
   verified_by: '22.8'
-  status: not_covered
-  note: ''
+  status: partial
+  note: 'process_merge_queue creates a fix card on a merge conflict or red Gate 3 (bounded by
+    fix_cards_per_task, escalating to a block once spent). A 2026-09-19 adversarial pipeline review found
+    the lifecycle behind it was broken, and it is fixed: plan_tasks.work_card_id is now repointed at the
+    fix card when one is created, so the merge queue waits for the fix card to reach done, merges the FIX
+    card''s branch, and process_review_lane and process_budget_gate can see it; fix cards are created
+    under the original card''s real Hermes project_id (not the ASES-internal label); and a benign
+    fast-forward race (Gate 3 passed, integration moved) no longer costs a fix card. Covered by a
+    real-git lifecycle test (conflict, fix card, fix done, fix branch merges) plus a two-round chain
+    test. Left partial, not covered: never exercised against a real Hermes dispatch, and two open design
+    decisions are recorded in docs/architecture.md -- (1) the race branch also swallows any persistent
+    ff-only refusal (dirty or wrong-branch primary checkout) into silent retries, and (2) a re-approve
+    resets the repoint. The lifecycle is otherwise consistent, but note plan_tasks no longer records the
+    original work card id once a fix exists (it survives in the cards_created event).'
 - id: ASES-GIT-10
   requirement: An empty repository gets an initial commit and the integration branch
   section: '8.3'
@@ -343,8 +368,15 @@ requirements:
   section: '8.4'
   verified_by: '22.12'
   status: covered
-  note: review.gate_before_review checks the diff against declared touches BEFORE Gate 1 even runs; out-of-scope
-    changes are sent back with the exact offending paths. Unit-tested incl. empty-touches-means-nothing-allowed.
+  note: 'review.gate_before_review checks the diff against declared touches BEFORE Gate 1 even runs;
+    out-of-scope changes are sent back with the exact offending paths. Unit-tested incl.
+    empty-touches-means-nothing-allowed. 2026-09-19 fix -- the merge-base lookup used a hardcoded
+    "integration" literal instead of the plan''s configured integration_branch, which only worked because
+    config/swarm.yaml happens to spell it that way (any other name silently degraded the check to
+    inspecting only the last commit). gate_before_review now takes integration_branch as a required
+    parameter, tested against a repo whose integration branch is named "main-line". Side effect worth
+    knowing -- fix cards are now policed here too, against the ORIGINAL task''s touches globs, so a fix
+    that must edit an out-of-scope file will bounce until the plan is widened.'
 - id: ASES-GIT-14
   requirement: Per-card ports, compose project, database and temp directory; locks for singletons
   section: '8.4'
