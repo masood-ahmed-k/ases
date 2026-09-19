@@ -2,7 +2,10 @@ import subprocess
 
 import pytest
 
-from ases import db, gates
+from ases import db, gates, tamper
+
+# Non-ASCII test data is built with chr() so that this file stays pure ASCII.
+E_ACUTE = chr(0xE9)
 
 
 def _git(*args, cwd):
@@ -108,3 +111,230 @@ def test_detect_tamper(diff, expected_hit):
 ])
 def test_hash_gate_profiles(a, b, expect_equal):
     assert (gates.hash_gate_profiles(a) == gates.hash_gate_profiles(b)) == expect_equal
+
+
+# --- detect_tamper delegates to tamper.py (ASES-QG-03) --------------------------------------------------------
+
+@pytest.mark.parametrize("line", [
+    "@pytest.mark.skip",
+    "@pytest.mark.skipif(True, reason='x')",
+    "@pytest.mark.xfail(strict=False)",
+    "run_all_tests || true",
+    "x = compute()  # noqa: test",
+])
+def test_detect_tamper_still_flags_the_old_cheap_markers(line):
+    findings = gates.detect_tamper(f"+{line}\n")
+
+    assert findings and all(isinstance(f, str) for f in findings)
+
+
+def test_detect_tamper_still_flags_a_removed_test_function_at_any_indent():
+    assert gates.detect_tamper("-def test_a():\n-    pass\n")
+    assert gates.detect_tamper("-    def test_a(self):\n-        pass\n")
+    assert gates.detect_tamper("+    assert x == 1\n") == []
+
+
+def test_detect_tamper_delegates_to_the_tamper_module_and_renders_one_string_per_finding(monkeypatch):
+    seen = []
+
+    def fake(diff_text, **kwargs):
+        seen.append(diff_text)
+        return [tamper.Finding("skip_marker", "a.py", "skip marker added: @skip", 3),
+                tamper.Finding("large_file", "big.bin", "too big")]
+
+    monkeypatch.setattr(tamper, "analyze_diff", fake)
+
+    assert gates.detect_tamper("some diff") == [
+        "skip_marker a.py:3: skip marker added: @skip", "large_file big.bin: too big",
+    ]
+    assert seen == ["some diff"]
+
+
+def test_detect_tamper_reports_a_real_diff_with_paths_and_stays_ascii():
+    diff = (
+        f"diff --git a/tests/test_caf{E_ACUTE}.py b/tests/test_caf{E_ACUTE}.py\n--- a/tests/test_caf{E_ACUTE}.py\n"
+        f"+++ b/tests/test_caf{E_ACUTE}.py\n@@ -1,2 +1,2 @@\n-def test_x():\n+@pytest.mark.skip\n+def test_x():\n     pass\n"
+    )
+
+    findings = gates.detect_tamper(diff)
+
+    assert any("skip_marker" in f and "test_caf\\xe9.py:1" in f for f in findings)
+    assert all(f.isascii() for f in findings)
+
+
+# --- scan_for_secrets: added secret files, and never echoing a value ------------------------------------------
+
+def _added_file_diff(path, line="DEBUG=1"):
+    return (
+        f"diff --git a/{path} b/{path}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n"
+        f"+++ b/{path}\n@@ -0,0 +1 @@\n+{line}\n"
+    )
+
+
+@pytest.mark.parametrize("path", [".env", "config/.env", ".env.local", "certs/server.pem", "id_rsa", "keys/id_ed25519",
+                                  "secrets/api.key", "cert.p12"])
+def test_scan_for_secrets_flags_an_added_secret_file_by_name_alone(path):
+    findings = gates.scan_for_secrets(_added_file_diff(path))
+
+    assert len(findings) == 1
+    assert path in findings[0] and "DEBUG=1" not in findings[0]
+
+
+@pytest.mark.parametrize("path", [".env.example", ".env.sample", "src/envelope.py", "docs/keys.md", "keyboard.py"])
+def test_scan_for_secrets_does_not_flag_look_alike_file_names(path):
+    assert gates.scan_for_secrets(_added_file_diff(path)) == []
+
+
+def test_scan_for_secrets_ignores_a_deleted_or_merely_modified_secret_file():
+    deleted = ("diff --git a/.env b/.env\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/.env\n"
+               "+++ /dev/null\n@@ -1 +0,0 @@\n-DEBUG=1\n")
+    modified = ("diff --git a/.env b/.env\nindex 1..2 100644\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-DEBUG=1\n+DEBUG=0\n")
+
+    assert gates.scan_for_secrets(deleted) == []
+    assert gates.scan_for_secrets(modified) == []
+
+
+def test_scan_for_secrets_never_echoes_the_secret_it_found():
+    planted = "sk-or-v1-PLANTEDVALUE0123456789abcd"
+    diff = _added_file_diff("config.py", f"API_KEY = '{planted}'")
+
+    findings = gates.scan_for_secrets(diff)
+
+    assert len(findings) == 1
+    assert "config.py:1" in findings[0]
+    assert planted not in findings[0] and "PLANTEDVALUE" not in findings[0]
+    # the way questions.py uses it: one bare added line at a time, with no file name
+    bare = gates.scan_for_secrets("+" + f"token = {planted}")
+    assert len(bare) == 1 and planted not in bare[0]
+    assert gates.scan_for_secrets("+" + "nothing to see here") == []
+
+
+def test_scan_for_secrets_finds_the_shapes_events_py_does_not_redact():
+    private_key = gates.scan_for_secrets(_added_file_diff("notes.txt", "-----BEGIN RSA PRIVATE KEY-----"))
+    aws = gates.scan_for_secrets(_added_file_diff("notes.txt", "id = AKIA" + "IOSFODNN7EXAMPLE"))
+
+    assert len(private_key) == 1 and "private key block" in private_key[0]
+    assert len(aws) == 1 and "AWS" in aws[0]
+
+
+def test_scan_for_secrets_output_is_ascii_even_for_an_odd_file_name():
+    findings = gates.scan_for_secrets(_added_file_diff(f"caf{E_ACUTE}/.env"))
+
+    assert findings and all(f.isascii() for f in findings)
+
+
+# --- run_gate(runner=...) ---------------------------------------------------------------------------------------
+
+class FakeRunner:
+    """A stand-in for the sandbox's runner: records what run_gate handed it and looks at the checkout."""
+
+    def __init__(self, passed=True, detail="fake runner output"):
+        self.passed, self.detail = passed, detail
+        self.calls = []
+        self.checkout_files = None
+
+    def __call__(self, worktree, commands, timeout):
+        self.calls.append((worktree, list(commands), timeout))
+        self.checkout_files = sorted(p.name for p in worktree.iterdir() if p.name != ".git")
+        return self.passed, self.detail
+
+
+def _forbid_local_runner(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("_run_commands must not run when a runner is given")
+
+    monkeypatch.setattr(gates, "_run_commands", boom)
+
+
+def test_run_gate_uses_the_runner_instead_of_the_local_command_runner(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    runner = FakeRunner(passed=True, detail="ran in a container")
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["pytest -q", "ruff check"], runner=runner,
+                            timeout_per_command=77)
+
+    assert (result.passed, result.detail, result.gate) == (True, "ran in a container", "gate1")
+    assert result.commit_sha == _head_sha(repo)
+    (worktree, commands, timeout), = runner.calls
+    assert commands == ["pytest -q", "ruff check"]
+    assert timeout == 77
+    assert runner.checkout_files == ["ok.py"]  # the runner got a real checkout of the exact commit
+
+
+def test_run_gate_passes_a_failing_runner_result_through_as_a_red_gate(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["x"], runner=FakeRunner(passed=False, detail="1 failed"))
+
+    assert (result.passed, result.detail) == (False, "1 failed")
+
+
+def test_run_gate_with_a_runner_still_records_the_gate_runs_row(repo, tmp_path, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+
+    gates.run_gate(repo, sha, "gate1", ["x"], conn=conn, task_key="T1", runner=FakeRunner(True, "green in docker"))
+    gates.run_gate(repo, sha, "gate3", ["x"], conn=conn, task_key="T1", runner=FakeRunner(False, "red in docker"))
+
+    rows = [dict(r) for r in conn.execute("SELECT * FROM gate_runs ORDER BY id")]
+    assert [(r["task_key"], r["gate"], r["commit_sha"], r["result"], r["detail"]) for r in rows] == [
+        ("T1", "gate1", sha, "pass", "green in docker"), ("T1", "gate3", sha, "fail", "red in docker"),
+    ]
+    assert all(r["ran_at"] for r in rows)
+    assert gates.last_gate_result(conn, "T1", "gate1", sha) == "pass"
+
+
+def test_run_gate_with_a_runner_cleans_the_worktree_up(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    runner = FakeRunner()
+
+    gates.run_gate(repo, _head_sha(repo), "gate1", ["x"], runner=runner)
+
+    worktree = runner.calls[0][0]
+    assert not worktree.exists() and not worktree.parent.exists()
+    listing = subprocess.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True).stdout
+    assert len(listing.strip().splitlines()) == 1
+
+
+def test_run_gate_with_a_runner_never_calls_it_for_a_bad_commit(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    runner = FakeRunner()
+
+    result = gates.run_gate(repo, "0000000000000000000000000000000000000000", "gate1", ["x"], runner=runner)
+
+    assert result.passed is False and "could not create gate worktree" in result.detail
+    assert runner.calls == []
+
+
+def test_a_runner_that_raises_still_cleans_up_and_writes_no_row(repo, tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    seen = []
+
+    def exploding(worktree, commands, timeout):
+        seen.append(worktree)
+        raise RuntimeError("docker daemon is not running")
+
+    with pytest.raises(RuntimeError, match="docker daemon"):
+        gates.run_gate(repo, _head_sha(repo), "gate1", ["x"], conn=conn, task_key="T1", runner=exploding)
+
+    assert not seen[0].exists()
+    assert conn.execute("SELECT COUNT(*) FROM gate_runs").fetchone()[0] == 0
+    listing = subprocess.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True).stdout
+    assert len(listing.strip().splitlines()) == 1
+
+
+def test_run_gate_without_a_runner_still_uses_the_local_command_runner(repo, monkeypatch):
+    calls = []
+
+    def spy(cwd, commands, timeout):
+        calls.append((cwd, list(commands), timeout))
+        return True, "from the local runner"
+
+    monkeypatch.setattr(gates, "_run_commands", spy)
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["echo x"])
+    explicit_none = gates.run_gate(repo, _head_sha(repo), "gate1", ["echo x"], runner=None)
+
+    assert result.detail == explicit_none.detail == "from the local runner"
+    assert [(c[1], c[2]) for c in calls] == [(["echo x"], 120), (["echo x"], 120)]

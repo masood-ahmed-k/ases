@@ -11,7 +11,7 @@ import pathlib
 import sqlite3
 import threading
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -165,6 +165,33 @@ CREATE TABLE IF NOT EXISTS intents (
     detail TEXT,
     started_at TEXT NOT NULL,
     completed_at TEXT
+);
+
+-- Schema v6 (2026-09-19). Leases on shared resources (ASES-GIT-14): a per-card port block, compose project name,
+-- database name and temp directory, and singletons such as a shared development database taken through a lock.
+-- A lease is active while released_at is NULL; the partial unique index makes a second active lease on the same
+-- resource impossible at the database level, not just in application code.
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    resource TEXT NOT NULL,        -- 'port-block:3', 'singleton:dev-db', ...
+    holder TEXT NOT NULL,          -- the card id that holds it
+    detail TEXT,                   -- JSON: the values that were handed out
+    acquired_at TEXT NOT NULL,
+    released_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_resource_leases_active
+    ON resource_leases (project, resource) WHERE released_at IS NULL;
+
+-- Snapshots of worktrees that no running card owns (ASES-GIT-12): only a running card's worker may change its
+-- worktree, so a HEAD or a status that moved in any other worktree was changed by something else.
+CREATE TABLE IF NOT EXISTS worktree_snapshots (
+    project TEXT NOT NULL,
+    path TEXT NOT NULL,
+    head TEXT NOT NULL,
+    status_hash TEXT NOT NULL,     -- sha256 of `git status --porcelain -z` output
+    taken_at TEXT NOT NULL,
+    PRIMARY KEY (project, path)
 );
 """
 

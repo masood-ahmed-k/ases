@@ -1,11 +1,16 @@
-"""Gate runner (section 9.1: gates.py; section 14, ASES-QG-01/02/04).
+"""Gate runner (section 9.1: gates.py; section 14, ASES-QG-01/02/03/04).
 
 Runs a gate profile's pinned commands against an exact commit SHA in a clean checkout, never in a
 worker's live worktree -- so leftover files can't turn a red build green (ASES-QG-04). "Clean checkout"
-here means a fresh git worktree at that commit, not a Docker sandbox: full sandbox isolation is a
-Phase 5 requirement (ASES-SEC-03) that doesn't exist yet. Documented as a known gap, not hidden.
+here means a fresh git worktree at that commit. Where the commands run is the `runner` hook of run_gate:
+by default they run locally (_run_commands), and the sandbox module supplies a runner that executes the
+same commands inside a container (ASES-SEC-03). Without one, the commands run on the host: a known gap,
+not hidden.
 
 The controller believes only these records, never a worker's self-report (ASES-QG-01, section 14.2).
+
+The text checks over a diff (the tamper check, the secret scan) live in tamper.py; detect_tamper and
+scan_for_secrets here are their string-returning entry points for callers that want messages, not Findings.
 """
 from __future__ import annotations
 
@@ -16,9 +21,11 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from . import db as ases_db
+from . import tamper as tamper_mod
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,11 +57,20 @@ def _run_commands(cwd: pathlib.Path, commands: list[str], timeout: int) -> tuple
 def run_gate(
     repo_path: pathlib.Path, commit_sha: str, gate_name: str, commands: list[str], *,
     conn=None, task_key: str = "", timeout_per_command: int = 120,
+    runner: Callable[[pathlib.Path, list[str], int], tuple[bool, str]] | None = None,
 ) -> GateResult:
     """Checks out commit_sha into a throwaway worktree, runs commands there, tears it down.
 
     If conn is given, records the result in gate_runs (task_key, gate, commit_sha, result, detail).
+
+    `runner` (ASES-QG-04, ASES-SEC-03) replaces the local command runner: a callable
+    runner(worktree, commands, timeout_per_command) -> (passed, output). This is how the sandbox module runs
+    the same commands inside a container instead of on the host. The checkout, the cleanup and the
+    gate_runs row are the same whichever runner ran the commands, so the controller's gate record means the
+    same thing either way. A runner that raises is not caught: the worktree is still torn down, no row is
+    written, and the caller decides what an infrastructure failure means (it is not a red gate).
     """
+    run_commands = runner if runner is not None else _run_commands
     tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="ases-gate-"))
     worktree = tmp_root / "wt"
     try:
@@ -66,7 +82,7 @@ def run_gate(
             result = GateResult(gate_name, commit_sha, False,
                                  f"could not create gate worktree: {add.stdout}{add.stderr}")
         else:
-            passed, detail = _run_commands(worktree, commands, timeout_per_command)
+            passed, detail = run_commands(worktree, commands, timeout_per_command)
             result = GateResult(gate_name, commit_sha, passed, detail)
     finally:
         subprocess.run(
@@ -95,31 +111,37 @@ def last_gate_result(conn, task_key: str, gate: str, commit_sha: str) -> str | N
 
 
 def scan_for_secrets(diff_text: str) -> list[str]:
-    """ASES-SEC-01: secret scan before merge. Reuses events.py's pattern set (one place that defines
-    what a secret looks like) plus a couple of diff-specific shapes events.py doesn't need."""
-    from . import events as events_mod
+    """ASES-SEC-01 / ASES-GIT-07: secret scan (Gates 1 and 3). Reads only the ADDED lines of the diff, through
+    tamper.secret_hint (events.py's pattern set, which is the one place that defines what a provider key
+    looks like, plus the few shapes a diff can carry that an event payload never does), and reports an added
+    FILE whose name marks it as holding secrets (.env, *.pem, id_rsa) even when its content matches nothing.
 
+    A finding names the file and the line and says what kind of secret it looks like; it NEVER contains the
+    matched text. It used to echo the first 80 characters of the offending line, so the message that reported
+    a leaked key printed the key into a card comment and a log. A bare "+text" line, as questions.py hands
+    over one at a time, is scanned as an added line of a file with no name."""
     findings = []
-    for line in diff_text.splitlines():
-        if not line.startswith("+"):
-            continue
-        redacted = events_mod.redact({"line": line})["line"]
-        if redacted != line:
-            findings.append(f"possible secret added: {line.strip()[:80]}")
+    for fd in tamper_mod.parse_diff(diff_text):
+        if fd.status == "A" and tamper_mod.is_secret_file(fd.path):
+            findings.append(tamper_mod.format_finding(tamper_mod.Finding(
+                "secret_added", fd.path, "possible secret added: a file whose name marks it as holding secrets",
+            )))
+        for number, text in fd.added_lines:
+            hint = tamper_mod.secret_hint(text)
+            if hint:
+                findings.append(tamper_mod.format_finding(tamper_mod.Finding(
+                    "secret_added", fd.path, f"possible secret added: secret-shaped value ({hint})", number,
+                )))
     return findings
 
 
 def detect_tamper(diff_text: str) -> list[str]:
-    """Cheap heuristics for ASES-QG-03: deleted/skipped tests, unconditional passes, weakened
-    assertions. Not a substitute for a real diff-aware checker; flags for a human/reviewer to confirm."""
-    findings = []
-    lowered = diff_text.lower()
-    if "-    def test_" in diff_text or "-def test_" in diff_text:
-        findings.append("a test function appears to have been deleted")
-    for marker in ("@pytest.mark.skip", "skipif(true", "|| true", "# noqa: test", "xfail(strict=false"):
-        if marker in lowered:
-            findings.append(f"suspicious marker found: {marker!r}")
-    return findings
+    """ASES-QG-03 over the text of a diff, as one string per finding (kind, path and line, then why). Delegates
+    to tamper.analyze_diff, which does the real work and returns Findings; the old cheap markers (a removed
+    test function, @pytest.mark.skip, `|| true`, xfail) are all covered by it. Flags for the controller and a
+    reviewer to confirm, it does not prove a test still tests what it did. With no allow_paths given, nothing
+    is treated as the task's own territory: use tamper.analyze_diff or tamper.check_range for that."""
+    return [tamper_mod.format_finding(finding) for finding in tamper_mod.analyze_diff(diff_text)]
 
 
 def hash_gate_profiles(gate_profiles: dict[str, list[str]]) -> str:

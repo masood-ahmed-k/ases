@@ -705,6 +705,88 @@ branch or gate-configuration hash, so after a fix card an old green row for the 
 head read as stale (it heals through Gate 1); `events.redact` does not redact a secret-shaped dictionary KEY; bare
 directory names in touches are literals that match nothing.
 
+## Building the remaining phases, rounds 2 and 3: ten modules exist, none is wired in yet (2026-09-19, night)
+
+The user asked for everything to be built first and tested afterwards ("no need to do testing, first build everything"), then
+to park the work for the day. Ten builder agents ran in parallel with exclusive files, one per package (the work orders they were
+given are in `docs/work-orders/`, and what each reported back, including every deviation and everything it noticed, is in
+`docs/work-orders/builder-findings.md`). Because testing was set aside, this round did NOT get round 1's seeded-bug pass or an
+independent nemotron review: the only checks so far are each builder's own unit tests (the suite went from 669 to about 3,400),
+one builder's hand-made mutations, and a builder's own adversarial read where the nemotron reviewers returned 403. Nothing here has
+run against a real Hermes, a real board or a real container, and NONE of it is called from `controller.py` or `cli.py` yet.
+
+Round 2 (blueprint phase 4):
+- `questions.py`: `list_questions`, `answer_question` (the comment is posted before the unblock, the answer is secret-scanned and
+  never written to the event), `format_questions` (ASES-REC-05).
+- `report.py`: `build_report` (seven panels), `render_status`, `render_text`, a self-contained HTML page with no script and no
+  external resource, `write_report` (ASES-OBS-01).
+- `recovery.py`: `classify_run` over the outcome strings Hermes really writes (`completed`, `review_requested`,
+  `changes_requested`, `blocked`, `scheduled`, `reclaimed`, `timed_out`, `stale`, `crashed`, `rate_limited`, `gave_up`,
+  `spawn_failed`), `decide` for the whole failure table, lineage counters per plan task, `next_model`, `failure_bundle`,
+  `process_failures` (ASES-REC-01, REC-02).
+- `bounds.py`: the section 9.3 bounds, project state helpers (planning, running, paused, stopped, finished), `evaluate_bounds`,
+  final-gate records, `is_finished`, `finish_project` (ASES-CTL-01).
+- `critic.py` and `prompts/critic.md`: a one-shot reviewer call with no toolsets, strict verdict parsing, one repair call, at
+  most two change requests, approval bound to the plan hash (ASES-REV-02).
+- `reconcile.py` (extended) and `intents.py`: repairs for done-without-record, record-without-done-card, unfinished candidates,
+  open intents, dead workers, orphan workers (found by card id in the process command line and never killed otherwise) and orphan
+  worktrees, with the three crash points of section 22.7 as scenarios (ASES-REC-03, REC-04).
+- `killswitch.py`: stop flag first, `hermes pause`, reclaim, kill verified worker process trees, stop the plan's containers,
+  write a stop report, all time-boxed to 30 seconds; `resume_all` clears the flag only after reconcile (ASES-REC-06). Its process
+  helpers were checked for real against two throwaway processes (a worker's grandchild died with it, a decoy without the card id
+  survived).
+
+Round 3 (blueprint phase 5), plus schema v6 (`resource_leases`, `worktree_snapshots`):
+- `sandbox.py`: the Docker policy for worker profiles, a checker for a profile's terminal block, the mount and sensitive-path
+  rules, `docker_run_argv` for the controller's own sandboxed gates, the key-visibility and no-network probes, doctor rows. Docker
+  was never started and nothing was pulled (ASES-SEC-02, SEC-03, SEC-05, SEC-06, SEC-07, CFG-04).
+- `tamper.py` and `gates.py`: a diff parser and checker for deleted or skipped tests, unconditional passes, weakened assertions,
+  gate configuration and CI changes, generated artifacts, secrets and large files, with the exact section 22.12 sequence tested on
+  real git repositories; `run_gate` takes an optional `runner` so the sandbox can execute the commands (ASES-QG-03, QG-02,
+  GIT-07).
+- `leases.py` and `guards.py`: per-card port blocks, compose project names, database names and temp directories, singleton locks,
+  `.env.ases`, and snapshots of the worktrees no running card owns (ASES-GIT-14, GIT-12).
+
+What the builders found by reading the real Hermes 0.21.3 source (each one is a fix or a decision waiting for the wiring):
+- The Docker sandbox cannot use table 33 as written. An explicit `terminal.cwd: /workspace` makes Hermes look for a host
+  directory called `workspace`, so the worktree is not mounted (the block leaves `cwd` out); `docker_persist_across_processes` must
+  be false or card 2's worker sees card 1's worktree; `docker_run_as_host_user` does nothing on native Windows; Hermes silently
+  drops all CPU, memory and PID limits when its probe container fails to start (an image that is not pulled); killed workers leave
+  a running container; and a git worktree's `.git` is a FILE pointing at a host path outside the mount, so `git` fails inside a
+  worktree-only sandbox (workers are told to commit, and gates call git). That last one needs a design decision before the sandbox
+  is switched on: run gates on a `git archive` export and let the controller commit for the worker, or mount the shared git
+  directory, which lets a worker touch the integration branch refs and breaks ASES-GIT-02.
+- `create_cards_from_plan` never passes `max_retries`, so Hermes gives up after 2 attempts, not the blueprint's 3, and an unknown
+  or rate-limit failure on a blocked card is then never unblocked by anything. Real Hermes also refuses `block` on a card that is
+  already blocked (it adds the comment, then exits 1), and a `ready` card whose last failure looks like quota or auth is held by
+  Hermes's respawn guard forever.
+- `mergeq.merge_task` puts the raw secret-scanner findings into the merge failure detail, which `process_merge_queue` writes into
+  the fix card body: a secret can reach a card body (ASES-SEC-01). The same function's candidate upsert never resets `reverted`,
+  `squash_commit` or `completed_at`, so after a revert, a fix card and a second merge, `check()` would report
+  `done_but_reverted` forever. And `process_merge_queue` re-blocks an already-blocked merge card on every pass, which resets its
+  age and undoes an answer while the merge still fails.
+- `gate_runs`, `merge_records` and `events` have no project column, so two projects that reuse a task key in one database mix
+  their rows (the report and the final-gate check both depend on it).
+- Two `Bounds` classes and two `stop_requested` functions now exist (`recovery` and `bounds`, `killswitch` and `bounds`) and
+  disagree (four fields against eight; stopped against stopped-or-paused; a missing daily reserve reads 0 in one place and 10 in
+  another). They must be unified when wired.
+- The stop flag only takes effect between steps, so a merge or gate step already running is not interrupted; test 22.13 needs the
+  gate runner to check the flag or be killable.
+- `events._SECRET_VALUE_PATTERN` only knows the `sk-` shape, so a Stripe-style `sk_live_` key is never redacted from an event.
+
+What is written down but not built: Gates 4 and 5 with the release report (`docs/work-orders/r3_wp_finalgates.md`) and profile
+scaffolding with the role prompts (`docs/work-orders/r4_wp_profiles.md`). What is not yet written as a work order: the evaluation
+harness (phase 7), the in-memory fake Hermes board, scripted fake worker and fake provider with acceptance scenarios 22.2 to 22.16
+(ASES-TST-01, TST-02), and hardening (phase 9: worktree and branch cleanup, real migrations, log retention, the runbook).
+
+The wiring plan (`run_pass` version 2): stop flag first; primary-checkout guard and idle-worktree guard; usage ingest; review-round
+refresh and `process_failures` (the controller applies `fresh_attempt` and `replan`); bounds evaluation and stop reasons; budget
+gate plus un-parking when the provider's window resets; review lane with the tamper and secret checks; dispatch; `.env.ases`
+provisioning for running cards; merge queue with a stop check between steps and intent records around each multi-step action;
+final gates and the release report once every merge card is done. New CLI commands: `questions`, `answer`, `status`, `report`,
+`critique`, a real `stop` and `resume`, `init`; `approve` requires a critic PASS for the exact plan hash; `run` reconciles for real
+at start.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of
