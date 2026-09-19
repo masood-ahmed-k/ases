@@ -191,7 +191,22 @@ def kanban_dispatch(board: str, *, dry_run: bool = False, max_spawns: int | None
 
 
 def kanban_request_changes(board: str, card_id: str, reason: str) -> None:
+    """The REVIEWER's verdict (Hermes: "return the active review run to its implementer"). It only works
+    on a card claimed in an active review run, so the controller must not use it on a card that merely
+    sits in `review`: see kanban_reopen_review."""
     _kanban(board, ["request-changes", card_id, reason])
+
+
+def kanban_reopen_review(board: str, card_id: str, reason: str) -> None:
+    """The controller's own send-back for a card sitting in `review`: review -> ready/todo, restored to
+    its implementer, with `reason` recorded as a comment first ("CHANGES REQUESTED: <reason>").
+
+    Checked against real Hermes 0.21.3 on 2026-09-19 (a scratch board): on a card in `review` that no
+    reviewer has claimed, `request-changes` prints "task is not in an active review run" and exits 1,
+    which _kanban raises as HermesCommandError, while `reopen-review` exits 0 and lands the card in
+    `ready`. Passed as `--reason=<text>` in one argument so a reason starting with a dash is never read
+    as an option."""
+    _kanban(board, ["reopen-review", card_id, f"--reason={reason}"])
 
 
 def kanban_complete(board: str, card_id: str, *, result: str | None = None, metadata: dict | None = None) -> None:

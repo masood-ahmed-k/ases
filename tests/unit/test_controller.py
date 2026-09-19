@@ -1,4 +1,6 @@
+import copy
 import dataclasses
+import json
 import subprocess
 
 import pytest
@@ -12,6 +14,12 @@ def _git_ok(*args, cwd):
     return result
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
+
+# Hermes records one run per attempt with the profile that ran it. A work card the reviewer approved ends with
+# a completed run by the reviewer profile, and only such a card may merge (ASES-GIT-03, 2026-09-19). Every
+# fake "done" work card below carries this unless a test deliberately says otherwise.
+REVIEWER_COMPLETED = {"outcome": "completed", "profile": "reviewer"}
+CODER_COMPLETED = {"outcome": "completed", "profile": "coder-1"}
 
 PLAN_RAW = {
     "project": "t3",
@@ -498,13 +506,20 @@ def _repo_with_conflict(tmp_path):
     return r
 
 
-def _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=2):
-    plan = plan_mod.parse_and_validate(ONE_TASK_PLAN, known_roles=set(ROLES), max_cards=40)
+def _one_task_plan_raw(role):
+    """ONE_TASK_PLAN with its single task given `role` (a review-only task is any role but "coder")."""
+    raw = copy.deepcopy(ONE_TASK_PLAN)
+    raw["tasks"][0]["role"] = role
+    return raw
+
+
+def _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=2, plan_raw=ONE_TASK_PLAN, roles=ROLES):
+    plan = plan_mod.parse_and_validate(plan_raw, known_roles=set(ROLES), max_cards=40)
     conn = db.connect(tmp_path / "ases.db")
     project = config.ProjectConfig(
         name="t3", environment="native", data_class="public",
         workspace_root=tmp_path / "ws", ases_home=tmp_path / "home", board="b",
-        integration_branch="integration", roles=ROLES, concurrency={},
+        integration_branch="integration", roles=roles, concurrency={},
         budgets={"fix_cards_per_task": fix_cards_per_task}, hermes_tested_version="0.21.3",
         hermes_native_home=tmp_path / "hermes",
     )
@@ -527,8 +542,8 @@ def test_merge_conflict_creates_a_fix_card_not_a_block_only(tmp_path, monkeypatc
 
     def fake_show(board, cid):
         if cid == pair.work_card_id:
-            return {"status": "done", "branch_name": "swarm/T1-coder"}
-        return {"status": "blocked"}
+            return {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [REVIEWER_COMPLETED]}
+        return {"id": cid, "status": "blocked"}
 
     monkeypatch.setattr(hermes, "kanban_show", fake_show)
     links = []
@@ -554,8 +569,8 @@ def test_fix_card_budget_exhausted_escalates_to_block(tmp_path, monkeypatch):
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=0)
 
     monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
-        {"status": "done", "branch_name": "swarm/T1-coder"} if cid == pair.work_card_id
-        else {"status": "blocked"}
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [REVIEWER_COMPLETED]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
     ))
     monkeypatch.setattr(hermes, "kanban_link", lambda *a: None)
     blocked = []
@@ -588,8 +603,8 @@ def test_successful_merge_needs_no_fix_card(tmp_path, monkeypatch):
 
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
     monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
-        {"status": "done", "branch_name": "swarm/T1-coder"} if cid == pair.work_card_id
-        else {"status": "blocked"}
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [REVIEWER_COMPLETED]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
     ))
     completed = []
     monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: completed.append(cid))
@@ -639,16 +654,27 @@ _MERGED = mergeq.MergeOutcome(
 )
 
 
-def _board_state(monkeypatch, pair, *, project_id=REAL_HERMES_PROJECT_ID):
+def _board_state(monkeypatch, pair, *, project_id=REAL_HERMES_PROJECT_ID, branch="swarm/T1-coder"):
     """A fake hermes.kanban_show backed by a dict the test can edit between passes (e.g. to move a fix
     card from "running" to "done"). project_id mirrors a real card's own project_id field, and differs
     on purpose from both _project()'s name ("t3") and the id _setup_one_task creates its cards under
-    ("proj1"), so a test can tell which of the three a fix card was created under."""
+    ("proj1"), so a test can tell which of the three a fix card was created under. Like the real
+    kanban_show, every card it returns carries its own "id" (the squash commit message names it), so an
+    entry a test adds later needs no id of its own. `branch` is what the work card reports as its branch.
+    A "done" card carries a reviewer-completed run unless its entry sets its own "_runs" (a test that wants a
+    card its implementer finished itself, or one nobody finished, says so explicitly)."""
     states = {
-        pair.work_card_id: {"status": "done", "branch_name": "swarm/T1-coder", "project_id": project_id},
+        pair.work_card_id: {"status": "done", "branch_name": branch, "project_id": project_id},
         pair.merge_card_id: {"status": "blocked"},
     }
-    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: dict(states[cid]))
+
+    def show(board, cid):
+        card = {"id": cid, **states[cid]}
+        if card["status"] == "done":
+            card.setdefault("_runs", [dict(REVIEWER_COMPLETED)])
+        return card
+
+    monkeypatch.setattr(hermes, "kanban_show", show)
     return states
 
 
@@ -669,8 +695,10 @@ def _script_merge_task(monkeypatch, *outcomes):
     calls = []
     queue = list(outcomes)
 
-    def fake(repo, integration_branch, work_branch, task_key, gate3_commands, *, conn=None, commit_message=None):
-        calls.append({"integration_branch": integration_branch, "work_branch": work_branch, "task_key": task_key})
+    def fake(repo, integration_branch, work_branch, task_key, gate3_commands, *, conn=None, commit_message=None,
+             allow_empty=False):
+        calls.append({"integration_branch": integration_branch, "work_branch": work_branch, "task_key": task_key,
+                      "commit_message": commit_message, "allow_empty": allow_empty})
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
     monkeypatch.setattr(mergeq, "merge_task", fake)
@@ -777,6 +805,11 @@ def test_merge_queue_merges_the_fix_cards_own_branch_once_it_is_done(tmp_path, m
     assert (repo / "fixed.txt").exists()  # the fix branch's content is what landed on integration
     assert actions["block"] == []
     assert len(_fix_cards(created)) == 1  # and no second fix card was opened
+    # The squash commit of a repointed task names the CURRENT card (the fix card) and its branch, while the
+    # merge card is the task's own, which never moves.
+    message = _git_ok("log", "-1", "--format=%B", "integration", cwd=repo).stdout
+    assert f"Work card: {fix_card['id']}\n" in message and f"Merge card: {pair.merge_card_id}\n" in message
+    assert f"Branch: {fix_card['branch']}\n" in message and f"Work card: {pair.work_card_id}\n" not in message
 
 
 def test_fix_cards_chain_and_each_merge_attempt_follows_the_current_card(tmp_path, monkeypatch):
@@ -1067,3 +1100,436 @@ def test_verify_gate_pin_scoped_per_project(tmp_path):
     conn = db.connect(tmp_path / "ases.db")
     controller.pin_gate_profiles(conn, "a", {"default": ["pytest -q"]})
     controller.verify_gate_pin(conn, "b", {"default": ["a completely different command"]})  # must not raise
+
+
+# ---------------------------------------------------------------------------------------------
+# Review-only tasks merge as a recorded no-op, work and fix cards say how to hand off, and the squash
+# commit carries the card IDs (2026-09-19). Real git where the merged content matters; a scripted
+# mergeq.merge_task where only the SHAPE of an outcome, or the arguments it was called with, matter.
+# ---------------------------------------------------------------------------------------------
+
+NO_OP_RESULT = "no changes to merge (review-only task)"
+_NO_OP = mergeq.MergeOutcome(
+    merged=True, candidate_sha=None, squash_commit=None, gate3_result="skipped", detail=NO_OP_RESULT,
+)
+
+
+def _repo_with_branch_at_tip(tmp_path, branch):
+    """A worker that made no commit (a reviewer): its branch sits exactly at the integration tip."""
+    repo = _plain_repo(tmp_path)
+    _git_ok("branch", branch, cwd=repo)
+    return repo
+
+
+def _repo_with_a_coder_commit(tmp_path):
+    repo = _plain_repo(tmp_path)
+    _git_ok("checkout", "-q", "-b", "swarm/T1-coder", cwd=repo)
+    (repo / "new.txt").write_text("x\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "add file", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    return repo
+
+
+def _merged_events(conn):
+    """The payloads of the "merged" events, task_key included (events.record used to redact it, because the
+    credential pattern matched any field name containing "key"; fixed 2026-09-19)."""
+    return [json.loads(e["payload"]) for e in events.recent(conn) if e["kind"] == "merged"]
+
+
+def _merge_record(conn):
+    return conn.execute("SELECT * FROM merge_records WHERE task_key='T1'").fetchone()
+
+
+@pytest.mark.parametrize("role", ["reviewer", "lead"])
+def test_review_only_task_with_an_empty_branch_completes_its_merge_card_as_a_no_op(tmp_path, monkeypatch, role):
+    """Real git and the real mergeq.merge_task. A reviewer never commits, so its branch is empty against the
+    integration tip; that used to be "nothing to commit" and a spurious fix card. Any role but "coder" gets
+    the no-op: the merge card completes, nothing is merged, no fix card, no fix budget."""
+    branch = f"swarm/T1-{role}"
+    repo = _repo_with_branch_at_tip(tmp_path, branch)
+    tip = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, plan_raw=_one_task_plan_raw(role))
+    _board_state(monkeypatch, pair, branch=branch)
+    actions = _record_card_actions(monkeypatch)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == ["T1"]
+    assert actions == {
+        "link": [], "block": [],
+        "complete": [(pair.merge_card_id, {"result": NO_OP_RESULT,
+                                           "metadata": {"squash_commit": None, "no_op": True}})],
+    }
+    assert _merged_events(conn) == [{"task_key": "T1", "sha": None, "no_op": True}]
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "merge_failed" not in kinds and "fix_card_created" not in kinds
+    assert _fix_cards(created) == []
+    row = _task_row(conn)
+    assert row["fix_cards"] == 0  # no fix budget was consumed
+    assert row["work_card_id"] == pair.work_card_id  # and nothing was repointed
+    assert _git_ok("rev-parse", "integration", cwd=repo).stdout.strip() == tip  # nothing was merged
+    record = _merge_record(conn)  # the shape reconcile expects of a done merge card
+    assert (record["gate3_result"], record["squash_commit"], record["reverted"]) == ("skipped", None, 0)
+    assert record["completed_at"]
+
+
+def test_coder_task_with_an_empty_branch_is_still_a_merge_failure(tmp_path, monkeypatch):
+    """allow_empty is keyed on the task's role. A coder that produced no commit has not done its job, so
+    its empty branch keeps failing the merge and opening a fix card instead of being recorded as a no-op."""
+    repo = _repo_with_branch_at_tip(tmp_path, "swarm/T1-coder")
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    assert actions["complete"] == []
+    (fix_card,) = _fix_cards(created)
+    assert _task_row(conn)["fix_cards"] == 1
+    failed = next(e for e in events.recent(conn) if e["kind"] == "merge_failed")
+    assert "nothing to commit" in failed["payload"]
+    assert "Failure detail:\nnothing to commit" in fix_card["body"]
+    assert _merged_events(conn) == []
+    assert _merge_record(conn) is None  # nothing was recorded as merged
+
+
+def test_normal_coder_merge_still_completes_with_the_squash_sha(tmp_path, monkeypatch):
+    """The real-merge path is unchanged: result "merged <sha>", metadata {"squash_commit": sha}, and a
+    "merged" event carrying just the task key and sha (no no_op key)."""
+    repo = _repo_with_a_coder_commit(tmp_path)
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+
+    assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == ["T1"]
+
+    sha = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    assert actions["complete"] == [(pair.merge_card_id, {"result": f"merged {sha}",
+                                                         "metadata": {"squash_commit": sha}})]
+    assert _merged_events(conn) == [{"task_key": "T1", "sha": sha}]
+    record = _merge_record(conn)
+    assert (record["gate3_result"], record["squash_commit"]) == ("pass", sha)
+    assert _fix_cards(created) == []
+
+
+@pytest.mark.parametrize("role, expected", [("coder", False), ("reviewer", True), ("lead", True)])
+def test_allow_empty_is_passed_for_every_role_but_coder(tmp_path, monkeypatch, role, expected):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, plan_raw=_one_task_plan_raw(role))
+    _board_state(monkeypatch, pair, branch=f"swarm/T1-{role}")
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert [c["allow_empty"] for c in calls] == [expected]
+
+
+def test_a_no_op_merge_is_never_routed_through_the_failure_path(tmp_path, monkeypatch):
+    """With a fix budget of zero any failure blocks the merge card at once. A no-op must complete it
+    instead, which shows it never reaches the failure path (or the fix budget) at all."""
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, fix_cards_per_task=0, plan_raw=_one_task_plan_raw("reviewer"),
+    )
+    _board_state(monkeypatch, pair, branch="swarm/T1-reviewer")
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _NO_OP)
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == ["T1"]
+
+    assert [cid for cid, _ in actions["complete"]] == [pair.merge_card_id]
+    assert actions["block"] == [] and actions["link"] == []
+    assert _fix_cards(created) == [] and _task_row(conn)["fix_cards"] == 0
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "merge_failed" not in kinds and "fix_card_budget_exhausted" not in kinds
+
+
+def test_squash_commit_message_carries_the_card_ids(tmp_path, monkeypatch):
+    """ASES-GIT-06: one squash commit per plan task, with the card ID in the commit message."""
+    repo = _repo_with_a_coder_commit(tmp_path)
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+
+    assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == ["T1"]
+
+    message = _git_ok("log", "-1", "--format=%B", "integration", cwd=repo).stdout.strip()
+    assert pair.work_card_id in message and pair.merge_card_id in message and "scaffold" in message
+    assert message == (
+        f"T1: scaffold\n\nWork card: {pair.work_card_id}\nMerge card: {pair.merge_card_id}\n"
+        "Branch: swarm/T1-coder\nControlled by ASES (one squash commit per plan task)."
+    )
+
+
+def _plan_task(key):
+    """One of PLAN_RAW's tasks: T1 is a coder task (touches a.py), T2 a reviewer task (touches nothing)."""
+    return plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40).task(key)
+
+
+def test_coder_work_card_body_tells_the_worker_to_commit_and_request_review():
+    body = controller._work_card_body(_plan_task("T1"))
+
+    assert body.startswith("Role: coder")
+    assert "kanban_request_review" in body
+    assert "Do NOT call kanban_complete" in body
+    assert "Commit your work" in body
+    lines = body.splitlines()
+    # The pre-existing lines are untouched, and the handoff block follows them after one blank line.
+    assert lines[:6] == ["Role: coder", "Acceptance criteria:", "- exists", "Touches: a.py",
+                         "Gate profile: trivial", ""]
+    assert lines[6] == "How to finish (ASES):"
+
+
+def test_reviewer_work_card_body_tells_the_worker_to_give_a_verdict_not_request_review():
+    body = controller._work_card_body(_plan_task("T2"))
+
+    assert body.startswith("Role: reviewer")
+    assert "kanban_complete" in body and "PASS or FAIL" in body
+    assert "kanban_request_review" not in body
+    assert "Do NOT call kanban_complete" not in body
+    lines = body.splitlines()
+    # T2 touches nothing, so there is no Touches line; the handoff block still follows after a blank line.
+    assert lines[:6] == ["Role: reviewer", "Acceptance criteria:", "- reviewed", "Gate profile: trivial", "",
+                         "How to finish (ASES):"]
+
+
+def test_finish_instructions_wording_is_pinned():
+    """The words are load-bearing (a worker follows them literally), so any edit to them must be deliberate."""
+    reviewer_block = [
+        "How to finish (ASES):",
+        "1. Read the acceptance criteria above and inspect the code in your worktree. You review; you do not "
+        "edit product files.",
+        "2. Give your verdict with kanban_complete: the summary starts with PASS or FAIL, and the metadata "
+        "carries verdict, findings and criteria_checked.",
+        "3. If you need a human decision, call kanban_block with one precise question.",
+        "4. This card has no commit to merge; its merge card completes as a recorded no-op.",
+    ]
+
+    assert controller._finish_instructions("coder") == [
+        "How to finish (ASES):",
+        "1. Make the change only inside your worktree and only on the paths listed under Touches.",
+        "2. Run the commands of your gate profile and fix what they report. Never edit tests, gate settings "
+        "or CI files to make a check pass.",
+        "3. Commit your work on this card's branch (git add, then git commit). Uncommitted work is not merged.",
+        '4. Hand off with kanban_request_review, and always pass reviewer="reviewer" so the independent '
+        "reviewer profile takes the card (without it the card stays assigned to you and you would review "
+        "your own work). Give a one or two sentence summary, plus metadata with changed_files, the "
+        "verification commands you ran, residual_risk and the commit SHA. Do NOT call kanban_complete on "
+        "this card. The reviewer completes it after approving, and only then does the merge queue run.",
+    ]
+    assert controller._finish_instructions("reviewer") == reviewer_block
+    assert controller._finish_instructions("lead") == reviewer_block  # any role but coder
+
+
+@pytest.mark.parametrize("role, present, absent", [
+    ("coder", ["kanban_request_review", "Do NOT call kanban_complete", "Commit your work"], ["PASS or FAIL"]),
+    ("reviewer", ["kanban_complete", "PASS or FAIL"], ["kanban_request_review"]),
+])
+def test_fix_card_body_keeps_the_failure_detail_and_appends_the_handoff_for_its_role(
+    tmp_path, monkeypatch, role, present, absent,
+):
+    """The handoff text is chosen by the FIX task's role (task.role), not hardcoded to a coder's."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, plan_raw=_one_task_plan_raw(role))
+    _board_state(monkeypatch, pair, branch=f"swarm/T1-{role}")
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    (fix_card,) = _fix_cards(created)
+    body = fix_card["body"]
+    assert body.startswith(
+        "Merge attempt for T1 failed. Fix in a fresh worktree.\n\nFailure detail:\nmerge conflict: CONFLICT"
+    )
+    assert all(text in body for text in present) and not any(text in body for text in absent)
+    # Appended after the existing text, preceded by a blank line, and nothing follows it.
+    assert body.endswith("\n\n" + "\n".join(controller._finish_instructions(role)))
+
+
+def test_fix_card_body_carries_the_tasks_touches_and_gate_profile(tmp_path, monkeypatch):
+    """The hand-off steps tell the worker to stay inside "the paths listed under Touches" and to run "the
+    commands of your gate profile"; a fix card's body used to carry neither line for them to refer to."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    (fix_card,) = _fix_cards(created)
+    body = fix_card["body"]
+    assert "Failure detail:\nmerge conflict" in body
+    assert "\nTouches: base.txt\n" in body and "\nGate profile: trivial\n" in body
+    # In order: failure detail, then the scope, then the hand-off steps.
+    assert body.index("Failure detail:") < body.index("Touches: base.txt") < body.index("How to finish (ASES):")
+
+
+def test_work_card_body_still_lists_touches_and_gate_profile_in_the_original_order():
+    body = controller._work_card_body(_plan_task("T1"))
+    lines = body.splitlines()
+    assert lines[0] == "Role: coder" and lines[1] == "Acceptance criteria:"
+    assert lines.index("Gate profile: trivial") < lines.index("How to finish (ASES):")
+
+
+def test_coder_body_names_the_default_reviewer_profile():
+    assert 'reviewer="reviewer"' in controller._work_card_body(_plan_task("T1"))
+
+
+def test_created_coder_card_names_the_projects_own_reviewer_profile(tmp_path, monkeypatch):
+    """Hermes has no default reviewer: kanban_request_review only reassigns the card when reviewer= is given,
+    so a coder that omits it would review its own work. The profile named is the one the project's roles map
+    gives "reviewer" (here "rev-2"), the same one the reviewer-role task's own card is assigned to."""
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    created = []
+    monkeypatch.setattr(
+        hermes, "kanban_create",
+        lambda board, title, **kw: created.append({"id": counter.next_id("t"), "title": title, **kw})
+        or created[-1],
+    )
+    project = dataclasses.replace(_project(tmp_path), roles={**ROLES, "reviewer": "rev-2"})
+
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, project, conn=conn)
+
+    t1_work = next(c for c in created if c["title"] == "T1: scaffold")
+    t2_work = next(c for c in created if c["title"] == "T2: review scaffold")
+    assert 'reviewer="rev-2"' in t1_work["body"]
+    assert 'reviewer="reviewer"' not in t1_work["body"]
+    assert t2_work["assignee"] == "rev-2"
+
+
+def test_fix_card_body_names_the_projects_own_reviewer_profile(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, roles={**ROLES, "reviewer": "rev-2"},
+    )
+    states = _board_state(monkeypatch, pair)
+    # This project's reviewer profile is "rev-2", so a card its reviewer approved was completed by that profile.
+    states[pair.work_card_id]["_runs"] = [{"outcome": "completed", "profile": "rev-2"}]
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    (fix_card,) = _fix_cards(created)
+    assert 'reviewer="rev-2"' in fix_card["body"]
+    assert 'reviewer="reviewer"' not in fix_card["body"]
+
+
+def test_a_project_with_no_reviewer_role_falls_back_to_the_literal_reviewer_profile(tmp_path, monkeypatch):
+    """policy.resolve_assignee raises for an unmapped role, but a missing mapping is doctor's job to flag, not
+    the card body's: a coder task's work card AND its fix card are still built, naming the literal
+    profile "reviewer"."""
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, roles={"lead": "lead", "coder": "coder-1"},
+    )
+    t1_work = next(c for c in created if c["title"] == "T1: scaffold")
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    (fix_card,) = _fix_cards(created)
+    assert 'reviewer="reviewer"' in t1_work["body"]
+    assert 'reviewer="reviewer"' in fix_card["body"]
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-GIT-03: a work card merges only if the reviewer profile completed it, and a pass polices the
+# review lane before it dispatches (2026-09-19).
+# ---------------------------------------------------------------------------------------------
+
+def _refused_events(conn):
+    return [json.loads(e["payload"]) for e in events.recent(conn, limit=200) if e["kind"] == "merge_refused_unreviewed"]
+
+
+def test_a_card_its_own_implementer_completed_is_refused_not_merged(tmp_path, monkeypatch):
+    """Real finding (2026-09-19): the first real coder run finished its own card with kanban_complete instead
+    of asking for review, and the merge queue merged anything that read "done", so no independent reviewer
+    ever saw the diff. Now only a card the reviewer profile completed merges."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    states = _board_state(monkeypatch, pair)
+    states[pair.work_card_id]["_runs"] = [CODER_COMPLETED]
+    actions = _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    unreviewed = []
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn, unreviewed=unreviewed)
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)  # the next poll
+
+    assert merged == []
+    assert calls == []  # merge_task was never reached, on either poll
+    assert unreviewed == ["T1"]
+    assert actions == {"link": [], "block": [], "complete": []}  # the merge card was left exactly as it was
+    assert _fix_cards(created) == []  # a refusal is not a merge failure: no fix card,
+    assert _task_row(conn)["fix_cards"] == 0  # and no fix budget spent
+    # Recorded once for the card, not once per poll.
+    assert _refused_events(conn) == [{
+        "task_key": "T1", "card_id": pair.work_card_id, "completed_by": "coder-1",
+        "needs_completion_by": "reviewer",
+    }]
+
+
+def test_a_done_card_that_no_run_completed_is_refused(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    states = _board_state(monkeypatch, pair)
+    states[pair.work_card_id]["_runs"] = []  # e.g. marked done by hand, with no run behind it
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
+
+    assert calls == []
+    assert [e["completed_by"] for e in _refused_events(conn)] == [None]
+
+
+@pytest.mark.parametrize("runs, merges", [
+    ([REVIEWER_COMPLETED], True),
+    ([{"outcome": "review_requested", "profile": "coder-1"}, REVIEWER_COMPLETED], True),
+    # A crashed or otherwise unfinished run after the approval is not a completion: the latest COMPLETED run decides.
+    ([REVIEWER_COMPLETED, {"outcome": "crashed", "profile": "coder-1"}], True),
+    ([CODER_COMPLETED, REVIEWER_COMPLETED], True),  # finished by the implementer once, approved after
+    ([REVIEWER_COMPLETED, CODER_COMPLETED], False),  # approved, then reopened and finished by the implementer
+    ([CODER_COMPLETED], False),
+    ([{"outcome": "review_requested", "profile": "coder-1"}], False),  # asked for review, nobody completed it
+])
+def test_the_latest_completed_run_decides_whether_a_card_may_merge(tmp_path, monkeypatch, runs, merges):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    states = _board_state(monkeypatch, pair)
+    states[pair.work_card_id]["_runs"] = runs
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert merged == (["T1"] if merges else [])
+    assert len(calls) == (1 if merges else 0)
+    assert len(_refused_events(conn)) == (0 if merges else 1)
+
+
+def test_run_pass_polices_the_review_lane_before_it_dispatches_and_reports_unreviewed_tasks(monkeypatch):
+    """Real bug (2026-09-19): dispatch ran first and it also claims cards waiting in `review` and spawns their
+    reviewer, so the Gate 1 re-check (which only acts on cards still in `review`) was skipped for every card
+    dispatch reached first. The blueprint's loop re-runs Gate 1 before anything else claims the card."""
+    import types
+
+    order = []
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: order.append("budget") or [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: order.append("review") or [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: order.append("dispatch") or {})
+
+    def fake_merge_queue(board, repo, plan, project, *, conn, unreviewed=None):
+        order.append("merge")
+        unreviewed.append("T1")
+        return []
+
+    monkeypatch.setattr(controller, "process_merge_queue", fake_merge_queue)
+    monkeypatch.setattr(controller, "all_merge_cards_done", lambda *a, **kw: False)
+
+    summary = controller.run_pass("b", None, None, types.SimpleNamespace(budgets={}), {}, conn=None)
+
+    assert order == ["budget", "review", "dispatch", "merge"]
+    assert summary["unreviewed"] == ["T1"]
+    assert summary["finished"] is False

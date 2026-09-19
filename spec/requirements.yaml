@@ -285,8 +285,19 @@ requirements:
   requirement: Merge eligibility needs a green Gate 1 record and a reviewer PASS for the same commit
   section: '8.1'
   verified_by: '22.6'
-  status: covered
-  note: review.gate_before_review re-runs Gate 1 on the branch head before a card is trusted in review.
+  status: partial
+  note: 'Downgraded from covered on 2026-09-19: the register note only ever described the Gate 1 half.
+    review.gate_before_review re-runs Gate 1 on the branch head before a card is trusted in review (unit-tested
+    and probed against real Hermes semantics, not yet seen firing in a real run). The reviewer half was not
+    enforced: process_merge_queue treated any work card that read done as approved, and the first real coder
+    run (T1) finished its own card with kanban_complete and would have gone straight to merge with no reviewer
+    involved. It now merges a card only if the latest completed run on it belongs to the reviewer profile,
+    refuses anything else (event merge_refused_unreviewed, once per card, shown on the swarm run pass line,
+    no fix card, no fix budget), and work-card bodies tell the coder to hand off with kanban_request_review and
+    reviewer=<profile> (Hermes has no default reviewer; without it the card stays with the coder). Left partial:
+    it checks WHO completed the card, not WHICH commit was reviewed (the verdict is not bound to a commit SHA,
+    which is ASES-REV-06), and Hermes''s own gateway dispatcher can still claim a review card before the Gate 1
+    re-check sees it, so that half rests on Gate 3 at merge time as a backstop.'
 - id: ASES-GIT-04
   requirement: 'One merge at a time: squash candidate on the integration HEAD, Gate 3, fast-forward, complete
     the merge card'
@@ -311,8 +322,12 @@ requirements:
   section: '8.1'
   verified_by: '22.2'
   status: covered
-  note: mergeq.py always squashes (git merge --squash); test_squash_produces_one_commit_not_the_branchs_history
-    confirms one commit regardless of branch history depth.
+  note: 'mergeq.py always squashes (git merge --squash); test_squash_produces_one_commit_not_the_branchs_history
+    confirms one commit regardless of branch history depth. The "with the card ID" half was NOT done until
+    2026-09-19 although this row said covered: process_merge_queue now passes a commit message naming the
+    work card, the merge card and the branch (test_squash_commit_message_carries_the_card_ids, and the fix
+    card variant). A review-only task makes no commit at all (recorded no-op merge), so "one commit per plan
+    task" holds for tasks that change code.'
 - id: ASES-GIT-07
   requirement: No generated artifacts or secrets in commits; secret scan in Gates 1 and 3
   section: '8.1'

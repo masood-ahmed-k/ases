@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 _SECRET_KEY_PATTERN = re.compile(r"(key|token|secret|password|credential|authorization)", re.IGNORECASE)
+# Field names that contain "key" but are plain identifiers, never credentials. Without this every event
+# stored `"task_key": "[redacted]"` (found 2026-09-19 while building the review-only merge tests), which
+# threw away the one field that says which plan task an event is about. Exact names only, so a real
+# credential field ("key", "api_key", "access_key") is still redacted wholesale.
+_NOT_SECRET_KEYS = frozenset({"task_key", "idempotency_key"})
 # Common provider-key shapes (OpenAI/OpenRouter sk-..., GitHub ghp_/glpat-, Slack xox...). Extend as
 # new providers are added; this is a safety net, not the primary control.
 _SECRET_VALUE_PATTERN = re.compile(r"\b(sk-|glpat-|ghp_|gho_|xox[baprs]-)[A-Za-z0-9_-]{10,}\b")
@@ -21,7 +26,8 @@ _SECRET_VALUE_PATTERN = re.compile(r"\b(sk-|glpat-|ghp_|gho_|xox[baprs]-)[A-Za-z
 def _redact(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {
-            k: ("[redacted]" if _SECRET_KEY_PATTERN.search(str(k)) else _redact(v))
+            k: ("[redacted]" if str(k) not in _NOT_SECRET_KEYS and _SECRET_KEY_PATTERN.search(str(k))
+                else _redact(v))
             for k, v in obj.items()
         }
     if isinstance(obj, list):

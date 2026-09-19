@@ -25,6 +25,10 @@ class MergeConflict(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class MergeOutcome:
+    """The result of one merge_task call. Three shapes matter to a caller: a real merge (merged=True with
+    squash_commit set), a refusal (merged=False), and a recorded no-op (merged=True with squash_commit None
+    and gate3_result "skipped"). The no-op means the branch added nothing to the integration branch and the
+    caller passed allow_empty: no commit was made, nothing was gated, and the integration branch did not move."""
     merged: bool
     candidate_sha: str | None
     squash_commit: str | None
@@ -54,7 +58,7 @@ def _resolve(repo: pathlib.Path, rev: str) -> str:
 
 def merge_task(
     repo: pathlib.Path, integration_branch: str, work_branch: str, task_key: str,
-    gate3_commands: list[str], *, conn=None, commit_message: str | None = None,
+    gate3_commands: list[str], *, conn=None, commit_message: str | None = None, allow_empty: bool = False,
 ) -> MergeOutcome:
     """ASES-GIT-04: squash candidate on integration HEAD -> Gate 3 -> fast-forward -> done.
     A merge conflict or a red Gate 3 leaves the integration branch untouched and returns merged=False;
@@ -68,7 +72,17 @@ def merge_task(
     A refused fast-forward returns gate3_result="pass" with `integration_moved` decided from git, not
     assumed: True only if the integration tip is no longer the candidate's parent (a real race, safe for
     the caller to retry for free). git also refuses a fast-forward while the tip has NOT moved (a dirty or
-    wrong-branch primary checkout, an index.lock); that is integration_moved=False and a real failure."""
+    wrong-branch primary checkout, an index.lock); that is integration_moved=False and a real failure.
+
+    An empty diff (2026-09-19): `git merge --squash` exits 0 with nothing staged when the branch adds
+    nothing to the integration tip (a review-only task never commits, so its branch sits at or behind the
+    tip), and `git commit` then fails. Emptiness is read from the staged index, not inferred from that
+    commit failing. With allow_empty=False (the default) it stays the failure it always was: merged=False,
+    detail starting "nothing to commit". With allow_empty=True it is a RECORDED NO-OP instead: no commit, no
+    secret scan and no Gate 3 (there is no candidate diff), the integration branch is not touched, and the
+    merge_records row is completed with squash_commit NULL and gate3_result "skipped". The outcome is
+    merged=True with squash_commit None, which is how a caller tells a no-op from a real merge. When the
+    squash does stage changes allow_empty changes nothing."""
     # Before mkdtemp and before any worktree, so refusing here leaves nothing behind to clean up.
     head = _git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
     current_branch = head.stdout.strip() if head.returncode == 0 else ""
@@ -99,10 +113,47 @@ def merge_task(
             _git(["merge", "--abort"], candidate)
             return MergeOutcome(False, None, None, None, f"merge conflict: {squash.stdout}{squash.stderr}")
 
+        # Empty or not is decided from the index (2026-09-19). --quiet implies --exit-code: 0 means nothing
+        # is staged, 1 means something is, and any other code is git failing to answer, which is reported
+        # rather than guessed at (guessing "empty" would silently record a merge that never happened).
+        staged = _git(["diff", "--cached", "--quiet"], candidate)
+        if staged.returncode not in (0, 1):
+            return MergeOutcome(
+                False, None, None, None,
+                f"could not tell whether squashing {work_branch} staged any changes (git diff --cached "
+                f"--quiet exited {staged.returncode}): {staged.stdout}{staged.stderr}",
+            )
+        if staged.returncode == 0:
+            if not allow_empty:
+                # Refused here instead of by attempting the commit: git's own text for that failure is only
+                # "Not currently on any branch. nothing to commit", which says nothing about why.
+                return MergeOutcome(
+                    False, None, None, None,
+                    f"nothing to commit: squashing {work_branch} onto {integration_branch} staged no changes "
+                    f"(an empty diff: the branch has no commit that adds anything to the integration tip)",
+                )
+            if conn is not None:
+                # Same upsert idiom as the Gate 3 record below, but complete in this one write: there is no
+                # fast-forward left to wait for, and reconcile (ASES-REC-04) wants completed_at on a done merge
+                # card. candidate_sha is the integration tip the empty squash was built on. A retry rewrites
+                # every column the no-op owns, so running it twice leaves one identical row.
+                conn.execute(
+                    "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
+                    "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, ?) "
+                    "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
+                    "gate3_result=excluded.gate3_result, squash_commit=NULL, "
+                    "completed_at=excluded.completed_at",
+                    (task_key, base_sha, "skipped", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                )
+            return MergeOutcome(True, None, None, "skipped", "no changes to merge (review-only task)")
+
         msg = commit_message or f"{task_key}: merge {work_branch}"
         commit = _git(["commit", "-q", "-m", msg], candidate)
         if commit.returncode != 0:
-            return MergeOutcome(False, None, None, None, f"nothing to commit: {commit.stdout}{commit.stderr}")
+            # Emptiness was decided from the index above, so a commit that fails NOW had staged changes and was
+            # refused for another reason (no usable git identity, a hook). It used to be labelled "nothing to
+            # commit" here, which sent whoever read the failure looking for an empty diff that was not there.
+            return MergeOutcome(False, None, None, None, f"commit failed: {commit.stdout}{commit.stderr}")
 
         candidate_sha = _head_sha(candidate)
 

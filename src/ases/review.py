@@ -8,6 +8,11 @@ transition: `kanban_complete` -> done (PASS), `kanban_request_changes` -> back t
 (CHANGES_REQUIRED), `kanban_block` -> blocked (BLOCKED). There is no separate verdict payload to parse
 here -- the state machine itself is the verdict (ASES-REV-06's schema lives in the run metadata for
 audit, not as something this module has to interpret to know what happened).
+
+The controller's own send-back is `reopen-review` (hermes.kanban_reopen_review), NOT `request-changes`:
+request-changes is the reviewer's verdict and Hermes rejects it (exit 1, "task is not in an active review
+run") on a card that is merely sitting in `review`, which is where this module finds it (2026-09-19 fix,
+verified against real Hermes; every earlier test mocked the wrapper, so none could see it).
 """
 from __future__ import annotations
 
@@ -32,23 +37,37 @@ def gate_before_review(
     worked because config/swarm.yaml's integration_branch happens to be spelled exactly that. Under any
     other name the merge-base lookup failed, `base` came back empty, and the check silently fell back
     to inspecting only the branch's LAST commit -- so an out-of-scope path in any earlier commit was
-    never seen."""
+    never seen. It now fails closed instead: no merge-base means the card is sent back, not guessed at."""
     import subprocess
 
-    head = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", branch], capture_output=True, text=True,
-    ).stdout.strip()
+    # --verify -q and the exit code, not bare stdout: `git rev-parse <bad-ref>` echoes the bad argument on
+    # stdout while failing, so a missing branch used to come back as a non-empty "head" and sail past the
+    # guard below (found 2026-09-19 by a test that asked for a branch that does not exist).
+    resolved = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "-q", branch], capture_output=True, text=True,
+    )
+    head = resolved.stdout.strip() if resolved.returncode == 0 else ""
     if not head:
-        hermes_mod.kanban_request_changes(board, card_id, f"could not resolve branch {branch}")
+        hermes_mod.kanban_reopen_review(board, card_id, f"could not resolve branch {branch}")
         return False
 
     base = subprocess.run(
         ["git", "-C", str(repo), "merge-base", integration_branch, branch], capture_output=True, text=True,
     ).stdout.strip()
-    changed = integrity.changed_paths(repo, head) if not base else _changed_since(repo, base, head)
+    if not base:
+        # Fail closed. Falling back to inspecting only the branch's LAST commit (what this used to do)
+        # lets an out-of-scope path in any earlier commit through, and it is exactly what an unrelated
+        # history or a missing integration branch would trigger without anyone noticing.
+        hermes_mod.kanban_reopen_review(
+            board, card_id,
+            f"could not compute a merge-base between '{integration_branch}' and '{branch}', so the "
+            f"touches check cannot be trusted",
+        )
+        return False
+    changed = _changed_since(repo, base, head)
     out_of_scope = integrity.paths_outside_touches(changed, touches)
     if out_of_scope:
-        hermes_mod.kanban_request_changes(
+        hermes_mod.kanban_reopen_review(
             board, card_id,
             f"diff touches paths outside the card's declared touches ({touches}): {out_of_scope}. "
             "Either the task needs widening or these changes need to come out.",
@@ -57,7 +76,7 @@ def gate_before_review(
 
     result = gates_mod.run_gate(repo, head, "gate1", gate1_commands, conn=conn, task_key=task_key)
     if not result.passed:
-        hermes_mod.kanban_request_changes(
+        hermes_mod.kanban_reopen_review(
             board, card_id, f"Gate 1 failed on the controller's re-check:\n{result.detail[:1500]}"
         )
         return False

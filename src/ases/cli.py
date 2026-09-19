@@ -17,12 +17,16 @@ from . import config as ases_config
 from . import controller as controller_mod
 from . import db as ases_db
 from . import doctor as ases_doctor
+from . import events as events_mod
 from . import hermes as hermes_mod
 from . import models as models_mod
 from . import plan as plan_mod
 from . import policy as policy_mod
 
 _GLYPH = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "pending": "[PEND]"}
+# swarm run keeps polling through an isolated failed pass (a hermes CLI timeout, a locked database) but
+# gives up when the same kind of failure repeats: past this many in a row it is a fault, not a blip.
+_MAX_CONSECUTIVE_PASS_ERRORS = 5
 _NOT_BUILT_YET = {
     "init", "status", "questions", "answer", "eval", "report",
 }
@@ -206,7 +210,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Bounded controller loop (section 9.2): dispatch, review-lane policing, merge queue, repeat
+    """Bounded controller loop (section 9.2): review-lane policing, dispatch, merge queue, repeat
     until every merge card is done or max-iterations is hit."""
     project = _load_project()
     conn = ases_db.connect(ases_config.db_path(project))
@@ -230,10 +234,31 @@ def cmd_run(args: argparse.Namespace) -> int:
               f"none of these are auto-repaired yet (Phase 3 scope).")
 
     models_config = _load_models_config()
+    consecutive_errors = 0
     for i in range(args.max_iterations):
-        summary = controller_mod.run_pass(project.board, repo, plan, project, models_config, conn=conn)
-        print(f"[pass {i + 1}] parked={summary['parked']} merged={summary['merged']} "
-              f"sent_back={summary['sent_back']} finished={summary['finished']}")
+        try:
+            summary = controller_mod.run_pass(project.board, repo, plan, project, models_config, conn=conn)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: see below
+            # One bad poll (a hermes CLI timeout, a transient error) used to end the whole run with a
+            # traceback and leave the board half-driven. Every step of a pass is idempotent and the state
+            # lives in Hermes and git, so the next pass simply retries; but a fault that repeats is not a
+            # blip, so it stops after _MAX_CONSECUTIVE_PASS_ERRORS in a row rather than looping to the bound.
+            consecutive_errors += 1
+            detail = f"{type(exc).__name__}: {exc}"[:500]
+            events_mod.record(conn, "pass_error", {"pass": i + 1, "consecutive": consecutive_errors, "error": detail})
+            print(f"[pass {i + 1}] ERROR ({consecutive_errors} in a row): {detail}", file=sys.stderr)
+            if consecutive_errors >= _MAX_CONSECUTIVE_PASS_ERRORS:
+                print(f"stopping after {consecutive_errors} failed passes in a row; fix the cause and re-run "
+                      f"swarm run (the plan and cards are untouched)", file=sys.stderr)
+                return 2
+            time.sleep(args.sleep_seconds)
+            continue
+        consecutive_errors = 0
+        line = (f"[pass {i + 1}] parked={summary['parked']} merged={summary['merged']} "
+                f"sent_back={summary['sent_back']}")
+        if summary.get("unreviewed"):
+            line += f" unreviewed={summary['unreviewed']}"
+        print(f"{line} finished={summary['finished']}")
         if summary["finished"]:
             print("all merge cards done")
             return 0

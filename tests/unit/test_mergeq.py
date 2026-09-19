@@ -1,4 +1,7 @@
+import pathlib
 import subprocess
+import tempfile
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -269,3 +272,237 @@ def test_merge_refuses_a_primary_checkout_that_is_not_on_the_integration_branch(
     assert _git_ok("rev-parse", "integration", cwd=repo).stdout.strip() == tip  # integration untouched
     assert _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip() == tip  # and so is whatever HEAD sits on
     assert not (repo / "new.txt").exists()
+
+
+# ---------------------------------------------------------------------------------------------
+# An empty diff (2026-09-19). A review-only task never commits, so its branch adds nothing to the
+# integration tip: `git merge --squash` exits 0 with nothing staged and `git commit` then fails. Without
+# allow_empty that is still the failure it always was; with it, a recorded no-op. Real git throughout.
+# ---------------------------------------------------------------------------------------------
+
+def _tip(repo):
+    return _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+
+def _merge_row(conn, task_key):
+    return conn.execute("SELECT * FROM merge_records WHERE task_key = ?", (task_key,)).fetchone()
+
+
+def _assert_utc_seconds_timestamp(value):
+    """completed_at is UTC isoformat at second precision: the same shape on a real merge and on a no-op."""
+    stamp = datetime.fromisoformat(value)
+    assert stamp.utcoffset() == timedelta(0) and stamp.microsecond == 0
+    assert abs(datetime.now(timezone.utc) - stamp) < timedelta(minutes=2)
+
+
+def _branch_at_tip(repo, branch):
+    _git_ok("branch", branch, cwd=repo)
+
+
+def _branch_behind_tip(repo, branch):
+    """Already merged: the branch is an ancestor of the integration tip. The usual shape of a reviewer's
+    branch, cut before the earlier tasks landed."""
+    _git_ok("branch", branch, cwd=repo)
+    (repo / "landed.txt").write_text("landed after the branch was cut\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "landed after the branch was cut", cwd=repo)
+
+
+def _branch_net_zero(repo, branch):
+    """Ahead of the tip by two commits whose net effect is nothing (a file added, then removed again). Not
+    an ancestor, so git does not say "Already up to date", yet the squash still stages nothing."""
+    _make_work_branch(repo, branch, "scratch.txt", "x\n")
+    _git_ok("checkout", "-q", branch, cwd=repo)
+    _git_ok("rm", "-q", "scratch.txt", cwd=repo)
+    _git_ok("commit", "-q", "-m", "remove it again", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+
+
+EMPTY_BRANCH_SHAPES = [
+    pytest.param(_branch_at_tip, id="at-the-tip"),
+    pytest.param(_branch_behind_tip, id="already-merged"),
+    pytest.param(_branch_net_zero, id="net-zero-diff"),
+]
+
+
+@pytest.mark.parametrize("make_empty_branch", EMPTY_BRANCH_SHAPES)
+def test_empty_branch_with_allow_empty_is_a_recorded_no_op(repo, tmp_path, make_empty_branch):
+    make_empty_branch(repo, "swarm/rev")
+    conn = db.connect(tmp_path / "ases.db")
+    tip = _tip(repo)
+    history = _git_ok("log", "--format=%H", "integration", cwd=repo).stdout
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/rev", "R1", ["echo ok"], conn=conn, allow_empty=True)
+
+    # merged=True with no squash commit is the "no-op merged" shape.
+    assert outcome == mergeq.MergeOutcome(True, None, None, "skipped", "no changes to merge (review-only task)")
+    assert _tip(repo) == tip  # integration did not move...
+    assert _git_ok("log", "--format=%H", "integration", cwd=repo).stdout == history  # ...and gained no commit
+    assert _git_ok("status", "--porcelain", cwd=repo).stdout.strip() == ""  # the primary checkout is untouched
+    row = _merge_row(conn, "R1")
+    assert row["candidate_sha"] == tip  # the integration tip the empty squash was built on
+    assert row["gate3_result"] == "skipped"
+    assert row["squash_commit"] is None
+    assert row["reverted"] == 0
+    _assert_utc_seconds_timestamp(row["completed_at"])
+
+
+def test_recorded_no_op_is_idempotent(repo, tmp_path):
+    _branch_at_tip(repo, "swarm/rev")
+    conn = db.connect(tmp_path / "ases.db")
+
+    first = mergeq.merge_task(repo, "integration", "swarm/rev", "R2", ["echo ok"], conn=conn, allow_empty=True)
+    row_after_first = dict(_merge_row(conn, "R2"))
+    second = mergeq.merge_task(repo, "integration", "swarm/rev", "R2", ["echo ok"], conn=conn, allow_empty=True)
+
+    assert first == second and second.merged is True
+    assert conn.execute("SELECT COUNT(*) AS n FROM merge_records WHERE task_key = 'R2'").fetchone()["n"] == 1
+    row = dict(_merge_row(conn, "R2"))
+    assert {k: v for k, v in row.items() if k != "completed_at"} == \
+        {k: v for k, v in row_after_first.items() if k != "completed_at"}
+    _assert_utc_seconds_timestamp(row["completed_at"])
+
+
+def test_no_op_overwrites_every_column_it_owns_on_an_existing_row(repo, tmp_path):
+    """The ON CONFLICT half of the upsert, not just the insert: a row left behind by an earlier attempt at
+    this task (a red Gate 3, never completed) must not keep any stale value once the no-op completes it."""
+    _branch_at_tip(repo, "swarm/rev")
+    conn = db.connect(tmp_path / "ases.db")
+    conn.execute(
+        "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES ('R3', 'stale-candidate', 'fail', 'stale-squash', 0, NULL)"
+    )
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/rev", "R3", ["echo ok"], conn=conn, allow_empty=True)
+
+    assert outcome.merged is True
+    row = _merge_row(conn, "R3")
+    assert (row["candidate_sha"], row["gate3_result"], row["squash_commit"]) == (_tip(repo), "skipped", None)
+    _assert_utc_seconds_timestamp(row["completed_at"])
+
+
+@pytest.mark.parametrize("make_empty_branch", EMPTY_BRANCH_SHAPES)
+def test_empty_branch_without_allow_empty_is_still_nothing_to_commit(repo, tmp_path, make_empty_branch):
+    """The default keeps the failure an empty branch always was: merged=False, "nothing to commit", the
+    integration branch untouched, and no merge record marked completed."""
+    make_empty_branch(repo, "swarm/none")
+    conn = db.connect(tmp_path / "ases.db")
+    tip = _tip(repo)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/none", "R4", ["echo ok"], conn=conn)
+
+    assert outcome.merged is False
+    assert outcome.detail.startswith("nothing to commit:")
+    assert (outcome.candidate_sha, outcome.squash_commit, outcome.gate3_result) == (None, None, None)
+    assert outcome.integration_moved is False
+    assert _tip(repo) == tip
+    row = _merge_row(conn, "R4")
+    assert row is None or not row["completed_at"]
+
+
+def test_a_commit_that_fails_with_staged_changes_is_not_labelled_nothing_to_commit(repo, tmp_path, monkeypatch):
+    """The changes ARE staged, so this is not an empty diff: a commit that git refuses for another reason (here
+    signing is required and the signing program does not exist, the same shape as a rejecting hook or an
+    unusable identity) fails the commit. It used to be reported as "nothing to commit"."""
+    _make_work_branch(repo, "swarm/t9", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    before = _tip(repo)
+    _git_ok("config", "commit.gpgsign", "true", cwd=repo)
+    _git_ok("config", "gpg.program", "ases-test-no-such-signing-program", cwd=repo)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/t9", "T9", ["echo gate3-ok"], conn=conn)
+
+    assert outcome.merged is False
+    assert outcome.detail.startswith("commit failed:")
+    assert "nothing to commit" not in outcome.detail
+    assert _tip(repo) == before
+    assert _merge_row(conn, "T9") is None
+
+
+def test_non_empty_branch_with_allow_empty_is_a_normal_squash_merge(repo, tmp_path):
+    """allow_empty only decides what an EMPTY squash means. A branch that adds something still gets the
+    commit, the secret scan, Gate 3 and the fast-forward."""
+    _make_work_branch(repo, "swarm/code", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    before = _tip(repo)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/code", "R5", ["echo ok"], conn=conn, allow_empty=True)
+
+    after = _tip(repo)
+    assert outcome.merged is True and outcome.gate3_result == "pass"
+    assert outcome.squash_commit == after and outcome.candidate_sha == after
+    assert after != before
+    assert _git_ok("rev-parse", "integration^", cwd=repo).stdout.strip() == before  # exactly one new commit
+    assert (repo / "new.txt").exists()
+    row = _merge_row(conn, "R5")
+    assert (row["candidate_sha"], row["gate3_result"], row["squash_commit"]) == (after, "pass", after)
+    _assert_utc_seconds_timestamp(row["completed_at"])
+
+
+def test_no_op_skips_gate3_and_the_secret_scan(repo, tmp_path, monkeypatch):
+    """There is no candidate diff, so neither runs. The gate command here always fails, so a Gate 3 that
+    ran would have turned the no-op into a failure; gate_runs is empty too, since run_gate records every
+    run it makes."""
+    _branch_at_tip(repo, "swarm/rev")
+    conn = db.connect(tmp_path / "ases.db")
+    scans = []
+    monkeypatch.setattr(gates, "scan_for_secrets", lambda diff: scans.append(diff) or [])
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/rev", "R6", ["exit 1"], conn=conn, allow_empty=True)
+
+    assert outcome.merged is True and outcome.gate3_result == "skipped"
+    assert scans == []
+    assert conn.execute("SELECT COUNT(*) AS n FROM gate_runs WHERE task_key = 'R6'").fetchone()["n"] == 0
+    # Control: the very same gate command DOES fail a real merge, so the assertions above prove something.
+    _make_work_branch(repo, "swarm/code", "new.txt", "hello\n")
+    control = mergeq.merge_task(repo, "integration", "swarm/code", "R7", ["exit 1"], conn=conn, allow_empty=True)
+    assert control.merged is False and control.gate3_result == "fail"
+
+
+@pytest.mark.parametrize("code", [128, 129])
+def test_a_failed_emptiness_check_is_reported_not_guessed(repo, tmp_path, monkeypatch, code):
+    """`git diff --cached --quiet` answers 0 (nothing staged) or 1 (something staged). Any other exit code is
+    git failing to answer, and guessing either way is wrong: "empty" would record a merge that never
+    happened, "not empty" would commit blind. Real branch is non-empty and allow_empty is on, so both wrong
+    guesses would end in merged=True."""
+    _make_work_branch(repo, "swarm/unsure", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    tip = _tip(repo)
+    real_git = mergeq._git
+
+    def unsure_git(args, cwd, timeout=60):
+        if args[:2] == ["diff", "--cached"]:
+            return subprocess.CompletedProcess(args, code, stdout="", stderr="fatal: could not read the index\n")
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", unsure_git)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/unsure", "R8", ["echo ok"], conn=conn, allow_empty=True)
+
+    assert outcome.merged is False
+    assert (outcome.candidate_sha, outcome.squash_commit, outcome.gate3_result) == (None, None, None)
+    assert "could not tell" in outcome.detail and str(code) in outcome.detail
+    assert "could not read the index" in outcome.detail  # git's own text is carried through
+    assert _tip(repo) == tip
+    assert _merge_row(conn, "R8") is None
+
+
+def test_no_op_leaves_no_worktree_or_temp_dir_behind(repo, monkeypatch):
+    """The early return still runs the cleanup in the finally block. Also runs with no db connection, which
+    the no-op must tolerate like every other path does."""
+    _branch_at_tip(repo, "swarm/rev")
+    made = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def spy_mkdtemp(*args, **kwargs):
+        made.append(pathlib.Path(real_mkdtemp(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(mergeq.tempfile, "mkdtemp", spy_mkdtemp)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/rev", "R9", ["echo ok"], allow_empty=True)
+
+    assert outcome.merged is True and outcome.squash_commit is None and outcome.gate3_result == "skipped"
+    assert made and all(not path.exists() for path in made)  # the throwaway directory is gone
+    lines = [ln for ln in _git_ok("worktree", "list", cwd=repo).stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1  # only the primary checkout is still registered

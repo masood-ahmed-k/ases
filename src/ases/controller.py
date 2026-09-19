@@ -80,6 +80,7 @@ def create_cards_from_plan(
     it now leaves work_card_id alone for any task with fix_cards > 0."""
     pairs: dict[str, CardPair] = {}
     order = plan_mod.topological_order(plan)
+    reviewer_profile = _reviewer_profile(project)
 
     for key in order:
         task = plan.task(key)
@@ -89,7 +90,7 @@ def create_cards_from_plan(
         work = hermes_mod.kanban_create(
             board, f"{key}: {task.title}", assignee=assignee, workspace="worktree",
             branch=f"swarm/{key}-{task.role}", project=project_id,
-            body=_work_card_body(task), parent=parent_merge_ids or None,
+            body=_work_card_body(task, reviewer_profile), parent=parent_merge_ids or None,
             idempotency_key=f"ases-work-{plan.project}-{key}",
             max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
         )
@@ -119,13 +120,91 @@ def create_cards_from_plan(
     return list(pairs.values())
 
 
-def _work_card_body(task: plan_mod.PlanTask) -> str:
-    lines = [f"Role: {task.role}", "Acceptance criteria:"]
-    lines += [f"- {a}" for a in task.acceptance]
+def _scope_lines(task: plan_mod.PlanTask) -> list[str]:
+    """The lines that scope a task for its worker: the paths it may change and the gate profile it must
+    pass. On every work card body, and on every fix card body (the hand-off steps refer to both, and a
+    fix card used to carry neither)."""
+    lines = []
     if task.touches:
         lines.append("Touches: " + ", ".join(task.touches))
     lines.append(f"Gate profile: {task.gate_profile}")
+    return lines
+
+
+def _work_card_body(task: plan_mod.PlanTask, reviewer_profile: str = "reviewer") -> str:
+    lines = [f"Role: {task.role}", "Acceptance criteria:"]
+    lines += [f"- {a}" for a in task.acceptance]
+    lines += _scope_lines(task)
+    lines += ["", *_finish_instructions(task.role, reviewer_profile)]
     return "\n".join(lines)
+
+
+def _reviewer_profile(project: ases_config.ProjectConfig) -> str:
+    """The Hermes profile a coder must name as reviewer= when it calls kanban_request_review. Hermes only
+    reassigns the card when reviewer= is given (there is no default reviewer), so without it the card stays
+    with the implementer, who would then review its own work. Resolved like every other role, from the
+    roles: map in config/swarm.yaml."""
+    try:
+        return policy.resolve_assignee("reviewer", project.roles)
+    except policy.UnknownRoleError:
+        return "reviewer"  # a missing mapping is doctor's job to flag, not the card body's
+
+
+def _completing_profile(work_card: dict) -> str | None:
+    """The Hermes profile that ran the work card's latest COMPLETED run, or None when no run completed it.
+    Hermes keeps one run per attempt with the profile that ran it and its outcome (`_runs`, see
+    hermes.kanban_show): a card the reviewer approved ends with a reviewer run whose outcome is "completed",
+    while a card its implementer finished itself ends with the implementer's."""
+    completed = [run for run in work_card.get("_runs", []) if run.get("outcome") == "completed"]
+    return completed[-1].get("profile") if completed else None
+
+
+def _refuse_unreviewed(
+    conn, task_key: str, work_card: dict, completed_by: str | None, reviewer_profile: str,
+) -> None:
+    """Record, once per work card, that the merge queue refused it because the reviewer profile did not
+    complete it. Once, not on every poll: a pass repeats every few seconds and would otherwise add an
+    identical event each time for as long as the card sits there."""
+    seen = conn.execute(
+        "SELECT 1 FROM events WHERE kind = 'merge_refused_unreviewed' "
+        "AND json_extract(payload, '$.card_id') = ? LIMIT 1", (work_card["id"],),
+    ).fetchone()
+    if seen is None:
+        events.record(conn, "merge_refused_unreviewed", {
+            "task_key": task_key, "card_id": work_card["id"], "completed_by": completed_by,
+            "needs_completion_by": reviewer_profile,
+        })
+
+
+def _finish_instructions(role: str, reviewer_profile: str = "reviewer") -> list[str]:
+    """How a worker hands its card off (ASES-REV-04: a review request carries handoff evidence). Appended to
+    every work card body and every fix card body. A coder commits and asks for review, and must NOT complete
+    its own card: that would let the merge queue run before anyone independent had looked at the diff. Any
+    other role (a reviewer) has no commit to hand off: it completes with its verdict, and the merge card
+    for its task completes as a recorded no-op."""
+    if role == "coder":
+        return [
+            "How to finish (ASES):",
+            "1. Make the change only inside your worktree and only on the paths listed under Touches.",
+            "2. Run the commands of your gate profile and fix what they report. Never edit tests, gate settings "
+            "or CI files to make a check pass.",
+            "3. Commit your work on this card's branch (git add, then git commit). Uncommitted work is not merged.",
+            f"4. Hand off with kanban_request_review, and always pass reviewer=\"{reviewer_profile}\" so the "
+            "independent reviewer profile takes the card (without it the card stays assigned to you and you "
+            "would review your own work). Give a one or two sentence summary, plus metadata with "
+            "changed_files, the verification commands you ran, residual_risk and the commit SHA. Do NOT call "
+            "kanban_complete on this card. The reviewer completes it after approving, and only then does the "
+            "merge queue run.",
+        ]
+    return [
+        "How to finish (ASES):",
+        "1. Read the acceptance criteria above and inspect the code in your worktree. You review; you do not "
+        "edit product files.",
+        "2. Give your verdict with kanban_complete: the summary starts with PASS or FAIL, and the metadata "
+        "carries verdict, findings and criteria_checked.",
+        "3. If you need a human decision, call kanban_block with one precise question.",
+        "4. This card has no commit to merge; its merge card completes as a recorded no-op.",
+    ]
 
 
 class GateConfigTamperedError(RuntimeError):
@@ -243,9 +322,18 @@ def process_review_lane(
 
 def process_merge_queue(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn,
+    unreviewed: list[str] | None = None,
 ) -> list[str]:
     """One pass: for every DONE work card whose merge card is still blocked/ready, run the merge.
     Serialized -- one merge_task call at a time, in task order, matching ASES-GIT-04.
+
+    "Done" alone is not approval (ASES-GIT-03, 2026-09-19): a work card only merges if its latest completed
+    run belongs to the reviewer profile. The first real coder run finished its own card with kanban_complete
+    instead of asking for review, and this queue used to merge anything that read `done`. A card completed
+    by anyone else, or by no run at all, is refused: nothing is merged, no fix card is opened, a
+    `merge_refused_unreviewed` event is recorded once per card, and the task key is appended to `unreviewed`
+    when the caller passes a list, so the polling loop can show it. This checks WHO completed the card, not
+    WHICH commit they reviewed: binding the verdict to the exact commit SHA is ASES-REV-06 and is not built.
 
     On conflict or a red Gate 3 (ASES-GIT-09, ASES-REC-01/02): open a fix card for the same role,
     fresh worktree, the failure bundle attached, and link it as an EXTRA parent of the merge card --
@@ -272,9 +360,17 @@ def process_merge_queue(
     index.lock) is not a race and would only be refused again, so it takes the ordinary failure path
     below (2026-09-19 fix): a merge_failed event carrying git's own text, a fix card bounded by
     fix_cards_per_task, then a block for a human. Keying the free retry on gate3_result == "pass" alone
-    would have retried those silently on every poll."""
+    would have retried those silently on every poll.
+
+    A review-only task (any role other than "coder") has no commit to merge: its branch adds nothing to the
+    integration tip. Those are merged with allow_empty, which makes mergeq.merge_task record a no-op instead
+    of failing (merged=True, squash_commit None). The merge card is completed with result "no changes to
+    merge (review-only task)" and metadata no_op=True, the "merged" event carries no_op=True, and it is never
+    a failure: no fix card, no fix budget. A coder's empty branch is still the failure it always was.
+    Every squash commit carries the work card and merge card ids in its message (ASES-GIT-06)."""
     merged = []
     fix_limit = project.budgets.get("fix_cards_per_task", 2)
+    reviewer_profile = _reviewer_profile(project)
 
     for key in plan_mod.topological_order(plan):
         row = conn.execute(
@@ -288,11 +384,42 @@ def process_merge_queue(
         if work_card["status"] != "done" or merge_card["status"] not in ("blocked", "ready", "todo"):
             continue
 
+        completed_by = _completing_profile(work_card)
+        if completed_by != reviewer_profile:
+            _refuse_unreviewed(conn, key, work_card, completed_by, reviewer_profile)
+            if unreviewed is not None:
+                unreviewed.append(key)
+            continue
+
         task = plan.task(key)
         gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
         branch = work_card.get("branch_name") or f"swarm/{key}-{task.role}"
-        outcome = mergeq.merge_task(repo, plan.integration_branch, branch, key, gate_cmds, conn=conn)
+        # ASES-GIT-06: one squash commit per plan task, with the card IDs in its message. work_card is the
+        # task's CURRENT card (the original, or the latest fix card), so a merge of a fix card's branch names
+        # the fix card that produced it.
+        commit_message = (
+            f"{key}: {task.title}\n\nWork card: {work_card['id']}\nMerge card: {row['merge_card_id']}\n"
+            f"Branch: {branch}\nControlled by ASES (one squash commit per plan task)."
+        )
+        # Only a coder is expected to commit. Any other role (a reviewer) legitimately leaves an empty diff,
+        # which merge_task then records as a no-op rather than failing on "nothing to commit".
+        outcome = mergeq.merge_task(
+            repo, plan.integration_branch, branch, key, gate_cmds, conn=conn,
+            commit_message=commit_message, allow_empty=(task.role != "coder"),
+        )
 
+        if outcome.merged and outcome.squash_commit is None:
+            # The recorded no-op (an empty diff on a review-only task): nothing was committed or gated and
+            # nothing is wrong, so it is never a failure. No fix card, no fix budget. The merge card still
+            # completes, which is what releases the tasks that depend on it (ASES-TSK-02).
+            hermes_mod.kanban_complete(
+                board, row["merge_card_id"],
+                result="no changes to merge (review-only task)",
+                metadata={"squash_commit": None, "no_op": True},
+            )
+            merged.append(key)
+            events.record(conn, "merged", {"task_key": key, "sha": None, "no_op": True})
+            continue
         if outcome.merged:
             hermes_mod.kanban_complete(
                 board, row["merge_card_id"],
@@ -333,7 +460,8 @@ def process_merge_queue(
             board, f"{key}: fix (round {row['fix_cards'] + 1})", assignee=assignee,
             workspace="worktree", branch=fix_branch, project=work_card.get("project_id"),
             body=(f"Merge attempt for {key} failed. Fix in a fresh worktree.\n\n"
-                  f"Failure detail:\n{outcome.detail[:1500]}"),
+                  f"Failure detail:\n{outcome.detail[:1500]}\n\n"
+                  + "\n".join([*_scope_lines(task), "", *_finish_instructions(task.role, reviewer_profile)])),
             parent=[row["work_card_id"]],
             idempotency_key=f"ases-fix-{plan.project}-{key}-{row['fix_cards'] + 1}",
             max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
@@ -367,13 +495,21 @@ def run_pass(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig,
     models_config: dict, *, conn,
 ) -> dict:
-    """One full controller iteration: budget gate, dispatch, review-lane policing, merge queue.
+    """One full controller iteration: budget gate, review-lane policing, dispatch, merge queue.
     Returns a small summary dict for logging -- this is what a bounded `swarm run` loop calls
-    repeatedly (section 9.2's pseudocode), sleeping between calls to respect provider pacing."""
+    repeatedly (section 9.2's pseudocode), sleeping between calls to respect provider pacing.
+
+    Review-lane policing runs BEFORE dispatch (2026-09-19), as in the blueprint's loop, which re-runs Gate 1
+    for cards that entered review first. `kanban_dispatch` also claims cards waiting in `review` and spawns
+    their reviewer, and the Gate 1 re-check only acts on cards still sitting in `review`, so with the old
+    order (dispatch first) it was skipped for every card that dispatch reached first. Not closed: Hermes's
+    own gateway dispatcher can still claim a review card between two of these passes; Gate 3 at merge time is
+    the backstop for that."""
+    unreviewed: list[str] = []
     parked = process_budget_gate(board, plan, models_config, conn=conn, budgets=project.budgets)
-    dispatch_result = hermes_mod.kanban_dispatch(board)
     sent_back = process_review_lane(board, repo, plan, conn=conn)
-    merged = process_merge_queue(board, repo, plan, project, conn=conn)
+    dispatch_result = hermes_mod.kanban_dispatch(board)
+    merged = process_merge_queue(board, repo, plan, project, conn=conn, unreviewed=unreviewed)
     finished = all_merge_cards_done(board, plan, conn=conn)
     return {"parked": parked, "dispatch": dispatch_result, "sent_back": sent_back, "merged": merged,
-            "finished": finished}
+            "unreviewed": unreviewed, "finished": finished}

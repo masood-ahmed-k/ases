@@ -60,6 +60,21 @@ def test_done_merge_with_proper_record_is_clean(tmp_path, monkeypatch):
     assert reconcile.check("b", "p1", conn=conn) == []
 
 
+def test_done_merge_with_a_no_op_record_is_clean(tmp_path, monkeypatch):
+    """A review-only task's merge card completes as a recorded no-op: gate3_result "skipped", no squash
+    commit, completed_at set (the row mergeq.merge_task writes for an empty diff). That is a finished
+    merge, not a merge_done_without_record finding."""
+    conn = db.connect(tmp_path / "ases.db")
+    _seed(conn)
+    conn.execute(
+        "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES ('T1', 'abc', 'skipped', NULL, 0, datetime('now'))"
+    )
+    monkeypatch.setattr(hermes, "kanban_show", lambda b, cid: {"status": "done"})
+
+    assert reconcile.check("b", "p1", conn=conn) == []
+
+
 def test_done_but_reverted_is_flagged(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "ases.db")
     _seed(conn)

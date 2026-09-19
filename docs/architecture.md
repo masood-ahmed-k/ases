@@ -508,6 +508,68 @@ task cannot rank models, and this file does not claim MiniMax is better or worse
 recorded in `config/models.yaml` as `role_class: coder_candidate`, `pinned: false`, and no role was
 switched. Compare them on something harder (a fix card, a multi-file task) before changing a role.
 
+## The review lane, checked against real Hermes before its first real run (2026-09-19)
+
+The review lane had never run for real: the one real coder run so far (T1, above) finished its card directly
+and never went through review. Before spending a real run on it, its Hermes semantics were read from the
+installed source (v0.21.3) and probed on a scratch board (created, used and archived the same day). Every
+unit test around it mocked the Hermes wrapper, so none of the following could have been seen by them.
+
+- **The controller's send-back crashed the polling loop.** `review.gate_before_review` returned a card to its
+  implementer with `hermes kanban request-changes`. That command is the REVIEWER's verdict and Hermes only
+  accepts it on a card claimed in an active review run. On a card that merely sits in `review`, which is where
+  `process_review_lane` finds cards, it prints "task is not in an active review run" and exits 1 (probed), which
+  `hermes.py` raises as `HermesCommandError` straight out of `run_pass` and out of `swarm run`. The correct
+  controller-side command is `reopen-review --reason`, which moves the card back to `ready`, restores the
+  implementer and records the reason as a "CHANGES REQUESTED" comment (probed). Fixed:
+  `hermes.kanban_reopen_review`, used at all three send-back sites, with a test that fails if
+  `request-changes` is ever called from there again.
+- **Hermes has no default reviewer.** `kanban_request_review` only reassigns the card when `reviewer=` is
+  passed; otherwise it stays assigned to the implementer, and the dispatcher would spawn coder-1 to review its
+  own work. The coder's persona file said "request review" without saying who. Work-card and fix-card bodies
+  now tell the coder to hand off with `reviewer="<reviewer profile from the roles map>"`, to commit first, and
+  not to call `kanban_complete`. (Only cards created from now on carry this: card creation is idempotent by
+  key, so a re-approve hands back the original card with its original body.)
+- **A coder can bypass review, and did.** On the first real run coder-1 called `kanban_complete` on T1 itself
+  (a one-line script is what Hermes's own worker guidance calls "genuinely terminal"), and the merge queue
+  treated any `done` card as approved. ASES-GIT-03 was marked `covered` on the strength of the Gate 1 re-check
+  alone; the half that says "a reviewer PASS" was never enforced. The merge queue now requires the work card's
+  latest completed run to belong to the reviewer profile and otherwise refuses to merge it, records a
+  `merge_refused_unreviewed` event once per card, and shows it on the `swarm run` pass line. The register row is
+  `partial`: the profile is checked, the binding of the verdict to the exact commit SHA (ASES-REV-06) is not.
+- **The pass ran dispatch before policing the review lane.** `run_pass` called `kanban_dispatch` first, and
+  that call also claims cards in `review` and spawns their reviewer, so the Gate 1 re-check (which only acts on
+  cards still in `review`) was skipped for every card the same pass's dispatch got to first. The blueprint's
+  loop runs the Gate 1 re-check first. Reordered. Residual race, not closed: Hermes's own gateway dispatcher
+  (60 s tick) can still claim a review card between two ASES passes; Gate 3 at merge time is the backstop.
+  Note the scope (touches) check lives only in the review-lane path, so a card that skips that path also skips
+  it (ASES-GIT-13 stays `partial`).
+- **Smaller findings from testing the send-back path.** `review.py` decided a branch did not exist by looking
+  for empty output from `git rev-parse <branch>`, but git echoes the bad name on stdout while failing, so that
+  guard was dead code (the same trap `mergeq._resolve` had already been fixed for). And when no merge-base
+  could be computed the touches check silently fell back to inspecting only the last commit; it now fails
+  closed. `mergeq` labelled any failed commit "nothing to commit", including one refused for a bad identity or
+  a hook after changes were staged; it now says "commit failed". `events.record` redacted `task_key` in every
+  event, because the credential pattern matches any field name containing "key", so the events table held
+  `"task_key": "[redacted]"` for every merge, failure and fix card; the exact names `task_key` and
+  `idempotency_key` are now exempt (a value that looks like a secret is still scrubbed).
+- **`swarm run` died on the first failed pass.** An exception out of `run_pass` (a Hermes CLI timeout, a locked
+  database) ended the whole run with a traceback. A failed pass is now recorded (`pass_error` event), reported
+  and retried on the next poll, and the run stops with exit code 2 only after five failed passes in a row.
+- **Review-only tasks and commit provenance.** A plan task with role `reviewer` (which the Lead is told it may
+  write, and which Hermes's own review skill calls "ordinary implementation work with a review-oriented
+  specification") leaves an empty diff: `git merge --squash` exits 0 with nothing staged and the commit then
+  fails, which would have opened spurious fix cards. `merge_task(..., allow_empty=True)` now records that as a
+  no-op merge (a `merge_records` row with `gate3_result` "skipped" and no squash commit; no secret scan, no
+  Gate 3, the integration branch untouched) and the merge card completes with result "no changes to merge
+  (review-only task)". A coder's empty branch is still a failure. Squash commit messages now carry the work
+  card and merge card ids (ASES-GIT-06 says "with the card ID"; the register had it `covered` without that).
+- **Not fixed, noted by the build agent.** A missing work branch is reported as "merge conflict: ... not
+  something we can merge", and for a reviewer task whose branch was never created that still opens a fix card.
+  Fix-card bodies carry the hand-off steps but no "Touches:" or "Gate profile:" line, which those steps refer to.
+  A no-op merge counts in `run_pass`'s `merged` list. For a no-op the returned outcome has `candidate_sha` None
+  while the `merge_records` row holds the integration tip.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of
