@@ -85,6 +85,7 @@ def create_cards_from_plan(
             branch=f"swarm/{key}-{task.role}", project=project_id,
             body=_work_card_body(task), parent=parent_merge_ids or None,
             idempotency_key=f"ases-work-{plan.project}-{key}",
+            max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
         )
         merge = hermes_mod.kanban_create(
             board, f"{key}: merge", workspace="scratch", project=project_id,
@@ -122,11 +123,19 @@ def process_budget_gate(
     the time it's actually about to run (other real-world usage, a quota reset that hasn't happened
     yet). Checked every pass, not just once at approval -- parks with `hermes kanban schedule` rather
     than failing outright; a scheduled card is picked back up once the reset time genuinely arrives
-    (the reset itself is a human/cron action in Phase 3; auto-unblock-on-reset is a later refinement)."""
+    (the reset itself is a human/cron action in Phase 3; auto-unblock-on-reset is a later refinement).
+
+    The plan_tasks lookup is scoped to `plan.project` (2026-09-19 fix): a board can carry more than one
+    project's cards at once (Hermes projects share a board on purpose), and two different projects'
+    plans commonly reuse the same task keys ("T1", "T2", ...). Before this fix, a "ready" card from a
+    DIFFERENT project with a colliding key would resolve via `plan.task()` against the wrong plan's
+    task definition -- caught while about to run a second, unrelated real project on the same board as
+    an in-flight one, before it actually happened, not after."""
     parked = []
     for card in hermes_mod.kanban_list(board, status="ready"):
         row = conn.execute(
-            "SELECT task_key FROM plan_tasks WHERE work_card_id = ?", (card["id"],)
+            "SELECT task_key FROM plan_tasks WHERE work_card_id = ? AND project = ?",
+            (card["id"], plan.project),
         ).fetchone()
         if row is None:
             continue
@@ -148,11 +157,15 @@ def process_review_lane(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn,
 ) -> list[str]:
     """One pass: for every work card currently in 'review', re-run Gate 1 (ASES-REV-05). Returns the
-    task keys that were sent back this pass."""
+    task keys that were sent back this pass.
+
+    Scoped to `plan.project`, same reasoning as `process_budget_gate` above -- a "review" card from a
+    different project sharing this board must not be matched against this run's plan by task key alone."""
     sent_back = []
     for card in hermes_mod.kanban_list(board, status="review"):
         row = conn.execute(
-            "SELECT task_key FROM plan_tasks WHERE work_card_id = ?", (card["id"],)
+            "SELECT task_key FROM plan_tasks WHERE work_card_id = ? AND project = ?",
+            (card["id"], plan.project),
         ).fetchone()
         if row is None:
             continue
@@ -229,6 +242,7 @@ def process_merge_queue(
                   f"Failure detail:\n{outcome.detail[:1500]}"),
             parent=[row["work_card_id"]],
             idempotency_key=f"ases-fix-{plan.project}-{key}-{row['fix_cards'] + 1}",
+            max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
         )
         hermes_mod.kanban_link(board, fix_card["id"], row["merge_card_id"])
         conn.execute(

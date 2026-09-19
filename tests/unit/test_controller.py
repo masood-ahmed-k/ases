@@ -1,6 +1,6 @@
 import subprocess
 
-from ases import config, controller, db, hermes, plan as plan_mod
+from ases import config, controller, db, hermes, plan as plan_mod, review as review_mod
 
 
 def _git_ok(*args, cwd):
@@ -136,6 +136,53 @@ def test_create_cards_from_plan_assigns_correct_profile(tmp_path, monkeypatch):
     assert t2_work["assignee"] == "reviewer"
 
 
+def test_create_cards_from_plan_caps_worker_card_runtime(tmp_path, monkeypatch):
+    """A worker-assigned card must carry a --max-runtime, or a stuck/looping worker never stops on
+    its own -- ASES had no code path setting this at all until 2026-09-18, found while chasing an
+    unrelated real timeout. Defaults to 45m when budgets doesn't say (config/swarm.yaml's own default);
+    honors an explicit card_runtime_minutes otherwise."""
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    created = []
+
+    def fake_create(board, title, **kwargs):
+        card = {"id": counter.next_id("t"), "title": title, **kwargs}
+        created.append(card)
+        return card
+
+    monkeypatch.setattr(hermes, "kanban_create", fake_create)
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    t1_work = next(c for c in created if c["title"] == "T1: scaffold")
+    t1_merge = next(c for c in created if c["title"] == "T1: merge")
+    assert t1_work["max_runtime"] == "45m"  # _project()'s budgets={} -> falls back to the default
+    assert "max_runtime" not in t1_merge  # never assigned to an agent, nothing to cap
+
+
+def test_create_cards_from_plan_honors_configured_card_runtime(tmp_path, monkeypatch):
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    created = []
+    monkeypatch.setattr(
+        hermes, "kanban_create",
+        lambda board, title, **kw: created.append({"id": counter.next_id("t"), "title": title, **kw})
+        or created[-1],
+    )
+    project = config.ProjectConfig(
+        name="t3", environment="native", data_class="public",
+        workspace_root=tmp_path / "ws", ases_home=tmp_path / "home", board="b", integration_branch="integration",
+        roles=ROLES, concurrency={}, budgets={"card_runtime_minutes": 20}, hermes_tested_version="0.21.3",
+        hermes_native_home=tmp_path / "hermes",
+    )
+
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, project, conn=conn)
+
+    t1_work = next(c for c in created if c["title"] == "T1: scaffold")
+    assert t1_work["max_runtime"] == "20m"
+
+
 def test_create_cards_from_plan_persists_to_db(tmp_path, monkeypatch):
     plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
     conn = db.connect(tmp_path / "ases.db")
@@ -199,6 +246,95 @@ def test_process_budget_gate_leaves_affordable_cards_alone(tmp_path, monkeypatch
 
     assert parked == []
     assert scheduled == []
+
+
+def test_process_budget_gate_ignores_another_projects_card_with_the_same_task_key(tmp_path, monkeypatch):
+    """Real bug, caught before it could actually happen: a board can carry more than one project's
+    cards (that's the point of Hermes projects sharing a board), and two different projects' plans
+    commonly reuse generic task keys like "T1". Before scoping this lookup by project, a "ready" card
+    belonging to a DIFFERENT, unrelated project -- found only because kanban_list(status="ready") lists
+    the whole board -- would resolve via plan.task() against *this* plan's same-named task instead of
+    its own, and could be budget-parked using the wrong task's numbers entirely."""
+    plan_a_raw = {
+        "project": "proj-a", "integration_branch": "integration",
+        "gate_profiles": {"trivial": ["echo ok"]},
+        "tasks": [{"key": "T1", "title": "review something", "role": "reviewer", "depends_on": [],
+                   "touches": [], "acceptance": ["n/a"], "gate_profile": "trivial", "estimated_requests": 1}],
+    }
+    plan_b_raw = {
+        "project": "proj-b", "integration_branch": "integration",
+        "gate_profiles": {"trivial": ["echo ok"]},
+        "tasks": [{"key": "T1", "title": "unrelated coder task", "role": "coder", "depends_on": [],
+                   "touches": [], "acceptance": ["n/a"], "gate_profile": "trivial", "estimated_requests": 1}],
+    }
+    plan_a = plan_mod.parse_and_validate(plan_a_raw, known_roles=set(ROLES), max_cards=40)
+    plan_b = plan_mod.parse_and_validate(plan_b_raw, known_roles=set(ROLES), max_cards=40)
+
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    monkeypatch.setattr(hermes, "kanban_create", lambda board, title, **kw: {"id": counter.next_id("t"), **kw})
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan_a, _project(tmp_path), conn=conn)
+    pairs_b = controller.create_cards_from_plan("b", "proj2", tmp_path / "repo", plan_b, _project(tmp_path), conn=conn)
+
+    # The only "ready" card on the board right now belongs to plan_b, an unrelated project -- plan_a is
+    # never even mentioned. Its T1 key collides with plan_a's, which is exactly the failure mode.
+    other_projects_t1_work_id = pairs_b[0].work_card_id
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": other_projects_t1_work_id, "status": "ready"}] if status == "ready" else []
+    ))
+    scheduled = []
+    monkeypatch.setattr(hermes, "kanban_schedule", lambda b, cid, reason: scheduled.append((cid, reason)))
+    from ases import ledger
+    ledger.record_usage(conn, "openrouter", "any-model", n=50)  # exhaust the cap plan_a's T1 (reviewer) uses
+
+    parked = controller.process_budget_gate("b", plan_a, MODELS_CONFIG, conn=conn, budgets={})
+
+    # Without project-scoping, plan_b's card would resolve to plan_a's T1 (role reviewer, exhausted
+    # budget) and get wrongly scheduled -- a card from a project this call never mentioned.
+    assert parked == []
+    assert scheduled == []
+
+
+def test_process_review_lane_ignores_another_projects_card_with_the_same_task_key(tmp_path, monkeypatch):
+    """Same real bug as process_budget_gate's cross-project test above, in the sibling function: a
+    "review" card belonging to an unrelated project with a colliding task key must never be re-gated
+    using this run's plan -- it isn't part of this run at all."""
+    plan_a_raw = {
+        "project": "proj-a", "integration_branch": "integration",
+        "gate_profiles": {"trivial": ["echo ok"]},
+        "tasks": [{"key": "T1", "title": "a", "role": "coder", "depends_on": [], "touches": [],
+                   "acceptance": ["n/a"], "gate_profile": "trivial", "estimated_requests": 1}],
+    }
+    plan_b_raw = {
+        "project": "proj-b", "integration_branch": "integration",
+        "gate_profiles": {"trivial": ["echo ok"]},
+        "tasks": [{"key": "T1", "title": "b", "role": "coder", "depends_on": [], "touches": [],
+                   "acceptance": ["n/a"], "gate_profile": "trivial", "estimated_requests": 1}],
+    }
+    plan_a = plan_mod.parse_and_validate(plan_a_raw, known_roles=set(ROLES), max_cards=40)
+    plan_b = plan_mod.parse_and_validate(plan_b_raw, known_roles=set(ROLES), max_cards=40)
+
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    monkeypatch.setattr(hermes, "kanban_create", lambda board, title, **kw: {"id": counter.next_id("t"), **kw})
+    controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan_a, _project(tmp_path), conn=conn)
+    pairs_b = controller.create_cards_from_plan("b", "proj2", tmp_path / "repo", plan_b, _project(tmp_path), conn=conn)
+
+    other_projects_t1_work_id = pairs_b[0].work_card_id
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": other_projects_t1_work_id, "status": "review"}] if status == "review" else []
+    ))
+    gate_calls = []
+    monkeypatch.setattr(
+        review_mod, "gate_before_review",
+        lambda *a, **kw: gate_calls.append((a, kw)) or True,
+    )
+
+    sent_back = controller.process_review_lane("b", tmp_path / "repo", plan_a, conn=conn)
+
+    # plan_b's card was never even passed to the gate re-check -- it belongs to a different project.
+    assert sent_back == []
+    assert gate_calls == []
 
 
 def test_all_merge_cards_done_false_when_one_pending(tmp_path, monkeypatch):
@@ -299,6 +435,7 @@ def test_merge_conflict_creates_a_fix_card_not_a_block_only(tmp_path, monkeypatc
     fix_cards = [c for c in created if "fix" in c["title"]]
     assert len(fix_cards) == 1
     assert fix_cards[0]["parent"] == [pair.work_card_id]
+    assert fix_cards[0]["max_runtime"] == "45m"  # a fix card is worker-assigned too -- same cap applies
     assert links == [(fix_cards[0]["id"], pair.merge_card_id)]  # fix card linked as EXTRA parent of merge
     assert blocked == []  # not yet at budget -- a fix card was created instead of blocking
     row = conn.execute("SELECT fix_cards FROM plan_tasks WHERE task_key='T1'").fetchone()

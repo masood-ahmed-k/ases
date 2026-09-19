@@ -74,6 +74,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     Deliberately not --in / cwd-dependent (the environment bug from Phase 2): the prompt names the
     exact absolute repo path and tells the model not to rely on any inherited working directory.
+
+    Passes -t file,terminal explicitly: -z/--oneshot grants NO toolset by default (confirmed by real
+    use 2026-09-18 -- a bare oneshot call to lead reported its own terminal tool as unavailable and
+    correctly said so instead of guessing, which is what surfaced this rather than a silent bad plan).
+    Kanban-dispatched workers (cmd_run's path) are unaffected -- they run under the profile's full
+    configured toolset, not oneshot's default-empty one.
     """
     project = _load_project()
     repo = pathlib.Path(args.repo).resolve()
@@ -93,10 +99,25 @@ def cmd_plan(args: argparse.Namespace) -> int:
         f"Use a trivial, fast gate_profile command since this is a throwaway test repo. "
         f"After writing the file, reply with just the word done."
     )
-    result = subprocess.run(
-        [hermes_mod.hermes_path(), "-p", "lead", "-z", prompt],
-        capture_output=True, text=True, timeout=600, encoding="utf-8", errors="replace",
-    )
+    # 1800s, not 600s: UnoRouter's per_model_rpm: 1 means a multi-turn agentic planning task (inspect,
+    # think, write, confirm) can genuinely take several minutes per turn -- confirmed by a real timeout
+    # at 600s on 2026-09-18 with no sign lead was stuck, just paced. Caught as a bare, unhandled
+    # subprocess.TimeoutExpired crashing the whole CLI with a traceback; now handled cleanly too, since
+    # even a generous timeout isn't a guarantee.
+    try:
+        result = subprocess.run(
+            [hermes_mod.hermes_path(), "-p", "lead", "-z", prompt, "-t", "file,terminal"],
+            capture_output=True, text=True, timeout=1800, encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = ((exc.stdout or "") + (exc.stderr or "")).strip()
+        print(f"lead did not finish within {exc.timeout:.0f}s. This is not necessarily stuck -- "
+              f"UnoRouter's 1 req/min pace makes multi-turn planning slow. Re-run, or inspect "
+              f"{repo / 'docs' / 'ases' / 'plan.json'} in case it was written just before the cutoff.",
+              file=sys.stderr)
+        if partial:
+            print(f"partial output:\n{partial[-2000:]}", file=sys.stderr)
+        return 1
     print(result.stdout.strip() or result.stderr.strip())
     plan_path = repo / "docs" / "ases" / "plan.json"
     if not plan_path.exists():
@@ -107,7 +128,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
-    """Gate 0 on docs/ases/plan.json, then create work+merge card pairs (ASES-LED-01/02)."""
+    """Gate 0 on docs/ases/plan.json, show budget + calendar time and get explicit user approval
+    (ASES-REV-03), then create work+merge card pairs (ASES-LED-01/02)."""
     project = _load_project()
     conn = ases_db.connect(ases_config.db_path(project))
     repo = pathlib.Path(args.repo).resolve()
@@ -127,6 +149,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     models_config = _load_models_config()
     provider_policies = {name: p.get("data_policy") for name, p in models_config["providers"].items()}
     per_provider: dict[str, int] = {}
+    per_model: dict[tuple[str, str], int] = {}
     for task in plan.tasks:
         pp = policy_mod.profile_provider(task.role, models_config)
         if pp is None:
@@ -137,6 +160,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
             print(f"Gate P REFUSED (ASES-PRV-01): {exc}", file=sys.stderr)
             return 1
         per_provider[pp.provider] = per_provider.get(pp.provider, 0) + task.estimated_requests
+        key = (pp.provider, pp.model)
+        per_model[key] = per_model.get(key, 0) + task.estimated_requests
     unaffordable = []
     for provider, total in per_provider.items():
         afford = policy_mod.check_budget(conn, models_config["providers"], provider, total, budgets=project.budgets)
@@ -147,6 +172,26 @@ def cmd_approve(args: argparse.Namespace) -> int:
         print(f"Gate P REFUSED: cannot afford this plan today on {unaffordable} (ASES-CAP-03). "
               f"Wait for the quota reset or shrink the plan.")
         return 1
+
+    print("Estimated calendar time (pacing, not a budget decision -- ASES-CAP-04):")
+    for (provider, model), n in per_model.items():
+        minutes = policy_mod.estimate_calendar_minutes(
+            models_config["providers"], provider,
+            requests_for_model=n, requests_for_provider=per_provider[provider],
+        )
+        if minutes is None:
+            print(f"  {provider}/{model}: needs {n} request(s); provider declares no rate limit to pace against")
+        else:
+            print(f"  {provider}/{model}: needs {n} request(s), ~{minutes:.1f} min at this provider's pace")
+
+    if not args.yes:
+        print()
+        print(f"About to publish this plan and create {len(plan.tasks)} card(s) on board {project.board!r} "
+              f"(ASES-REV-03: nothing above is an implementation card yet).")
+        answer = input("Proceed? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Not approved -- no plan published, no cards created.")
+            return 1
 
     publish_sha = controller_mod.publish_plan(repo, plan.integration_branch)
     print(f"Gate P: published approved plan at {publish_sha}")
@@ -255,6 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_approve = sub.add_parser("approve", help="Gate 0 the plan, then create work+merge cards")
     p_approve.add_argument("--repo", required=True)
     p_approve.add_argument("--project-id", required=True, help="Hermes project id (see `hermes project list`)")
+    p_approve.add_argument("--yes", action="store_true",
+                            help="Skip the interactive confirmation (ASES-REV-03) -- for scripted/CI use")
     p_approve.set_defaults(func=cmd_approve)
 
     p_run = sub.add_parser("run", help="Bounded controller loop: dispatch, review, merge, repeat")

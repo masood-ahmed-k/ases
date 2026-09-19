@@ -37,16 +37,25 @@ class ModelRecord:
 
 
 def sync_from_config(conn: sqlite3.Connection, models_config: dict) -> None:
-    """Upsert config/models.yaml's declared models into model_registry.
+    """Upsert config/models.yaml's declared models into model_registry, then drop any row for a
+    (provider, model) pair no longer declared anywhere in config.
 
     Declared fields (context_length, tool_calling, role_class, data_policy, pinned) are refreshed from
     config every time -- config is the source of truth for those. Smoke-test columns are left alone if
     the row already exists, so re-running this never erases a previously recorded smoke test.
+
+    The delete step is real, not defensive: renaming/retiring a model (e.g. lead moving from
+    openai/gpt-5.6-terra to xkiro/openai/gpt-5.6-terra) used to leave the old row behind forever, so
+    `swarm models`/`swarm doctor` kept showing two "pinned, role=lead" rows -- caught by actually running
+    `swarm models` after a real provider swap, not by a unit test (a fake config that always matches
+    what's asserted has no way to exercise "a row that used to be there isn't anymore").
     """
     providers = models_config.get("providers", {})
+    declared: set[tuple[str, str]] = set()
     for entry in models_config.get("models", []):
         provider = entry["provider"]
         model = entry["model"]
+        declared.add((provider, model))
         data_policy = entry.get("data_policy") or providers.get(provider, {}).get("data_policy")
         conn.execute(
             """
@@ -70,6 +79,10 @@ def sync_from_config(conn: sqlite3.Connection, models_config: dict) -> None:
                 1 if entry.get("pinned") else 0,
             ),
         )
+
+    existing = {(r["provider"], r["model"]) for r in conn.execute("SELECT provider, model FROM model_registry")}
+    for provider, model in existing - declared:
+        conn.execute("DELETE FROM model_registry WHERE provider = ? AND model = ?", (provider, model))
 
 
 def list_models(conn: sqlite3.Connection) -> list[ModelRecord]:

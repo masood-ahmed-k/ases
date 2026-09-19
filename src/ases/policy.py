@@ -83,3 +83,25 @@ def check_budget(
         reserve_percent=budgets.get("daily_reserve_percent", 0),
         extra_reserve=budgets.get("review_reserve_requests", 0),
     )
+
+
+def estimate_calendar_minutes(
+    provider_limits: dict, provider: str, *, requests_for_model: int, requests_for_provider: int,
+) -> float | None:
+    """ASES-CAP-04/ASES-REV-03's 'calendar time': how long a plan will take to actually run against a
+    provider's own pace limit. This is pacing, never a budget decision -- check_budget/can_afford above
+    is what refuses a plan; this only estimates a wait. Returns None if the provider declares no rate
+    limit to pace against.
+
+    UnoRouter publishes per_model_rpm: each pinned model is paced independently, so the estimate uses
+    only the requests going to that one model. OpenRouter publishes a single account-wide rpm shared by
+    every model on it, so the estimate uses the provider's full request total instead.
+    """
+    limits = provider_limits.get(provider, {}).get("limits", {})
+    if "per_model_rpm" in limits:
+        rpm = limits["per_model_rpm"]
+        return requests_for_model / rpm if rpm > 0 else None
+    if "rpm" in limits:
+        rpm = limits["rpm"]
+        return requests_for_provider / rpm if rpm > 0 else None
+    return None

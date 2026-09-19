@@ -67,3 +67,26 @@ def test_resync_preserves_smoke_test(tmp_path):
     models.sync_from_config(conn, CONFIG)  # re-running config sync must not wipe the smoke test
     by_model = {m.model: m for m in models.list_models(conn)}
     assert by_model["some/reviewer-model"].smoke_tested is True
+
+
+def test_resync_drops_rows_no_longer_declared(tmp_path):
+    """A model swapped out of config.yaml (e.g. a role moving to a different provider) must not
+    linger in the registry forever as a phantom pinned row -- real bug, found by actually running
+    `swarm models` after a real provider swap for lead."""
+    conn = _conn(tmp_path)
+    swapped = {
+        "providers": CONFIG["providers"],
+        "models": [
+            {
+                "provider": "unorouter", "model": "a-new-lead-model",
+                "context_length": None, "tool_calling": None, "role_class": "lead", "pinned": True,
+            },
+            CONFIG["models"][1],  # the reviewer row is unchanged
+        ],
+    }
+    models.sync_from_config(conn, swapped)
+    provider_model_pairs = {(m.provider, m.model) for m in models.list_models(conn)}
+    assert ("unorouter", "glm-5.3-thinking:free") not in provider_model_pairs
+    assert provider_model_pairs == {
+        ("unorouter", "a-new-lead-model"), ("openrouter", "some/reviewer-model")
+    }

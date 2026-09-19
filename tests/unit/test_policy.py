@@ -50,3 +50,36 @@ def test_resolve_assignee_unknown_role_raises():
 
 def test_resolve_assignee_known_role():
     assert policy.resolve_assignee("coder", {"coder": "coder-1"}) == "coder-1"
+
+
+def test_calendar_time_per_model_rpm_uses_only_that_models_requests():
+    """UnoRouter paces each model independently -- a second model's volume must not inflate the
+    estimate for this one."""
+    limits = {"unorouter": {"limits": {"per_model_rpm": 1}}}
+    minutes = policy.estimate_calendar_minutes(
+        limits, "unorouter", requests_for_model=5, requests_for_provider=30,
+    )
+    assert minutes == 5.0
+
+
+def test_calendar_time_account_rpm_uses_full_provider_total():
+    """OpenRouter's rpm is account-wide, so it paces against every model's requests combined."""
+    limits = {"openrouter": {"limits": {"rpm": 20}}}
+    minutes = policy.estimate_calendar_minutes(
+        limits, "openrouter", requests_for_model=5, requests_for_provider=25,
+    )
+    assert minutes == 1.25
+
+
+def test_calendar_time_none_when_provider_declares_no_rate_limit():
+    limits = {"opencode_free": {"limits": {}}}
+    assert policy.estimate_calendar_minutes(
+        limits, "opencode_free", requests_for_model=5, requests_for_provider=5,
+    ) is None
+
+
+def test_calendar_time_none_when_rpm_is_zero():
+    limits = {"unorouter": {"limits": {"per_model_rpm": 0}}}
+    assert policy.estimate_calendar_minutes(
+        limits, "unorouter", requests_for_model=5, requests_for_provider=5,
+    ) is None

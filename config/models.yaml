@@ -6,16 +6,15 @@
 # until a smoke test or an explicit number here confirms the Hermes floor of 65536 tokens.
 
 providers:
-  unorouter:
-    type: openai_compatible
-    base_url: https://api.unorouter.com/v1
-    key_env: HERMES_CUSTOM_UNOROUTER_API_KEY   # Hermes's real generated name for this custom provider,
-                                                # not the illustrative "UNOROUTER_API_KEY" in Appendix B.
-    limits:
-      per_model_rpm: 1
-    quota_endpoint: null
-    data_policy: forwards_to_upstreams_that_may_train
-    verified_on: "2026-09-17"
+  # unorouter (base_url https://api.unorouter.com/v1) was removed entirely 2026-09-19, per an explicit
+  # user decision ("dont use unorouter at all - its complete waste"), not just left demoted like the
+  # models.yaml `_retired` rows elsewhere in this file. It was the source of nearly every real provider
+  # problem hit all night: an undeclared per-model daily token cap, an output-tokens-per-minute cap,
+  # a gate command its own terminal tool refused as "dangerous", and recurring transient "service
+  # unavailable" errors that kept sending real dispatch attempts back to blocked. Both roles that used
+  # it (lead, coder) have moved to xkiro. Its exact former config (base_url, key_env, limits, real
+  # observed numbers) is preserved in git history, not reproduced here -- this is a closed decision, not
+  # a "revive later" one like the unfunded xkiro rows below.
 
   openrouter:
     type: openrouter
@@ -30,6 +29,31 @@ providers:
     data_policy: some_free_endpoints_train
     verified_on: "2026-09-17"
 
+  xkiro:
+    type: openai_compatible          # a router (like unorouter/openrouter), not a single vendor: one
+    base_url: https://api.xkiro.com/v1  # key, 111+ models across 16 providers behind an OpenAI/
+                                         # Anthropic-compatible API. Model IDs are vendor/model-prefixed
+                                         # (confirmed against https://docs.xkiro.com/, 2026-09-19).
+    key_env: XKIRO_API_KEY
+    limits: {}                        # unknown -- not published anywhere seen yet; re-verify once real
+                                       # usage exposes a 429 (the pattern every other provider's real
+                                       # limits in this file were actually learned).
+    quota_endpoint: null
+    data_policy: router_ztr_upstream_varies   # 2026-09-19, from xKiro's own privacy policy
+                                               # (https://xkiro.com/privacy): "Zero Data Retention for
+                                               # content: we do NOT persist your request or response
+                                               # bodies, nor request headers" (narrow exception: brief
+                                               # diagnostic logging on errors, auto-deleted). That covers
+                                               # xKiro's OWN handling -- it says nothing about what the
+                                               # 16 different upstream vendors it routes to do once a
+                                               # request reaches them, and that varies per vendor. Not
+                                               # given a _SAFE_FOR_PRIVATE marker at the provider level
+                                               # for that reason (same logic as unorouter's
+                                               # forwards_to_upstreams_that_may_train) -- see the
+                                               # gpt-5.6-terra model row below for the one specific
+                                               # routed model actually checked end-to-end.
+    verified_on: "2026-09-19"
+
   opencode_free:
     type: hermes_provider
     provider_id: opencode-free
@@ -43,39 +67,65 @@ providers:
                                      # other opencode-free models expecting a different result.
 
 models:
-  - provider: unorouter
-    model: "glm-5.3-thinking:free"
-    context_length: null            # UNVERIFIED. Native config.yaml's model: block has no explicit
-                                     # context_length, and hermes doctor did not warn at startup, so
-                                     # Hermes likely auto-detected something via its own probing tiers
-                                     # -- but auto-detected is not the same as declared. Confirm and
-                                     # set this explicitly once verified (ASES-MOD-02).
-    tool_calling: true               # verified 2026-09-18, but ONLY with the exact recipe below
+  - provider: xkiro
+    model: "openai/gpt-5.6-terra"     # xKiro's vendor-prefixed model ID, not OpenAI's own bare
+                                      # "gpt-5.6-terra" -- this provider is the router, not OpenAI direct.
+    context_length: 1050000          # OpenAI's own docs, 2026-09-19: 1.05M context, 128K max output.
+    tool_calling: true               # OpenAI's own docs list function calling as supported.
+    role_class: lead_unfunded         # 2026-09-19: real HTTP 403 against a real key -- "This premium
+                                      # model requires an active paid plan or real deposited balance...
+                                      # promotional/bonus credits do not apply." Confirmed the key/wiring
+                                      # itself is fine by immediately re-running the identical prompt
+                                      # against a free model on the same key, which worked. Not pinned,
+                                      # not deleted: revive this row (role_class: lead, pinned: true) once
+                                      # the xKiro wallet actually has a balance -- gpt-5.6-terra is still
+                                      # the better pick for reliability than any free model here.
+    pinned: false
+    data_policy: no_training          # see the discussion this had when it was still the pinned row,
+                                      # preserved in git history / docs/architecture.md.
+
+  - provider: xkiro
+    model: "qwen/qwen3.8-max"         # the PAID tier of the model actually in use below -- also hit
+    context_length: 1050000           # "pay-as-you-go premium model requires real deposited balance"
+    tool_calling: true                # on the same (second) key, so this is the same funding blocker,
+    role_class: lead_unfunded          # not a different problem. Revive alongside gpt-5.6-terra above
+    pinned: false                      # once funded, and compare which is actually more reliable for
+                                        # real -- this file isn't claiming one beats the other yet.
+
+  - provider: xkiro
+    model: "qwen/qwen3.8-max:free"
+    context_length: 1050000          # xKiro's own catalog page, 2026-09-19; not independently confirmed.
+    tool_calling: true               # verified 2026-09-19: real terminal tool call, correct answer.
     role_class: lead
     pinned: true
-    requires:                        # 2026-09-18: without BOTH of these, tool_call_count=0 -- the
-                                      # model narrates an intent to act ("I should use ls to...") and
-                                      # then stops. Isolation-tested: each alone fails.
-      reasoning_effort: low          # hermes -p lead ... needs agent.reasoning_effort: low in config.yaml
-      system_prompt_addition: >-
-        You must verify facts using your tools before answering - never answer from memory or guess.
+    data_policy: router_ztr_upstream_varies   # see the xkiro provider block's note above; this is the
+                                               # provider-level policy, same caveat applies to every
+                                               # model routed through xkiro regardless of upstream vendor.
+    # 2026-09-19: both xKiro keys the user created so far are unfunded wallets -- gpt-5.6-terra and
+    # qwen/qwen3.8-max (paid) both refused with the same "needs real balance" 403. This free tier is
+    # what's actually usable right now. Real open question, not yet answered: does "Qwen3.8 Max" (a
+    # flagship-tier model in its own family, unlike coder-1's smaller qwen3.8-27b) actually clear the
+    # complex-structured-task bar that glm-5.3-thinking:free failed? Verify against the real plan.json
+    # task before trusting this for anything beyond the trivial smoke test it's passed so far.
 
-  - provider: unorouter
-    model: "qwen3.8-27b:free"
-    context_length: null            # UNVERIFIED (ASES-MOD-02) -- not yet checked against live catalog
-    tool_calling: true               # verified 2026-09-18
-    role_class: coder                # its real Phase 3 job (coder-1 profile). Also passed E1/E9/E10
-                                      # as a lead candidate in the Phase 2 report -- kept as a
-                                      # documented fallback there, but this row's role_class reflects
-                                      # what it's actually deployed as today, since policy.py's
-                                      # profile_provider() does an exact-match lookup by role for
-                                      # budget/data-class checks (a plan task's role: "coder" found
-                                      # nothing here before this fix -- its budget was silently never
-                                      # checked in Gate P. Real bug, caught by actually running
-                                      # `swarm approve` for real, not just unit tests with fakes).
+  - provider: xkiro
+    model: "qwen/qwen3-coder-plus:free"   # xKiro's own catalog: 1.05M context, purpose-built for coding.
+    context_length: 1050000               # xKiro's own catalog page, 2026-09-19; not independently
+                                           # confirmed against a real Hermes context-probe yet.
+    tool_calling: true                    # xKiro's own catalog lists function calling; not yet verified
+                                           # against the real coder-1 profile (needs the user's key).
+    role_class: coder
     pinned: true
-    requires:
-      reasoning_effort: medium       # default reasoning_effort 400s: "invalid Qwen3.8 reasoning_effort"
+    data_policy: router_ztr_upstream_varies   # see the xkiro provider block's note near the top of this
+                                               # file -- same caveat applies to every model routed
+                                               # through xkiro, this one included.
+    # 2026-09-19: "switch coder-1 to xkiro" -- the user's call right after switching lead there too,
+    # given UnoRouter's accumulated real flakiness above. Picked the coding-specialized free model
+    # (qwen3-coder-plus) over reusing lead's qwen3.8-max:free, on the theory that a model actually
+    # marketed for code generation is a better fit for the coder role specifically than a general
+    # flagship-reasoning model -- not yet verified against a real dispatch, needs its own key (coder-1
+    # and lead deliberately use separate xKiro keys, matching the UnoRouter-era per-profile isolation
+    # pattern, not because xKiro is known to need it the way UnoRouter's per-model-rpm did).
 
   - provider: openrouter
     model: "cohere/north-mini-code:free"

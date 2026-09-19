@@ -119,8 +119,9 @@ requirements:
   section: '4.2'
   verified_by: 22.1, 22.6
   status: covered
-  note: doctor.reviewer_diversity fails closed if lead and reviewer share a provider; real check confirms
-    unorouter vs openrouter today.
+  note: doctor.reviewer_diversity fails closed if lead and reviewer share a provider; real check confirmed
+    unorouter vs openrouter on 2026-09-18, and confirms xkiro vs openrouter today (2026-09-19, after lead
+    moved off unorouter entirely per an explicit user decision -- see docs/architecture.md).
 - id: ASES-ROL-06
   requirement: Least-privilege toolsets per role
   section: '4.2'
@@ -205,8 +206,11 @@ requirements:
   section: '5.4'
   verified_by: '22.14'
   status: covered
-  note: cmd_approve prints each provider's budget line (needed vs. affordability reason) as part of the
-    Gate P output.
+  note: 'Was marked covered while only printing the per-provider budget line -- the "calendar time" half
+    was never actually implemented (caught by grepping the source for it, not by a test, since nothing
+    tested for its absence either). Fixed 2026-09-18: policy.estimate_calendar_minutes() paces UnoRouter
+    per model (per_model_rpm) and OpenRouter per account (rpm), and cmd_approve now prints it alongside
+    the budget line. Unit-tested; see ASES-REV-03 for the confirmation gate this feeds.'
 - id: ASES-CAP-05
   requirement: Credit purchases are a user decision; ASES works without them
   section: '5.4'
@@ -415,8 +419,13 @@ requirements:
   requirement: The user approves plan, budget and calendar time before any implementation card exists
   section: '13.1'
   verified_by: '22.14'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'cmd_approve now prints budget + calendar time (ASES-CAP-04) and then blocks on an interactive
+    input() confirmation before publish_plan/create_cards_from_plan run; --yes skips it for scripted use.
+    Argparse wiring smoke-tested for real (swarm approve --help); the interactive prompt itself has not
+    yet been exercised against a real approve run -- deliberately deferred to avoid touching the live
+    ases-phase3 board/test-repo-phase3 while the real T1/T2 dispatch (22.2) is in flight. Promote to
+    covered after the next real `swarm approve` run confirms the prompt.'
 - id: ASES-REV-04
   requirement: Review requests carry handoff evidence
   section: '13.2'
