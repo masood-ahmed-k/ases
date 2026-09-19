@@ -623,6 +623,45 @@ parking, more than one task in flight, crash and resume, the kill switch, questi
 independent nemotron review of the approval logic was attempted and returned 403 (the known key problem), so
 the new code rests on direct reading, 24 seeded-bug mutation checks (every one caught) and this run.
 
+## Side by side: the swarm against one Sonnet agent on the same small task (2026-09-19)
+
+Same request, word for word, to both (`benchmarks/allocate/`, with its README): a money-splitting function with
+subtle rules, graded by a hidden 91-test suite that both arms never saw, plus 15 seeded bugs to measure how
+strong each arm's own tests are. The grader was validated first (the reference passes 91 of 91, every seeded
+bug is caught by the hidden suite). The swarm arm ran through the real pipeline with the Lead's plan unedited
+(commit 179e1c1 on `integration`); the agent arm worked in a fresh repository with the same starting tree.
+
+| | swarm (free models) | one Sonnet agent |
+| ------ | ------ | ------ |
+| hidden suite | 91 of 91 | 91 of 91 |
+| own tests | 26 | 150 |
+| seeded bugs caught by its own tests | 12 of 15 | 15 of 15 |
+| wall clock | 9 min 36 s, plan to merge | 11 min 32 s |
+| cost | free tiers | about 155,600 tokens |
+| independent review | yes | no |
+
+What it says, and what it does not:
+
+- **Correctness was a tie at the ceiling.** Both solutions matched the spec on every hidden test, so this task
+  cannot tell them apart on correctness. The Lead's plan kept every rule of the request (it dropped only the
+  worked example and the formulas) and the free coder implemented them exactly.
+- **The gap is in how hard each arm tried to break its own work.** The agent wrote 150 tests, including an
+  independent exact oracle and exhaustive small-input sweeps, and ran its own mutation check; the swarm's coder
+  wrote 26 example-style tests that miss three of the fifteen seeded bugs (a negative weight that is not
+  rejected, ties broken by weight instead of by index, leftover cents handed out in index order).
+- **The reviewer did not close that gap.** It approved, listing "all tests pass" although it has no command
+  tool: that was the coder's claim repeated, and the coder's claim was slightly wrong (28 tests reported, 26
+  present; the agent's own count was off too, 152 reported against 150). It also did not notice the thin tests.
+  This is the same weakness as in the first real run and the clearest place to improve the swarm: give the
+  reviewer the controller's gate evidence, and have the controller measure test strength itself (a mutation
+  gate is what ASES-QG-03's tamper and weak-test intent points at).
+- **A hard review can eat the reviewer's free quota.** This review took 37 API calls and 933,000 input tokens
+  on OpenRouter's free tier, which allows about 50 requests a day. The usage ledger is not wired
+  (ASES-CAP-03), so nothing warned about it.
+- **What was not tested:** ambiguity in the request, changing existing code, more than one file, larger tasks,
+  and any recovery path. One run per arm, so no variance. The agent got the full request while the swarm's coder
+  got the Lead's eleven acceptance bullets, which is how the swarm works but is a difference between the arms.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of

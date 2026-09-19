@@ -1,0 +1,16 @@
+Create a small Python module `allocate.py` in the repository root, and a pytest file `test_allocate.py` next to it.
+
+`allocate.py` must provide two functions.
+
+allocate(total, weights) splits an integer amount of money, counted in cents, across parties in proportion to their integer weights, using the largest remainder method. It returns a list of integer shares, one per weight, in the same order. Rules:
+
+1. Inputs. total is an int (it may be negative or zero). weights is a non-empty list of non-negative ints. Anything else is an error: a bool or non-int total, a weights that is not a list, or a non-int or bool weight raises TypeError; an empty list, a negative weight, or all weights zero raises ValueError.
+2. Exactness. Use integer arithmetic only, no floats, so results are exact for very large totals such as 10**30.
+3. Method. Let W be the sum of the weights and n = abs(total). Each party first gets the whole number floor(n * w / W). The cents still unassigned (n minus the sum of those floors) are then handed out one each to the parties with the largest fractional remainder (n * w mod W); when remainders are equal, the lower index goes first.
+4. Sign. A negative total is allocated as abs(total) and then every share is negated, so allocate(-100, [1, 1, 1]) is [-34, -33, -33]. A zero total gives all zeros.
+5. Zero weights. A party with weight 0 always gets exactly 0.
+6. The shares always sum to exactly total.
+
+split_evenly(total, n) splits total into n near-equal shares, with the same rules as allocate(total, [1] * n). n must be an int (not a bool) of at least 1: a non-int or bool n raises TypeError, and n < 1 raises ValueError.
+
+test_allocate.py must contain pytest tests of these rules, including the error cases, and `python -m pytest -q` must pass. Use only the standard library. Change only these two files.
