@@ -10,6 +10,8 @@ The controller believes only these records, never a worker's self-report (ASES-Q
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import pathlib
 import shutil
 import subprocess
@@ -118,3 +120,16 @@ def detect_tamper(diff_text: str) -> list[str]:
         if marker in lowered:
             findings.append(f"suspicious marker found: {marker!r}")
     return findings
+
+
+def hash_gate_profiles(gate_profiles: dict[str, list[str]]) -> str:
+    """ASES-QG-02: a stable content hash of a plan's gate profiles, pinned in controller config (see
+    controller.pin_gate_profiles / verify_gate_pin) so a later diff that quietly edits gate
+    configuration, CI scripts, or test-runner settings is caught instead of trusted.
+
+    `sort_keys=True` makes profile-NAME order irrelevant; command order within a profile's own list is
+    preserved -- reordering commands still changes the hash. That's deliberately stricter than a set
+    comparison would be, since any textual change to what a profile actually does should force
+    re-approval."""
+    encoded = json.dumps(gate_profiles, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

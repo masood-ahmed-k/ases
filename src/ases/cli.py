@@ -194,6 +194,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
             return 1
 
     publish_sha = controller_mod.publish_plan(repo, plan.integration_branch)
+    controller_mod.pin_gate_profiles(conn, plan.project, plan.gate_profiles)
     print(f"Gate P: published approved plan at {publish_sha}")
 
     pairs = controller_mod.create_cards_from_plan(
@@ -214,6 +215,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     plan = plan_mod.load_plan_file(
         plan_path, known_roles=set(project.roles), max_cards=project.budgets.get("max_cards", 40)
     )
+    try:
+        controller_mod.verify_gate_pin(conn, plan.project, plan.gate_profiles)
+    except controller_mod.GateConfigTamperedError as exc:
+        print(f"swarm run REFUSED (ASES-QG-02): {exc}", file=sys.stderr)
+        return 1
 
     from . import reconcile as reconcile_mod
     findings = reconcile_mod.check(project.board, plan.project, conn=conn)

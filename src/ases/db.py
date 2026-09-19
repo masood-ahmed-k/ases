@@ -11,7 +11,7 @@ import pathlib
 import sqlite3
 import threading
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -83,6 +83,14 @@ CREATE TABLE IF NOT EXISTS merge_records (
     squash_commit TEXT,
     reverted INTEGER NOT NULL DEFAULT 0,
     completed_at TEXT
+);
+
+-- ASES-QG-02: the gate profile content hash pinned at this project's last `swarm approve`, checked
+-- again by `swarm run` so a diff that quietly changes gate configuration is refused, not trusted.
+CREATE TABLE IF NOT EXISTS gate_pins (
+    project TEXT PRIMARY KEY,
+    gate_profiles_hash TEXT NOT NULL,
+    pinned_at TEXT NOT NULL
 );
 """
 

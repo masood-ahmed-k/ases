@@ -57,6 +57,7 @@ blueprint first; this is the "where did that requirement end up in code" index.
 | `hermes.kanban_schedule` / `kanban_unblock` | added for the parking flow above | - |
 | `cli.py` additions | `swarm plan` (invokes `lead`), `swarm approve` (Gate 0 + Gate P publish + budget check + card creation), `swarm run` (bounded loop, reconciles on start), `swarm stop`/`resume` (kill switch) | - |
 | `policy.estimate_calendar_minutes` | pacing estimate (not a budget decision) from a provider's rpm limit; `cmd_approve` prints it and then blocks on an interactive confirmation before publishing the plan or creating any card | ASES-CAP-04, ASES-REV-03 |
+| `gates.hash_gate_profiles` / `controller.pin_gate_profiles` / `verify_gate_pin` | pins a project's approved gate commands by content hash at `swarm approve`; `swarm run` refuses if they've since changed without a fresh approve | ASES-QG-02 (partial) |
 
 Real Hermes profiles `lead`/`coder-1`/`reviewer` created fresh (no `--clone-from`, per ASES-ROL-10),
 toolsets restricted (reviewer has no terminal/code_execution/browser, kanban enabled for verdicts only),
@@ -299,6 +300,62 @@ Two separate user decisions, same session:
   fixes) is still sitting uncommitted locally, because the repo's local git identity (`git config
   user.name`/`user.email`) has been missing since partway through tonight and nothing here writes git
   config on the user's behalf. A second push is needed once the user restores it.
+
+## A multi-agent pass at the remaining register gaps (2026-09-19)
+
+Git identity got fixed (the user ran the commands directly), so the backlog above was committed and
+pushed for real (`6e4758f`). Separately, the user asked whether multi-agent orchestration would finish
+"this project" faster; clarified to mean a genuinely working v1 of the whole pipeline, not a specific
+document. Since the actual remaining blocker (coder-1's key) can't be sped up by more agents -- it's an
+external, sequential dependency -- the agents were pointed at two things that COULD parallelize: the
+`not_covered` requirement backlog, and a pre-flight adversarial review of pipeline code that has only
+ever been exercised by mocked tests (see the next section).
+
+Six parallel agents each read their actual blueprint section (not just the one-line requirements.yaml
+summary) plus the current code, and reported honestly on what's really buildable:
+
+- **ASES-CAP-06** (provider diversity): mostly already satisfied by tonight's real xKiro/UnoRouter work
+  -- register moved from `not_covered` to `in_progress`, with the one real residual gap (same-account
+  key-quota-sharing has no code check, needs a live provider API call) written into the note.
+- **ASES-REV-02** (plan bounces to Lead at most twice): genuinely blocked on ASES-REV-01, the
+  plan-critique mechanism itself, which doesn't exist as a call site or a data model yet. Real finding
+  along the way: "Gate P" as the blueprint defines it (critique -> privacy check -> budget check ->
+  approval -> publish) is 4 of 5 steps built under that name today; grepping "Gate P" in this codebase
+  makes it look done, and it isn't quite. Left `not_covered`, note filled in with the real reason.
+- **ASES-QG-02** (gate commands pinned by hash): genuinely buildable, and built (see the module map).
+- **ASES-TST-02** (acceptance tests cost no quota): produced the most consequential finding of the
+  batch -- the blueprint's own section 22.0 says tests 22.2 through 22.16 are specified to run against a
+  *fake* provider; only 22.1, the Phase 2 evaluation, and 22.17 are meant to touch a real one. Tonight's
+  real end-to-end dispatch against real coder-1/lead credentials has been standing in for a fake-provider
+  harness that doesn't exist yet, not fulfilling the design as specified. Not unwound -- the real run is
+  still genuinely valuable, proving things a fake never could -- but worth knowing precisely what it is
+  and isn't. Also surfaced that `gates.detect_tamper` (ASES-QG-03) is written and unit-tested but has
+  zero callers anywhere in the real pipeline, unlike `scan_for_secrets` which is wired into
+  `mergeq.merge_task`; and that the secret-scan requirement row (section 8.1) is marked `not_covered`
+  despite being directly tested (`test_gates.py::test_scan_for_secrets`,
+  `test_mergeq.py::test_merge_blocks_on_a_planted_secret`) -- a stale status, not an ID-drift problem.
+  Register left `not_covered` (the full 16-test closure is a substantial harness-building effort, not a
+  small task); the coverage mapping and these two findings are recorded here rather than silently fixed.
+- **ASES-DOC-04** ("the stop condition is honored"): resolved an ambiguity the task itself flagged --
+  this is section 16's STOP CONDITION paragraph, a rule for whoever builds/operates ASES (originally
+  Claude Code), not runtime software. No artifact stating it existed anywhere in this repo. Added
+  `C:\Users\masoo\ases\CLAUDE.md` restating it verbatim so a future session without this conversation's
+  memory still loads and honors it; register moved to `partial` (real but scattered evidence exists for
+  2 of the rule's 6 categories, not a durable artifact until now).
+- **ASES-GIT-16** (worktree pinning): declined to guess, correctly. This needs a real Hermes CLI/config
+  investigation that was already deliberately deferred earlier tonight to avoid disturbing T1's live
+  dispatch -- the agent independently reached the same conclusion already recorded in this file's
+  "Known gaps" section and did not re-investigate past that point.
+
+ASES-QG-02 was then built by a single dispatched agent, faithfully executing the investigation agent's
+own detailed spec: `gates.hash_gate_profiles()`, a new `gate_pins` SQLite table (schema version 2 -> 3),
+`controller.pin_gate_profiles()`/`verify_gate_pin()`, and the two call sites in `cli.py` (`cmd_approve`
+pins right after a plan clears every refusal gate; `cmd_run` refuses with `REFUSED (ASES-QG-02)` if the
+pin no longer matches). 9 new tests. The build agent reported 2 pre-existing test failures
+(`test_run_gate_pass`, `test_run_gate_records_to_db`, a `'python' not recognized` error) as unrelated to
+its change -- re-verified directly afterward in the main session's own shell: 147/147 pass cleanly.
+That's a PATH difference in the agent's own sandboxed subprocess environment, not a real regression in
+this codebase; recorded here so it isn't mistaken for one later.
 
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 

@@ -222,8 +222,21 @@ requirements:
   requirement: Capacity should come from provider diversity, each addition evaluated
   section: '5.4'
   verified_by: Inspection
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'The blueprint''s real text (section 5.4) is a 4-step process -- discovery, smoke test,
+    data-policy check, evaluation -- plus an explicit warning not to assume extra keys on one account
+    add quota. The data-policy-check step is generic and already covered by policy.check_data_class
+    (ASES-PRV-01/02/03, wired into cmd_approve); the smoke-test step is covered by models.py''s
+    record_smoke_test, already exercised for real (xkiro/qwen/qwen3.8-max:free shows smoke=pass). Real
+    discovery + evaluation happened for real 2026-09-19: xKiro was added and evaluated as a genuine
+    second, independently-accounted provider, and UnoRouter was run for real, found unreliable (an
+    undocumented daily token cap, an output-tokens-per-minute cap, a refused dangerous gate command,
+    recurring transient failures) and dropped entirely -- see docs/architecture.md''s dated D2/D3
+    sections. Left at in_progress rather than covered because (a) the "don''t assume extra keys share a
+    quota" warning has no code check anywhere and can only be verified by a live call to a provider''s
+    own account/key-info endpoint, and (b) there''s no repeatable artifact (checklist/template) that
+    would make discovery+evaluation hold for the *next* provider addition -- only a one-time real
+    instance exists so far.'
 - id: ASES-TSK-01
   requirement: Each plan task becomes a work card and a merge card
   section: '7'
@@ -414,7 +427,19 @@ requirements:
   section: '13.1'
   verified_by: '22.14'
   status: not_covered
-  note: ''
+  note: 'Blocked on ASES-REV-01 (also not_covered): the plan-critique mechanism itself (a critique card
+    for the Reviewer, a PASS/CHANGES_REQUIRED/BLOCKED verdict) does not exist yet -- review.py only
+    re-runs Gate 1 for diff review (ASES-REV-05), never touches plans. There is no call site to attach a
+    bounce counter to, and no data model to hold it (plan_tasks, the only per-task counter table, is
+    only created by create_cards_from_plan AFTER Gate P/approval succeeds, i.e. after this loop would
+    already be over -- and config/swarm.yaml''s budgets.replans_per_project, the field meant for this,
+    has no DB column anywhere, reserved or otherwise). Worth noting: "Gate P" as the blueprint defines it
+    (section 13) is a compound checkpoint -- critique, then privacy check, then budget check, then user
+    approval, then publish -- and cmd_approve today implements 4 of those 5 steps under that same name,
+    printing "Gate P REFUSED"/"Gate P: published" for the parts that exist. Once ASES-REV-01 lands, this
+    bound is exactly as offline-testable as fix_cards_per_task is today (fake the verdict, assert on the
+    counter and the escalation call) -- the blocker is the missing mechanism, not a need for a live
+    LLM call.'
 - id: ASES-REV-03
   requirement: The user approves plan, budget and calendar time before any implementation card exists
   section: '13.1'
@@ -456,8 +481,17 @@ requirements:
   requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
   section: '14.3'
   verified_by: '22.12'
-  status: not_covered
-  note: ''
+  status: partial
+  note: 'gates.hash_gate_profiles() + controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19):
+    a plan''s gate_profiles are content-hashed and pinned per-project at swarm approve time (only after
+    every earlier REFUSED path -- data-policy, budget -- has passed, so a refused plan is never pinned),
+    and swarm run refuses with "REFUSED (ASES-QG-02)" if the hash no longer matches, telling the user to
+    re-approve. Re-running swarm approve deliberately moves the pin -- that IS "an explicit plan task
+    that allows it." Unit-tested (9 new tests: hash stability/sensitivity, no-op-when-unpinned, pin/
+    verify round trip, re-approve moves the pin, cross-project isolation). Left at partial, not covered:
+    the blueprint''s text also covers "CI scripts or test runner settings" beyond gate_profiles itself
+    -- hashing a fixed list of config files (CI workflow, pytest/tox config) is a natural follow-up but
+    needs its own decision about which files count, deliberately not bundled into this change.'
 - id: ASES-QG-03
   requirement: The tamper check fails deleted or skipped tests, unconditional passes and weakened assertions
   section: '14.3'
@@ -524,8 +558,18 @@ requirements:
   requirement: The stop condition is honored
   section: '16'
   verified_by: Inspection
-  status: not_covered
-  note: ''
+  status: partial
+  note: 'This is a rule for whoever builds/operates ASES (Claude Code), not runtime software -- section
+    16''s STOP CONDITION paragraph lists six categories (spends money, deletes user data, overwrites an
+    existing repo/Hermes config, installs new software, sends code to a provider outside the allow-list,
+    needs an unconfigured secret) that require explicit user sign-off before proceeding. Restated
+    verbatim in the new C:\Users\masoo\ases\CLAUDE.md (2026-09-19) so a future session without this
+    conversation''s memory still loads and honors it -- no such artifact existed before. Real, scattered
+    evidence of it already being followed exists in docs/architecture.md''s dated log (secret-scanning
+    the repo before the first GitHub push, only after explicit "you can push"; the lead-role provider
+    moves were both the user''s explicit call), covering roughly 2 of the 6 categories with a real
+    incident; the other 4 have no incident to point to yet, which is why this is partial rather than
+    covered.'
 - id: ASES-REC-01
   requirement: Infrastructure failures resume; capability failures restart fresh with the failure bundle
     and then a new model

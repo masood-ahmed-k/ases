@@ -116,6 +116,49 @@ def _work_card_body(task: plan_mod.PlanTask) -> str:
     return "\n".join(lines)
 
 
+class GateConfigTamperedError(RuntimeError):
+    pass
+
+
+def pin_gate_profiles(conn, project: str, gate_profiles: dict) -> str:
+    """ASES-QG-02: pin this project's approved gate profiles by content hash at `swarm approve` time,
+    so `swarm run` can refuse to trust a diff that quietly changed gate configuration, CI scripts, or
+    test-runner settings. Called only after publish_plan succeeds (see cmd_approve) -- a plan refused
+    earlier by a data-policy or budget gate must never reach this and get pinned.
+
+    Re-approving (a fresh `swarm approve`) intentionally moves the pin to whatever is approved now --
+    that's the sanctioned way to change gate configuration, not a bypass of it."""
+    digest = gates_mod.hash_gate_profiles(gate_profiles)
+    conn.execute(
+        "INSERT INTO gate_pins (project, gate_profiles_hash, pinned_at) VALUES (?, ?, datetime('now')) "
+        "ON CONFLICT(project) DO UPDATE SET gate_profiles_hash=excluded.gate_profiles_hash, "
+        "pinned_at=excluded.pinned_at",
+        (project, digest),
+    )
+    return digest
+
+
+def verify_gate_pin(conn, project: str, gate_profiles: dict) -> None:
+    """ASES-QG-02: refuse to proceed if the plan's gate profiles no longer match what was pinned at
+    this project's last `swarm approve`. No pin row means this project has never been through the
+    pinning path yet -- nothing to verify against, so this is a silent no-op rather than a false
+    positive on a first-ever approve."""
+    row = conn.execute(
+        "SELECT gate_profiles_hash FROM gate_pins WHERE project = ?",
+        (project,),
+    ).fetchone()
+    if row is None:
+        return
+    current = gates_mod.hash_gate_profiles(gate_profiles)
+    if row["gate_profiles_hash"] != current:
+        raise GateConfigTamperedError(
+            f"gate configuration for project {project!r} no longer matches the pin recorded at the "
+            f"last `swarm approve` (ASES-QG-02): gate commands, CI scripts, or test-runner settings "
+            f"changed without an explicit approved plan task allowing it. Re-run `swarm approve` if "
+            f"this change is intentional."
+        )
+
+
 def process_budget_gate(
     board: str, plan: plan_mod.Plan, models_config: dict, *, conn, budgets: dict,
 ) -> list[str]:

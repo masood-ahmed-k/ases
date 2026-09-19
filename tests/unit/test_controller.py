@@ -493,3 +493,46 @@ def test_successful_merge_needs_no_fix_card(tmp_path, monkeypatch):
     assert completed == [pair.merge_card_id]
     fix_cards = [c for c in created if "fix" in c["title"]]
     assert fix_cards == []
+
+
+# ---------------------------------------------------------------------------------------------
+# gate profile pinning (ASES-QG-02): pin_gate_profiles / verify_gate_pin.
+# ---------------------------------------------------------------------------------------------
+
+def test_verify_gate_pin_noop_when_nothing_pinned_yet(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    controller.verify_gate_pin(conn, "brand-new-project", {"default": ["pytest -q"]})  # must not raise
+
+
+def test_pin_then_verify_same_profiles_passes(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles)
+    controller.verify_gate_pin(conn, "t3", dict(profiles))  # must not raise
+
+
+def test_verify_gate_pin_raises_on_changed_commands(tmp_path):
+    import pytest
+    conn = db.connect(tmp_path / "ases.db")
+    controller.pin_gate_profiles(conn, "t3", {"default": ["pytest -q"]})
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(conn, "t3", {"default": ["pytest -q", "|| true"]})
+
+
+def test_pin_gate_profiles_reapprove_moves_the_pin(tmp_path):
+    """A fresh `swarm approve` is the sanctioned way to change gate configuration: pinning twice with
+    different content must move the pin, not leave the old one behind to conflict with it."""
+    conn = db.connect(tmp_path / "ases.db")
+    controller.pin_gate_profiles(conn, "t3", {"default": ["pytest -q"]})
+    controller.pin_gate_profiles(conn, "t3", {"default": ["pytest -q", "--maxfail=1"]})
+    controller.verify_gate_pin(conn, "t3", {"default": ["pytest -q", "--maxfail=1"]})  # must not raise
+
+
+def test_verify_gate_pin_scoped_per_project(tmp_path):
+    """Mirrors the cross-project isolation pattern in
+    test_process_budget_gate_ignores_another_projects_card_with_the_same_task_key above: pinning
+    project "a" must not affect verification for an untouched project "b" -- a lookup that forgot to
+    scope by project could otherwise match "a"'s row and wrongly refuse "b"."""
+    conn = db.connect(tmp_path / "ases.db")
+    controller.pin_gate_profiles(conn, "a", {"default": ["pytest -q"]})
+    controller.verify_gate_pin(conn, "b", {"default": ["a completely different command"]})  # must not raise

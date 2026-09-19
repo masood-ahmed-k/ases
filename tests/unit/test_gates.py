@@ -93,3 +93,18 @@ def test_detect_tamper(diff, expected_hit):
         assert any(expected_hit in f for f in findings)
     else:
         assert findings == []
+
+
+@pytest.mark.parametrize("a,b,expect_equal", [
+    # identical content -> identical hash
+    ({"fast": ["pytest -q"], "slow": ["pytest", "flake8"]},
+     {"fast": ["pytest -q"], "slow": ["pytest", "flake8"]}, True),
+    # changing a command's text changes the hash
+    ({"default": ["pytest -q"]}, {"default": ["pytest -q -x"]}, False),
+    # profile-KEY order doesn't matter (sort_keys=True)
+    ({"fast": ["pytest -q"], "slow": ["pytest"]}, {"slow": ["pytest"], "fast": ["pytest -q"]}, True),
+    # command ORDER within one profile's list DOES matter
+    ({"default": ["a", "b"]}, {"default": ["b", "a"]}, False),
+])
+def test_hash_gate_profiles(a, b, expect_equal):
+    assert (gates.hash_gate_profiles(a) == gates.hash_gate_profiles(b)) == expect_equal
