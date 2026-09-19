@@ -165,6 +165,12 @@ def kanban_show(board: str, card_id: str) -> dict:
     task["_children"] = raw.get("children", [])
     task["_parents"] = raw.get("parents", [])
     task["_runs"] = raw.get("runs", [])
+    # Real shapes (probed on a scratch board 2026-09-19): events are [{kind, payload, created_at, run_id}],
+    # comments are [{author, body, created_at}]. A block adds a "BLOCKED: <reason>" comment and a `blocked`
+    # event whose payload carries `reason`; an unblock adds "UNBLOCK: <reason>".
+    task["_events"] = raw.get("events", [])
+    task["_comments"] = raw.get("comments", [])
+    task["_latest_summary"] = raw.get("latest_summary")
     return task
 
 
@@ -226,8 +232,44 @@ def kanban_schedule(board: str, card_id: str, reason: str) -> None:
     _kanban(board, ["schedule", card_id, reason])
 
 
-def kanban_unblock(board: str, card_id: str) -> None:
-    _kanban(board, ["unblock", card_id])
+def kanban_unblock(board: str, card_id: str, reason: str | None = None) -> None:
+    """Unblock a card; `reason`, when given, is recorded as an "UNBLOCK: <reason>" comment first (this is how
+    swarm answer delivers an answer)."""
+    args = ["unblock", card_id]
+    if reason:
+        args += [f"--reason={reason}"]
+    _kanban(board, args)
+
+
+def kanban_comment(board: str, card_id: str, text: str, *, author: str | None = None) -> None:
+    """Append a comment to a card. `--` before the text so a comment that starts with a dash is never read as
+    an option (checked against real Hermes 2026-09-19)."""
+    args = ["comment"]
+    if author:
+        args += ["--author", author]
+    _kanban(board, [*args, card_id, "--", text])
+
+
+def kanban_promote(board: str, card_id: str, reason: str | None = None) -> None:
+    """Promote a todo/blocked card to ready with an audit reason (refused by Hermes while a parent is unfinished)."""
+    args = ["promote", card_id]
+    if reason:
+        args += ["--", reason]
+    _kanban(board, args)
+
+
+def kanban_archive(board: str, card_ids: list[str]) -> None:
+    """Archive cards (soft: Hermes keeps them, `archive --rm` is what deletes and this never calls it)."""
+    if card_ids:
+        _kanban(board, ["archive", *card_ids])
+
+
+def kanban_set_model(board: str, card_id: str, model: str | None, *, provider: str | None = None) -> None:
+    """Pin one card's worker to a model (and provider), or clear the override with model=None."""
+    args = ["set-model"]
+    if provider and model:
+        args += ["--provider", provider]
+    _kanban(board, [*args, card_id, model or "none"])
 
 
 def kanban_reclaim(board: str, card_id: str, *, reason: str | None = None) -> None:
@@ -252,3 +294,46 @@ def resume(timeout: int = 20) -> None:
     result = _run(["resume"], timeout=timeout)
     if result.returncode != 0:
         raise HermesCommandError(["resume"], result.returncode, result.stdout + result.stderr)
+
+
+def session_usage(profile: str, session_id: str, timeout: int = 60) -> dict | None:
+    """What one Hermes worker session cost, read from `hermes -p <profile> sessions export` (ASES-CAP-03).
+
+    Checked against real Hermes 0.21.3 on 2026-09-19: the export prints ONE JSON object per session on one
+    line, and that object also carries the whole conversation under "messages", which is never returned here.
+    "api_call_count" is the number of model API calls the session made, which is what counts against a
+    provider's daily quota.
+
+    Returns {"id", "model", "api_call_count", "input_tokens", "output_tokens"} with the numbers as ints (a
+    missing or unreadable number is 0, a missing model is ""). Returns None, and never raises, when the
+    command cannot run, exits non-zero, times out, or prints no parseable JSON line for exactly this session
+    id. None means "unknown, ask again later" and never "zero requests": a caller must record nothing for a
+    session it got None for."""
+    args = ["-p", profile, "sessions", "export", "--session-id", session_id, "--format", "jsonl", "--redact", "-"]
+    try:
+        result = _run(args, timeout=timeout)
+    except (HermesNotFound, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    def count(value) -> int:
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    for line in result.stdout.splitlines():
+        try:
+            session = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(session, dict) and session.get("id") == session_id:
+            return {
+                "id": session_id,
+                "model": str(session.get("model") or ""),
+                "api_call_count": count(session.get("api_call_count")),
+                "input_tokens": count(session.get("input_tokens")),
+                "output_tokens": count(session.get("output_tokens")),
+            }
+    return None

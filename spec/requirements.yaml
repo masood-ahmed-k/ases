@@ -201,18 +201,18 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: partial
-  note: 'Two layers exist and are unit-tested: cmd_approve checks the whole plan''s budget upfront at
-    Gate P (refuses outright if unaffordable then), and controller.process_budget_gate re-checks every
-    ''ready'' card on every run_pass and parks it with hermes kanban schedule if the budget has since
-    been exhausted. Downgraded from covered 2026-09-19 by an adversarial pipeline review, independently
-    verified against the real source: ledger.record_usage() -- the only function that would ever
-    increment requests_ledger -- has zero production callers anywhere in src/ases (grepped; only its own
-    unit test calls it). Both layers above check affordability correctly against whatever the ledger
-    currently says, but nothing ever tells the ledger a real request happened, so in the live system the
-    ledger permanently reads zero usage and every card looks affordable regardless of real spend. This
-    needs a real design decision (where in the real dispatch lifecycle a request actually gets counted,
-    and whether Hermes exposes a per-card/session request count to count from) before it can be wired
-    in -- not yet attempted.'
+  note: 'Three layers, all unit-tested: cmd_approve checks the whole plan''s budget at Gate P;
+    controller.process_budget_gate re-checks every ready card on every pass and parks it with hermes kanban
+    schedule when the budget is gone; and, since 2026-09-19, the ledger sees REAL usage:
+    usage.ingest_run_usage runs first in every pass and counts each finished worker session once (Hermes
+    session export, api_call_count, idempotent through the usage_ingested table, attributed to the plan task
+    so lineage requests can be summed), and the outgoing card of a fix-card repoint is ingested just before
+    the repoint. The review half of the requirement is applied too: ready coder cards are parked when the
+    REVIEWER''s provider cannot afford the review reserve (the reserve is counted once, not twice). This
+    closes the gap an adversarial review found (record_usage had no production caller; one review really used
+    37 of OpenRouter''s 50 daily free requests unseen). Left partial: a card parked for budget is not yet
+    unparked when the provider''s window resets (a human or cron action today), a backlog is charged to the
+    day it is first ingested, and none of this has run in a real dispatch yet.'
 - id: ASES-CAP-04
   requirement: Gate P shows estimated requests per provider and the calendar time
   section: '5.4'
@@ -289,19 +289,19 @@ requirements:
   requirement: Merge eligibility needs a green Gate 1 record and a reviewer PASS for the same commit
   section: '8.1'
   verified_by: '22.6'
-  status: partial
-  note: 'Downgraded from covered on 2026-09-19: the register note only ever described the Gate 1 half.
-    review.gate_before_review re-runs Gate 1 on the branch head before a card is trusted in review (unit-tested
-    and probed against real Hermes semantics, not yet seen firing in a real run). The reviewer half was not
-    enforced: process_merge_queue treated any work card that read done as approved, and the first real coder
-    run (T1) finished its own card with kanban_complete and would have gone straight to merge with no reviewer
-    involved. It now merges a card only if the latest completed run on it belongs to the reviewer profile,
-    refuses anything else (event merge_refused_unreviewed, once per card, shown on the swarm run pass line,
-    no fix card, no fix budget), and work-card bodies tell the coder to hand off with kanban_request_review and
-    reviewer=<profile> (Hermes has no default reviewer; without it the card stays with the coder). Left partial:
-    it checks WHO completed the card, not WHICH commit was reviewed (the verdict is not bound to a commit SHA,
-    which is ASES-REV-06), and Hermes''s own gateway dispatcher can still claim a review card before the Gate 1
-    re-check sees it, so that half rests on Gate 3 at merge time as a backstop.'
+  status: covered
+  note: 'Enforced at merge time since 2026-09-19 (unit and seeded-bug tested; the real runs so far pre-date it).
+    process_merge_queue merges a coder task only when: the latest completed run on the work card belongs to
+    the reviewer profile; its verdict metadata passes validate_verdict as a PASS (either the blueprint''s
+    review_status shape or the Hermes review skill''s review_outcome shape; a contradiction is never a PASS);
+    the reviewed commit (the verdict''s own, else the commit the coder''s hand-off named, found by an
+    independent nemotron review as a gap) is a prefix of the branch head, and an approval that names no commit
+    at all is refused as unbound; and the controller''s OWN green Gate 1 record exists for that exact head,
+    else Gate 1 runs then (a green record for an older commit means a later commit voided the review:
+    stale_review). merge_task is then told the exact checked SHA, refuses if the branch moved, and squashes
+    from the SHA itself. A failed check takes the ordinary failure path (fix card, bounded); a missing or
+    malformed verdict is a refusal event once per card. History: downgraded from covered earlier the same day
+    because the note only described the Gate 1 half.'
 - id: ASES-GIT-04
   requirement: 'One merge at a time: squash candidate on the integration HEAD, Gate 3, fast-forward, complete
     the merge card'
@@ -345,8 +345,16 @@ requirements:
   requirement: Tasks with overlapping touches and no dependency path are serialized by Gate 0
   section: '8.2'
   verified_by: '22.8'
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'Built 2026-09-19 (phase-completion round 1): plan.serialize_overlapping_tasks runs at the end of Gate 0
+    (parse_and_validate), after the dangling-dependency and cycle checks. Two tasks with overlapping touches
+    and no dependency path in either direction get a serialization link, the later task in plan order
+    depending on the earlier one (priority = position in the plan); links added earlier in the same pass count
+    as paths, so three overlapping tasks become a chain, and the function is idempotent. Overlap is decided
+    conservatively (over-serialising only costs parallelism), including character classes, verified by a
+    brute-force oracle over millions of glob pairs and 300 seeded random plans. swarm approve prints what was
+    serialized, and the Lead''s prompt now explains that touches must be globs (dir/** for a directory). Unit
+    and seeded-bug tested; the parallel acceptance test (22.5) has not been run for real yet.'
 - id: ASES-GIT-09
   requirement: Conflicts become fix or reconciliation cards, never an argument between the two workers
   section: '8.2'
@@ -384,27 +392,32 @@ requirements:
   requirement: Integrity snapshots around every worker run; changes outside the worktree fail the card
   section: '8.4'
   verified_by: 22.5, 22.11
-  status: in_progress
-  note: 'integrity.py has snapshot()/diff_snapshots() fully unit-tested (HEAD-move and unexpected-dirty-file
-    detection). Still not wired into a real dispatched run (needs before/after snapshots around an actual
-    worker spawn). The 2026-09-19 real run shows why it matters: coder-1 ran pip install pytest into Hermes''s
-    own virtualenv (outside its worktree; it reported this itself in residual_risk) and nothing in ASES
-    noticed. Worktree snapshots would not catch that either, since the change was to the Python environment;
-    the Docker sandbox (ASES-SEC-03, Phase 5) is what prevents it.'
+  status: partial
+  note: 'Built 2026-09-19: guards.check_primary_checkout runs at the start of every controller pass and at swarm
+    run start. The primary checkout must be on the integration branch, clean (modified, staged, deleted and
+    untracked files, except Hermes''s .worktrees/), and at the HEAD ASES itself last wrote (adopted at run
+    start, updated after every fast-forward it makes). A violation records an integrity_violation event and
+    halts the run with exit code 3 before anything is dispatched or merged. Two deviations from the blueprint
+    text, on purpose: the check is per pass, not around each spawn (Hermes, not ASES, spawns workers), and it
+    halts the run instead of failing one card (the writer cannot be attributed to a card). Not covered: the
+    other active worktrees (a stray write into another worker''s worktree) and changes outside git entirely;
+    on 2026-09-19 coder-1 ran pip install into Hermes''s own virtualenv unnoticed, which only the Docker
+    sandbox (ASES-SEC-03) prevents. integrity.py''s own snapshot() has quirks (non -z porcelain quoting,
+    rename strings, fail-open on a non-repo) that make this note''s earlier claim that it was fully
+    unit-tested overstated; guards.py does not use it.'
 - id: ASES-GIT-13
   requirement: Diffs outside the declared touches block review
   section: '8.4'
   verified_by: '22.12'
   status: covered
-  note: 'review.gate_before_review checks the diff against declared touches BEFORE Gate 1 even runs;
-    out-of-scope changes are sent back with the exact offending paths. Unit-tested incl.
-    empty-touches-means-nothing-allowed. 2026-09-19 fix -- the merge-base lookup used a hardcoded
-    "integration" literal instead of the plan''s configured integration_branch, which only worked because
-    config/swarm.yaml happens to spell it that way (any other name silently degraded the check to
-    inspecting only the last commit). gate_before_review now takes integration_branch as a required
-    parameter, tested against a repo whose integration branch is named "main-line". Side effect worth
-    knowing -- fix cards are now policed here too, against the ORIGINAL task''s touches globs, so a fix
-    that must edit an out-of-scope file will bounce until the plan is widened.'
+  note: 'The touches check now runs in BOTH places (2026-09-19): review.gate_before_review before Gate 1 in the
+    review lane, and review.check_branch_for_merge inside the merge queue, so a card the review lane never saw
+    (Hermes''s gateway dispatcher can claim a review card first) cannot merge out of scope. Out-of-scope
+    changes are refused with the exact offending paths. Fixed with it: git diff detects renames, so `git mv
+    SECRETS.md src/a.py` hid the removed out-of-scope path (now --no-renames), and a missing merge-base fails
+    closed. Earlier the same day the merge-base lookup stopped using a hardcoded integration branch name. Side
+    effect worth knowing: fix cards are policed against the ORIGINAL task''s touches, so a fix that must edit
+    an out-of-scope file bounces until the plan is widened. Unit and seeded-bug tested.'
 - id: ASES-GIT-14
   requirement: Per-card ports, compose project, database and temp directory; locks for singletons
   section: '8.4'
@@ -531,26 +544,39 @@ requirements:
   section: '13.2'
   verified_by: 22.6, 22.12
   status: partial
-  note: 'Seen firing in a real review-lane transition on 2026-09-19: the card entered review at 16:53:45, the
-    controller re-ran Gate 1 on the branch head in a clean worktree (pass, gate_runs id 1, 16:54:11) and the
-    reviewer was spawned one second later. Two real defects were fixed first, both invisible to mocked tests:
-    the send-back used request-changes, which real Hermes rejects for a card that only sits in review (it now
-    uses reopen-review, probed on a scratch board), and run_pass dispatched before policing the review lane.
-    Left partial: the send-back path (red Gate 1, out-of-scope diff) has never fired in a real run, and
-    Hermes''s own gateway dispatcher can still claim a review card before this check sees it.'
+  note: 'Seen firing in a real review-lane transition on 2026-09-19 (the card entered review at 16:53:45, the
+    controller re-ran Gate 1 in a clean worktree, pass, and the reviewer was spawned one second later). Two
+    real defects were fixed first, both invisible to mocked tests: the send-back used request-changes, which
+    real Hermes rejects for a card that only sits in review (now reopen-review, probed on a scratch board),
+    and run_pass dispatched before policing the review lane. Since then the merge queue re-checks
+    independently, so the gateway-dispatcher race no longer lets an unchecked commit merge. Left partial: the
+    send-back path (red Gate 1, out-of-scope diff) has never fired in a real run, and when Hermes''s
+    dispatcher wins the race the re-check happens at merge time instead of when the card enters review.'
 - id: ASES-REV-06
   requirement: The verdict is a tool call with schema-checked metadata stored by commit
   section: '13.2'
   verified_by: '22.6'
-  status: not_covered
-  note: ''
+  status: covered
+  note: 'Built 2026-09-19 (unit and seeded-bug tested, not yet seen in a real run beyond the reviewer''s real
+    metadata shape): review.validate_verdict checks the reviewer''s run metadata against a schema and accepts
+    both the blueprint''s shape (review_status PASS, CHANGES_REQUIRED or BLOCKED, commit, summary, the issue
+    lists, gate_tampering_suspected, required_changes) and the shape Hermes''s own review skill produces
+    (review_outcome approved, reviewer_checks), which is what the real reviewers emitted. Only the status or
+    outcome is required; every other field is type-checked when present; a contradiction between the two
+    shapes is never read as PASS; a quoted commit must be hex. record_verdict stores the accepted verdict by
+    (project, task, commit SHA), redacted, idempotently. The merge queue refuses a coder task whose verdict is
+    missing, malformed or not a PASS. The verdict-as-a-tool-call half is Hermes''s own: request-changes,
+    complete and block are its verdict tools.'
 - id: ASES-QG-01
   requirement: The controller believes only its own gate records
   section: '14.2'
   verified_by: '22.12'
   status: covered
-  note: gates.run_gate is the only source of gate truth; review.py sends a card back on a red re-check
-    regardless of the worker's own claim.
+  note: 'gates.run_gate is the only source of gate truth; the review lane sends a card back on a red re-check
+    regardless of the worker''s own claim, and since 2026-09-19 the merge queue believes only the
+    controller''s own gate_runs records for the exact head (a reviewer''s or coder''s claim that tests passed
+    is never read; the real review on 2026-09-19 listed the gate as verified although it had no way to run
+    anything). A profile with no commands is rejected at Gate 0 because it would be vacuously green.'
 - id: ASES-QG-02
   requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
   section: '14.3'

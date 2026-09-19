@@ -662,6 +662,49 @@ What it says, and what it does not:
   and any recovery path. One run per arm, so no variance. The agent got the full request while the swarm's coder
   got the Lead's eleven acceptance bullets, which is how the swarm works but is a difference between the arms.
 
+## Building the remaining phases, round 1: the Phase 3 leftovers (2026-09-19, evening)
+
+The user asked for every remaining phase to be BUILT first and tested for real afterwards. The method for each round:
+requirement text quoted from the blueprint (extracted to a searchable text file so agents read the source, not a
+summary), builder agents with exclusive files, then my own review, seeded-bug (mutation) checks against the
+integration code, an independent nemotron review (the NVIDIA key works again), and a local commit. Round 1 took the
+Phase 3 items that block parallel coders:
+
+- **Schema v5** (`db.py`): `usage_ingested`, `review_verdicts`, `integrity_state`, `lineage`, `project_state`,
+  `intents`, and a small `_ensure_columns` step because `CREATE TABLE IF NOT EXISTS` cannot add a column to a table an
+  earlier version made.
+- **Real usage into the ledger** (ASES-CAP-03, `usage.py`, `hermes.session_usage`): every pass first counts each
+  finished worker session once, attributed to its plan task; the outgoing card of a fix-card repoint is counted just
+  before the repoint; ready coder cards are parked when the reviewer's provider cannot afford the review reserve.
+- **Gate 0 serialization** (ASES-GIT-08, `plan.py`): overlapping touches with no dependency path become a chain in
+  plan order; `swarm approve` shows what was serialized; Gate 0 now also rejects a gate profile with no commands
+  (it would be vacuously green).
+- **Merge-time checks** (ASES-GIT-03/13, REV-05/06, QG-01, `review.py`, `controller.process_merge_queue`,
+  `mergeq.merge_task`): the merge queue no longer relies on the review lane having seen the card. It requires the
+  reviewer profile's completion, a schema-valid PASS verdict (both the blueprint's shape and the shape Hermes's review
+  skill actually emits), the approval bound to a commit, the scope check, and the controller's own green Gate 1 record
+  for that exact head; the merge is then taken from the checked SHA and refused if the branch moved. Verdicts are
+  stored by commit SHA.
+- **Primary-checkout guard** (ASES-GIT-12, `guards.py`): checked at run start and every pass; a violation halts the
+  run (exit code 3) before anything is dispatched or merged.
+- **Fixed on the way:** renames hid a removed out-of-scope path from the touches check; the Gate 1 evidence sent to a
+  worker kept the start of the output and lost the failure summary at the end; the Lead is now told how to write touches
+  globs.
+
+What the checks found. A first-time independent review by nemotron ultra of the merge-queue change found one real gap
+that my own review and the builders' tests had missed: the Hermes review skill's verdict has no commit field, so an
+approval could be tied to no commit, and a commit added after the approval with no Gate 1 record yet would merge under
+it. The approval is now bound to the commit the verdict quotes, else to the commit the coder's hand-off named, and an
+approval that names none is refused. 33 seeded-bug checks were run against the integration code: the first pass missed
+two (the project not being handed to the budget gate, and the squash-by-SHA race window), both got tests, and every one
+is now caught.
+
+Builder findings worth keeping in view (not all fixed): `integrity.snapshot` fails open and mis-parses quoted paths (the
+new guard does not use it); the reviewer's failure summary is now trimmed from the middle; `gate_runs` still has no
+branch or gate-configuration hash, so after a fix card an old green row for the original branch can make an unchecked
+head read as stale (it heals through Gate 1); `events.redact` does not redact a secret-shaped dictionary KEY; bare
+directory names in touches are literals that match nothing.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of

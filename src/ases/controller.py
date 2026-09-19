@@ -9,7 +9,9 @@ re-check before trusting a review, and the merge queue. Dispatch itself is Herme
 from __future__ import annotations
 
 import dataclasses
+import json
 import pathlib
+import re
 import subprocess
 import time
 
@@ -17,11 +19,13 @@ from . import config as ases_config
 from . import db as ases_db
 from . import events
 from . import gates as gates_mod
+from . import guards as guards_mod
 from . import hermes as hermes_mod
 from . import mergeq
 from . import plan as plan_mod
 from . import policy
 from . import review as review_mod
+from . import usage as usage_mod
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,30 +154,66 @@ def _reviewer_profile(project: ases_config.ProjectConfig) -> str:
         return "reviewer"  # a missing mapping is doctor's job to flag, not the card body's
 
 
-def _completing_profile(work_card: dict) -> str | None:
-    """The Hermes profile that ran the work card's latest COMPLETED run, or None when no run completed it.
-    Hermes keeps one run per attempt with the profile that ran it and its outcome (`_runs`, see
-    hermes.kanban_show): a card the reviewer approved ends with a reviewer run whose outcome is "completed",
-    while a card its implementer finished itself ends with the implementer's."""
+def _completing_run(work_card: dict) -> dict | None:
+    """The work card's latest COMPLETED run, or None when no run completed it. Hermes keeps one run per attempt
+    with the profile that ran it, its outcome and its metadata (`_runs`, see hermes.kanban_show): a card the
+    reviewer approved ends with a reviewer run whose outcome is "completed", while a card its implementer
+    finished itself ends with the implementer's."""
     completed = [run for run in work_card.get("_runs", []) if run.get("outcome") == "completed"]
-    return completed[-1].get("profile") if completed else None
+    return completed[-1] if completed else None
+
+
+def _completing_profile(work_card: dict) -> str | None:
+    """The Hermes profile that ran the work card's latest COMPLETED run, or None when no run completed it."""
+    run = _completing_run(work_card)
+    return run.get("profile") if run else None
+
+
+_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{7,40}")
+
+
+def _handoff_commit(work_card: dict) -> str | None:
+    """The commit SHA the coder named in its latest review hand-off (a run whose outcome is "review_requested";
+    its metadata carries `commit_sha`, which the work-card body asks for), or None. The reviewer's own verdict
+    often omits the commit (the Hermes review skill's shape has no such field), so this is what the approval is
+    bound to when the verdict does not say (ASES-GIT-03)."""
+    handoffs = [run for run in work_card.get("_runs", []) if run.get("outcome") == "review_requested"]
+    if not handoffs:
+        return None
+    metadata = handoffs[-1].get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, RecursionError):
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    for field in ("commit_sha", "commit"):
+        value = metadata.get(field)
+        if isinstance(value, str) and _COMMIT_SHA.fullmatch(value.strip()):
+            return value.strip()
+    return None
+
+
+def _refuse_once(conn, kind: str, work_card: dict, payload: dict) -> None:
+    """Record a merge refusal ONCE per work card and kind. Once, not on every poll: a pass repeats every few
+    seconds and would otherwise add an identical event each time for as long as the card sits there."""
+    seen = conn.execute(
+        "SELECT 1 FROM events WHERE kind = ? AND json_extract(payload, '$.card_id') = ? LIMIT 1",
+        (kind, work_card["id"]),
+    ).fetchone()
+    if seen is None:
+        events.record(conn, kind, {"card_id": work_card["id"], **payload})
 
 
 def _refuse_unreviewed(
     conn, task_key: str, work_card: dict, completed_by: str | None, reviewer_profile: str,
 ) -> None:
     """Record, once per work card, that the merge queue refused it because the reviewer profile did not
-    complete it. Once, not on every poll: a pass repeats every few seconds and would otherwise add an
-    identical event each time for as long as the card sits there."""
-    seen = conn.execute(
-        "SELECT 1 FROM events WHERE kind = 'merge_refused_unreviewed' "
-        "AND json_extract(payload, '$.card_id') = ? LIMIT 1", (work_card["id"],),
-    ).fetchone()
-    if seen is None:
-        events.record(conn, "merge_refused_unreviewed", {
-            "task_key": task_key, "card_id": work_card["id"], "completed_by": completed_by,
-            "needs_completion_by": reviewer_profile,
-        })
+    complete it."""
+    _refuse_once(conn, "merge_refused_unreviewed", work_card, {
+        "task_key": task_key, "completed_by": completed_by, "needs_completion_by": reviewer_profile,
+    })
 
 
 def _finish_instructions(role: str, reviewer_profile: str = "reviewer") -> list[str]:
@@ -252,6 +292,7 @@ def verify_gate_pin(conn, project: str, gate_profiles: dict) -> None:
 
 def process_budget_gate(
     board: str, plan: plan_mod.Plan, models_config: dict, *, conn, budgets: dict,
+    project: ases_config.ProjectConfig | None = None,
 ) -> list[str]:
     """ASES-CAP-03, ongoing case: a card affordable at Gate P time may not be affordable anymore by
     the time it's actually about to run (other real-world usage, a quota reset that hasn't happened
@@ -264,8 +305,15 @@ def process_budget_gate(
     plans commonly reuse the same task keys ("T1", "T2", ...). Before this fix, a "ready" card from a
     DIFFERENT project with a colliding key would resolve via `plan.task()` against the wrong plan's
     task definition -- caught while about to run a second, unrelated real project on the same board as
-    an in-flight one, before it actually happened, not after."""
+    an in-flight one, before it actually happened, not after.
+
+    With `project` given it also applies the review half of ASES-CAP-03 (2026-09-19): a coder card that
+    finishes needs a review pass on the REVIEWER's provider, which can be a much tighter one than the
+    coder's (a provider with no known cap for the coder, OpenRouter's 50 a day for the reviewer). When that
+    provider cannot afford the review reserve, ready coder cards are parked instead of started, since work
+    that cannot be reviewed today would only sit in review."""
     parked = []
+    review_afford = usage_mod.review_budget(conn, models_config, project) if project is not None else None
     for card in hermes_mod.kanban_list(board, status="ready"):
         row = conn.execute(
             "SELECT task_key FROM plan_tasks WHERE work_card_id = ? AND project = ?",
@@ -284,6 +332,12 @@ def process_budget_gate(
             hermes_mod.kanban_schedule(board, card["id"], f"budget: {afford.reason}")
             parked.append(task.key)
             events.record(conn, "card_parked_for_budget", {"task_key": task.key, "reason": afford.reason})
+        elif review_afford is not None and not review_afford.can_afford and task.role == "coder":
+            reviewer_pp = policy.profile_provider("reviewer", models_config)
+            reason = f"review budget on {reviewer_pp.provider if reviewer_pp else 'the reviewer provider'}: {review_afford.reason}"
+            hermes_mod.kanban_schedule(board, card["id"], reason)
+            parked.append(task.key)
+            events.record(conn, "card_parked_for_budget", {"task_key": task.key, "reason": reason})
     return parked
 
 
@@ -322,7 +376,7 @@ def process_review_lane(
 
 def process_merge_queue(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn,
-    unreviewed: list[str] | None = None,
+    unreviewed: list[str] | None = None, models_config: dict | None = None,
 ) -> list[str]:
     """One pass: for every DONE work card whose merge card is still blocked/ready, run the merge.
     Serialized -- one merge_task call at a time, in task order, matching ASES-GIT-04.
@@ -384,7 +438,8 @@ def process_merge_queue(
         if work_card["status"] != "done" or merge_card["status"] not in ("blocked", "ready", "todo"):
             continue
 
-        completed_by = _completing_profile(work_card)
+        completed_run = _completing_run(work_card)
+        completed_by = completed_run.get("profile") if completed_run else None
         if completed_by != reviewer_profile:
             _refuse_unreviewed(conn, key, work_card, completed_by, reviewer_profile)
             if unreviewed is not None:
@@ -394,6 +449,46 @@ def process_merge_queue(
         task = plan.task(key)
         gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
         branch = work_card.get("branch_name") or f"swarm/{key}-{task.role}"
+
+        # Merge-time checks (2026-09-19), independent of whether the review lane ever saw this card: Hermes's own
+        # gateway dispatcher can start the reviewer before the controller's Gate 1 re-check, so the merge queue,
+        # the only writer to the integration branch (ASES-GIT-02), verifies for itself. Only a coder task has a
+        # diff, a Gate 1 record and a schema-checked verdict; a reviewer-role task's card has no commit to check.
+        pre_merge_outcome = None
+        expected_head = None
+        if task.role == "coder":
+            # ASES-REV-06: the verdict is validated against the schema, and it must be a PASS.
+            verdict = review_mod.validate_verdict(completed_run.get("metadata"))
+            if not verdict.valid or verdict.outcome != "PASS":
+                _refuse_once(conn, "merge_refused_invalid_verdict", work_card, {
+                    "task_key": key, "outcome": verdict.outcome, "problems": list(verdict.problems)[:10],
+                })
+                if unreviewed is not None:
+                    unreviewed.append(key)
+                continue
+            # ASES-GIT-03, ASES-GIT-13, ASES-REV-05, ASES-QG-01: scope, then the controller's OWN green Gate 1
+            # record for this exact head. A red or stale result takes the ordinary failure path (fix card).
+            check = review_mod.check_branch_for_merge(
+                repo, branch, plan.integration_branch, gate_cmds, list(task.touches), conn=conn, task_key=key,
+                require_binding=True, reviewed_commit=verdict.commit or _handoff_commit(work_card),
+            )
+            if not check.ok:
+                pre_merge_outcome = mergeq.MergeOutcome(
+                    False, check.head or None, None, None, f"{check.kind}: {check.detail}",
+                )
+            elif not review_mod.verdict_matches_head(verdict, check.head):
+                _refuse_once(conn, "merge_refused_verdict_commit_mismatch", work_card, {
+                    "task_key": key, "reviewed_commit": verdict.commit, "branch_head": check.head,
+                })
+                if unreviewed is not None:
+                    unreviewed.append(key)
+                continue
+            else:
+                expected_head = check.head
+                review_mod.record_verdict(
+                    conn, plan.project, key, check.head, work_card["id"], verdict.outcome, reviewer_profile,
+                    completed_run.get("metadata"),
+                )
         # ASES-GIT-06: one squash commit per plan task, with the card IDs in its message. work_card is the
         # task's CURRENT card (the original, or the latest fix card), so a merge of a fix card's branch names
         # the fix card that produced it.
@@ -403,9 +498,9 @@ def process_merge_queue(
         )
         # Only a coder is expected to commit. Any other role (a reviewer) legitimately leaves an empty diff,
         # which merge_task then records as a no-op rather than failing on "nothing to commit".
-        outcome = mergeq.merge_task(
+        outcome = pre_merge_outcome or mergeq.merge_task(
             repo, plan.integration_branch, branch, key, gate_cmds, conn=conn,
-            commit_message=commit_message, allow_empty=(task.role != "coder"),
+            commit_message=commit_message, allow_empty=(task.role != "coder"), expected_head=expected_head,
         )
 
         if outcome.merged and outcome.squash_commit is None:
@@ -428,6 +523,9 @@ def process_merge_queue(
             )
             merged.append(key)
             events.record(conn, "merged", {"task_key": key, "sha": outcome.squash_commit})
+            # The merge queue moved the primary checkout's HEAD itself, so that is the HEAD the integrity
+            # guard must now expect (a move it did not make is the violation, ASES-GIT-12).
+            guards_mod.set_expected_head(conn, plan.project, outcome.squash_commit)
             continue
         elif outcome.integration_moved:
             # Only the fast-forward was refused, and mergeq verified in git that the integration branch
@@ -467,6 +565,17 @@ def process_merge_queue(
             max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
         )
         hermes_mod.kanban_link(board, fix_card["id"], row["merge_card_id"])
+        if models_config is not None:
+            # Count the outgoing card's finished runs NOW: once work_card_id points at the fix card, the
+            # per-pass ingest never looks at this card again, and a reviewer run that ended since the last
+            # pass would go uncounted (found by the usage builder).
+            try:
+                usage_mod.ingest_card_usage(
+                    board, row["work_card_id"], project, models_config, conn=conn,
+                    plan_project=plan.project, task_key=key,
+                )
+            except Exception as exc:  # noqa: BLE001 - a stale ledger must not stop the fix card being tracked
+                events.record(conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]})
         # Spend the fix budget and repoint work_card_id in ONE statement: the next pass then waits for
         # the fix card to reach done, merges the fix card's branch, and the review lane can find it.
         conn.execute(
@@ -505,11 +614,35 @@ def run_pass(
     order (dispatch first) it was skipped for every card that dispatch reached first. Not closed: Hermes's
     own gateway dispatcher can still claim a review card between two of these passes; Gate 3 at merge time is
     the backstop for that."""
+    # The primary checkout first (ASES-GIT-12): it must still be on the integration branch, clean, and at the HEAD
+    # ASES itself last wrote. Hermes, not ASES, spawns workers, so a snapshot around each spawn is not possible;
+    # checking every pass bounds how long a stray write (the reviewer has file-write tools) can go unseen. A
+    # violation stops the pass before anything is dispatched or merged: nothing is safe to build on until a human
+    # has looked, and the polling loop reports it and halts (a deviation from "fails the card", because the writer
+    # cannot be attributed to a card).
+    guard = guards_mod.check_primary_checkout(
+        repo, plan.integration_branch, guards_mod.expected_head(conn, plan.project),
+    )
+    if not guard.ok:
+        problems = list(guard.problems)[:20]
+        events.record(conn, "integrity_violation", {"problems": problems, "head": guard.head, "branch": guard.branch})
+        return {"parked": [], "dispatch": {}, "sent_back": [], "merged": [], "unreviewed": [],
+                "usage_sessions": 0, "integrity": problems, "finished": False}
     unreviewed: list[str] = []
-    parked = process_budget_gate(board, plan, models_config, conn=conn, budgets=project.budgets)
+    # Real usage into the ledger first (ASES-CAP-03), as the blueprint's loop does: the budget gate below is
+    # only as honest as the ledger it reads. A failure here (one unreadable card, a Hermes hiccup) costs a
+    # stale ledger for one pass, not the pass.
+    try:
+        ingested = usage_mod.ingest_run_usage(board, plan, project, models_config, conn=conn)
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: see above
+        events.record(conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]})
+        ingested = []
+    parked = process_budget_gate(board, plan, models_config, conn=conn, budgets=project.budgets, project=project)
     sent_back = process_review_lane(board, repo, plan, conn=conn)
     dispatch_result = hermes_mod.kanban_dispatch(board)
-    merged = process_merge_queue(board, repo, plan, project, conn=conn, unreviewed=unreviewed)
+    merged = process_merge_queue(
+        board, repo, plan, project, conn=conn, unreviewed=unreviewed, models_config=models_config,
+    )
     finished = all_merge_cards_done(board, plan, conn=conn)
     return {"parked": parked, "dispatch": dispatch_result, "sent_back": sent_back, "merged": merged,
-            "unreviewed": unreviewed, "finished": finished}
+            "unreviewed": unreviewed, "usage_sessions": len(ingested), "integrity": [], "finished": finished}

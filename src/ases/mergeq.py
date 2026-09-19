@@ -59,6 +59,7 @@ def _resolve(repo: pathlib.Path, rev: str) -> str:
 def merge_task(
     repo: pathlib.Path, integration_branch: str, work_branch: str, task_key: str,
     gate3_commands: list[str], *, conn=None, commit_message: str | None = None, allow_empty: bool = False,
+    expected_head: str | None = None,
 ) -> MergeOutcome:
     """ASES-GIT-04: squash candidate on integration HEAD -> Gate 3 -> fast-forward -> done.
     A merge conflict or a red Gate 3 leaves the integration branch untouched and returns merged=False;
@@ -82,7 +83,12 @@ def merge_task(
     secret scan and no Gate 3 (there is no candidate diff), the integration branch is not touched, and the
     merge_records row is completed with squash_commit NULL and gate3_result "skipped". The outcome is
     merged=True with squash_commit None, which is how a caller tells a no-op from a real merge. When the
-    squash does stage changes allow_empty changes nothing."""
+    squash does stage changes allow_empty changes nothing.
+
+    `expected_head` closes the time-of-check gap (2026-09-19): the caller checked and gate-ran ONE commit of the
+    work branch (review.check_branch_for_merge), and a commit pushed after that must not ride in unchecked. With
+    it given, the branch must still be at exactly that commit, else the merge is refused (nothing is built);
+    and the squash is taken from that SHA itself, not from the branch name, so there is no window at all."""
     # Before mkdtemp and before any worktree, so refusing here leaves nothing behind to clean up.
     head = _git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
     current_branch = head.stdout.strip() if head.returncode == 0 else ""
@@ -100,6 +106,18 @@ def merge_task(
             f"whatever branch is checked out, not '{integration_branch}')",
         )
 
+    squash_ref = work_branch
+    if expected_head is not None:
+        now = _resolve(repo, work_branch)
+        if now != expected_head:
+            return MergeOutcome(
+                False, None, None, None,
+                f"branch {work_branch} moved after the pre-merge checks (checked {expected_head[:12]}, now "
+                f"{now[:12] or 'unresolvable'}): a later commit voids the review and the gate record "
+                f"(ASES-GIT-03), so nothing was merged",
+            )
+        squash_ref = expected_head
+
     tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="ases-merge-"))
     candidate = tmp_root / "candidate"
     try:
@@ -108,7 +126,7 @@ def merge_task(
         if add.returncode != 0:
             return MergeOutcome(False, None, None, None, f"could not create candidate worktree: {add.stderr}")
 
-        squash = _git(["merge", "--squash", work_branch], candidate)
+        squash = _git(["merge", "--squash", squash_ref], candidate)
         if squash.returncode != 0:
             _git(["merge", "--abort"], candidate)
             return MergeOutcome(False, None, None, None, f"merge conflict: {squash.stdout}{squash.stderr}")

@@ -6,6 +6,8 @@ import subprocess
 import pytest
 
 from ases import config, controller, db, events, hermes, mergeq, plan as plan_mod, review as review_mod
+from ases import guards as guards_mod
+from ases import usage as usage_mod
 
 
 def _git_ok(*args, cwd):
@@ -18,7 +20,10 @@ ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
 # Hermes records one run per attempt with the profile that ran it. A work card the reviewer approved ends with
 # a completed run by the reviewer profile, and only such a card may merge (ASES-GIT-03, 2026-09-19). Every
 # fake "done" work card below carries this unless a test deliberately says otherwise.
-REVIEWER_COMPLETED = {"outcome": "completed", "profile": "reviewer"}
+REVIEWER_COMPLETED = {
+    "outcome": "completed", "profile": "reviewer",
+    "metadata": {"review_outcome": "approved", "reviewer_checks": ["read the diff"]},
+}
 CODER_COMPLETED = {"outcome": "completed", "profile": "coder-1"}
 
 PLAN_RAW = {
@@ -696,9 +701,10 @@ def _script_merge_task(monkeypatch, *outcomes):
     queue = list(outcomes)
 
     def fake(repo, integration_branch, work_branch, task_key, gate3_commands, *, conn=None, commit_message=None,
-             allow_empty=False):
+             allow_empty=False, expected_head=None):
         calls.append({"integration_branch": integration_branch, "work_branch": work_branch, "task_key": task_key,
-                      "commit_message": commit_message, "allow_empty": allow_empty})
+                      "commit_message": commit_message, "allow_empty": allow_empty,
+                      "expected_head": expected_head})
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
     monkeypatch.setattr(mergeq, "merge_task", fake)
@@ -1406,7 +1412,9 @@ def test_fix_card_body_names_the_projects_own_reviewer_profile(tmp_path, monkeyp
     )
     states = _board_state(monkeypatch, pair)
     # This project's reviewer profile is "rev-2", so a card its reviewer approved was completed by that profile.
-    states[pair.work_card_id]["_runs"] = [{"outcome": "completed", "profile": "rev-2"}]
+    states[pair.work_card_id]["_runs"] = [
+        {"outcome": "completed", "profile": "rev-2", "metadata": {"review_outcome": "approved"}},
+    ]
     _record_card_actions(monkeypatch)
     _script_merge_task(monkeypatch, _CONFLICT)
 
@@ -1509,27 +1517,631 @@ def test_the_latest_completed_run_decides_whether_a_card_may_merge(tmp_path, mon
     assert len(_refused_events(conn)) == (0 if merges else 1)
 
 
-def test_run_pass_polices_the_review_lane_before_it_dispatches_and_reports_unreviewed_tasks(monkeypatch):
+def test_run_pass_polices_the_review_lane_before_it_dispatches_and_reports_unreviewed_tasks(tmp_path, monkeypatch):
     """Real bug (2026-09-19): dispatch ran first and it also claims cards waiting in `review` and spawns their
     reviewer, so the Gate 1 re-check (which only acts on cards still in `review`) was skipped for every card
     dispatch reached first. The blueprint's loop re-runs Gate 1 before anything else claims the card."""
     import types
 
     order = []
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: order.append("usage") or ["s1", "s2"])
     monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: order.append("budget") or [])
     monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: order.append("review") or [])
     monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: order.append("dispatch") or {})
 
-    def fake_merge_queue(board, repo, plan, project, *, conn, unreviewed=None):
+    passed = {}
+
+    def fake_merge_queue(board, repo, plan, project, *, conn, unreviewed=None, models_config=None):
         order.append("merge")
+        passed["merge_models_config"] = models_config
         unreviewed.append("T1")
         return []
 
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: (
+        order.append("budget") or passed.update(gate_project=kw.get("project")) or []))
     monkeypatch.setattr(controller, "process_merge_queue", fake_merge_queue)
     monkeypatch.setattr(controller, "all_merge_cards_done", lambda *a, **kw: False)
 
-    summary = controller.run_pass("b", None, None, types.SimpleNamespace(budgets={}), {}, conn=None)
+    _guard_ok(monkeypatch)
+    plan = types.SimpleNamespace(project="p", integration_branch="integration")
+    project = types.SimpleNamespace(budgets={})
+    models_config = {"providers": {}, "models": []}
 
-    assert order == ["budget", "review", "dispatch", "merge"]
+    summary = controller.run_pass(
+        "b", None, plan, project, models_config, conn=db.connect(tmp_path / "ases.db"),
+    )
+
+    # The budget gate needs the project for the review reserve; the merge queue needs the models config to ingest
+    # the outgoing card's usage before a fix-card repoint. Both were once easy to drop without a test noticing.
+    assert passed["gate_project"] is project
+    assert passed["merge_models_config"] is models_config
+
+    # Usage first (ASES-CAP-03: the budget gate is only as honest as the ledger), then the review lane
+    # before dispatch, as the blueprint's loop does.
+    assert order == ["usage", "budget", "review", "dispatch", "merge"]
     assert summary["unreviewed"] == ["T1"]
+    assert summary["usage_sessions"] == 2
     assert summary["finished"] is False
+
+
+# ---------------------------------------------------------------------------------------------
+# Real usage into the ledger, and the review reserve (ASES-CAP-03, 2026-09-19).
+# ---------------------------------------------------------------------------------------------
+
+def test_run_pass_survives_a_usage_ingest_failure(tmp_path, monkeypatch):
+    """A stale ledger for one pass is acceptable; a dead pass is not (one unreadable card would otherwise
+    stall the whole polling loop, since the ingest runs first)."""
+    import types
+
+    conn = db.connect(tmp_path / "ases.db")
+    order = []
+
+    def boom(*a, **kw):
+        raise hermes.HermesCommandError(["kanban", "show", "x"], 1, "card vanished")
+
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", boom)
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: order.append("budget") or [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: order.append("review") or [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: order.append("dispatch") or {})
+    monkeypatch.setattr(controller, "process_merge_queue", lambda *a, **kw: order.append("merge") or [])
+    monkeypatch.setattr(controller, "all_merge_cards_done", lambda *a, **kw: False)
+
+    _guard_ok(monkeypatch)
+    plan = types.SimpleNamespace(project="p", integration_branch="integration")
+
+    summary = controller.run_pass("b", None, plan, types.SimpleNamespace(budgets={}), {}, conn=conn)
+
+    assert order == ["budget", "review", "dispatch", "merge"]  # every later step still ran
+    assert summary["usage_sessions"] == 0
+    (event,) = [json.loads(e["payload"]) for e in events.recent(conn) if e["kind"] == "usage_ingest_error"]
+    assert "card vanished" in event["error"]
+
+
+REVIEW_MODELS_CONFIG = {
+    "providers": {
+        "xkiro": {"limits": {}},  # no known daily cap: the coder's own provider never runs dry
+        "openrouter": {"limits": {"per_day_default": 50, "per_day_after_credits": 1000}, "credits_purchased": False},
+    },
+    "models": [
+        {"provider": "xkiro", "model": "coder-m", "role_class": "coder", "pinned": True},
+        {"provider": "openrouter", "model": "rev-m", "role_class": "reviewer", "pinned": True},
+    ],
+}
+
+
+def _ready_cards_gate(tmp_path, monkeypatch, *, used_on_reviewer_provider, project_budgets):
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    monkeypatch.setattr(hermes, "kanban_create", lambda board, title, **kw: {"id": counter.next_id("t"), **kw})
+    project = dataclasses.replace(_project(tmp_path), budgets=project_budgets)
+    pairs = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, project, conn=conn)
+    from ases import ledger
+    if used_on_reviewer_provider:
+        ledger.record_usage(conn, "openrouter", "rev-m", n=used_on_reviewer_provider)
+    ready = [pairs[0].work_card_id, pairs[1].work_card_id]  # T1 (coder) and T2 (reviewer role)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": cid, "status": "ready"} for cid in ready] if status == "ready" else []
+    ))
+    scheduled = []
+    monkeypatch.setattr(hermes, "kanban_schedule", lambda b, cid, reason: scheduled.append((cid, reason)))
+    return plan, conn, project, pairs, scheduled
+
+
+def test_budget_gate_parks_coder_cards_when_the_reviewer_provider_cannot_afford_the_review_reserve(
+    tmp_path, monkeypatch,
+):
+    """ASES-CAP-03's review half: a coder card that finishes needs a review pass on the REVIEWER's provider.
+    Here the coder's provider has no cap but OpenRouter (the reviewer) is nearly spent, so starting the coder
+    card would only leave finished work sitting in review with nobody able to review it today. The reviewer
+    role's own card is a different question and is left alone: it has its own provider check."""
+    plan, conn, project, pairs, scheduled = _ready_cards_gate(
+        tmp_path, monkeypatch, used_on_reviewer_provider=35,  # 15 of 50 left, minus the 10% reserve = 10 usable
+        project_budgets={"review_reserve_requests": 20, "daily_reserve_percent": 10},
+    )
+
+    parked = controller.process_budget_gate(
+        "b", plan, REVIEW_MODELS_CONFIG, conn=conn, budgets={}, project=project,
+    )
+
+    assert parked == ["T1"]
+    assert [cid for cid, _ in scheduled] == [pairs[0].work_card_id]
+    assert "review budget on openrouter" in scheduled[0][1]
+    assert any(e["kind"] == "card_parked_for_budget" for e in events.recent(conn))
+
+
+def test_budget_gate_starts_coder_cards_when_the_review_reserve_is_affordable(tmp_path, monkeypatch):
+    plan, conn, project, pairs, scheduled = _ready_cards_gate(
+        tmp_path, monkeypatch, used_on_reviewer_provider=10,  # 40 left: plenty for a 20 request reserve
+        project_budgets={"review_reserve_requests": 20, "daily_reserve_percent": 10},
+    )
+
+    parked = controller.process_budget_gate(
+        "b", plan, REVIEW_MODELS_CONFIG, conn=conn, budgets={}, project=project,
+    )
+
+    assert parked == [] and scheduled == []
+
+
+def test_budget_gate_without_a_project_never_applies_the_review_reserve(tmp_path, monkeypatch):
+    """The review reserve needs the project's roles and budgets; the pre-existing callers that pass none keep
+    exactly the behaviour they had."""
+    plan, conn, project, pairs, scheduled = _ready_cards_gate(
+        tmp_path, monkeypatch, used_on_reviewer_provider=45,
+        project_budgets={"review_reserve_requests": 20},
+    )
+
+    parked = controller.process_budget_gate("b", plan, REVIEW_MODELS_CONFIG, conn=conn, budgets={})
+
+    assert "T1" not in parked
+
+
+def test_fix_card_creation_ingests_the_outgoing_cards_usage_before_the_repoint(tmp_path, monkeypatch):
+    """Found by the usage builder: process_merge_queue repoints plan_tasks.work_card_id at a fix card, after
+    which the per-pass ingest never reads the outgoing card again, so a reviewer run that ended since the last
+    pass would go uncounted. The outgoing card is ingested first, by id, and only when models_config is given."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+    calls = []
+
+    def fake_ingest(board, card_id, proj, models_config, *, conn, plan_project=None, task_key=None):
+        calls.append((card_id, _task_row(conn)["work_card_id"], plan_project, task_key))  # work_card_id at call time
+        return []
+
+    monkeypatch.setattr(usage_mod, "ingest_card_usage", fake_ingest)
+
+    controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, models_config=REVIEW_MODELS_CONFIG,
+    )
+
+    # the ORIGINAL card, before it was repointed, attributed to its plan task
+    assert calls == [(pair.work_card_id, pair.work_card_id, plan.project, "T1")]
+    assert _task_row(conn)["work_card_id"] != pair.work_card_id  # and only then was it repointed
+
+
+def test_fix_card_creation_without_models_config_does_not_ingest(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+    monkeypatch.setattr(usage_mod, "ingest_card_usage", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no")))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert len(_fix_cards(created)) == 1  # the fix card was still made
+
+
+def test_a_failing_outgoing_card_ingest_does_not_stop_the_fix_card(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+
+    def boom(*a, **kw):
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(usage_mod, "ingest_card_usage", boom)
+
+    controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, models_config=REVIEW_MODELS_CONFIG,
+    )
+
+    assert len(_fix_cards(created)) == 1
+    assert _task_row(conn)["work_card_id"] != pair.work_card_id
+    assert any(e["kind"] == "usage_ingest_error" for e in events.recent(conn))
+
+
+# ---------------------------------------------------------------------------------------------
+# The primary checkout guard (ASES-GIT-12, 2026-09-19).
+# ---------------------------------------------------------------------------------------------
+
+def _guard_ok(monkeypatch, expected=None):
+    """Make run_pass's per-pass guard pass without a real repository (guards.py has its own git tests)."""
+    seen = []
+
+    def fake_check(repo, integration_branch, expected_head=None, **kw):
+        seen.append((integration_branch, expected_head))
+        return guards_mod.GuardResult(True, (), "abc123", integration_branch)
+
+    monkeypatch.setattr(guards_mod, "check_primary_checkout", fake_check)
+    return seen
+
+
+def test_run_pass_halts_before_doing_anything_when_the_primary_checkout_was_changed(tmp_path, monkeypatch):
+    """ASES-GIT-12: a dirty primary checkout, a HEAD ASES did not move or a wrong branch stops the pass BEFORE
+    usage, budget, review, dispatch or merge run, records a security event, and reports the problems so the
+    polling loop can halt. Nothing is safe to build on until a human has looked."""
+    import types
+
+    conn = db.connect(tmp_path / "ases.db")
+    order = []
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: order.append("usage") or [])
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: order.append("budget") or [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: order.append("review") or [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: order.append("dispatch") or {})
+    monkeypatch.setattr(controller, "process_merge_queue", lambda *a, **kw: order.append("merge") or [])
+    monkeypatch.setattr(guards_mod, "check_primary_checkout", lambda *a, **kw: guards_mod.GuardResult(
+        False, ("primary checkout is dirty: ?? 'stray.txt'", "primary checkout HEAD moved: expected aaa, found bbb"),
+        "bbb", "integration"))
+    plan = types.SimpleNamespace(project="p", integration_branch="integration")
+
+    summary = controller.run_pass("b", tmp_path, plan, types.SimpleNamespace(budgets={}), {}, conn=conn)
+
+    assert order == []  # not one later step ran
+    assert summary["integrity"] == ["primary checkout is dirty: ?? 'stray.txt'",
+                                    "primary checkout HEAD moved: expected aaa, found bbb"]
+    assert summary["finished"] is False and summary["merged"] == [] and summary["dispatch"] == {}
+    (event,) = [json.loads(e["payload"]) for e in events.recent(conn) if e["kind"] == "integrity_violation"]
+    assert event["head"] == "bbb" and len(event["problems"]) == 2
+
+
+def test_run_pass_passes_the_stored_expected_head_and_the_plans_integration_branch_to_the_guard(tmp_path, monkeypatch):
+    import types
+
+    conn = db.connect(tmp_path / "ases.db")
+    guards_mod.set_expected_head(conn, "p", "deadbeef")
+    seen = _guard_ok(monkeypatch)
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: {})
+    monkeypatch.setattr(controller, "process_merge_queue", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "all_merge_cards_done", lambda *a, **kw: False)
+    plan = types.SimpleNamespace(project="p", integration_branch="trunk")
+
+    summary = controller.run_pass("b", tmp_path, plan, types.SimpleNamespace(budgets={}), {}, conn=conn)
+
+    assert seen == [("trunk", "deadbeef")]
+    assert summary["integrity"] == []
+
+
+def test_a_real_merge_records_the_new_head_as_the_expected_one(tmp_path, monkeypatch):
+    """The merge queue moves the primary checkout's HEAD itself, so the guard must expect the new tip or the
+    controller's own fast-forward would be reported as a violation on the very next pass."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == ["T1"]
+
+    assert guards_mod.expected_head(conn, plan.project) == "cand1"
+
+
+def test_a_no_op_merge_leaves_the_expected_head_alone(tmp_path, monkeypatch):
+    repo = _repo_with_branch_at_tip(tmp_path, "swarm/T1-reviewer")
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("reviewer"))
+    _board_state(monkeypatch, pair, branch="swarm/T1-reviewer")
+    _record_card_actions(monkeypatch)
+    guards_mod.set_expected_head(conn, plan.project, "before")
+
+    controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert guards_mod.expected_head(conn, plan.project) == "before"  # nothing was committed, HEAD did not move
+
+
+def test_a_failed_merge_leaves_the_expected_head_alone(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _CONFLICT)
+    guards_mod.set_expected_head(conn, plan.project, "before")
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert guards_mod.expected_head(conn, plan.project) == "before"
+
+
+# ---------------------------------------------------------------------------------------------
+# Merge-time checks in front of merge_task (ASES-GIT-03, GIT-13, REV-05, REV-06, QG-01, 2026-09-19). review.py has
+# its own tests for the checks themselves; these pin how process_merge_queue USES them.
+# ---------------------------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _pre_merge_check_passes(monkeypatch):
+    """The merge queue now calls review.check_branch_for_merge before merge_task. Every test below that is about
+    something else gets a passing check whose head is the real branch tip when the repository exists, so the
+    real-git tests still merge the right commit. Tests about the check itself replace this stub."""
+    def lenient(repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key, **kwargs):
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "-q", branch], capture_output=True, text=True,
+        ).stdout.strip() or "0" * 40
+        return review_mod.BranchCheck(True, "ok", "stubbed for the merge-queue tests", head)
+
+    monkeypatch.setattr(review_mod, "check_branch_for_merge", lenient)
+
+
+def _stub_check(monkeypatch, result):
+    seen = []
+
+    def fake(repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key, **kwargs):
+        seen.append({"branch": branch, "integration_branch": integration_branch, "gate1_commands": gate1_commands,
+                     "touches": touches, "task_key": task_key, **kwargs})
+        return result
+
+    monkeypatch.setattr(review_mod, "check_branch_for_merge", fake)
+    return seen
+
+
+def _work_card_runs(monkeypatch, pair, runs, **board_kwargs):
+    states = _board_state(monkeypatch, pair, **board_kwargs)
+    states[pair.work_card_id]["_runs"] = runs
+    return states
+
+
+def _reviewer_run(metadata):
+    return {"outcome": "completed", "profile": "reviewer", "metadata": metadata}
+
+
+def _refusals(conn, kind):
+    return [json.loads(e["payload"]) for e in events.recent(conn, limit=200) if e["kind"] == kind]
+
+
+def test_a_reviewer_completion_with_no_verdict_metadata_is_refused(tmp_path, monkeypatch):
+    """ASES-REV-06: the verdict is a tool call with schema-checked metadata. A reviewer that completed the card
+    without any is not a recorded PASS."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(None)])
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    unreviewed = []
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn, unreviewed=unreviewed)
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)  # the next poll
+
+    assert merged == [] and calls == [] and unreviewed == ["T1"]
+    (event,) = _refusals(conn, "merge_refused_invalid_verdict")  # once, not once per poll
+    assert event["card_id"] == pair.work_card_id and event["task_key"] == "T1" and event["problems"]
+    assert _fix_cards(created) == [] and _task_row(conn)["fix_cards"] == 0  # a refusal is not a merge failure
+
+
+@pytest.mark.parametrize("metadata", [
+    {"review_outcome": "changes_needed"},
+    {"review_status": "CHANGES_REQUIRED", "required_changes": ["add a test"]},
+    {"review_status": "BLOCKED"},
+    {"review_outcome": "approved", "review_status": "CHANGES_REQUIRED"},  # contradiction is never read as PASS
+    {"review_outcome": "approved", "commit": "not-hex"},
+    "not json at all",
+])
+def test_a_verdict_that_is_not_a_well_formed_pass_is_refused(tmp_path, monkeypatch, metadata):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(metadata)])
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
+
+    assert calls == []
+    assert len(_refusals(conn, "merge_refused_invalid_verdict")) == 1
+
+
+@pytest.mark.parametrize("metadata", [
+    {"review_outcome": "approved"},                                  # what the Hermes review skill emits
+    {"review_status": "PASS", "summary": "fine", "test_gaps": []},   # the blueprint's shape (section 13.3)
+    json.dumps({"review_outcome": "approved"}),                      # metadata as a JSON string
+])
+def test_both_verdict_shapes_and_a_json_string_are_accepted_as_a_pass(tmp_path, monkeypatch, metadata):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(metadata)])
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == ["T1"]
+
+    assert len(calls) == 1
+
+
+def test_the_merge_time_check_gets_the_tasks_own_gate_commands_touches_and_branch(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    seen = _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "abc123def456"))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert len(seen) == 1
+    assert {k: seen[0][k] for k in ("branch", "integration_branch", "gate1_commands", "touches", "task_key")} == {
+        "branch": "swarm/T1-coder", "integration_branch": "integration",
+        "gate1_commands": ["echo ok"], "touches": ["base.txt"], "task_key": "T1"}
+    assert seen[0]["require_binding"] is True  # the merge queue always asks for the approval to be bound
+
+
+def test_merge_task_is_told_the_exact_commit_that_was_checked(tmp_path, monkeypatch):
+    """The time-of-check gap: a commit pushed after the check must not ride in unchecked."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "abc123def456"))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert calls[0]["expected_head"] == "abc123def456"
+
+
+@pytest.mark.parametrize("kind", ["out_of_scope", "gate1_red", "stale_review", "unresolvable_branch", "no_merge_base"])
+def test_a_failed_merge_time_check_takes_the_ordinary_failure_path_and_never_merges(tmp_path, monkeypatch, kind):
+    """A red result is a capability failure, not a refusal: merge_failed, a fix card carrying the exact reason,
+    bounded by fix_cards_per_task. merge_task is never reached."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    _stub_check(monkeypatch, review_mod.BranchCheck(False, kind, f"detail for {kind}", "abc123def456"))
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert merged == [] and calls == []
+    (failed,) = _refusals(conn, "merge_failed")
+    assert kind in failed["detail"] and f"detail for {kind}" in failed["detail"]
+    (fix_card,) = _fix_cards(created)
+    assert f"detail for {kind}" in fix_card["body"]
+    assert _task_row(conn)["fix_cards"] == 1
+
+
+def test_a_failed_check_after_the_fix_budget_is_spent_blocks_the_merge_card(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=0)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    _stub_check(monkeypatch, review_mod.BranchCheck(False, "out_of_scope", "stray path", "abc123def456"))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert [cid for cid, _ in actions["block"]] == [pair.merge_card_id]
+    assert _fix_cards(created) == []
+
+
+def test_a_verdict_quoting_a_different_commit_than_the_checked_head_is_refused(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run({"review_status": "PASS", "commit": "aaaaaaa"})])
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "bbbbbbbb" + "0" * 32))
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
+
+    assert calls == []
+    (event,) = _refusals(conn, "merge_refused_verdict_commit_mismatch")
+    assert event["reviewed_commit"] == "aaaaaaa" and event["branch_head"].startswith("bbbbbbbb")
+
+
+def test_a_verdict_quoting_a_prefix_of_the_checked_head_merges(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run({"review_status": "PASS", "commit": "bbbbbbb"})])
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "bbbbbbbb" + "0" * 32))
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == ["T1"]
+
+    assert len(calls) == 1
+
+
+def test_an_accepted_verdict_is_stored_by_commit_sha_exactly_once(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run({"review_outcome": "approved", "reviewer_checks": ["ok"]})])
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    head = "c" * 40
+    _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", head))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)  # a retry stores nothing new
+
+    rows = conn.execute("SELECT * FROM review_verdicts").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["project"], row["task_key"], row["commit_sha"], row["card_id"], row["outcome"],
+            row["reviewer_profile"]) == (plan.project, "T1", head, pair.work_card_id, "PASS", "reviewer")
+    assert "approved" in row["metadata"]
+
+
+def test_a_refused_verdict_is_not_stored(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(None)])
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM review_verdicts").fetchone()["n"] == 0
+
+
+def test_a_reviewer_role_task_needs_no_verdict_and_no_branch_check(tmp_path, monkeypatch):
+    """A reviewer-role task has no diff, no Gate 1 record and no verdict in the review-lane schema: its merge is
+    the recorded no-op, and none of the coder-only checks apply."""
+    repo = _repo_with_branch_at_tip(tmp_path, "swarm/T1-reviewer")
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("reviewer"))
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(None)], branch="swarm/T1-reviewer")
+    _record_card_actions(monkeypatch)
+
+    def _forbidden(*a, **kw):
+        raise AssertionError("no branch check for a reviewer-role task")
+
+    monkeypatch.setattr(review_mod, "check_branch_for_merge", _forbidden)
+
+    assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == ["T1"]
+
+    assert _refusals(conn, "merge_refused_invalid_verdict") == []
+
+
+# ---------------------------------------------------------------------------------------------
+# The approval is bound to a commit (ASES-GIT-03), found by an independent nemotron review: the Hermes review
+# skill's verdict has no commit field, so the reviewed commit comes from the verdict when it quotes one and from
+# the coder's hand-off otherwise.
+# ---------------------------------------------------------------------------------------------
+
+def _handoff_run(commit=None, key="commit_sha", as_json=False):
+    metadata = {key: commit} if commit is not None else {"summary": "done"}
+    return {"outcome": "review_requested", "profile": "coder-1", "metadata": json.dumps(metadata) if as_json else metadata}
+
+
+def _reviewed_commit_passed(tmp_path, monkeypatch, runs):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, runs)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    seen = _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "a" * 40))
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+    return seen[0]["reviewed_commit"]
+
+
+def test_the_reviewed_commit_is_the_one_the_verdict_quotes(tmp_path, monkeypatch):
+    runs = [_handoff_run("1111111"), _reviewer_run({"review_status": "PASS", "commit": "aaaaaaa"})]
+
+    assert _reviewed_commit_passed(tmp_path, monkeypatch, runs) == "aaaaaaa"  # the verdict wins over the hand-off
+
+
+def test_without_a_verdict_commit_the_reviewed_commit_is_the_one_the_coder_handed_off(tmp_path, monkeypatch):
+    runs = [_handoff_run("a" * 40), _reviewer_run({"review_outcome": "approved"})]
+
+    assert _reviewed_commit_passed(tmp_path, monkeypatch, runs) == "a" * 40
+
+
+@pytest.mark.parametrize("handoff", [
+    _handoff_run("abcdef1", key="commit"),              # the alternative field name
+    _handoff_run("abcdef1", as_json=True),              # metadata that arrives as a JSON string
+])
+def test_the_hand_off_commit_is_found_under_either_field_and_as_a_json_string(tmp_path, monkeypatch, handoff):
+    runs = [handoff, _reviewer_run({"review_outcome": "approved"})]
+
+    assert _reviewed_commit_passed(tmp_path, monkeypatch, runs) == "abcdef1"
+
+
+def test_the_latest_hand_off_is_the_one_that_counts(tmp_path, monkeypatch):
+    """A changes-requested round produces a second hand-off: the approval is for the LAST commit handed off."""
+    runs = [_handoff_run("1111111"), _handoff_run("2222222"), _reviewer_run({"review_outcome": "approved"})]
+
+    assert _reviewed_commit_passed(tmp_path, monkeypatch, runs) == "2222222"
+
+
+@pytest.mark.parametrize("handoff_runs", [
+    [],                                                  # no hand-off at all
+    [_handoff_run(None)],                                # a hand-off that names no commit
+    [_handoff_run("not-a-sha")],                         # not hex
+    [_handoff_run("abc")],                               # too short to identify a commit
+    [{"outcome": "review_requested", "profile": "coder-1", "metadata": "{broken"}],
+    [{"outcome": "review_requested", "profile": "coder-1", "metadata": None}],
+    [{"outcome": "review_requested", "profile": "coder-1", "metadata": ["a" * 40]}],
+])
+def test_no_commit_anywhere_passes_none_so_the_check_can_refuse_an_unbound_approval(tmp_path, monkeypatch, handoff_runs):
+    runs = [*handoff_runs, _reviewer_run({"review_outcome": "approved"})]
+
+    assert _reviewed_commit_passed(tmp_path, monkeypatch, runs) is None
+
+
+def test_an_unbound_approval_takes_the_failure_path_and_never_merges(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    _stub_check(monkeypatch, review_mod.BranchCheck(False, "unbound_review", "cannot bind", "a" * 40))
+
+    assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
+
+    assert calls == []
+    assert "unbound_review" in _refusals(conn, "merge_failed")[0]["detail"]

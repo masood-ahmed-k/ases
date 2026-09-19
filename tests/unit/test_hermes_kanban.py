@@ -54,3 +54,103 @@ def test_kanban_reopen_review_raises_when_hermes_refuses(monkeypatch):
 
     with pytest.raises(hermes.HermesCommandError):
         hermes.kanban_reopen_review("b", "t_1", "anything")
+
+
+def _capture(monkeypatch, stdout=""):
+    seen = []
+
+    def fake_run(args, **kw):
+        seen.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(hermes, "_run", fake_run)
+    return seen
+
+
+def test_kanban_show_also_returns_events_comments_and_latest_summary(monkeypatch):
+    real = {
+        "task": {"id": "t_1", "status": "blocked"},
+        "parents": [], "children": [], "runs": [],
+        "comments": [{"author": "default", "body": "BLOCKED: which database?", "created_at": 1}],
+        "events": [{"kind": "blocked", "payload": {"reason": "which database?"}, "created_at": 1, "run_id": 1}],
+        "latest_summary": "s",
+    }
+    monkeypatch.setattr(hermes, "_run", lambda args, **kw: subprocess.CompletedProcess(
+        args, 0, stdout=json.dumps(real), stderr=""))
+
+    card = hermes.kanban_show("b", "t_1")
+
+    assert card["_events"][0]["payload"]["reason"] == "which database?"
+    assert card["_comments"][0]["body"] == "BLOCKED: which database?"
+    assert card["_latest_summary"] == "s"
+
+
+def test_kanban_show_defaults_events_and_comments_to_empty_lists(monkeypatch):
+    monkeypatch.setattr(hermes, "_run", lambda args, **kw: subprocess.CompletedProcess(
+        args, 0, stdout=json.dumps({"task": {"id": "t_1"}}), stderr=""))
+
+    card = hermes.kanban_show("b", "t_1")
+
+    assert card["_events"] == [] and card["_comments"] == [] and card["_latest_summary"] is None
+
+
+def test_kanban_comment_passes_the_text_after_a_double_dash_so_a_leading_dash_is_not_an_option(monkeypatch):
+    seen = _capture(monkeypatch)
+
+    hermes.kanban_comment("b", "t_1", "-x looks like an option", author="asestest")
+
+    assert seen == [["kanban", "--board", "b", "comment", "--author", "asestest", "t_1", "--", "-x looks like an option"]]
+
+
+def test_kanban_comment_without_an_author_leaves_the_default(monkeypatch):
+    seen = _capture(monkeypatch)
+
+    hermes.kanban_comment("b", "t_1", "hello")
+
+    assert seen == [["kanban", "--board", "b", "comment", "t_1", "--", "hello"]]
+
+
+def test_kanban_unblock_with_a_reason_uses_the_single_argument_form(monkeypatch):
+    seen = _capture(monkeypatch)
+
+    hermes.kanban_unblock("b", "t_1", "-use sqlite")
+    hermes.kanban_unblock("b", "t_2")
+
+    assert seen == [
+        ["kanban", "--board", "b", "unblock", "t_1", "--reason=-use sqlite"],
+        ["kanban", "--board", "b", "unblock", "t_2"],
+    ]
+
+
+def test_kanban_promote_passes_the_reason_after_a_double_dash(monkeypatch):
+    seen = _capture(monkeypatch)
+
+    hermes.kanban_promote("b", "t_1", "validated by the controller")
+    hermes.kanban_promote("b", "t_2")
+
+    assert seen == [
+        ["kanban", "--board", "b", "promote", "t_1", "--", "validated by the controller"],
+        ["kanban", "--board", "b", "promote", "t_2"],
+    ]
+
+
+def test_kanban_archive_archives_only_and_never_purges(monkeypatch):
+    seen = _capture(monkeypatch)
+
+    hermes.kanban_archive("b", ["t_1", "t_2"])
+    hermes.kanban_archive("b", [])
+
+    assert seen == [["kanban", "--board", "b", "archive", "t_1", "t_2"]]  # nothing called for the empty list
+    assert not any("--rm" in call for call in seen)
+
+
+def test_kanban_set_model_pins_or_clears(monkeypatch):
+    seen = _capture(monkeypatch)
+
+    hermes.kanban_set_model("b", "t_1", "minimax/minimax-m3:free", provider="xkiro")
+    hermes.kanban_set_model("b", "t_2", None)
+
+    assert seen == [
+        ["kanban", "--board", "b", "set-model", "--provider", "xkiro", "t_1", "minimax/minimax-m3:free"],
+        ["kanban", "--board", "b", "set-model", "t_2", "none"],
+    ]

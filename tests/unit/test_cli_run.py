@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from ases import cli, db, events
+from ases import cli, db, events, guards
 
 
 @pytest.fixture
@@ -16,13 +16,16 @@ def wired(tmp_path, monkeypatch):
     """cmd_run with everything outside the loop stubbed, so only the loop's own behaviour is under test."""
     db_file = tmp_path / "ases.db"
     project = types.SimpleNamespace(board="b", roles={"coder": "coder-1", "reviewer": "reviewer"}, budgets={})
-    plan = types.SimpleNamespace(project="p", gate_profiles={})
+    plan = types.SimpleNamespace(project="p", gate_profiles={}, integration_branch="integration", serialization_links=())
     monkeypatch.setattr(cli, "_load_project", lambda: project)
     monkeypatch.setattr(cli.ases_config, "db_path", lambda p: db_file)
     monkeypatch.setattr(cli.plan_mod, "load_plan_file", lambda *a, **kw: plan)
     monkeypatch.setattr(cli.controller_mod, "verify_gate_pin", lambda *a, **kw: None)
     monkeypatch.setattr("ases.reconcile.check", lambda *a, **kw: [])
     monkeypatch.setattr(cli, "_load_models_config", lambda: {})
+    monkeypatch.setattr(cli.guards_mod, "check_primary_checkout",
+                        lambda *a, **kw: guards.GuardResult(True, (), "abc", "integration"))
+    monkeypatch.setattr(cli.guards_mod, "adopt_current_head", lambda conn, project, repo: "abc")
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
     args = argparse.Namespace(repo=str(tmp_path), max_iterations=20, sleep_seconds=0)
     return types.SimpleNamespace(args=args, db_file=db_file)
@@ -92,3 +95,67 @@ def test_unreviewed_tasks_are_shown_on_the_pass_line(wired, monkeypatch, capsys)
     assert cli.cmd_run(wired.args) == 0
 
     assert "unreviewed=['T1']" in capsys.readouterr().out
+
+
+def test_usage_sessions_are_shown_on_the_pass_line_only_when_there_are_some(wired, monkeypatch, capsys):
+    _scripted_run_pass(monkeypatch, [dict(_NOT_DONE, usage_sessions=3), dict(_NOT_DONE, usage_sessions=0), _DONE])
+
+    assert cli.cmd_run(wired.args) == 0
+
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[pass")]
+    assert "usage_sessions=3" in lines[0]
+    assert "usage_sessions" not in lines[1]
+
+
+def test_run_refuses_to_start_on_a_primary_checkout_ases_cannot_trust(wired, monkeypatch, capsys):
+    """ASES-GIT-12: a dirty or wrong-branch primary checkout stops swarm run before the first pass."""
+    monkeypatch.setattr(cli.guards_mod, "check_primary_checkout", lambda *a, **kw: guards.GuardResult(
+        False, ("primary checkout is dirty: ?? 'stray.txt'",), "abc", "integration"))
+    calls = _scripted_run_pass(monkeypatch, [_DONE])
+
+    assert cli.cmd_run(wired.args) == 3
+
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "REFUSED (ASES-GIT-12)" in err and "stray.txt" in err
+
+
+def test_run_adopts_the_checkouts_head_only_after_the_guard_passes(wired, monkeypatch):
+    adopted = []
+    monkeypatch.setattr(cli.guards_mod, "adopt_current_head", lambda conn, project, repo: adopted.append(project) or "abc")
+    _scripted_run_pass(monkeypatch, [_DONE])
+
+    assert cli.cmd_run(wired.args) == 0
+
+    assert adopted == ["p"]
+
+
+def test_run_does_not_adopt_a_head_it_refused(wired, monkeypatch):
+    adopted = []
+    monkeypatch.setattr(cli.guards_mod, "check_primary_checkout", lambda *a, **kw: guards.GuardResult(
+        False, ("wrong branch",), "abc", "other"))
+    monkeypatch.setattr(cli.guards_mod, "adopt_current_head", lambda conn, project, repo: adopted.append(project) or "abc")
+    _scripted_run_pass(monkeypatch, [_DONE])
+
+    assert cli.cmd_run(wired.args) == 3
+
+    assert adopted == []
+
+
+def test_run_halts_with_exit_code_3_and_names_the_problems_on_a_security_event(wired, monkeypatch, capsys):
+    summary = dict(_NOT_DONE, integrity=["primary checkout is dirty: ?? 'stray.txt'"])
+    calls = _scripted_run_pass(monkeypatch, [summary, _DONE])
+
+    assert cli.cmd_run(wired.args) == 3
+
+    assert len(calls) == 1  # halted on the first violation, did not poll on
+    err = capsys.readouterr().err
+    assert "SECURITY EVENT" in err and "stray.txt" in err
+
+
+def test_serialization_lines_tell_the_user_what_gate_0_added():
+    link = types.SimpleNamespace(later="T2", earlier="T1", reason="touches overlap: src/* and src/a.py")
+    plan = types.SimpleNamespace(serialization_links=(link,))
+
+    assert cli.serialization_lines(plan) == ["  Gate 0 serialized T2 after T1: touches overlap: src/* and src/a.py"]
+    assert cli.serialization_lines(types.SimpleNamespace(serialization_links=())) == []

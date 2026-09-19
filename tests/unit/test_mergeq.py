@@ -506,3 +506,72 @@ def test_no_op_leaves_no_worktree_or_temp_dir_behind(repo, monkeypatch):
     assert made and all(not path.exists() for path in made)  # the throwaway directory is gone
     lines = [ln for ln in _git_ok("worktree", "list", cwd=repo).stdout.splitlines() if ln.strip()]
     assert len(lines) == 1  # only the primary checkout is still registered
+
+
+def test_expected_head_merges_exactly_the_checked_commit(repo, tmp_path):
+    """The time-of-check gap: the caller gate-ran ONE commit, so that SHA is what gets squashed."""
+    _make_work_branch(repo, "swarm/X1", "new.txt", "hello\n")
+    checked = _git_ok("rev-parse", "swarm/X1", cwd=repo).stdout.strip()
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/X1", "X1", ["echo ok"], conn=conn, expected_head=checked)
+
+    assert outcome.merged is True
+    assert (repo / "new.txt").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_expected_head_refuses_when_the_branch_moved_after_the_checks(repo, tmp_path):
+    _make_work_branch(repo, "swarm/X2", "new.txt", "hello\n")
+    checked = _git_ok("rev-parse", "swarm/X2", cwd=repo).stdout.strip()
+    _git_ok("checkout", "-q", "swarm/X2", cwd=repo)  # a late commit lands on the branch after the checks
+    (repo / "late.txt").write_text("unchecked\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "late", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    conn = db.connect(tmp_path / "ases.db")
+    before = _tip(repo)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/X2", "X2", ["echo ok"], conn=conn, expected_head=checked)
+
+    assert outcome.merged is False
+    assert "moved after the pre-merge checks" in outcome.detail and checked[:12] in outcome.detail
+    assert _tip(repo) == before and not (repo / "late.txt").exists()
+    assert _merge_row(conn, "X2") is None
+
+
+def test_expected_head_for_an_unresolvable_branch_is_refused(repo, tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/nope", "X3", ["echo ok"], conn=conn, expected_head="a" * 40)
+
+    assert outcome.merged is False and "unresolvable" in outcome.detail
+
+
+def test_without_expected_head_the_branch_name_is_used_as_before(repo, tmp_path):
+    _make_work_branch(repo, "swarm/X4", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    assert mergeq.merge_task(repo, "integration", "swarm/X4", "X4", ["echo ok"], conn=conn).merged is True
+
+
+def test_the_squash_is_taken_from_the_checked_sha_even_if_the_branch_moves_after_the_head_comparison(
+    repo, tmp_path, monkeypatch,
+):
+    """Belt and braces for the last window: even if the branch moves between the head comparison and the squash,
+    the squash comes from the checked SHA, so the late commit cannot ride in. The comparison is faked to see the
+    checked head, as it would in that window."""
+    _make_work_branch(repo, "swarm/X5", "new.txt", "hello\n")
+    checked = _git_ok("rev-parse", "swarm/X5", cwd=repo).stdout.strip()
+    _git_ok("checkout", "-q", "swarm/X5", cwd=repo)
+    (repo / "late.txt").write_text("unchecked\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "late", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    real_resolve = mergeq._resolve
+    monkeypatch.setattr(mergeq, "_resolve", lambda r, rev: checked if rev == "swarm/X5" else real_resolve(r, rev))
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/X5", "X5", ["echo ok"], conn=conn, expected_head=checked)
+
+    assert outcome.merged is True
+    assert (repo / "new.txt").exists() and not (repo / "late.txt").exists()

@@ -18,6 +18,7 @@ from . import controller as controller_mod
 from . import db as ases_db
 from . import doctor as ases_doctor
 from . import events as events_mod
+from . import guards as guards_mod
 from . import hermes as hermes_mod
 from . import models as models_mod
 from . import plan as plan_mod
@@ -42,6 +43,13 @@ def _load_project() -> ases_config.ProjectConfig:
 
 def _load_models_config() -> dict:
     return ases_config.load_models_config(_repo_root() / "config" / "models.yaml")
+
+
+def serialization_lines(plan) -> list[str]:
+    """What Gate 0 added (ASES-GIT-08): tasks with overlapping touches and no dependency path are run one after
+    the other, the lower priority after the higher. Shown at approve so the user is never surprised that two
+    tasks they expected to run side by side will not."""
+    return [f"  Gate 0 serialized {link.later} after {link.earlier}: {link.reason}" for link in plan.serialization_links]
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
@@ -100,6 +108,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         f'"touches": ["<path glob>", ...], "acceptance": ["<criterion>", ...], '
         f'"gate_profile": "<name>", "estimated_requests": <int>}}]}}. '
         f"Keep it small: 2 to 4 tasks. Every task's role must be exactly 'coder' or 'reviewer'. "
+        f"touches entries are glob patterns relative to the repository root: use exact file names, or dir/** "
+        f"for everything under a directory (a bare directory name matches nothing). Tasks whose touches "
+        f"overlap and that have no dependency between them will be run one after the other by Gate 0. "
         f"Use a trivial, fast gate_profile command since this is a throwaway test repo. "
         f"After writing the file, reply with just the word done."
     )
@@ -149,6 +160,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
             print(f"  - {e}")
         return 1
     print(f"Gate 0 passed: {len(plan.tasks)} tasks")
+    for line in serialization_lines(plan):
+        print(line)
 
     models_config = _load_models_config()
     provider_policies = {name: p.get("data_policy") for name, p in models_config["providers"].items()}
@@ -225,6 +238,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"swarm run REFUSED (ASES-QG-02): {exc}", file=sys.stderr)
         return 1
 
+    # ASES-GIT-12: refuse to start on a primary checkout ASES cannot trust (wrong branch, uncommitted changes),
+    # then adopt its HEAD as the one the per-pass guard expects.
+    guard = guards_mod.check_primary_checkout(repo, plan.integration_branch)
+    if not guard.ok:
+        print("swarm run REFUSED (ASES-GIT-12): the primary checkout is not in a state ASES can trust:", file=sys.stderr)
+        for problem in guard.problems[:20]:
+            print(f"  - {problem}", file=sys.stderr)
+        return 3
+    guards_mod.adopt_current_head(conn, plan.project, repo)
+
     from . import reconcile as reconcile_mod
     findings = reconcile_mod.check(project.board, plan.project, conn=conn)
     for f in findings:
@@ -254,10 +277,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             time.sleep(args.sleep_seconds)
             continue
         consecutive_errors = 0
+        if summary.get("integrity"):
+            print(f"[pass {i + 1}] SECURITY EVENT: the primary checkout changed outside the controller "
+                  f"(ASES-GIT-12); halting so a human can look before anything else is dispatched or merged:",
+                  file=sys.stderr)
+            for problem in summary["integrity"]:
+                print(f"  - {problem}", file=sys.stderr)
+            return 3
         line = (f"[pass {i + 1}] parked={summary['parked']} merged={summary['merged']} "
                 f"sent_back={summary['sent_back']}")
         if summary.get("unreviewed"):
             line += f" unreviewed={summary['unreviewed']}"
+        if summary.get("usage_sessions"):
+            line += f" usage_sessions={summary['usage_sessions']}"
         print(f"{line} finished={summary['finished']}")
         if summary["finished"]:
             print("all merge cards done")

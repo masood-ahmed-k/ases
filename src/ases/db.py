@@ -11,7 +11,7 @@ import pathlib
 import sqlite3
 import threading
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -92,7 +92,96 @@ CREATE TABLE IF NOT EXISTS gate_pins (
     gate_profiles_hash TEXT NOT NULL,
     pinned_at TEXT NOT NULL
 );
+
+-- Schema v4 (2026-09-19). One row per Hermes worker session whose usage has been counted against the request
+-- ledger, so ingesting the same session twice cannot double count it (ASES-CAP-03).
+CREATE TABLE IF NOT EXISTS usage_ingested (
+    session_id TEXT PRIMARY KEY,
+    profile TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    ingested_at TEXT NOT NULL
+);
+
+-- The reviewer's verdict, stored by commit SHA (ASES-REV-06, ASES-GIT-03: a verdict belongs to one commit).
+CREATE TABLE IF NOT EXISTS review_verdicts (
+    project TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reviewer_profile TEXT NOT NULL,
+    metadata TEXT,                 -- JSON, secret-redacted
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (project, task_key, commit_sha)
+);
+
+-- The primary checkout HEAD ASES itself last wrote or verified, per project (ASES-GIT-12): a HEAD that differs
+-- from this, or a dirty primary checkout, was changed by something other than the controller.
+CREATE TABLE IF NOT EXISTS integrity_state (
+    project TEXT PRIMARY KEY,
+    expected_head TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Schema v5 (2026-09-19). Lineage counters per plan task (ASES-REC-02): every fix card starts a new card-level
+-- counter, so review rounds, capability and infrastructure failures and re-plans are counted per TASK.
+CREATE TABLE IF NOT EXISTS lineage (
+    project TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    capability_failures INTEGER NOT NULL DEFAULT 0,
+    infra_failures INTEGER NOT NULL DEFAULT 0,
+    replans INTEGER NOT NULL DEFAULT 0,
+    seen_card TEXT,                            -- the card whose review events seen_events counts
+    seen_events INTEGER NOT NULL DEFAULT 0,    -- review events already counted for seen_card (reset on a new card)
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project, task_key)
+);
+
+-- Project-level state for the global bounds (ASES-CTL-01): when it started, the wall-clock deadline set at
+-- Gate P, how many re-plans were spent, and why a stopped project stopped.
+CREATE TABLE IF NOT EXISTS project_state (
+    project TEXT PRIMARY KEY,
+    started_at TEXT,
+    deadline_at TEXT,
+    replans INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'planning',   -- planning | running | paused | stopped | finished
+    stop_reason TEXT,
+    updated_at TEXT NOT NULL
+);
+
+-- Intent and completion records for every multi-step action (blueprint section 19.4): create cards, run a gate,
+-- build a candidate, fast-forward, complete a merge card, revert. An intent with no completed_at is what
+-- reconcile-on-start looks for after a crash.
+CREATE TABLE IF NOT EXISTS intents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    detail TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT
+);
 """
+
+# Columns added to an EXISTING table after it first shipped. CREATE TABLE IF NOT EXISTS cannot add a column to a
+# table an earlier version already made, so each is added here when missing (table, column, declaration).
+_ADDED_COLUMNS = (
+    ("usage_ingested", "project", "TEXT"),
+    ("usage_ingested", "task_key", "TEXT"),
+    ("usage_ingested", "card_id", "TEXT"),
+)
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, column, declaration in _ADDED_COLUMNS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 _lock = threading.Lock()
 
@@ -107,6 +196,7 @@ def connect(db_path: str | pathlib.Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     with _lock:
         conn.executescript(_SCHEMA)
+        _ensure_columns(conn)
         current = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()["v"] or 0
         if current < SCHEMA_VERSION:
             conn.execute(
