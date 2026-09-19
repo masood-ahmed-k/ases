@@ -103,10 +103,12 @@ models:
                                                # model routed through xkiro regardless of upstream vendor.
     # 2026-09-19: both xKiro keys the user created so far are unfunded wallets -- gpt-5.6-terra and
     # qwen/qwen3.8-max (paid) both refused with the same "needs real balance" 403. This free tier is
-    # what's actually usable right now. Real open question, not yet answered: does "Qwen3.8 Max" (a
+    # what's actually usable right now. Open question, partly answered: does "Qwen3.8 Max" (a
     # flagship-tier model in its own family, unlike coder-1's smaller qwen3.8-27b) actually clear the
-    # complex-structured-task bar that glm-5.3-thinking:free failed? Verify against the real plan.json
-    # task before trusting this for anything beyond the trivial smoke test it's passed so far.
+    # complex-structured-task bar that glm-5.3-thinking:free failed? On 2026-09-19 it wrote a valid,
+    # complete plan.json on the first try for a two-task request (project slug, dependency, touches,
+    # acceptance criteria, a real gate command, estimates), and that plan was not edited before
+    # approval. One small plan is evidence, not a verdict: a larger, ambiguous request is still untested.
 
   - provider: xkiro
     model: "qwen/qwen3-coder-plus:free"   # xKiro's own catalog: 1.05M context, purpose-built for coding.
@@ -127,9 +129,12 @@ models:
     # known xKiro requirement). Result, stated precisely: with that key it claimed the real T1 card
     # (07:42:47), found hello.py already committed on the branch by an EARLIER UnoRouter-era attempt
     # (commit c23b684, authored 00:00, one file, inside the card's touches), ran `python hello.py` to
-    # verify it, and completed the card at 07:43:51. So it has verified and completed real work on a real
-    # card; it has NOT yet written and committed real work on one (only the scratch slugify task below
-    # shows it writing code in this harness).
+    # verify it, and completed the card at 07:43:51. So it had verified and completed real work on a real
+    # card, but not yet authored any.
+    # Later the same day, on the greet-e2e run (docs/architecture.md), it DID author real work on a real
+    # card: commit 12995fc (greet.py and test_greet.py, both inside the card's touches), ran the card's gate
+    # itself (2 passed) and handed off for review with the evidence metadata, in 2 m 49 s, 21 tool calls.
+    # It also pip-installed pytest into Hermes's own virtualenv, outside its worktree, and said so itself.
 
   # Coding candidates evaluated 2026-09-19 at the user's suggestion ("minimax could be better option when
   # it comes to coding and development"). One identical real task (write a slugify() function to a spec,
@@ -162,3 +167,9 @@ models:
     role_class: reviewer
     pinned: true
     data_policy: some_free_endpoints_train
+    # First real reviews, 2026-09-19 (greet-e2e): it completed two review runs correctly through the Kanban
+    # tools. G1 (a coder diff): read both changed files, tried to run the tests, could not (the reviewer has
+    # no terminal tool, by design), and approved anyway with review_outcome metadata; 5 API calls, 92,785
+    # input tokens, 1,585 output tokens. G2 (a review-only task): PASS in 13 s. Weakness worth knowing: its
+    # approval listed the gate as verified although it had only the coder's word for it. n=2 on trivially
+    # small changes says nothing about whether it catches a real defect.

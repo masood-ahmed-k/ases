@@ -118,10 +118,14 @@ requirements:
     and no product-file write or command-execution tools; Kanban verdict tools remain allowed'
   section: '4.2'
   verified_by: 22.1, 22.6
-  status: covered
-  note: doctor.reviewer_diversity fails closed if lead and reviewer share a provider; real check confirmed
+  status: partial
+  note: 'doctor.reviewer_diversity fails closed if lead and reviewer share a provider; real check confirmed
     unorouter vs openrouter on 2026-09-18, and confirms xkiro vs openrouter today (2026-09-19, after lead
-    moved off unorouter entirely per an explicit user decision -- see docs/architecture.md).
+    moved off unorouter entirely per an explicit user decision -- see docs/architecture.md). Downgraded from
+    covered after the first real review: the reviewer has no command tool (its terminal call failed with
+    "Tool terminal does not exist"), but its tool list includes write_file and patch, because Hermes toolsets
+    are per group (file is reads and writes together) and this version has no per-tool deny. So "no
+    product-file write" is not enforced by profile configuration; a read-only sandbox mount (Phase 5) is.'
 - id: ASES-ROL-06
   requirement: Least-privilege toolsets per role
   section: '4.2'
@@ -305,7 +309,10 @@ requirements:
   verified_by: 22.5, 22.8
   status: covered
   note: 'mergeq.merge_task: squash candidate on integration HEAD in a throwaway worktree, Gate 3, fast-forward
-    only if green. Unit-tested incl. conflict and red-gate3 cases.'
+    only if green. Unit-tested incl. conflict and red-gate3 cases. Also seen in a real run on 2026-09-19
+    (greet-e2e, task G1): candidate 676628f built on the tip, secret scan clean, Gate 3 (python -m pytest -q)
+    pass, fast-forward, merge_records completed, merge card completed with the squash SHA. A review-only task
+    completes its merge card as a recorded no-op instead (nothing to fast-forward).'
 - id: ASES-GIT-05
   requirement: The integration branch stays runnable; post-merge failures are reverted
   section: '8.1'
@@ -378,9 +385,12 @@ requirements:
   section: '8.4'
   verified_by: 22.5, 22.11
   status: in_progress
-  note: integrity.py has snapshot()/diff_snapshots() fully unit-tested (HEAD-move and unexpected-dirty-file
-    detection). Not yet wired into a real dispatched run (needs before/after snapshots around an actual
-    worker spawn) -- that wiring lands once the credentials are in and the real end-to-end test runs.
+  note: 'integrity.py has snapshot()/diff_snapshots() fully unit-tested (HEAD-move and unexpected-dirty-file
+    detection). Still not wired into a real dispatched run (needs before/after snapshots around an actual
+    worker spawn). The 2026-09-19 real run shows why it matters: coder-1 ran pip install pytest into Hermes''s
+    own virtualenv (outside its worktree; it reported this itself in residual_risk) and nothing in ASES
+    noticed. Worktree snapshots would not catch that either, since the change was to the Python environment;
+    the Docker sandbox (ASES-SEC-03, Phase 5) is what prevents it.'
 - id: ASES-GIT-13
   requirement: Diffs outside the declared touches block review
   section: '8.4'
@@ -470,8 +480,13 @@ requirements:
   requirement: Plan critique and diff review are done by the independent Reviewer profile
   section: '13'
   verified_by: '22.1'
-  status: not_covered
-  note: ''
+  status: partial
+  note: 'Diff review by the independent Reviewer profile happened for real on 2026-09-19: the reviewer (OpenRouter
+    cohere/north-mini-code:free, a different provider and family from the Lead on xKiro) read the coder''s
+    two files and approved via kanban_complete with review_outcome metadata, and the merge queue only merged
+    once the reviewer profile had completed the card. Plan critique (the critic role in Gate P) is not built.
+    The reviewer verified less than it claimed: it listed the gate as verified after its own attempt to run
+    the tests failed (it has no command tools), relying on the coder''s hand-off.'
 - id: ASES-REV-02
   requirement: A plan goes back to the Lead at most twice
   section: '13.1'
@@ -505,15 +520,24 @@ requirements:
   requirement: Review requests carry handoff evidence
   section: '13.2'
   verified_by: '22.6'
-  status: in_progress
-  note: coder-1's SOUL.md instructs the handoff-evidence shape; not yet observed in a real run.
+  status: covered
+  note: 'Observed in a real run on 2026-09-19: coder-1 handed off with kanban_request_review carrying changed_files,
+    verification_commands, gate_profile, gate_result, commit_sha, branch and residual_risk (its SOUL.md
+    instructs the shape and, since that day, so does every work-card body, including reviewer=<profile> and a
+    ban on kanban_complete). Depends on the model following the instruction: the first real coder run, before
+    the card body said so, completed its own card instead. The metadata is not schema-checked (ASES-REV-06).'
 - id: ASES-REV-05
   requirement: The controller re-runs Gate 1 when a card enters review
   section: '13.2'
   verified_by: 22.6, 22.12
-  status: in_progress
-  note: review.gate_before_review implemented and unit-testable in shape; not yet exercised against a
-    real review-lane transition.
+  status: partial
+  note: 'Seen firing in a real review-lane transition on 2026-09-19: the card entered review at 16:53:45, the
+    controller re-ran Gate 1 on the branch head in a clean worktree (pass, gate_runs id 1, 16:54:11) and the
+    reviewer was spawned one second later. Two real defects were fixed first, both invisible to mocked tests:
+    the send-back used request-changes, which real Hermes rejects for a card that only sits in review (it now
+    uses reopen-review, probed on a scratch board), and run_pass dispatched before policing the review lane.
+    Left partial: the send-back path (red Gate 1, out-of-scope diff) has never fired in a real run, and
+    Hermes''s own gateway dispatcher can still claim a review card before this check sees it.'
 - id: ASES-REV-06
   requirement: The verdict is a tool call with schema-checked metadata stored by commit
   section: '13.2'
@@ -647,7 +671,9 @@ requirements:
   note: reconcile.py checks card IDs still resolve, a done merge has a matching merge_records row, and
     nothing reads done-but-reverted; wired into swarm run's startup. Unit-tested (6 cases) AND real-verified
     against the live board after fixing kanban_show's return shape (was crashing with KeyError on real
-    data -- see docs/architecture.md). Findings are reported, not yet auto-repaired.
+    data -- see docs/architecture.md). Findings are reported, not yet auto-repaired. After the 2026-09-19 real
+    run (a code task merged, a review-only task recorded as a no-op) it reported no findings, so a no-op
+    merge record is accepted as a done merge.
 - id: ASES-REC-05
   requirement: Questions block cards and are answered through the CLI; they never time out into guesses
   section: '19.5'
@@ -778,8 +804,12 @@ requirements:
     manual creation is used
   section: '8'
   verified_by: 22.2, 22.5
-  status: not_covered
-  note: ''
+  status: partial
+  note: 'Observed on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at the
+    exact integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and merge
+    worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote, so
+    Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
+    guards against) was never exercised, and whether worktree_sync must be turned off explicitly is unverified.'
 - id: ASES-CFG-05
   requirement: UnoRouter custom-endpoint credentials use Hermes custom-endpoint secret handling; do not
     export provider keys into worker shells

@@ -570,6 +570,59 @@ unit test around it mocked the Hermes wrapper, so none of the following could ha
   A no-op merge counts in `run_pass`'s `merged` list. For a no-op the returned outcome has `candidate_sha` None
   while the `merge_records` row holds the integration tip.
 
+## The first real end-to-end run: lead, coder, reviewer, merge (2026-09-19)
+
+Project `greet-e2e` in the throwaway repo, board `ases-phase3`, run through the controller as it stood at
+commit 59d5abb. Times are the machine's local time (UTC+2). Nothing below was mocked: real Hermes, real git,
+real providers.
+
+| time | what happened |
+| ------ | ------ |
+| earlier | `swarm plan`: the Lead (xKiro `qwen/qwen3.8-max:free`) wrote `docs/ases/plan.json` from a two-task request. It was valid on the first try and was not edited: project `greet-e2e`, G1 (coder, touches `greet.py` and `test_greet.py`), G2 (reviewer, depends on G1, no touches), one gate profile `tests` = `python -m pytest -q` |
+| 16:51:56 | `swarm approve --yes`: Gate 0 passed, budgets fine, plan published to `integration` at 232e12e (ASES-ARC-09), gate profile pinned (ASES-QG-02), four cards created (G1 work `t_4fc6dc34` and merge `t_515c19fc`, G2 work `t_f62b1534` and merge `t_467fdd18`); the work-card body carried the new hand-off steps |
+| 16:52 | `swarm run` pass 1 dispatched G1 to coder-1 (xKiro `qwen/qwen3-coder-plus:free`). Its worktree was cut at 232e12e, exactly the integration tip |
+| 16:53:45 | coder-1 committed `12995fc` (`greet.py`, `test_greet.py`, both inside its touches), ran the gate itself (2 passed) and handed off with `kanban_request_review` naming `reviewer="reviewer"` and metadata: changed_files, verification_commands, gate_result, commit_sha, branch, residual_risk. 2 m 49 s, 21 tool calls |
+| 16:54:11 | the controller re-ran Gate 1 on 12995fc in a clean worktree: pass (`gate_runs` id 1). The reviewer worker was spawned one second later |
+| 16:54 to 16:57:47 | the reviewer (OpenRouter `cohere/north-mini-code:free`) read both files, tried to run the tests, could not, and approved with `kanban_complete` (`review_outcome: approved`). 5 API calls, 92,785 input tokens, 1,585 output tokens. Most of the wall time was Hermes starting up (about two minutes before its first model call), not reviewing |
+| 16:57:56 | merge queue: work card completed by the `reviewer` profile, so eligible; squash candidate `676628f` built on the tip (message names both card ids), secret scan clean, Gate 3 pass (`gate_runs` id 2), fast-forward, `merge_records` completed, merge card completed |
+| 16:58:28 | G2, unlocked by G1's merge card, went to the reviewer: 13 s, verdict PASS with structured metadata. Its branch `swarm/G2-reviewer` was cut at 676628f, the tip after G1's merge |
+| 16:58:58 | G2's merge: an empty diff, recorded as a no-op (`gate3_result` "skipped", no squash commit); merge card completed "no changes to merge (review-only task)" |
+| 16:59:05 | `swarm run`: "all merge cards done", exit 0, 15 passes, about seven minutes after approve. `reconcile.check`: no findings. Integration branch: exactly one new commit for the code task |
+
+What the run showed beyond "it works":
+
+- **The new hand-off text was followed to the letter**, and the fix that mattered most (naming the reviewer) is
+  why the card reached a different profile at all. The coder also handled Hermes's post-hand-off "protocol
+  violation" nudge correctly: it worked out from the run history that its run had ended and the reviewer's run was
+  live, and declined to complete its own card.
+- **The reviewer really is command-less, but not write-less.** Its `terminal` call failed with "Tool 'terminal'
+  does not exist", which confirms the command-execution half of ASES-ROL-05. The tool list it was given also
+  contains `write_file` and `patch`: Hermes toolsets are per group (`file` is reads and writes together) and this
+  version has no per-tool deny, so "no product-file write" is not enforced by profile configuration. ROL-05 is
+  now `partial`; the real fix is the Phase 5 sandbox with a read-only mount.
+- **The reviewer vouched for something it could not check.** It listed `verified_gate_tests_passed` among its
+  checks right after its own attempt to run the tests failed; it was relying on the coder's hand-off claim. It has
+  no way to see the controller's gate records (they live in the ASES database, not on the card). Open item: post
+  the controller's Gate 1 result to the card as a comment so a reviewer can cite evidence the controller produced.
+- **The coder changed the machine outside its worktree.** `pytest` was missing from Hermes's own virtualenv, so
+  it ran `pip install pytest` there (pytest 9.1.1 is now in `hermes-agent/venv`). It reported this honestly in
+  `residual_risk`. Nothing in ASES would have noticed otherwise: the integrity snapshots (ASES-GIT-12) are still
+  not wired into worker runs and the Docker sandbox (ASES-SEC-03) is Phase 5. It also means the worker's `python`
+  and the gate's `python` (system Python 3.11) are different interpreters that both happened to pass.
+- **Evidence for ASES-GIT-16:** the work-card worktree base was the exact integration tip both times. This repo
+  has no remote, so the remote-sync behaviour the requirement guards against was not exercised; the register row
+  is `partial`, not `covered`.
+- **The `task_key` fix is visible in the database:** the run's events carry `"task_key": "G1"`, while the
+  events from before the fix still read `"[redacted]"`.
+
+Not exercised in a real run, so still unproven end to end: the send-back path (a red Gate 1 or an out-of-scope
+diff), merge conflicts and fix cards, a red Gate 3, the reviewer requesting changes or blocking, the merge queue
+refusing an unreviewed card (unit- and mutation-tested only; coder-1 followed its instructions), the race
+between Hermes's gateway dispatcher and the Gate 1 re-check (this time ASES's own pass got there first), budget
+parking, more than one task in flight, crash and resume, the kill switch, questions, and Gates 4 and 5. An
+independent nemotron review of the approval logic was attempted and returned 403 (the known key problem), so
+the new code rests on direct reading, 24 seeded-bug mutation checks (every one caught) and this run.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of
@@ -655,18 +708,23 @@ one -- per-role data classes aren't a thing this architecture supports today.
 - ~~Gate P plan publication (ASES-ARC-09)... new v1.2 requirements with no code yet~~ -- also stale:
   `controller.publish_plan` exists and is wired into `cmd_approve` (ASES-ARC-09, `covered`).
   Pinned-worktree creation (ASES-GIT-16) is the one still genuinely open -- see below.
-- **ASES-GIT-16 (`not_covered`)**: "ASES worktrees start from the exact local integration HEAD;
+- **ASES-GIT-16 (`partial`)**: "ASES worktrees start from the exact local integration HEAD;
   worktree_sync is disabled or manual creation is used." `gates.py`/`mergeq.py`'s own throwaway
-  worktrees already satisfy this (detached at an exact SHA). What's unverified is the WORK card's
-  worktree, which Hermes itself creates on dispatch (`workspace: worktree` in `kanban_create`) -- whether
-  Hermes's own `worktree_sync` project setting needs to be explicitly turned off requires checking real
-  Hermes project/profile flags, not just ASES code. Deliberately not touched while T1's real dispatch
-  (below) is using that exact worktree; revisit after this run concludes.
-- The UnoRouter (`ases-reviewer`/GLM/Qwen keys, one each, GLM and Qwen scoped per-model) and OpenRouter
-  credentials landed in the `lead`/`coder-1`/`reviewer` profiles' `.env` files on 2026-09-18. T1 was
-  unblocked and `swarm run` is executing the real end-to-end loop (acceptance test 22.2) against the
-  live `ases-phase3` board for the first time -- outcome not yet known as of this note; whatever it
-  finds gets its own dated entry below, in this file's established style, once it lands.
+  worktrees already satisfy this (detached at an exact SHA). The WORK card's worktree, which Hermes itself
+  creates on dispatch (`workspace: worktree`), was observed at the exact integration tip on both real
+  dispatches of the 2026-09-19 run (232e12e, then 676628f after G1's merge). What is still unverified is the
+  case the requirement really guards against: this test repo has no remote, so Hermes's default of syncing a
+  worktree from the freshly fetched REMOTE tip was never exercised, and whether `worktree_sync` needs to be
+  turned off explicitly for a repo that has one is still open.
+- **Gaps the first real run exposed** (details in "The first real end-to-end run"): the reviewer profile has
+  `write_file` and `patch` (Hermes toolsets are per group, no per-tool deny; ASES-ROL-05 `partial`); the reviewer
+  cannot see the controller's gate records, so it can only trust the coder's claim about them; a worker changed
+  the machine outside its worktree (`pip install` into Hermes's own venv) and nothing detected it (integrity
+  snapshots, ASES-GIT-12, are not wired; Docker sandbox, ASES-SEC-03, is Phase 5).
+- Credentials, as of 2026-09-19: `lead` and `coder-1` are on xKiro (own key each), `reviewer` is on
+  OpenRouter, and UnoRouter is removed entirely (an explicit decision). The first complete real end-to-end
+  run (acceptance test 22.2's shape: two tasks, both merge cards done) finished on 2026-09-19 and is
+  written up in "The first real end-to-end run" above, including what it did NOT exercise.
 - Gate 1/3 run directly on the host, not inside Docker (Phase 5 requirement, not built). Documented in
   `gates.py`'s own docstring so this isn't quietly assumed to be sandboxed.
 
