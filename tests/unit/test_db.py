@@ -1,5 +1,329 @@
+import os
+import pathlib
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+import pytest
+
 from ases import db
 
+# ---------------------------------------------------------------------------------------------
+# The OLD schema, as text, taken verbatim from the git history of src/ases/db.py, so an upgrade is proven against
+# what really shipped and not against a copy derived from the new code. _OLD_SCHEMA_V5 is the whole `_SCHEMA` of the
+# commit whose SCHEMA_VERSION was 5 (the version data/ases.db is at in the field); _OLD_SCHEMA_V6_EXTRA is what the
+# next commit (SCHEMA_VERSION 6) added. The old code ran the whole script on every connect and then added three
+# usage_ingested columns with ALTER TABLE, and it recorded ONE row: the version of the code that opened the file.
+# ---------------------------------------------------------------------------------------------
+
+_OLD_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS requests_ledger (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    utc_date TEXT NOT NULL,        -- YYYY-MM-DD, UTC
+    count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider, model, utc_date)
+);
+
+CREATE TABLE IF NOT EXISTS model_registry (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    context_length INTEGER,        -- NULL = undeclared / unverified (ASES-MOD-02)
+    tool_calling INTEGER,          -- 0/1/NULL = unknown
+    role_class TEXT,
+    data_policy TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    smoke_test_at TEXT,
+    smoke_test_result TEXT,        -- 'pass' | 'fail' | NULL
+    smoke_test_detail TEXT,
+    PRIMARY KEY (provider, model)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL          -- JSON, secret-redacted before write (ASES-SEC-01)
+);
+
+-- Phase 3: one plan task becomes a work card (W) and a merge card (M) (ASES-TSK-01).
+CREATE TABLE IF NOT EXISTS plan_tasks (
+    project TEXT NOT NULL,
+    task_key TEXT NOT NULL,        -- plan.json task key, e.g. 'T1'
+    work_card_id TEXT,             -- Hermes kanban card id, once created
+    merge_card_id TEXT,
+    role TEXT NOT NULL,
+    touches TEXT,                  -- JSON list of path globs
+    gate_profile TEXT,
+    estimated_requests INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    fix_cards INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (project, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS gate_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key TEXT NOT NULL,
+    gate TEXT NOT NULL,            -- 'gate1' | 'gate3' | ...
+    commit_sha TEXT,
+    result TEXT NOT NULL,          -- 'pass' | 'fail'
+    detail TEXT,
+    ran_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS merge_records (
+    task_key TEXT PRIMARY KEY,
+    candidate_sha TEXT,
+    gate3_result TEXT,
+    squash_commit TEXT,
+    reverted INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT
+);
+
+-- ASES-QG-02: the gate profile content hash pinned at this project's last `swarm approve`, checked
+-- again by `swarm run` so a diff that quietly changes gate configuration is refused, not trusted.
+CREATE TABLE IF NOT EXISTS gate_pins (
+    project TEXT PRIMARY KEY,
+    gate_profiles_hash TEXT NOT NULL,
+    pinned_at TEXT NOT NULL
+);
+
+-- Schema v4 (2026-09-19). One row per Hermes worker session whose usage has been counted against the request
+-- ledger, so ingesting the same session twice cannot double count it (ASES-CAP-03).
+CREATE TABLE IF NOT EXISTS usage_ingested (
+    session_id TEXT PRIMARY KEY,
+    profile TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    ingested_at TEXT NOT NULL
+);
+
+-- The reviewer's verdict, stored by commit SHA (ASES-REV-06, ASES-GIT-03: a verdict belongs to one commit).
+CREATE TABLE IF NOT EXISTS review_verdicts (
+    project TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reviewer_profile TEXT NOT NULL,
+    metadata TEXT,                 -- JSON, secret-redacted
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (project, task_key, commit_sha)
+);
+
+-- The primary checkout HEAD ASES itself last wrote or verified, per project (ASES-GIT-12): a HEAD that differs
+-- from this, or a dirty primary checkout, was changed by something other than the controller.
+CREATE TABLE IF NOT EXISTS integrity_state (
+    project TEXT PRIMARY KEY,
+    expected_head TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Schema v5 (2026-09-19). Lineage counters per plan task (ASES-REC-02): every fix card starts a new card-level
+-- counter, so review rounds, capability and infrastructure failures and re-plans are counted per TASK.
+CREATE TABLE IF NOT EXISTS lineage (
+    project TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    capability_failures INTEGER NOT NULL DEFAULT 0,
+    infra_failures INTEGER NOT NULL DEFAULT 0,
+    replans INTEGER NOT NULL DEFAULT 0,
+    seen_card TEXT,                            -- the card whose review events seen_events counts
+    seen_events INTEGER NOT NULL DEFAULT 0,    -- review events already counted for seen_card (reset on a new card)
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project, task_key)
+);
+
+-- Project-level state for the global bounds (ASES-CTL-01): when it started, the wall-clock deadline set at
+-- Gate P, how many re-plans were spent, and why a stopped project stopped.
+CREATE TABLE IF NOT EXISTS project_state (
+    project TEXT PRIMARY KEY,
+    started_at TEXT,
+    deadline_at TEXT,
+    replans INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'planning',   -- planning | running | paused | stopped | finished
+    stop_reason TEXT,
+    updated_at TEXT NOT NULL
+);
+
+-- Intent and completion records for every multi-step action (blueprint section 19.4): create cards, run a gate,
+-- build a candidate, fast-forward, complete a merge card, revert. An intent with no completed_at is what
+-- reconcile-on-start looks for after a crash.
+CREATE TABLE IF NOT EXISTS intents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    detail TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT
+);
+"""
+
+_OLD_SCHEMA_V6_EXTRA = """
+-- Schema v6 (2026-09-19). Leases on shared resources (ASES-GIT-14): a per-card port block, compose project name,
+-- database name and temp directory, and singletons such as a shared development database taken through a lock.
+-- A lease is active while released_at is NULL; the partial unique index makes a second active lease on the same
+-- resource impossible at the database level, not just in application code.
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    resource TEXT NOT NULL,        -- 'port-block:3', 'singleton:dev-db', ...
+    holder TEXT NOT NULL,          -- the card id that holds it
+    detail TEXT,                   -- JSON: the values that were handed out
+    acquired_at TEXT NOT NULL,
+    released_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_resource_leases_active
+    ON resource_leases (project, resource) WHERE released_at IS NULL;
+
+-- Snapshots of worktrees that no running card owns (ASES-GIT-12): only a running card's worker may change its
+-- worktree, so a HEAD or a status that moved in any other worktree was changed by something else.
+CREATE TABLE IF NOT EXISTS worktree_snapshots (
+    project TEXT NOT NULL,
+    path TEXT NOT NULL,
+    head TEXT NOT NULL,
+    status_hash TEXT NOT NULL,     -- sha256 of `git status --porcelain -z` output
+    taken_at TEXT NOT NULL,
+    PRIMARY KEY (project, path)
+);
+"""
+
+# The tables that did NOT exist yet at an older schema version (from the git history: version 1 had four tables,
+# version 2 added the phase 3 tables, version 3 added gate_pins). Version 4 was never committed on its own, so its
+# shape here is a RECONSTRUCTION (version 3 plus usage_ingested without its attribution columns, review_verdicts and
+# integrity_state); the upgrade must cope with it either way.
+_ADDED_AFTER = {
+    1: ["plan_tasks", "gate_runs", "merge_records", "gate_pins", "usage_ingested", "review_verdicts",
+        "integrity_state", "lineage", "project_state", "intents"],
+    2: ["gate_pins", "usage_ingested", "review_verdicts", "integrity_state", "lineage", "project_state", "intents"],
+    3: ["usage_ingested", "review_verdicts", "integrity_state", "lineage", "project_state", "intents"],
+    4: ["lineage", "project_state", "intents"],
+}
+
+# One row per table, so "rows intact" is checked on real content in every table that exists at a version.
+_SEED_ROWS = {
+    "requests_ledger": ["INSERT INTO requests_ledger VALUES ('openrouter', 'm1', '2026-09-19', 7, '2026-09-19T10:00:00')"],
+    "model_registry": ["INSERT INTO model_registry (provider, model, context_length, pinned) "
+                       "VALUES ('openrouter', 'm1', 131072, 1)"],
+    "events": ["INSERT INTO events (ts, kind, payload) VALUES ('2026-09-19T10:00:00+00:00', 'card_created', '{\"a\": 1}')",
+               "INSERT INTO events (ts, kind, payload) VALUES ('2026-09-19T10:05:00+00:00', 'gate_pass', '{}')"],
+    "plan_tasks": ["INSERT INTO plan_tasks (project, task_key, work_card_id, merge_card_id, role, touches, "
+                   "gate_profile, estimated_requests, fix_cards, created_at) VALUES "
+                   "('p1', 'T1', 't_w1', 't_m1', 'coder', '[\"a.py\"]', 'g', 12, 1, '2026-09-19 10:00:00')"],
+    "gate_runs": ["INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES "
+                  "('T1', 'gate1', 'abc123', 'pass', 'ok', '2026-09-19T10:01:00')"],
+    "merge_records": ["INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+                      "completed_at) VALUES ('T1', 'def456', 'pass', 'def456', 0, '2026-09-19T10:02:00')"],
+    "gate_pins": ["INSERT INTO gate_pins VALUES ('p1', 'hash1', '2026-09-19 10:00:00')"],
+    "usage_ingested": ["INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+                       "output_tokens, ingested_at) VALUES ('s1', 'coder-1', 'openrouter', 'm1', 4, 100, 50, "
+                       "'2026-09-19T10:03:00')"],
+    "review_verdicts": ["INSERT INTO review_verdicts VALUES ('p1', 'T1', 'abc123', 't_w1', 'PASS', 'reviewer', "
+                        "'{}', '2026-09-19T10:04:00')"],
+    "integrity_state": ["INSERT INTO integrity_state VALUES ('p1', 'abc123', '2026-09-19T10:00:00')"],
+    "lineage": ["INSERT INTO lineage (project, task_key, review_rounds, capability_failures, updated_at) VALUES "
+                "('p1', 'T1', 2, 1, '2026-09-19T10:00:00')"],
+    "project_state": ["INSERT INTO project_state (project, started_at, status, updated_at) VALUES "
+                      "('p1', '2026-09-19T09:00:00', 'running', '2026-09-19T10:00:00')"],
+    "intents": ["INSERT INTO intents (project, kind, key, started_at) VALUES ('p1', 'fast_forward', 'T1', "
+                "'2026-09-19T10:02:00')"],
+    "resource_leases": ["INSERT INTO resource_leases (project, resource, holder, acquired_at) VALUES "
+                        "('p1', 'port-block:3', 't_w1', '2026-09-19T10:00:00')"],
+    "worktree_snapshots": ["INSERT INTO worktree_snapshots VALUES ('p1', 'C:/wt/t_w1', 'abc123', 'h', "
+                           "'2026-09-19T10:00:00')"],
+}
+
+_ALL_TABLES = {
+    "schema_migrations", "requests_ledger", "model_registry", "events", "plan_tasks", "gate_runs", "merge_records",
+    "gate_pins", "usage_ingested", "review_verdicts", "integrity_state", "lineage", "project_state", "intents",
+    "resource_leases", "worktree_snapshots",
+}
+
+
+def _make_old_database(path, version, *, seed=True, record_version=True):
+    """A database exactly as the ASES of schema `version` left it: its tables, its one version row, its rows."""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript(_OLD_SCHEMA_V5)
+    if version >= 6:
+        raw.executescript(_OLD_SCHEMA_V6_EXTRA)
+    for table in _ADDED_AFTER.get(version, []):
+        raw.execute(f"DROP TABLE {table}")
+    if version >= 5:
+        # what the old connect() did after the script, on every open (the field database has these three)
+        for column in ("project", "task_key", "card_id"):
+            raw.execute(f"ALTER TABLE usage_ingested ADD COLUMN {column} TEXT")
+    if record_version:
+        raw.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, '2026-09-19 10:00:00')", (version,))
+    if seed:
+        existing = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table, statements in _SEED_ROWS.items():
+            if table in existing:
+                for statement in statements:
+                    raw.execute(statement)
+    raw.close()
+    return path
+
+
+def _user_tables(conn):
+    return sorted(r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"))
+
+
+def _snapshot(conn):
+    """{table: (column names, rows in rowid order)} for every user table except schema_migrations."""
+    result = {}
+    for table in _user_tables(conn):
+        if table == "schema_migrations":
+            continue
+        columns = tuple(r[1] for r in conn.execute(f"PRAGMA table_info({table})"))
+        rows = [tuple(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+        result[table] = (columns, rows)
+    return result
+
+
+def _shape(conn):
+    """The schema of a database as a comparable value: every table's columns (name, type, not null, default, pk
+    position) and every index (name, table, unique, columns)."""
+    tables = {}
+    for table in _user_tables(conn):
+        tables[table] = [tuple(r)[1:] for r in conn.execute(f"PRAGMA table_info({table})")]
+    indexes = {}
+    for name, table, sql in conn.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall():
+        listing = [tuple(r) for r in conn.execute(f"PRAGMA index_list({table})") if r[1] == name][0]
+        columns = [r[2] for r in conn.execute(f"PRAGMA index_info({name})")]
+        # the stored text too, so a partial index keeps its WHERE clause, with whitespace collapsed
+        indexes[name] = (table, listing[2], columns, " ".join((sql or "").split()))
+    return tables, indexes
+
+
+def _versions(conn):
+    return [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
+
+
+def _backups(directory, name="ases.db"):
+    return sorted(p.name for p in pathlib.Path(directory).glob(f"{name}.bak-*"))
+
+
+# --- the original two tests ------------------------------------------------------------------------------------
 
 def test_connect_creates_schema_and_is_idempotent(tmp_path):
     path = tmp_path / "sub" / "ases.db"
@@ -8,13 +332,618 @@ def test_connect_creates_schema_and_is_idempotent(tmp_path):
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"schema_migrations", "requests_ledger", "model_registry", "events"} <= tables
 
-    # Reconnecting must not error or duplicate the migration row.
+    # Reconnecting must not error or duplicate the migration rows (one row per migration, applied once).
     conn2 = db.connect(path)
     rows = conn2.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert rows == 1
+    assert rows == len(db.MIGRATIONS)
 
 
 def test_connect_uses_wal_mode(tmp_path):
     conn = db.connect(tmp_path / "ases.db")
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert mode.lower() == "wal"
+
+
+# --- the connection contract is unchanged ----------------------------------------------------------------------
+
+def test_connection_keeps_autocommit_row_factory_and_foreign_keys(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    assert conn.isolation_level is None
+    assert conn.row_factory is sqlite3.Row
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert conn.in_transaction is False  # a finished migration never leaves a transaction open behind it
+    conn.execute("INSERT INTO requests_ledger VALUES ('p', 'm', '2026-09-21', 1, 't')")  # autocommit: visible at once
+    other = sqlite3.connect(str(tmp_path / "ases.db"))
+    assert other.execute("SELECT COUNT(*) FROM requests_ledger").fetchone()[0] == 1
+    other.close()
+
+
+# --- the migration list -----------------------------------------------------------------------------------------
+
+def test_migrations_are_numbered_from_one_without_gaps_and_the_version_is_derived():
+    assert [m.version for m in db.MIGRATIONS] == list(range(1, len(db.MIGRATIONS) + 1))
+    assert db.SCHEMA_VERSION == db.MIGRATIONS[-1].version == db.latest_version() == 7
+    for migration in db.MIGRATIONS:
+        assert migration.description
+        assert isinstance(migration.apply, str) or callable(migration.apply)
+
+
+@pytest.mark.parametrize("versions", [[], [2], [1, 3], [1, 1, 2], [2, 1], [0, 1]])
+def test_a_migration_list_with_a_gap_a_repeat_or_a_bad_start_is_refused(versions):
+    listing = [db.Migration(v, "x", "SELECT 1") for v in versions]
+
+    with pytest.raises(db.MigrationError):
+        db._check_migrations(listing)
+
+
+def test_statement_splitter_ignores_semicolons_in_comments_and_strings_and_drops_trailing_comments():
+    script = (
+        "-- a comment; with a semicolon\n"
+        "CREATE TABLE a (x TEXT DEFAULT 'one;two');\n"
+        "\n"
+        "CREATE TABLE b (y INTEGER   -- trailing; comment\n"
+        ");\n"
+        "-- nothing follows but this comment\n"
+    )
+
+    statements = db._statements(script)
+
+    assert len(statements) == 2
+    assert "CREATE TABLE a" in statements[0] and "'one;two'" in statements[0]
+    assert "CREATE TABLE b" in statements[1]
+
+
+def test_statement_splitter_does_not_cut_at_a_semicolon_that_ends_a_comment_or_a_comment_line():
+    # a comment line that itself ends in a semicolon, and a column comment that does: neither may end a statement
+    script = (
+        "-- this comment line ends in a semicolon;\n"
+        "CREATE TABLE a (\n"
+        "    x INTEGER,   -- note;\n"
+        "    y TEXT       -- another note;\n"
+        ");\n"
+        "CREATE INDEX i ON a (x);\n"
+    )
+
+    statements = db._statements(script)
+
+    assert len(statements) == 2
+    assert statements[0].count("CREATE TABLE") == 1 and "y TEXT" in statements[0] and statements[0].rstrip().endswith(");")
+    assert statements[1] == "CREATE INDEX i ON a (x);"
+
+
+def test_statement_splitter_keeps_a_final_statement_that_has_no_semicolon():
+    assert len(db._statements("CREATE TABLE a (x INTEGER);\nCREATE TABLE b (y INTEGER)")) == 2
+
+
+# --- a brand-new database ---------------------------------------------------------------------------------------
+
+def test_fresh_database_has_every_table_and_ends_at_the_newest_version(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    assert set(_user_tables(conn)) == _ALL_TABLES
+    assert db.current_version(conn) == db.latest_version() == 7
+    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]  # one row per migration, each stamped
+    assert conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE applied_at IS NULL OR applied_at = ''").fetchone()[0] == 0
+    assert db.pending(conn) == []
+
+
+def test_a_new_database_is_not_backed_up_and_a_current_one_is_not_written_or_backed_up_again(tmp_path):
+    path = tmp_path / "ases.db"
+    first = db.connect(path)
+    first.close()
+
+    again = db.connect(path)
+
+    assert _backups(tmp_path) == []
+    assert again.total_changes == 0  # nothing was inserted or updated by reconnecting to a current database
+    assert _versions(again) == [1, 2, 3, 4, 5, 6, 7]
+    again.close()
+
+
+def test_a_zero_byte_file_is_a_new_database_and_gets_no_backup(tmp_path):
+    path = tmp_path / "ases.db"
+    path.write_bytes(b"")
+
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 7
+    assert _backups(tmp_path) == []
+    conn.close()
+
+
+def test_connect_works_for_a_path_with_spaces_and_a_non_ascii_directory(tmp_path):
+    path = tmp_path / f"my dir caf{chr(0xE9)}" / "ases.db"
+    _make_old_database(path, 5)
+
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 7
+    assert len(_backups(path.parent)) == 1
+    conn.close()
+
+
+# --- current_version and pending on a plain connection ----------------------------------------------------------
+
+def test_current_version_is_zero_without_the_table_and_the_highest_row_with_gaps(tmp_path):
+    raw = sqlite3.connect(str(tmp_path / "raw.db"), isolation_level=None)
+    assert db.current_version(raw) == 0
+    raw.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+    assert db.current_version(raw) == 0
+    raw.execute("INSERT INTO schema_migrations VALUES (2, 'x')")
+    raw.execute("INSERT INTO schema_migrations VALUES (5, 'x')")
+    assert db.current_version(raw) == 5  # the MAX: the old code wrote one row per bump, so gaps are normal
+    raw.close()
+
+
+def test_pending_lists_the_higher_migrations_oldest_first(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+
+    assert [m.version for m in db.pending(raw)] == [6, 7]
+    raw.execute("DELETE FROM schema_migrations")
+    assert [m.version for m in db.pending(raw)] == [1, 2, 3, 4, 5, 6, 7]
+    raw.execute("INSERT INTO schema_migrations VALUES (7, 'x')")
+    assert db.pending(raw) == []
+    raw.close()
+
+
+# --- upgrading a database made by ANY earlier ASES --------------------------------------------------------------
+
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4, 5, 6])
+def test_a_database_from_any_earlier_schema_upgrades_in_place_with_its_rows_and_a_backup(tmp_path, old_version):
+    path = _make_old_database(tmp_path / "ases.db", old_version)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    before = _snapshot(raw)
+    raw.close()
+
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 7
+    assert set(_user_tables(conn)) == _ALL_TABLES
+    after = _snapshot(conn)
+    for table, (columns, rows) in before.items():
+        # every old row is still there with every old value (the tables only ever GAIN columns)
+        old_columns = ", ".join(columns)
+        kept = [tuple(r) for r in conn.execute(f"SELECT {old_columns} FROM {table} ORDER BY rowid")]
+        assert kept == rows, table
+    assert set(after) == set(_ALL_TABLES) - {"schema_migrations"}
+    # exactly one backup, named for the version the file was at
+    assert len(_backups(tmp_path)) == 1
+    assert f".bak-v{old_version}-" in _backups(tmp_path)[0]
+    # the version rows: the old one is kept, and each migration that ran is recorded once
+    assert _versions(conn) == sorted({old_version, *range(old_version + 1, 8)})
+    conn.close()
+
+
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4, 5, 6])
+def test_an_upgraded_database_has_exactly_the_schema_of_a_brand_new_one(tmp_path, old_version):
+    fresh = db.connect(tmp_path / "fresh" / "ases.db")
+    upgraded = db.connect(_make_old_database(tmp_path / "old" / "ases.db", old_version))
+
+    assert _shape(upgraded) == _shape(fresh)
+    fresh.close()
+    upgraded.close()
+
+
+def test_the_field_database_shape_v5_upgrades_and_the_new_columns_are_null_for_old_rows(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+
+    conn = db.connect(path)
+
+    for table in ("gate_runs", "merge_records", "events"):
+        columns = {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
+        assert "project" in columns
+        assert columns["project"][2].upper() == "TEXT"
+        assert columns["project"][3] == 0  # nullable
+        assert columns["project"][4] is None  # no default
+        assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE project IS NOT NULL").fetchone()[0] == 0
+    # the leases and snapshots of version 6 exist and work, including the partial unique index
+    conn.execute("INSERT INTO resource_leases (project, resource, holder, acquired_at) VALUES ('p', 'r', 'h', 't')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO resource_leases (project, resource, holder, acquired_at) VALUES ('p', 'r', 'h2', 't')")
+    conn.close()
+
+
+def test_upgrading_from_the_old_schema_6_changes_nothing_but_the_version_7_additions(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 6)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    tables_before, indexes_before = _shape(raw)
+    primary_keys_before = {t: [c[0] for c in sorted((c for c in cols if c[4]), key=lambda c: c[4])]
+                           for t, cols in tables_before.items()}
+    raw.close()
+
+    conn = db.connect(path)
+    tables_after, indexes_after = _shape(conn)
+
+    for table, columns in tables_before.items():
+        if table in ("gate_runs", "merge_records", "events"):
+            assert tables_after[table][:-1] == columns  # the old columns, unchanged and in order
+            assert tables_after[table][-1][0] == "project"  # plus exactly one
+        elif table == "schema_migrations":
+            assert tables_after[table] == columns
+        else:
+            assert tables_after[table] == columns, table
+    assert set(tables_after) == set(tables_before)
+    assert set(indexes_after) - set(indexes_before) == {"idx_gate_runs_project_task_sha", "idx_events_kind"}
+    assert {k: v for k, v in indexes_after.items() if k in indexes_before} == indexes_before
+    primary_keys_after = {t: [c[0] for c in sorted((c for c in cols if c[4]), key=lambda c: c[4])]
+                          for t, cols in tables_after.items()}
+    assert primary_keys_after == primary_keys_before  # no primary key changed
+    conn.close()
+
+
+def test_the_version_7_indexes_cover_the_columns_the_work_order_names(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    _, indexes = _shape(conn)
+
+    assert indexes["idx_gate_runs_project_task_sha"][:3] == ("gate_runs", 0, ["project", "task_key", "commit_sha"])
+    assert indexes["idx_events_kind"][:3] == ("events", 0, ["kind"])
+    assert "WHERE released_at IS NULL" in indexes["idx_resource_leases_active"][3]  # the partial index is intact
+
+
+def test_a_schema_4_database_whose_usage_table_predates_the_attribution_columns_gets_them(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 4)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert [r[1] for r in raw.execute("PRAGMA table_info(usage_ingested)")][-1] == "ingested_at"
+    raw.close()
+
+    conn = db.connect(path)
+
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(usage_ingested)")]
+    assert columns[-3:] == ["project", "task_key", "card_id"]
+    conn.close()
+
+
+def test_a_database_whose_version_row_is_missing_is_repaired_by_connecting(tmp_path):
+    # tables and rows present, but the crash came before the version row: version 0, every migration runs over
+    # objects that already exist and must be a no-op for them
+    path = _make_old_database(tmp_path / "ases.db", 5, record_version=False)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    before = _snapshot(raw)
+    raw.close()
+
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 7
+    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
+    for table, (columns, rows) in before.items():
+        kept = [tuple(r) for r in conn.execute(f"SELECT {', '.join(columns)} FROM {table} ORDER BY rowid")]
+        assert kept == rows, table
+    assert len(_backups(tmp_path)) == 1 and ".bak-v0-" in _backups(tmp_path)[0]
+    conn.close()
+
+
+def test_a_project_column_that_already_exists_does_not_fail_migration_7(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 6)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    raw.execute("ALTER TABLE gate_runs ADD COLUMN project TEXT")
+    raw.close()
+
+    conn = db.connect(path)
+
+    assert [r[1] for r in conn.execute("PRAGMA table_info(gate_runs)")].count("project") == 1
+    assert db.current_version(conn) == 7
+    conn.close()
+
+
+def test_reconnecting_an_upgraded_database_is_idempotent(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+    first = db.connect(path)
+    shape = _shape(first)
+    versions = _versions(first)
+    first.close()
+
+    for _ in range(3):
+        again = db.connect(path)
+        assert _shape(again) == shape
+        assert _versions(again) == versions
+        assert again.total_changes == 0
+        again.close()
+
+    assert len(_backups(tmp_path)) == 1  # only the one real upgrade made a backup
+
+
+# --- the backup -------------------------------------------------------------------------------------------------
+
+def test_backup_path_is_next_to_the_database_and_names_the_version_and_a_utc_timestamp(tmp_path):
+    moment = datetime(2026, 9, 21, 10, 15, 0, tzinfo=timezone.utc)
+
+    assert db.backup_path(tmp_path / "ases.db", 5, now=moment) == tmp_path / "ases.db.bak-v5-20260921T101500Z"
+    assert db.backup_path(str(tmp_path / "x.db"), 0, now=moment).name == "x.db.bak-v0-20260921T101500Z"
+
+
+def test_backup_path_converts_an_aware_time_to_utc_and_reads_a_naive_one_as_utc(tmp_path):
+    from datetime import timedelta
+    plus_two = timezone(timedelta(hours=2))
+
+    aware = db.backup_path(tmp_path / "ases.db", 5, now=datetime(2026, 9, 21, 12, 0, 0, tzinfo=plus_two))
+    naive = db.backup_path(tmp_path / "ases.db", 5, now=datetime(2026, 9, 21, 10, 0, 0))
+
+    assert aware.name == naive.name == "ases.db.bak-v5-20260921T100000Z"
+
+
+def test_backup_path_default_time_is_now_in_utc(tmp_path):
+    name = db.backup_path(tmp_path / "ases.db", 3).name
+
+    assert name.startswith("ases.db.bak-v3-") and name.endswith("Z")
+    assert len(name) == len("ases.db.bak-v3-20260921T101500Z")
+
+
+def test_the_backup_is_a_whole_single_file_at_the_old_version_with_the_old_rows(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+
+    conn = db.connect(path)
+    conn.close()
+
+    names = sorted(p.name for p in tmp_path.iterdir() if ".bak-" in p.name)
+    assert len(names) == 1  # no -wal, -shm or .tmp beside it
+    backup = sqlite3.connect(str(tmp_path / names[0]))
+    assert backup.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5  # the state BEFORE the upgrade
+    assert backup.execute("SELECT count FROM requests_ledger").fetchone()[0] == 7
+    assert backup.execute("SELECT name FROM sqlite_master WHERE name = 'resource_leases'").fetchone() is None
+    assert backup.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    backup.close()
+    assert sorted(p.name for p in tmp_path.iterdir() if ".bak-" in p.name) == names  # opening it left no sidecar
+
+
+def test_backups_are_pruned_to_the_newest_five_by_timestamp(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+    # six older backups (mixed versions, so the order must come from the timestamp and not the version), a partial
+    # copy, a note, and another database's backups: none of the last three kinds may be counted or removed
+    fakes = {
+        "ases.db.bak-v3-20200101T000000Z": None, "ases.db.bak-v5-20200102T000000Z": None,
+        "ases.db.bak-v4-20200103T000000Z": None, "ases.db.bak-v6-20200104T000000Z": None,
+        "ases.db.bak-v2-20200105T000000Z": None, "ases.db.bak-v5-20200106T000000Z": None,
+    }
+    others = ["ases.db.bak-v5-20200101T000000Z.99.tmp", "ases.db.bak-notes.txt",
+              *[f"other.db.bak-v1-2019010{i}T000000Z" for i in range(1, 8)]]
+    for name in [*fakes, *others]:
+        (tmp_path / name).write_bytes(b"x")
+
+    conn = db.connect(path)
+    conn.close()
+
+    remaining = _backups(tmp_path)
+    real = [n for n in remaining if n.startswith("ases.db.bak-v") and not n.endswith(".tmp")]
+    assert len(real) == db.BACKUPS_KEPT == 5
+    assert "ases.db.bak-v3-20200101T000000Z" not in real and "ases.db.bak-v5-20200102T000000Z" not in real
+    for kept in ("ases.db.bak-v4-20200103T000000Z", "ases.db.bak-v6-20200104T000000Z",
+                 "ases.db.bak-v2-20200105T000000Z", "ases.db.bak-v5-20200106T000000Z"):
+        assert kept in real
+    new = [n for n in real if n not in fakes]
+    assert len(new) == 1 and new[0].startswith("ases.db.bak-v5-") and new[0].split("-")[-1] > "2021"  # the fifth
+    for untouched in others:
+        assert (tmp_path / untouched).exists(), untouched
+
+
+def test_a_same_second_backup_another_process_already_made_is_accepted_even_if_the_rename_is_refused(tmp_path, monkeypatch):
+    # Found by the multi-process test on Windows: two upgrades in one second aim at the same backup name, and the rename
+    # of the second onto the first fails with "access denied". A file under that name is a finished copy, so it is enough.
+    path = _make_old_database(tmp_path / "ases.db", 5)
+    target = tmp_path / "ases.db.bak-v5-20260921T101500Z"
+    target.write_bytes(b"a whole backup made by the other process")
+    monkeypatch.setattr(db, "backup_path", lambda p, v, now=None: target)
+
+    def refused(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(db.os, "replace", refused)
+
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 7  # the upgrade went ahead: a backup exists
+    assert target.read_bytes() == b"a whole backup made by the other process"  # theirs was left alone
+    assert not list(tmp_path.glob("*.tmp"))  # and ours was not left behind
+    conn.close()
+
+
+def test_a_rename_that_fails_with_no_backup_under_that_name_is_reported_and_nothing_is_migrated(tmp_path, monkeypatch):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+
+    def refused(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(db.os, "replace", refused)
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert "could not back up" in str(info.value) and info.value.version == 5
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert db.current_version(raw) == 5
+    raw.close()
+    assert _backups(tmp_path) == [] and not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_backup_that_cannot_be_made_refuses_the_migration_and_changes_nothing(tmp_path, monkeypatch):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+    monkeypatch.setattr(db, "backup_path", lambda p, v, now=None: tmp_path / "no_such_dir" / "backup.db")
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert "back up" in str(info.value) and info.value.version == 5
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert db.current_version(raw) == 5  # not migrated: no backup, no migration
+    assert raw.execute("SELECT name FROM sqlite_master WHERE name = 'resource_leases'").fetchone() is None
+    raw.close()
+
+
+# --- a failing migration ----------------------------------------------------------------------------------------
+
+def _boom(conn):
+    conn.execute("CREATE TABLE half_done (a INTEGER)")
+    conn.execute("INSERT INTO half_done VALUES (1)")
+    raise RuntimeError("boom")
+
+
+def test_a_failing_migration_rolls_back_leaves_the_version_and_raises_naming_it(tmp_path, monkeypatch):
+    path = tmp_path / "ases.db"
+    db.connect(path).close()
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(8, "will fail", _boom)])
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert info.value.version == 8
+    assert "migration 8" in str(info.value) and "boom" in str(info.value) and "version 7" in str(info.value)
+    assert isinstance(info.value.__cause__, RuntimeError)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert db.current_version(raw) == 7  # the version stayed where it was
+    assert raw.execute("SELECT name FROM sqlite_master WHERE name = 'half_done'").fetchone() is None  # rolled back
+    assert _versions(raw) == [1, 2, 3, 4, 5, 6, 7]
+    raw.close()
+
+
+def test_a_migration_written_as_sql_is_atomic_across_its_statements(tmp_path, monkeypatch):
+    path = tmp_path / "ases.db"
+    db.connect(path).close()
+    # the first statement works and the second cannot: the whole migration must vanish
+    broken = db.Migration(8, "sql that fails half way", "CREATE TABLE t_one (a INTEGER); CREATE TABLE t_one (b INTEGER);")
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, broken])
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert info.value.version == 8
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert raw.execute("SELECT name FROM sqlite_master WHERE name = 't_one'").fetchone() is None
+    assert db.current_version(raw) == 7
+    raw.close()
+
+
+def test_each_migration_has_its_own_transaction_so_earlier_ones_survive_a_later_failure(tmp_path, monkeypatch):
+    path = tmp_path / "ases.db"
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS[:3], db.Migration(4, "fails", _boom)])
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert info.value.version == 4
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert _versions(raw) == [1, 2, 3]  # committed one by one: 1 to 3 stay, 4 is gone
+    assert "plan_tasks" in _user_tables(raw) and "gate_pins" in _user_tables(raw)
+    assert "half_done" not in _user_tables(raw)
+    raw.close()
+
+
+def test_a_failed_upgrade_can_be_retried_once_the_migration_is_fixed(tmp_path, monkeypatch):
+    path = tmp_path / "ases.db"
+    db.connect(path).close()
+    good = list(db.MIGRATIONS)
+    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(8, "will fail", _boom)])
+    with pytest.raises(db.MigrationError):
+        db.connect(path)
+
+    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(8, "fixed", "CREATE TABLE half_done (a INTEGER)")])
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 8
+    assert "half_done" in _user_tables(conn)
+    conn.close()
+
+
+def test_a_failed_migration_closes_the_connection_so_the_file_can_be_removed(tmp_path, monkeypatch):
+    path = tmp_path / "ases.db"
+    db.connect(path).close()
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(8, "will fail", _boom)])
+    with pytest.raises(db.MigrationError):
+        db.connect(path)
+
+    # on Windows a file with an open handle cannot be deleted, so this is a real check that nothing leaked
+    for suffix in ("", "-wal", "-shm"):
+        target = pathlib.Path(str(path) + suffix)
+        if target.exists():
+            target.unlink()
+    assert not path.exists()
+
+
+def test_a_migration_already_applied_by_another_process_is_skipped_not_repeated(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 6)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    seventh = db.MIGRATIONS[-1]
+
+    db._apply(raw, seventh)
+    db._apply(raw, seventh)  # what a second process sees after waiting for the write lock: already there
+
+    assert _versions(raw).count(7) == 1
+    assert raw.in_transaction is False
+    raw.close()
+
+
+def test_processes_upgrading_the_same_database_at_the_same_time_all_succeed(tmp_path):
+    path = _make_old_database(tmp_path / "ases.db", 5)
+    go = tmp_path / "go"
+    src = str(pathlib.Path(db.__file__).resolve().parents[1])
+    code = (
+        "import os, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from ases import db\n"
+        "while not os.path.exists(sys.argv[3]):\n"
+        "    time.sleep(0.001)\n"
+        "conn = db.connect(sys.argv[2])\n"
+        "print(db.current_version(conn))\n"
+        "conn.close()\n"
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", code, src, str(path), str(go)],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(4)
+    ]
+    time.sleep(1.5)  # let every child finish importing and reach the wait loop
+    go.write_text("go", encoding="utf-8")
+    outputs = [(p.communicate(timeout=120), p.returncode) for p in procs]
+
+    for (out, err), code_ in outputs:
+        assert code_ == 0, err
+        assert out.strip() == "7"
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    assert _versions(raw) == [5, 6, 7]  # applied once each: a double apply would have failed on the primary key
+    assert set(_user_tables(raw)) == _ALL_TABLES
+    raw.close()
+    assert len(_backups(tmp_path)) >= 1
+    assert not list(tmp_path.glob("*.tmp"))  # no partial copy left behind
+
+
+# --- a database NEWER than this code ----------------------------------------------------------------------------
+
+def test_a_newer_database_is_refused_untouched_and_never_downgraded(tmp_path):
+    path = tmp_path / "ases.db"
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+    raw.execute("INSERT INTO schema_migrations VALUES (99, '2030-01-01 00:00:00')")
+    raw.close()
+    before = path.read_bytes()
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert info.value.version == 99
+    assert "99" in str(info.value) and "newer" in str(info.value) and str(db.latest_version()) in str(info.value)
+    assert path.read_bytes() == before  # not one byte changed
+    assert _backups(tmp_path) == []
+    check = sqlite3.connect(str(path), isolation_level=None)
+    assert _user_tables(check) == ["schema_migrations"]  # no table was added
+    assert _versions(check) == [99]  # and the version was not lowered
+    check.close()
+    for suffix in ("", "-wal", "-shm"):  # the refused connection was closed: the file can be deleted
+        target = pathlib.Path(str(path) + suffix)
+        if target.exists():
+            target.unlink()
+
+
+def test_a_database_one_version_ahead_is_refused_and_one_at_the_newest_is_accepted(tmp_path):
+    path = tmp_path / "ases.db"
+    db.connect(path).close()
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    raw.execute("INSERT INTO schema_migrations VALUES (8, 'x')")
+    raw.close()
+
+    with pytest.raises(db.MigrationError) as info:
+        db.connect(path)
+
+    assert info.value.version == 8

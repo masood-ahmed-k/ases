@@ -83,15 +83,20 @@ requirements:
   section: '6.2'
   verified_by: 22.1, 22.5
   status: in_progress
-  note: kanban.max_in_progress etc. not yet written into Hermes config.yaml for this board -- still relying
-    on defaults.
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Same as ASES-ROL-08: the kanban limits, failure_limit,
+    auto_decompose false, auto_promote_children false and no default assignee are in the opt-in global desired
+    state of profiles.plan_init (`swarm init --global`); not applied. Hermes''s auto_decompose defaults to
+    true. Earlier note: kanban.max_in_progress etc. not yet written into Hermes config.yaml for this board --
+    still relying on defaults.'
 - id: ASES-ROL-01
   requirement: Phase 3 starts with three core profiles; tester and other roles are added only after measured
     evaluation
   section: 4.1, 16
   verified_by: 22.17 at level L2
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py holds the roster as data: lead, coder-1 and
+    reviewer active; coder-2, coder-3 and tester defined but inactive until enabled. `swarm init` is a dry run
+    by default; nothing has been applied to the real Hermes.'
 - id: ASES-ROL-02
   requirement: Profiles are created by cloning from the default profile, with a description
   section: '4.2'
@@ -137,15 +142,20 @@ requirements:
   requirement: Worker memory is disabled or scoped per project
   section: '4.2'
   verified_by: Inspection
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py turns memory off for every profile
+    (memory.memory_enabled, memory.user_profile_enabled and the memory toolset) in the desired state; not
+    applied to the real profiles.'
 - id: ASES-ROL-08
   requirement: Concurrency starts at 3, is raised only after the recovery tests pass, and never exceeds
     6
   section: '4.3'
   verified_by: 22.5, 22.9
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts
+    kanban.max_in_progress (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global
+    state; `swarm init --global` shows it and applies it only after `--apply --yes`. Not applied: it changes
+    the user''s whole Hermes.'
 - id: ASES-MOD-01
   requirement: Model IDs are discovered, and a capability record is kept per model
   section: '5'
@@ -340,9 +350,9 @@ requirements:
   section: '8.1'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): tamper.py adds generated-artifact and secret findings and
-    gates.scan_for_secrets now also flags added secret-named files; Gate 3 already scanned added lines. Not
-    called from Gate 1 yet.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The secret scan now also runs in Gate 1 (through the
+    tamper check) as well as Gate 3, and Gate 4 scans the whole tracked tree. Known gap: Gate 4 fails on any
+    repository that tracks sample keys in tests or docs, with no allowlist.'
 - id: ASES-GIT-08
   requirement: Tasks with overlapping touches and no dependency path are serialized by Gate 0
   section: '8.2'
@@ -395,22 +405,21 @@ requirements:
   section: '8.4'
   verified_by: 22.5, 22.11
   status: partial
-  note: 'BUILT, NOT WIRED (2026-09-19): guards.py now also snapshots the OTHER worktrees (list_worktrees,
-    check_idle_worktrees, refresh_snapshots; schema v6 worktree_snapshots) so a change in a worktree no
-    running card owns is reported; not called from run_pass yet, and a card re-dispatched into the same
-    worktree between two polls must be excluded by the caller. Earlier note: Built 2026-09-19:
-    guards.check_primary_checkout runs at the start of every controller pass and at swarm run start. The
-    primary checkout must be on the integration branch, clean (modified, staged, deleted and untracked files,
-    except Hermes''s .worktrees/), and at the HEAD ASES itself last wrote (adopted at run start, updated after
-    every fast-forward it makes). A violation records an integrity_violation event and halts the run with exit
-    code 3 before anything is dispatched or merged. Two deviations from the blueprint text, on purpose: the
-    check is per pass, not around each spawn (Hermes, not ASES, spawns workers), and it halts the run instead
-    of failing one card (the writer cannot be attributed to a card). Not covered: the other active worktrees
-    (a stray write into another worker''s worktree) and changes outside git entirely; on 2026-09-19 coder-1
-    ran pip install into Hermes''s own virtualenv unnoticed, which only the Docker sandbox (ASES-SEC-03)
-    prevents. integrity.py''s own snapshot() has quirks (non -z porcelain quoting, rename strings, fail-open
-    on a non-repo) that make this note''s earlier claim that it was fully unit-tested overstated; guards.py
-    does not use it.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): guards.check_idle_worktrees runs every pass and reports
+    changes in worktrees no running card owns as WARNINGS (an idle_worktree_changed event), never a halt: the
+    first version has known false positives (a card re-dispatched into its worktree between two polls).
+    Earlier note: Built 2026-09-19: guards.check_primary_checkout runs at the start of every controller pass
+    and at swarm run start. The primary checkout must be on the integration branch, clean (modified, staged,
+    deleted and untracked files, except Hermes''s .worktrees/), and at the HEAD ASES itself last wrote
+    (adopted at run start, updated after every fast-forward it makes). A violation records an
+    integrity_violation event and halts the run with exit code 3 before anything is dispatched or merged. Two
+    deviations from the blueprint text, on purpose: the check is per pass, not around each spawn (Hermes, not
+    ASES, spawns workers), and it halts the run instead of failing one card (the writer cannot be attributed
+    to a card). Not covered: the other active worktrees (a stray write into another worker''s worktree) and
+    changes outside git entirely; on 2026-09-19 coder-1 ran pip install into Hermes''s own virtualenv
+    unnoticed, which only the Docker sandbox (ASES-SEC-03) prevents. integrity.py''s own snapshot() has quirks
+    (non -z porcelain quoting, rename strings, fail-open on a non-repo) that make this note''s earlier claim
+    that it was fully unit-tested overstated; guards.py does not use it.'
 - id: ASES-GIT-13
   requirement: Diffs outside the declared touches block review
   section: '8.4'
@@ -429,10 +438,11 @@ requirements:
   section: '8.4'
   verified_by: '22.5'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): leases.py (allocate_card_env, release_card_resources, acquire_singleton,
-    sweep, write_env_file, provision_running_cards; schema v6 resource_leases with a partial unique index)
-    with 154 unit cases incl. the 22.5 property. Best effort by nature: the worker starts before .env.ases can
-    be written; not called from run_pass.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): leases.py is called from every pass
+    (provision_running_cards after dispatch, sweep_finished with blocked cards kept): a port block, compose
+    project name, database name and temp directory per card in `.env.ases`. Best effort by nature: the worker
+    starts before the file can be written. The field name `workspace_path` of a card is unverified against a
+    live card.'
 - id: ASES-GIT-15
   requirement: Contracts, decisions and AGENTS.md live in the repository
   section: '8.5'
@@ -444,9 +454,12 @@ requirements:
   section: '9.3'
   verified_by: 22.6, 22.9, 22.14
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): bounds.py (Bounds with the section 9.3 defaults, project_state helpers,
-    evaluate_bounds, stop_reasons, final gate records, is_finished, finish_project) with 349 unit cases.
-    run_pass still uses the old all_merge_cards_done finish test and never evaluates bounds.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): bounds.py is evaluated every pass: a breached project
+    bound pauses the project with a report; finished now means every merge card done, Gates 4 and 5 green on
+    the integration HEAD and the release report written (finalgates.finalize, called by
+    controller.process_finalize). Known gap: `bounds.set_status(paused)` drops the reason (kept in a
+    project_paused event), and Gate 4 fails on any repository with sample keys in tests or docs (no
+    allowlist).'
 - id: ASES-CFG-01
   requirement: Secrets never enter source control, card bodies, logs or reports
   section: '10'
@@ -472,16 +485,19 @@ requirements:
   section: '10.2'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): sandbox.py: check_terminal_block rejects any forwarded credential-shaped
-    variable and key_visibility_test looks for planted secrets in `env` output from a container ASES starts
-    (never run for real). It cannot see inside Hermes-managed worker containers, and the real profiles still
-    use the local backend.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: the profile check rejects any forwarded
+    credential-shaped variable and key_visibility_test looks for planted secrets in `env` output from a
+    container ASES starts (never run for real). It cannot see inside Hermes-managed worker containers, and the
+    real profiles still use the local backend.'
 - id: ASES-RTE-01
   requirement: No hidden fallback; the provider and model actually used are recorded
   section: '11.2'
   verified_by: '22.3'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): usage.py records a model_mismatch event when a worker
+    session ran on a model other than the one pinned for its profile (detection only, no card is failed) and
+    every ingested session records the provider and model actually used. Not run against a live session; the
+    ledger probably under-counts worker sessions because Hermes keeps auxiliary calls in separate rows.'
 - id: ASES-LED-01
   requirement: The plan is a schema-validated file checked by Gate 0, with one repair round
   section: '12.4'
@@ -519,10 +535,10 @@ requirements:
   section: '13.1'
   verified_by: '22.14'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): critic.py and prompts/critic.md (one-shot reviewer call with no toolsets,
-    strict verdict parsing, one repair call, CHANGES_REQUIRED at most twice, plan-hash bound approval) with
-    225 unit cases. `swarm approve` does not require a critic PASS yet and there is no `swarm critique`
-    command. Earlier note: Blocked on ASES-REV-01 (also not_covered): the plan-critique mechanism itself (a
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): `swarm critique` runs the one-shot reviewer critique (at
+    most two change requests, optional --auto-replan) and `swarm approve` requires a PASS bound to the plan
+    hash or an explicit --skip-critic. It is a one-shot call, not the critique CARD that blueprint 13.1 words
+    it as. Earlier note: Blocked on ASES-REV-01 (also not_covered): the plan-critique mechanism itself (a
     critique card for the Reviewer, a PASS/CHANGES_REQUIRED/BLOCKED verdict) does not exist yet -- review.py
     only re-runs Gate 1 for diff review (ASES-REV-05), never touches plans. There is no call site to attach a
     bounce counter to, and no data model to hold it (plan_tasks, the only per-task counter table, is only
@@ -598,12 +614,13 @@ requirements:
   section: '14.3'
   verified_by: '22.12'
   status: partial
-  note: 'BUILT, NOT WIRED (2026-09-19): tamper.analyze_diff now reports a diff that changes gate configuration or
-    CI files unless the task''s touches name the file (the diff side); not called from Gate 1 yet. Earlier
-    note: gates.hash_gate_profiles() + controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a
-    plan''s gate_profiles are content-hashed and pinned per-project at swarm approve time (only after every
-    earlier REFUSED path -- data-policy, budget -- has passed, so a refused plan is never pinned), and swarm
-    run refuses with "REFUSED (ASES-QG-02)" if the hash no longer matches, telling the user to re-approve.
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The pin check of the gate profiles exists; the diff side
+    is the tamper module''s gate_config_changed finding, which cannot fire through the review wiring today
+    (see ASES-QG-03), so a change to gate configuration is stopped by the scope check alone. Earlier note:
+    gates.hash_gate_profiles() + controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a plan''s
+    gate_profiles are content-hashed and pinned per-project at swarm approve time (only after every earlier
+    REFUSED path -- data-policy, budget -- has passed, so a refused plan is never pinned), and swarm run
+    refuses with "REFUSED (ASES-QG-02)" if the hash no longer matches, telling the user to re-approve.
     Re-running swarm approve deliberately moves the pin -- that IS "an explicit plan task that allows it."
     Unit-tested (9 new tests: hash stability/sensitivity, no-op-when-unpinned, pin/ verify round trip,
     re-approve moves the pin, cross-project isolation). Left at partial, not covered: the blueprint''s text
@@ -615,10 +632,12 @@ requirements:
   section: '14.3'
   verified_by: '22.12'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): tamper.py (parse_diff, analyze_diff, check_range: deleted or skipped tests,
-    unconditional passes, weakened assertions, gate configuration, generated artifacts, secrets, large files)
-    with 98 unit cases including the exact 22.12 sequence on real git repos. Nothing calls check_range yet, so
-    Gate 1 does not run it.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): tamper.check_range runs in the review lane and in the
+    merge-time check (deleted or skipped tests, unconditional passes, weakened assertions, gate configuration,
+    generated artifacts, secrets, large files). KNOWN GAP: through this wiring the gate-configuration and
+    assertion-weakening findings can never fire, because the scope check runs first and a path that reaches
+    the tamper check is already inside the task''s touches (a wildcard touches glob silently allows config
+    edits); plan-time validation of touches is needed.'
 - id: ASES-QG-04
   requirement: Gates run in a clean checkout of the exact commit inside the sandbox
   section: '14.3'
@@ -636,29 +655,36 @@ requirements:
   requirement: The controller test suite runs on fakes and never touches a real provider
   section: '14.4'
   verified_by: CI without network
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): src/ases/fakes/: FakeHermes (an in-memory Hermes 0.21.3
+    board with the real block, unblock, triage-loop and give-up rules, real git worktrees, a fake clock and
+    failure injection, with a test that its signatures match hermes.py), ScriptedWorker with personas, and a
+    fake OpenAI-compatible server (429 with Retry-After, 401, 500, timeouts, malformed JSON, tool calls, a
+    request log with assert_never_received). Nothing runs it against a real Hermes board yet.'
 - id: ASES-TST-02
   requirement: Acceptance tests 22.1 to 22.16 are repeatable and cost no quota
   section: '22'
   verified_by: Inspection
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): tests/acceptance/ has the rig and two demonstration
+    scenarios (22.2 core with a worker question and a controller restart, 22.6 core); scenarios 22.3, 22.5,
+    22.7 to 22.16 are not written yet.'
 - id: ASES-OBS-01
   requirement: The Hermes dashboard is not rebuilt; ASES adds a project report
   section: '15'
   verified_by: Inspection
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): report.py (build_report with seven panels, render_status, render_text, a
-    self-contained HTML page with no script and no external resource, write_report) with 181 unit cases,
-    smoke-tested against a copy of the real database. `swarm status` and `swarm report` are not yet CLI
-    commands.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): report.py behind `swarm status` and `swarm report` (page
+    and JSON outside the repository with --html or --out, no script and no external resource). Unit tested and
+    smoke tested against a copy of the real database; not run against a live board.'
 - id: ASES-OBS-02
   requirement: Transcripts and logs stay local under a retention setting
   section: '15.2'
   verified_by: Inspection
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): `swarm retention` (hardening.retention) removes logs,
+    reports, stop reports, evaluation runs and old database backups older than the retention setting (dry run
+    by default, never the database itself); the transcripts of Hermes itself are Hermes''s.'
 - id: ASES-DOC-01
   requirement: Requirement IDs are quoted before a work package is built
   section: '2.3'
@@ -700,36 +726,39 @@ requirements:
   section: '19.2'
   verified_by: 22.3, 22.6
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): recovery.py (classify_run over the real Hermes outcome strings, decide for
-    the whole 19.1 to 19.3 table, next_model, failure_bundle, process_failures) with 282 unit cases.
-    process_failures is not called from the polling loop, and fresh_attempt decisions are returned, not yet
-    applied (the controller must create the replacement card).'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): recovery.py is called from controller.process_recovery
+    every pass: a capability failure becomes a fresh attempt card (fresh worktree, failure bundle attached),
+    the second also pins the next model of the role class on the new card, an infrastructure failure resumes
+    after a backoff, auth, policy and context failures become a question, and a decision the controller could
+    not carry out is redriven from the event log. Not run for real; the provider name for `hermes kanban
+    set-model` on a custom endpoint is unverified.'
 - id: ASES-REC-02
   requirement: Review rounds, fix cards and requests are budgeted per plan task lineage
   section: '19.3'
   verified_by: '22.6'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): recovery.py keeps lineage counters per plan task (review rounds, capability
-    and infrastructure failures, re-plans; refresh_review_rounds is idempotent) and exhausted() names the
-    budget that ran out; the controller does not call any of it yet.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Lineage counters per plan task are wired: review rounds
+    escalate once per round count, fix cards escalate at the failure that would need a third one, re-plans are
+    counted per project. The re-plan itself is a question to the user (`swarm answer` retries with guidance);
+    the automatic Lead re-plan call is NOT built.'
 - id: ASES-REC-03
   requirement: Card creation is idempotent
   section: '19.4'
   verified_by: '22.15'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): intents.py (begin, complete, open_intents, intent context manager,
-    mark_recovered) with 15 unit cases. Nothing writes an intent record yet (cards, gates, candidates,
-    fast-forwards, completions, reverts), so reconcile never sees an open one; create_cards_from_plan has not
-    been re-run twice against a real board.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): intents.py records are written around card creation,
+    candidate build with Gate 3, fast-forward, merge-card completion and revert (not around a gate run) and
+    closed by reconcile. Card creation passes idempotency keys; it has not been repeated twice against a real
+    board or after deleting the database (test 22.15).'
 - id: ASES-REC-04
   requirement: Reconcile-on-start repairs what is safe and blocks the rest
   section: '19.4'
   verified_by: '22.7'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): reconcile.py now has reconcile() with repairs for done-without-record,
-    record-without-done-card, unfinished candidates, open intents, dead workers, orphan workers (found by card
-    id in the process command line, never killed otherwise) and orphan worktrees, with 185 unit cases incl.
-    the three crash points of 22.7. cmd_run still calls the old check() and repairs nothing. Earlier note:
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): reconcile.reconcile() runs at `swarm run` start (a blocked
+    finding stops the run with exit code 5, --ignore-reconcile overrides) and before `swarm resume`; repairs
+    done-without-record, record-without-done-card, unfinished candidates, open intents, dead workers, orphan
+    workers (found by card id, never killed otherwise) and reports orphan worktrees. Earlier note:
     reconcile.py checks card IDs still resolve, a done merge has a matching merge_records row, and nothing
     reads done-but-reverted; wired into swarm run''s startup. Unit-tested (6 cases) AND real-verified against
     the live board after fixing kanban_show''s return shape (was crashing with KeyError on real data -- see
@@ -741,10 +770,13 @@ requirements:
   section: '19.5'
   verified_by: '22.2'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): questions.py (list_questions, answer_question, format_questions; comment
-    before unblock, the answer text is secret-scanned and never stored in the event) with 98 unit cases.
-    `swarm questions` and `swarm answer` are not yet CLI commands, and what event Hermes writes when its OWN
-    dispatcher blocks a card is unprobed.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): questions.py (open_question over four sources: a worker''s
+    block, the dispatcher''s give-up, Hermes''s unblock-loop triage lane and an ASES QUESTION comment;
+    ask_user for the controller; list_questions; answer_question) is used by `swarm questions`, `swarm
+    answer`, the merge queue (a merge card with an open question is not re-processed) and recovery. Real
+    Hermes limit: a second question on a card with the same block kind lands in triage, where swarm answer can
+    only comment. Unit and fake-board tested; the events Hermes writes on each give-up path are read from its
+    source, not probed live.'
 - id: ASES-REC-06
   requirement: swarm stop halts everything within 30 seconds
   section: '19.6'
@@ -768,43 +800,46 @@ requirements:
   section: '21.1'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): sandbox.py: sensitive_host_paths, is_sensitive_path, mount_problems (only
-    the worktree may be mounted; the Docker socket and system paths are refused) and mask_args (committed .env
-    and key files overlaid with an empty file). Unit-tested only; no container has run.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: only the worktree may be mounted (the Docker
+    socket and system paths are refused) and committed .env and key files are overlaid with an empty file.
+    Unit-tested only; no container has run.'
 - id: ASES-SEC-03
   requirement: From Phase 5 workers use the Docker terminal backend with only the worktree mounted
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): sandbox.py (SandboxPolicy, terminal_block, check_terminal_block,
-    docker_run_argv, doctor_checks) with 674 unit cases; Docker was never started. Real Hermes 0.21.3 facts
-    found while building: an explicit terminal.cwd of /workspace defeats the worktree mount (so it is
-    omitted), docker_persist_across_processes must be false, docker_run_as_host_user does nothing on native
-    Windows, and a git worktree''s .git file points outside the mount so git fails inside a worktree-only
-    sandbox (a design decision is open). No profile has a terminal block yet.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py plus `swarm init --sandbox` (dry run by
+    default) can put the Docker terminal block into a worker profile; the controller''s own gate runs do not
+    use docker_run_argv yet and Docker was never started. Real Hermes 0.21.3 facts: an explicit terminal.cwd
+    of /workspace defeats the worktree mount (omitted), docker_persist_across_processes must be false,
+    docker_run_as_host_user does nothing on native Windows, a git worktree''s .git file points outside the
+    mount so git fails inside a worktree-only sandbox (a design decision is open). No profile has a terminal
+    block yet.'
 - id: ASES-SEC-04
   requirement: Content that agents read is treated as data, never as instructions
   section: '21.3'
   verified_by: '22.11'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Every role prompt ends with the data-not-instructions
+    sentence and the prompts are checked against Hermes''s own injection patterns in a test. No injection test
+    (22.11) has run.'
 - id: ASES-SEC-05
   requirement: Sandbox network access is disabled by default and only enabled through explicit task-scoped
     exceptions
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): sandbox.py: docker_run_argv defaults to --network none and
-    check_terminal_block refuses docker_network true unless the policy allows it. Task-scoped exceptions are
-    not modelled in the plan schema.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: docker_run_argv defaults to --network none and
+    the profile check refuses docker_network true unless the policy allows it. Task-scoped exceptions are not
+    modelled in the plan schema.'
 - id: ASES-SEC-06
   requirement: Provider keys stay outside the sandbox; the egress proxy is optional and user-approved
   section: '21.3'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): sandbox.py keeps provider keys out of the container argv (no inherited
-    environment, no --env-file, credential-shaped names refused) and pull_command only returns argv for a
-    human to approve; the optional egress proxy is not installed.'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py keeps provider keys out of the container argv
+    (no inherited environment, no --env-file, credential-shaped names refused); pull_command only returns argv
+    for a human to approve; the optional egress proxy is not installed.'
 - id: ASES-PRV-01
   requirement: A data class per project is enforced before any other routing rule
   section: '21.2'
@@ -844,15 +879,22 @@ requirements:
     role or task assignee
   section: '18.2'
   verified_by: '22.2'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): finalgates.py: Gate 4 (built-in tracked-tree secret and
+    artifact scan plus the plan''s gate4 profile), Gate 5 (the plan''s gate5 profile, else every distinct task
+    command on the integration HEAD), the release report, and finalize(), called by
+    controller.process_finalize once every merge card is done. Unit tested with real git repositories; never
+    run on a real project. Gate 4 fails on ASES''s own repository (sample keys in tests and docs) and has no
+    allowlist.'
 - id: ASES-ROL-09
   requirement: Phase 3 uses lead, coder and reviewer; tester becomes the fourth core profile after the
     L2 gate
   section: 4.1, 16
   verified_by: '22.17'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The tester profile and prompt exist (inactive) in
+    profiles.py and prompts/tester.md. The controller''s finish instructions treat every non-coder role as a
+    review-only card, so a tester task needs its own branch there before it is enabled.'
 - id: ASES-ROL-10
   requirement: Worker profiles are fresh by default; clone operations are opt-in and cloned credentials/memory
     are reviewed or cleared
@@ -873,8 +915,10 @@ requirements:
     post-route capability validation
   section: '5.2'
   verified_by: 22.4, 22.5
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.verify_state compares each profile''s model with
+    the pinned one and evals.recommend never proposes a router for the lead, reviewer or debugger; nothing
+    checks a live configuration yet.'
 - id: ASES-GIT-16
   requirement: ASES worktrees start from the exact local integration HEAD; worktree_sync is disabled or
     manual creation is used
@@ -898,8 +942,9 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT, NOT WIRED (2026-09-19): sandbox.py: default-deny network in docker_run_argv and in the profile
-    terminal block check; exfiltration_probe proves it from inside a container (never run for real).'
+  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: default-deny network in docker_run_argv and in
+    the profile terminal block check; exfiltration_probe proves it from inside a container (never run for
+    real).'
 - id: ASES-PRV-04
   requirement: Private/confidential projects require an explicitly verified provider data policy; data-class
     rules are never relaxed to keep work flowing

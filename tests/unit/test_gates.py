@@ -209,12 +209,15 @@ def test_scan_for_secrets_never_echoes_the_secret_it_found():
     assert gates.scan_for_secrets("+" + "nothing to see here") == []
 
 
-def test_scan_for_secrets_finds_the_shapes_events_py_does_not_redact():
+def test_scan_for_secrets_finds_a_private_key_block_and_an_aws_key_id():
+    """Both shapes used to be found only by tamper.py's extra patterns; events.py now redacts them too (2026-09-21),
+    so the label may come from either place. What matters is one finding each and no echo of the value."""
+    aws_id = "AKIA" + "IOSFODNN7EXAMPLE"
     private_key = gates.scan_for_secrets(_added_file_diff("notes.txt", "-----BEGIN RSA PRIVATE KEY-----"))
-    aws = gates.scan_for_secrets(_added_file_diff("notes.txt", "id = AKIA" + "IOSFODNN7EXAMPLE"))
+    aws = gates.scan_for_secrets(_added_file_diff("notes.txt", f"id = {aws_id}"))
 
-    assert len(private_key) == 1 and "private key block" in private_key[0]
-    assert len(aws) == 1 and "AWS" in aws[0]
+    assert len(private_key) == 1 and "notes.txt:1" in private_key[0]
+    assert len(aws) == 1 and "notes.txt:1" in aws[0] and aws_id not in aws[0]
 
 
 def test_scan_for_secrets_output_is_ascii_even_for_an_odd_file_name():
@@ -338,3 +341,79 @@ def test_run_gate_without_a_runner_still_uses_the_local_command_runner(repo, mon
 
     assert result.detail == explicit_none.detail == "from the local runner"
     assert [(c[1], c[2]) for c in calls] == [(["echo x"], 120), (["echo x"], 120)]
+
+
+# --- ASES-SEC-01: the command output is redacted once, before it is stored and before it is returned -----------
+
+PLANTED = "sk-or-v1-PLANTEDVALUE0123456789abcd"
+
+
+def test_run_gate_redacts_a_secret_in_the_output_it_returns(repo):
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", [f"echo token={PLANTED}"])
+
+    assert result.passed is True
+    assert PLANTED not in result.detail and "PLANTEDVALUE" not in result.detail
+    assert "[redacted]" in result.detail
+    assert "token=" in result.detail  # only the secret went: the rest of the output is intact
+
+
+def test_run_gate_stores_the_redacted_output_and_stores_what_it_returns(repo, tmp_path):
+    """A red gate, because a failing test that prints its environment is the usual way a secret gets into gate
+    output. The gate_runs row and the returned GateResult must carry the same, redacted, text."""
+    conn = db.connect(tmp_path / "ases.db")
+
+    result = gates.run_gate(
+        repo, _head_sha(repo), "gate1", [f"echo leaked {PLANTED}", "exit 1"], conn=conn, task_key="T1",
+    )
+
+    row = conn.execute("SELECT result, detail FROM gate_runs WHERE task_key = 'T1'").fetchone()
+    assert result.passed is False and row["result"] == "fail"
+    assert PLANTED not in row["detail"] and "PLANTEDVALUE" not in row["detail"]
+    assert "[redacted]" in row["detail"] and "[exit 1]" in row["detail"]
+    assert row["detail"] == result.detail
+
+
+def test_run_gate_redacts_what_a_runner_hands_back(repo, tmp_path, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    conn = db.connect(tmp_path / "ases.db")
+
+    result = gates.run_gate(
+        repo, _head_sha(repo), "gate3", ["x"], conn=conn, task_key="T2",
+        runner=FakeRunner(passed=False, detail=f"container env: OPENAI_API_KEY={PLANTED}"),
+    )
+
+    stored = conn.execute("SELECT detail FROM gate_runs WHERE task_key = 'T2'").fetchone()["detail"]
+    assert PLANTED not in result.detail and PLANTED not in stored
+    assert result.detail == stored == "container env: OPENAI_API_KEY=[redacted]"
+
+
+def test_run_gate_redacts_the_worktree_error_too(repo):
+    """git echoes the bad ref back in its error, so a value shaped like a key in the commit argument would land in
+    the detail of a gate that never ran."""
+    result = gates.run_gate(repo, PLANTED, "gate1", ["echo x"])
+
+    assert result.passed is False and "could not create gate worktree" in result.detail
+    assert PLANTED not in result.detail and "[redacted]" in result.detail
+
+
+def test_run_gate_leaves_output_with_no_secret_exactly_as_it_was(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    text = "$ pytest -q\n3 passed in 0.12s\ncommit 0123456789abcdef0123456789abcdef01234567 ok"
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["x"], runner=FakeRunner(True, text))
+
+    assert result.detail == text
+
+
+def test_a_runner_result_that_is_not_text_is_passed_through_instead_of_crashing_the_gate(repo, tmp_path, monkeypatch):
+    """The runner contract is (passed, output-as-text). A runner that returns something else must not turn a gate
+    that already ran into an exception: there is nothing to redact, so it is left as it is."""
+    _forbid_local_runner(monkeypatch)
+    conn = db.connect(tmp_path / "ases.db")
+
+    result = gates.run_gate(
+        repo, _head_sha(repo), "gate1", ["x"], conn=conn, task_key="T3", runner=lambda tree, cmds, timeout: (True, None),
+    )
+
+    assert result.passed is True and result.detail is None
+    assert conn.execute("SELECT detail FROM gate_runs WHERE task_key = 'T3'").fetchone()["detail"] is None

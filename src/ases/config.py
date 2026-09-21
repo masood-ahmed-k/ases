@@ -3,16 +3,43 @@
 Two files: config/swarm.yaml (project settings, concurrency, budgets) and config/models.yaml (provider
 limits and model declarations, section 5.3/5.1). Both are plain YAML plus this module's validation --
 no environment-variable overlay yet (Phase 1 doesn't need one; add it when a real deployment does).
+
+Two optional blocks of swarm.yaml have safe defaults when they are absent, so a config written before they
+existed still loads: `sandbox:` (blueprint Appendix B, ASES-SEC-03: OFF until the user has Docker running and
+says so) and `retention:` (ASES-OBS-02: "Transcripts and logs stay local under a retention setting", default
+30 days). A typo in either block is an error, never a silent default: a retention key that is ignored keeps
+source code on disk for longer than the user asked, and a sandbox key that is ignored weakens a boundary.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import pathlib
 
 import yaml
 
+from . import sandbox as sandbox_mod
+
 VALID_ENVIRONMENTS = {"native", "wsl2"}
 VALID_DATA_CLASSES = {"public", "private", "confidential"}
+
+# The sandbox: block as ProjectConfig exposes it. `enabled` is ASES's own switch (the blueprint's Appendix B has
+# no such key): while it is false `swarm doctor` reports the sandbox checks as warnings and `swarm init` leaves
+# the workers' terminal blocks alone, because Docker is not running yet. The other five are the Appendix B keys.
+# image, cpu, memory_mb, pids_limit and extra_deny are optional and are carried through only when the file names
+# them (sandbox.SandboxPolicy owns their meaning and their validation).
+DEFAULT_SANDBOX = {
+    "enabled": False,
+    "terminal_backend": "docker",
+    "network_default": False,
+    "mount": "worktree_only",
+    "forward_env": [],
+    "network_exceptions": "explicit_allowlist",
+}
+
+# ASES-OBS-02: how many days ASES keeps what it writes under ases_home. Logs (and the worker transcripts that
+# contain source code) are short lived; reports and stop reports are the audit trail, so they live longer.
+DEFAULT_RETENTION = {"logs_days": 30, "reports_days": 90}
 
 
 class ConfigError(Exception):
@@ -21,6 +48,8 @@ class ConfigError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class ProjectConfig:
+    """The settings of config/swarm.yaml. `sandbox` and `retention` come last and have defaults, so every place
+    that builds a ProjectConfig by hand (the tests do) keeps working without naming them."""
     name: str
     environment: str
     data_class: str
@@ -33,6 +62,27 @@ class ProjectConfig:
     budgets: dict
     hermes_tested_version: str
     hermes_native_home: pathlib.Path
+    sandbox: dict = dataclasses.field(default_factory=lambda: copy.deepcopy(DEFAULT_SANDBOX))
+    retention: dict = dataclasses.field(default_factory=lambda: dict(DEFAULT_RETENTION))
+
+    @property
+    def sandbox_enabled(self) -> bool:
+        """True only when config/swarm.yaml says `sandbox: enabled: true`."""
+        return bool(self.sandbox.get("enabled", False))
+
+    @property
+    def logs_days(self) -> int:
+        return int(self.retention.get("logs_days", DEFAULT_RETENTION["logs_days"]))
+
+    @property
+    def reports_days(self) -> int:
+        return int(self.retention.get("reports_days", DEFAULT_RETENTION["reports_days"]))
+
+    def sandbox_policy_config(self) -> dict:
+        """The sandbox block as sandbox.SandboxPolicy.from_config reads it: the document form
+        {"sandbox": {...}} without `enabled`, which is ASES's switch and not a policy key."""
+        block = {key: copy.deepcopy(value) for key, value in self.sandbox.items() if key != "enabled"}
+        return {"sandbox": block}
 
 
 def _require(d: dict, path: str):
@@ -42,6 +92,59 @@ def _require(d: dict, path: str):
             raise ConfigError(f"config/swarm.yaml is missing required key: {path}")
         cur = cur[part]
     return cur
+
+
+def _parse_sandbox(raw: dict) -> dict:
+    """The `sandbox:` block with the defaults filled in, or ConfigError. Absent (or an empty `sandbox:`) means the
+    safe defaults: the sandbox is not enabled. The Appendix B keys are validated by sandbox.SandboxPolicy, the one
+    place that knows the rules (a backend other than docker, a mount other than worktree_only and
+    network_default: true are all refused there), so the two cannot drift; only `enabled` is checked here. The block
+    is handed over in its document form, {"sandbox": {...}}, because that is the form in which SandboxPolicy
+    rejects an unknown key instead of quietly ignoring it."""
+    block = raw.get("sandbox")
+    if block is None:
+        return copy.deepcopy(DEFAULT_SANDBOX)
+    if not isinstance(block, dict):
+        raise ConfigError("config/swarm.yaml: sandbox must be a mapping")
+    settings = copy.deepcopy(block)
+    enabled = settings.pop("enabled", DEFAULT_SANDBOX["enabled"])
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"config/swarm.yaml: sandbox.enabled must be true or false, got {enabled!r}")
+    try:
+        sandbox_mod.SandboxPolicy.from_config({"sandbox": settings})
+    except sandbox_mod.SandboxConfigError as exc:
+        raise ConfigError(f"config/swarm.yaml: sandbox: {exc}") from exc
+    merged = copy.deepcopy(DEFAULT_SANDBOX)
+    merged.update(settings)
+    merged["enabled"] = enabled
+    return merged
+
+
+def _parse_retention(raw: dict) -> dict:
+    """The `retention:` block with the defaults filled in, or ConfigError. Each value is a whole number of days,
+    at least 1: zero or a negative number would mean "delete everything", and a bool is refused although it is an
+    int in Python (`logs_days: true` would quietly mean one day)."""
+    block = raw.get("retention")
+    if block is None:
+        return dict(DEFAULT_RETENTION)
+    if not isinstance(block, dict):
+        raise ConfigError("config/swarm.yaml: retention must be a mapping")
+    unknown = sorted(str(key) for key in block if key not in DEFAULT_RETENTION)
+    if unknown:
+        raise ConfigError(
+            f"config/swarm.yaml: unknown retention key(s) {unknown}; the keys are {sorted(DEFAULT_RETENTION)}"
+        )
+    settings = dict(DEFAULT_RETENTION)
+    for key in DEFAULT_RETENTION:
+        if key not in block:
+            continue
+        value = block[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(
+                f"config/swarm.yaml: retention.{key} must be a whole number of days, 1 or more, got {value!r}"
+            )
+        settings[key] = value
+    return settings
 
 
 def load_swarm_config(path: str | pathlib.Path) -> ProjectConfig:
@@ -84,6 +187,8 @@ def load_swarm_config(path: str | pathlib.Path) -> ProjectConfig:
         budgets=_require(raw, "budgets"),
         hermes_tested_version=_require(raw, "hermes.tested_version"),
         hermes_native_home=pathlib.Path(_require(raw, "hermes.native_home")),
+        sandbox=_parse_sandbox(raw),
+        retention=_parse_retention(raw),
     )
 
 

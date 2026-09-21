@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from ases import cli, db, events, guards
+from ases import cli, db, events, guards, reconcile
 
 
 @pytest.fixture
@@ -21,13 +21,14 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.ases_config, "db_path", lambda p: db_file)
     monkeypatch.setattr(cli.plan_mod, "load_plan_file", lambda *a, **kw: plan)
     monkeypatch.setattr(cli.controller_mod, "verify_gate_pin", lambda *a, **kw: None)
-    monkeypatch.setattr("ases.reconcile.check", lambda *a, **kw: [])
+    # swarm run reconciles for real on start (ASES-REC-04); a clean report keeps these tests about the loop only.
+    monkeypatch.setattr(reconcile, "reconcile", lambda *a, **kw: reconcile.ReconcileReport())
     monkeypatch.setattr(cli, "_load_models_config", lambda: {})
     monkeypatch.setattr(cli.guards_mod, "check_primary_checkout",
                         lambda *a, **kw: guards.GuardResult(True, (), "abc", "integration"))
     monkeypatch.setattr(cli.guards_mod, "adopt_current_head", lambda conn, project, repo: "abc")
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
-    args = argparse.Namespace(repo=str(tmp_path), max_iterations=20, sleep_seconds=0)
+    args = argparse.Namespace(repo=str(tmp_path), max_iterations=20, sleep_seconds=0, ignore_reconcile=False)
     return types.SimpleNamespace(args=args, db_file=db_file)
 
 

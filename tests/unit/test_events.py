@@ -44,3 +44,45 @@ def test_record_and_recent_round_trip(tmp_path):
     assert len(rows) == 1
     assert rows[0]["kind"] == "test_event"
     assert "unorouter" in rows[0]["payload"]
+
+
+def test_redacts_the_more_recent_provider_key_shapes_inside_strings():
+    shapes = [
+        "nvapi-" + "a1B2c3D4" * 5,
+        "sk_live_" + "abcdefghij1234567890",
+        "sk-ant-api03-" + "abcdefghijklmnop",
+        "github_pat_" + "11ABCDEFG0" + "abcdefghijklmnop",
+        "hf_" + "A" * 34,
+        "AKIA" + "ABCDEFGHIJKLMNOP",
+        "AIza" + "B" * 35,
+        "Bearer " + "abcdefghijklmnopqrstuvwxyz0123456789",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz",
+        "-----BEGIN RSA PRIVATE KEY-----",
+    ]
+    for shape in shapes:
+        safe = events.redact({"log": f"the tool printed {shape} and then went on"})
+        assert shape not in safe["log"], shape
+        assert "[redacted]" in safe["log"], shape
+        assert "the tool printed" in safe["log"] and "and then went on" in safe["log"]
+
+
+def test_ordinary_text_is_not_mistaken_for_a_secret():
+    text = ("commit 0123456789abcdef0123456789abcdef01234567 fixes hf_model_name and sk-1 in "
+            "550e8400-e29b-41d4-a716-446655440000, see the AKIA prefix in the docs")
+    assert events.redact({"t": text})["t"] == text
+
+
+def test_a_count_or_a_flag_under_a_credential_shaped_key_is_kept_but_a_string_is_not():
+    """input_tokens and max_tokens are numbers. Only a string (or a container) under such a key can be a credential."""
+    safe = events.redact({
+        "input_tokens": 1200, "max_tokens": 4096, "token_ok": True, "token": None, "ratio_key": 0.5,
+        "password": "hunter2", "credentials": {"a": 1}, "token_list": ["x"],
+    })
+    assert safe["input_tokens"] == 1200 and safe["max_tokens"] == 4096 and safe["token_ok"] is True
+    assert safe["token"] is None and safe["ratio_key"] == 0.5
+    assert safe["password"] == safe["credentials"] == safe["token_list"] == "[redacted]"
+
+
+def test_redact_text_scans_one_string():
+    assert events.redact_text("used nvapi-" + "z" * 30 + " ok") == "used [redacted] ok"
+    assert events.redact_text("nothing to hide") == "nothing to hide"

@@ -31,8 +31,16 @@ not four. process_failures() therefore counts in memory first, decides, applies,
 counters and the decision record in one savepoint, so a Hermes call that fails leaves the database untouched
 and the same failure is simply decided again on the next pass.
 
-Nothing here calls a provider or starts a process. The only outside calls are the hermes.kanban_* wrappers,
-and creating the replacement card of a fresh attempt, or asking the Lead for a re-plan, is the controller's job.
+Nothing here calls a provider or starts a process. The only outside calls are the hermes.kanban_* wrappers and
+questions.ask_user, and creating the replacement card of a fresh attempt or of a model switch, or asking the Lead
+for a re-plan, is the controller's job.
+
+Asking the user goes through questions.ask_user and never through hermes.kanban_block directly. The cards this
+module acts on are `blocked` already (Hermes's circuit breaker gave up on them and wrote a `gave_up` event, and no
+`blocked` event), and Hermes's block_task accepts only a `running` or `ready` card: a block on a blocked card exits
+1 after it has left its comment behind (checked against the 0.21.3 source, 2026-09-21), so the question goes on the
+card as a comment instead, which `swarm questions` finds, and a question already open comes back as
+"already_asked" and is not put twice.
 """
 from __future__ import annotations
 
@@ -53,6 +61,7 @@ from . import hermes as hermes_mod
 from . import models as models_mod
 from . import plan as plan_mod
 from . import policy
+from . import questions as questions_mod
 from . import usage as usage_mod
 
 
@@ -401,7 +410,7 @@ def exhausted(lineage: Lineage, bounds: Bounds) -> str | None:
 ACTION_NONE = "none"                                        # nothing to do (Hermes's own retry, or not a failure)
 ACTION_RESUME = "resume"                                    # unblock: same card, same worktree, same model
 ACTION_FRESH_ATTEMPT = "fresh_attempt"                      # a NEW card from a fresh worktree, failure bundle attached
-ACTION_SWITCH_MODEL = "switch_model"                        # set the next model of the role class, then unblock
+ACTION_SWITCH_MODEL = "switch_model"                        # a NEW card from a fresh worktree, on the next model
 ACTION_PARK = "park"                                        # schedule the card until the provider's reset
 ACTION_REPLAN = "replan"                                    # the Lead may re-plan this task once
 ACTION_BLOCK_FOR_USER = "block_for_user"                    # a question for the user
@@ -424,10 +433,13 @@ class Decision:
     card each one is about: without them the controller could not tell which task a fresh_attempt or a replan
     belongs to. `run_id` is the failed run this decision answers.
 
-    Who does what for the two decisions process_failures only RETURNS: for fresh_attempt the controller creates the
+    Who does what for the three decisions process_failures only RETURNS: for fresh_attempt the controller creates the
     replacement card (fresh worktree at the current integration HEAD, failure_bundle() attached) and repoints
-    plan_tasks.work_card_id at it; for replan the controller asks the Lead once and calls bump(conn, project,
-    task_key, "replans") when it does, which is what stops the next decide() offering a second re-plan."""
+    plan_tasks.work_card_id at it; switch_model is the same, and the controller also pins `model` and `provider` on the
+    replacement card (ASES-REC-01, 19.2: a capability failure restarts from a fresh worktree, and the second one also
+    changes model, so the switch is never applied to the failed card in place); for replan the controller asks the Lead
+    once and calls bump(conn, project, task_key, "replans") when it does, which is what stops the next decide()
+    offering a second re-plan."""
     action: str
     reason: str
     backoff_seconds: int = 0
@@ -502,7 +514,8 @@ def decide(
     TOOL_CALLING    block_for_user: the model must be rejected for agent roles
     CAPABILITY,     when a lineage budget is spent (escalation): replan while lineage.replans == 0, else
     RUNTIME         block_for_user. Otherwise fresh_attempt on the first capability failure and switch_model from
-                    the second on. A runtime overrun counts as a capability failure ("counts as an attempt")
+                    the second on (both start from a fresh worktree; the second also takes the next model). A
+                    runtime overrun counts as a capability failure ("counts as an attempt")
     UNKNOWN         none until attempts_per_card runs in a row were unknown ("Hermes's own retry runs first"), then
                     block_for_user
     NONE            none"""
@@ -566,8 +579,9 @@ def decide(
                 f"with the failure bundle attached (failed attempt 1 of {bounds.attempts_per_card})."
             ))
         return Decision(ACTION_SWITCH_MODEL, (
-            f"The attempt {what} again (failed attempt {attempt} of {bounds.attempts_per_card}). Switch this card "
-            "to the next model for its role class."
+            f"The attempt {what} again (failed attempt {attempt} of {bounds.attempts_per_card}). Start the next one "
+            "from a fresh worktree at the current integration HEAD, with the failure bundle attached, on the next "
+            "model for its role class."
         ))
     # UNKNOWN: a failed run that says nothing recognisable.
     if consecutive_unknown >= bounds.attempts_per_card:
@@ -788,39 +802,8 @@ def _epoch(value) -> float | None:
 
 
 def _squash(value) -> str:
-    """Whitespace collapsed, so a question compares equal to the same question as Hermes stored it."""
+    """Whitespace collapsed, so one line of a failed run's error reads as one line."""
     return " ".join(_text(value).split())
-
-
-def _payload(event: dict) -> dict:
-    """A board event's payload as a dict (Hermes hands it over as a dict or a JSON string)."""
-    return _metadata(event.get("payload"))
-
-
-def _already_asked(card: dict, question: str) -> bool:
-    """True when `card` is already blocked with this exact question and nobody has answered it since. Either a
-    `blocked` event carrying the question as its reason, or a "BLOCKED: <question>" comment (which Hermes adds
-    before it tries the block, so it is there even when the block itself was refused), counts, but only when it
-    came after the last `unblocked` event or "UNBLOCK" comment: an answered question that comes back is asked again."""
-    target = _squash(question)
-    asked = False
-    for event in card.get("_events") or []:
-        if not isinstance(event, dict):
-            continue
-        if event.get("kind") == "unblocked":
-            asked = False
-        elif event.get("kind") == "blocked" and _squash(_payload(event).get("reason")) == target:
-            asked = True
-    if asked:
-        return True
-    marker = _squash(f"BLOCKED: {question}")
-    for comment in card.get("_comments") or []:
-        body = _squash(comment.get("body")) if isinstance(comment, dict) else ""
-        if body.startswith("UNBLOCK"):
-            asked = False
-        elif body == marker:
-            asked = True
-    return asked
 
 
 def _already_decided(conn: sqlite3.Connection, project: str, task_key: str, card_id: str, run_id) -> bool:
@@ -968,9 +951,9 @@ def _adjust(
     provider, model = _current_model(card, run, task, project, models_config)
     if decision.action == ACTION_MARK_CREDENTIAL_UNHEALTHY:
         return dataclasses.replace(decision, provider=provider, model=model)
-    # A switch an earlier pass chose but could not finish (set-model went through, the unblock did not) is reused,
-    # not chosen again: the card's override is already the new model by now, so "the next model after the current
-    # one" would flip straight back to the model that failed.
+    # A target an earlier pass chose for this failed run but did not get to record the decision for is reused, not
+    # chosen again: by now the controller may have pinned it on a card, and "the next model after the current one"
+    # would then flip straight back to the model that failed.
     target = _switch_target(conn, plan.project, task.key, card_id, run_id) or next_model(
         models_config, task.role, provider, model, unhealthy=unhealthy_credentials(conn),
         data_class=project.data_class,
@@ -1033,22 +1016,25 @@ def _recover_task(
         if not call(action, hermes_mod.kanban_schedule, board, card_id, decision.reason):
             return None
     elif action in (ACTION_BLOCK_FOR_USER, ACTION_MARK_CREDENTIAL_UNHEALTHY):
+        # ask_user, never kanban_block: this card is already `blocked`, which Hermes refuses to block again (after
+        # leaving its comment), so the question is a comment that `swarm questions` finds. "already_asked" means the
+        # same question is still open on the card: converged, the same as having asked it just now, and it writes
+        # nothing. (The call is wrapped because `call` takes its own `conn`, which is not ask_user's.)
         question = _question(task.key, decision, run)
-        if not _already_asked(card, question):
-            if not call(action, hermes_mod.kanban_block, board, card_id, question):
-                return None
+        if not call(action, lambda: questions_mod.ask_user(board, card, question, conn=conn)):
+            return None
     elif action == ACTION_SWITCH_MODEL:
+        # Not applied in place (ASES-REC-01, 19.2): the controller starts a fresh attempt on this model. What is
+        # remembered is the choice, before anything else is written, so that a decision made again after a failed
+        # write below takes the same target instead of choosing from a card whose model has moved since.
         if _switch_target(conn, plan.project, task.key, card_id, run_id) is None:
             events.record(conn, "recovery_switch_target", {
                 "project": plan.project, "task_key": task.key, "card_id": card_id, "run_id": run_id,
                 "provider": decision.provider, "model": decision.model,
             })
-        if not call(action, hermes_mod.kanban_set_model, board, card_id, decision.model, provider=decision.provider):
-            return None
-        if not call(action, hermes_mod.kanban_unblock, board, card_id):
-            return None
+        applied = False
     else:
-        applied = False   # none, fresh_attempt, replan: nothing for this module to apply
+        applied = False   # none, fresh_attempt, switch_model, replan: nothing for this module to apply
 
     with _atomic(conn):
         if action == ACTION_MARK_CREDENTIAL_UNHEALTHY and decision.provider:
@@ -1084,18 +1070,21 @@ def process_failures(
       resume                   kanban_unblock, but only once `now` (epoch seconds, default the clock) is past the
                                failed run's ended_at plus the backoff; before that nothing is done or recorded
       park                     kanban_schedule
-      block_for_user           kanban_block with a question, unless the card already carries that question
-      mark_credential_unhealthy  kanban_block with a question, and a `credential_unhealthy` event
-      switch_model             kanban_set_model to the next model of the role class, then kanban_unblock
-      fresh_attempt, replan    returned, NOT applied: creating the replacement card and asking the Lead are the
-                               controller's job (see Decision)
+      block_for_user           questions.ask_user with the question: a comment on the blocked card, and nothing at
+                               all when the same question is still open ("already_asked")
+      mark_credential_unhealthy  questions.ask_user with the question, and a `credential_unhealthy` event
+      fresh_attempt,           returned, NOT applied: creating the replacement card (and, for switch_model, pinning
+      switch_model, replan     `model` and `provider` on it) and asking the Lead are the controller's job (see
+                               Decision). A capability failure restarts from a fresh worktree and the second one
+                               also switches model (ASES-REC-01, 19.2), so a switch is never set in place on the
+                               failed card
     Each decision is recorded once as a `recovery_decision` event (project, task_key, card_id, run_id, kind, action,
     reason, applied), and a run that already has one is skipped, so a failure is counted once however many passes
     see the card. The event and the counter bump are written in one savepoint AFTER the hermes calls succeed, so a
     hermes call that fails (non-zero exit, no hermes, a hang) leaves the counters untouched: it is recorded once as
-    a `recovery_error` event, the task is decided again on the next pass, and no other task is affected.
-    `recovery_switch_target` remembers the model a switch chose, so that a retry after a half-finished switch does
-    not choose again.
+    a `recovery_error` event (which is only for a failure ask_user could not recover from), the task is decided
+    again on the next pass, and no other task is affected. `recovery_switch_target` remembers the model a switch
+    chose, so that a decision that has to be made again does not choose again.
 
     Not covered here: a review-round or fix-card budget that is spent is not a failed run. After
     refresh_review_rounds(), call escalation(load_lineage(...), Bounds.from_budgets(...)) for that. A card that

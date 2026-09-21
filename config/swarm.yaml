@@ -41,3 +41,28 @@ budgets:                           # section 9.3 global bounds
 hermes:
   tested_version: "0.21.3"
   native_home: "C:/Users/masoo/AppData/Local/hermes"
+
+# Worker sandbox (blueprint Appendix B and section 21.3; ASES-SEC-03, ASES-SEC-05, ASES-CFG-04).
+# OFF until Docker is running and the user has pulled a pinned image: while `enabled` is false, `swarm doctor`
+# reports the sandbox checks as warnings, and `swarm init` leaves the workers' terminal blocks alone. Set it to
+# true only after `swarm doctor` shows the sandbox rows green; from then on those rows are failures.
+# The other keys are the Appendix B keys and are validated by sandbox.SandboxPolicy: the backend must be docker,
+# the mount must be worktree_only, network access is default-deny (network_default: true is refused) and only
+# ever opened by an explicit task-scoped exception. Optional keys, not set here: image (a pinned reference,
+# for example python:3.11-slim@sha256:<digest>), cpu, memory_mb, pids_limit, extra_deny.
+sandbox:
+  enabled: false
+  terminal_backend: docker
+  network_default: false
+  mount: worktree_only
+  forward_env: []
+  network_exceptions: explicit_allowlist
+
+# How long ASES keeps what it writes under ases_home (ASES-OBS-02: "Transcripts and logs stay local under a
+# retention setting"). `swarm retention` applies these (a dry run unless --apply is given). Each is a whole
+# number of days, at least 1. Logs and worker transcripts contain source code, so they are kept for less time
+# than reports, which are the audit trail. Without --days, `swarm retention` uses the LONGER of the two, so it
+# never removes a file earlier than either setting allows.
+retention:
+  logs_days: 30
+  reports_days: 90

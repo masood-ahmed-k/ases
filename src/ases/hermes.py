@@ -224,8 +224,23 @@ def kanban_complete(board: str, card_id: str, *, result: str | None = None, meta
     _kanban(board, args)
 
 
-def kanban_block(board: str, card_id: str, reason: str) -> None:
-    _kanban(board, ["block", card_id, reason])
+def kanban_block(board: str, card_id: str, reason: str, *, kind: str | None = None) -> None:
+    """Block a card with `reason` (also recorded as a "BLOCKED: <reason>" comment, and as a `blocked` event whose
+    payload carries the reason). `kind` is Hermes's typed block reason: `needs_input` is a question for a human,
+    `capability` and `transient` describe a failure, `dependency` waits in todo. Hermes 0.21.3 (read from
+    kanban_db.py and kanban.py 2026-09-21): block_task only accepts a card that is `running` or `ready`, so blocking
+    a card that is already `blocked` (a merge card is created blocked) or in `todo` returns "cannot block" and exits
+    1 AFTER the comment was added; and a second block of the same kind after an unblock routes the card to `triage`
+    (BLOCK_RECURRENCE_LIMIT is 2) with a `block_loop_detected` event instead of `blocked`. Callers that escalate a
+    card they did not just observe running or ready should go through questions.ask_user, which knows both.
+    The reason follows `--` so one that starts with a dash is never read as an option, and `--kind` goes BEFORE the
+    card id: Hermes's argparse rejects `block <id> --kind K -- <reason>` ("unrecognized arguments"), because the
+    optional reason positional has already been matched empty when the option interrupts (checked offline against
+    hermes_cli.kanban_parser 2026-09-21, together with the accepted forms)."""
+    args = ["block"]
+    if kind:
+        args += ["--kind", kind]
+    _kanban(board, [*args, card_id, "--", reason])
 
 
 def kanban_schedule(board: str, card_id: str, reason: str) -> None:

@@ -3,7 +3,9 @@
 The hermes.kanban_* wrappers are replaced by an in-memory board and the database is a temp sqlite file, so nothing
 here touches a real board, a real Hermes or a provider. The board mimics the real Hermes behaviours this module
 depends on (probed against the installed 0.21.3 source): a block on a card that is already blocked is refused after
-its "BLOCKED: <reason>" comment has landed, and an unblock adds an `unblocked` event."""
+its "BLOCKED: <reason>" comment has landed, and an unblock adds an `unblocked` event. Recovery only ever acts on a
+`blocked` card, so it asks the user through questions.ask_user, which comments instead of blocking: the question a
+test looks for is the text of an "ASES QUESTION:" comment, and a `block` call is a failure of the test."""
 import copy
 import dataclasses
 import json
@@ -12,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from ases import config, db, events, hermes, plan as plan_mod, recovery
+from ases import config, db, events, hermes, plan as plan_mod, questions, recovery
 from ases.recovery import Bounds, Decision, FailureKind, Lineage
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
@@ -94,10 +96,12 @@ class FakeBoard:
         self.fail: dict[tuple[str, str], Exception] = {}
         self.status_follows = True      # False: a card stays `blocked` whatever is done to it
         self.block_mode = "accept"      # "refuse": block adds its comment, then fails, as Hermes does on a blocked card
+        self.clock = 100                # what a comment written now is stamped with: after every event a test seeds
         monkeypatch.setattr(hermes, "kanban_show", self.show)
         monkeypatch.setattr(hermes, "kanban_unblock", self.unblock)
         monkeypatch.setattr(hermes, "kanban_schedule", self.schedule)
         monkeypatch.setattr(hermes, "kanban_block", self.block)
+        monkeypatch.setattr(hermes, "kanban_comment", self.comment)
         monkeypatch.setattr(hermes, "kanban_set_model", self.set_model)
 
     def _maybe_fail(self, name, card_id):
@@ -117,7 +121,8 @@ class FakeBoard:
         card = self.cards[card_id]
         if self.status_follows:
             card["status"] = "ready"
-        card["_events"].append({"kind": "unblocked", "payload": None, "created_at": 1, "run_id": None})
+        self.clock += 1
+        card["_events"].append({"kind": "unblocked", "payload": None, "created_at": self.clock, "run_id": None})
 
     def schedule(self, board, card_id, reason):
         self._maybe_fail("schedule", card_id)
@@ -125,14 +130,22 @@ class FakeBoard:
         if self.status_follows:
             self.cards[card_id]["status"] = "scheduled"
 
-    def block(self, board, card_id, reason):
+    def block(self, board, card_id, reason, *, kind=None):
         card = self.cards[card_id]
-        self.mutations.append(("block", card_id, reason))
+        self.mutations.append(("block", card_id, reason, kind))
         card["_comments"].append({"author": "default", "body": f"BLOCKED: {reason}", "created_at": 2})
         self._maybe_fail("block", card_id)
         if self.block_mode == "refuse":
             raise hermes.HermesCommandError(["kanban", "block", card_id], 1, f"cannot block {card_id}")
         card["_events"].append({"kind": "blocked", "payload": {"reason": reason}, "created_at": 2, "run_id": None})
+
+    def comment(self, board, card_id, text, *, author=None):
+        self._maybe_fail("comment", card_id)
+        self.mutations.append(("comment", card_id, text, author))
+        self.clock += 1
+        self.cards[card_id]["_comments"].append(
+            {"author": author or "default", "body": text, "created_at": self.clock},
+        )
 
     def set_model(self, board, card_id, model, *, provider=None):
         self._maybe_fail("set_model", card_id)
@@ -194,6 +207,20 @@ def _pass(conn, tmp_path, *, now=ENDED + 10_000, budgets=None, data_class="publi
 
 def _lineage(**counters):
     return Lineage("p1", "T1", **counters)
+
+
+ASK = questions.ASK_PREFIX + " "     # "ASES QUESTION: ", what ask_user writes in front of the question
+
+
+def _asked(board):
+    """The questions put to the person, in order: the text of every ASES QUESTION comment the pass wrote."""
+    return [m[2][len(ASK):] for m in board.mutations if m[0] == "comment" and m[2].startswith(ASK)]
+
+
+def _gave_up(failures=3, error="boom", at=50):
+    """The `gave_up` event Hermes's dispatcher writes when its circuit breaker trips, and NO `blocked` event."""
+    return {"kind": "gave_up", "payload": {"failures": failures, "effective_limit": 3, "error": error,
+                                           "trigger_outcome": "crashed"}, "created_at": at, "run_id": None}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -781,6 +808,7 @@ def test_the_first_capability_failure_is_a_fresh_attempt_and_the_second_switches
     second = _decide(kind, capability_failures=2)
     assert second.action == "switch_model"
     assert "next model" in second.reason
+    assert "fresh worktree" in second.reason and "failure bundle" in second.reason   # the switch restarts too (19.2)
     assert first.model is None and second.model is None       # decide() has no model list: process_failures fills it in
 
 
@@ -1183,8 +1211,8 @@ def test_infrastructure_failures_escalate_to_a_question_at_attempts_per_card(con
 
     decisions = _pass(conn, tmp_path, now=ENDED)                      # no waiting: this is a question, not a resume
     assert [d.action for d in decisions] == ["block_for_user"]
-    ((verb, card_id, reason),) = board.mutations
-    assert (verb, card_id) == ("block", "w1")
+    assert [(m[0], m[1], m[3]) for m in board.mutations] == [("comment", "w1", "ases")]
+    (reason,) = _asked(board)
     assert reason.startswith("T1, last error: pid 4242 exited with code 1.") and reason.endswith("?")
     assert _lineage_row(conn, "T1")["infra_failures"] == 3
 
@@ -1203,26 +1231,26 @@ def test_a_quota_failure_parks_the_card_and_counts_nothing(conn, board, tmp_path
     assert (record["action"], record["applied"], record["kind"]) == ("park", True, "quota")
 
 
-def test_a_policy_failure_blocks_the_card_with_a_question_and_counts_nothing(conn, board, tmp_path):
+def test_a_policy_failure_asks_the_user_on_the_card_and_counts_nothing(conn, board, tmp_path):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", POLICY_TEXT)])
 
     decisions = _pass(conn, tmp_path)
 
     assert [d.action for d in decisions] == ["block_for_user"]
-    ((verb, card_id, reason),) = board.mutations
-    assert (verb, card_id) == ("block", "w1")
+    assert [(m[0], m[1]) for m in board.mutations] == [("comment", "w1")]
+    (reason,) = _asked(board)
     assert reason.startswith("T1, last error: HTTP 404: No endpoints found") and reason.endswith("?")
     assert "never relaxes the data class" in reason
     assert reason.isascii() and "\n" not in reason
     assert _lineage_row(conn, "T1") is None
 
 
-def test_a_card_that_already_carries_the_question_is_not_blocked_again(conn, board, tmp_path):
+def test_a_card_that_already_carries_the_question_is_not_asked_again(conn, board, tmp_path):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", POLICY_TEXT)])
     _pass(conn, tmp_path)
-    question = board.mutations[0][2]
+    (question,) = _asked(board)
 
     def rerun(**card_changes):
         """Decide the same failure again on a fresh database, against a card carrying `card_changes`."""
@@ -1233,18 +1261,24 @@ def test_a_card_that_already_carries_the_question_is_not_blocked_again(conn, boa
         return _pass(conn, tmp_path)
 
     blocked_event = {"kind": "blocked", "payload": {"reason": question}, "created_at": 5, "run_id": None}
+    posted = {"author": "ases", "body": f"ASES QUESTION: {question}", "created_at": 5}
     for changes in ({"_events": [blocked_event]},
                     {"_events": [{**blocked_event, "payload": json.dumps({"reason": question})}]},
-                    {"_comments": [{"author": "default", "body": f"BLOCKED: {question}", "created_at": 5}]},
-                    {"_comments": [{"author": "default", "body": f"BLOCKED:   {question}\n", "created_at": 5}]}):
+                    {"_comments": [posted]},
+                    {"_comments": [{**posted, "body": f"ASES QUESTION:   {question}\n"}]}):
         assert [d.action for d in rerun(**changes)] == ["block_for_user"]
         assert board.mutations == []                                # not asked again
         assert [e["action"] for e in _events_of(conn, "recovery_decision")] == ["block_for_user"]   # but decided
+        assert _events_of(conn, "question_asked") == []             # and nothing is logged about a question not asked
 
-    # A different question on the card does not count as this one.
+    # A different question on the card does not count as this one. Neither do the same words from somebody else, or
+    # a "BLOCKED:" comment that a refused block left behind: that is not the question ASES puts to the person.
     other = {"kind": "blocked", "payload": {"reason": "something else?"}, "created_at": 5, "run_id": None}
-    assert [d.action for d in rerun(_events=[other])] == ["block_for_user"]
-    assert [m[0] for m in board.mutations] == ["block"]
+    for changes in ({"_events": [other]},
+                    {"_comments": [{**posted, "author": "coder-1"}]},
+                    {"_comments": [{"author": "default", "body": f"BLOCKED: {question}", "created_at": 5}]}):
+        assert [d.action for d in rerun(**changes)] == ["block_for_user"]
+        assert _asked(board) == [question]
 
 
 def test_events_and_comments_that_are_not_records_do_not_hide_a_question(conn, board, tmp_path):
@@ -1255,54 +1289,122 @@ def test_events_and_comments_that_are_not_records_do_not_hide_a_question(conn, b
         _comments=["garbage", None, {"author": "default", "body": None, "created_at": 2}],
     )
     assert [d.action for d in _pass(conn, tmp_path)] == ["block_for_user"]
-    assert [m[0] for m in board.mutations] == ["block"]
+    assert [m[0] for m in board.mutations] == ["comment"]
 
 
 def test_an_answered_question_that_comes_back_is_asked_again(conn, board, tmp_path):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", POLICY_TEXT)])
     _pass(conn, tmp_path)
-    question = board.mutations[0][2]
+    (question,) = _asked(board)
     blocked = {"kind": "blocked", "payload": {"reason": question}, "created_at": 5, "run_id": None}
     unblocked = {"kind": "unblocked", "payload": None, "created_at": 6, "run_id": None}
+    posted = {"author": "ases", "body": f"ASES QUESTION: {question}", "created_at": 5}
 
     for cards in ({"_events": [blocked, unblocked]},
-                  {"_comments": [{"author": "default", "body": f"BLOCKED: {question}", "created_at": 5},
-                                 {"author": "default", "body": "UNBLOCK: use another provider", "created_at": 6}]}):
+                  {"_comments": [posted, {"author": "user", "body": "ANSWER: use another provider", "created_at": 6}]},
+                  {"_comments": [posted, {"author": "default", "body": "UNBLOCK: use another provider",
+                                          "created_at": 6}]}):
         board.mutations.clear()
         conn.execute("DELETE FROM events")
         board.cards["w1"] = _card("w1", [_run(8, "crashed", POLICY_TEXT)], **cards)
         assert [d.action for d in _pass(conn, tmp_path)] == ["block_for_user"]
-        assert [m[0] for m in board.mutations] == ["block"]
+        assert _asked(board) == [question]
 
 
-def test_real_hermes_refuses_to_block_a_blocked_card_but_the_question_still_lands_and_the_pass_converges(
+def test_a_blocked_card_is_never_blocked_again_the_question_is_a_comment_and_the_pass_converges(
     conn, board, tmp_path,
 ):
-    """Checked against the installed Hermes: `block` adds its "BLOCKED: <reason>" comment first and then fails on a
-    card that is already blocked. So the first pass sees an error, the second pass finds the question on the card
-    and records the decision without asking again, and no pass ever piles up comments."""
-    board.block_mode = "refuse"
+    """Checked against the installed Hermes: block_task accepts only a running or ready card, so `block` on a card that
+    is already blocked adds its "BLOCKED: <reason>" comment and then exits 1. Recovery only ever acts on a blocked
+    card, so it must not call block at all: the question is an "ASES QUESTION:" comment, the first pass already
+    records its decision, and no pass ever piles up comments or errors."""
+    board.block_mode = "refuse"          # a call to block would fail here, as it does on the real thing
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", POLICY_TEXT)])
 
-    assert _pass(conn, tmp_path) == []
-    assert [m[0] for m in board.mutations] == ["block"]
-    assert _events_of(conn, "recovery_decision") == []
-    (error,) = _events_of(conn, "recovery_error")
-    assert (error["task_key"], error["card_id"], error["action"]) == ("T1", "w1", "block_for_user")
-    assert "cannot block w1" in error["error"]
-
     decisions = _pass(conn, tmp_path)
+
     assert [d.action for d in decisions] == ["block_for_user"]
-    assert [m[0] for m in board.mutations] == ["block"]               # not called a second time
+    assert [(m[0], m[1], m[3]) for m in board.mutations] == [("comment", "w1", "ases")]
+    assert _events_of(conn, "recovery_error") == []
     assert len(board.cards["w1"]["_comments"]) == 1
 
-    assert _pass(conn, tmp_path) == []                                # and the run is settled
-    assert len(_events_of(conn, "recovery_error")) == 1
+    assert _pass(conn, tmp_path) == [] and _pass(conn, tmp_path) == []      # the run is settled
+    assert [m[0] for m in board.mutations] == ["comment"]
+    assert len(_events_of(conn, "recovery_decision")) == 1
 
 
-def test_an_auth_failure_is_recorded_blocked_for_the_user_and_the_provider_is_marked_unhealthy(conn, board, tmp_path):
+@pytest.mark.parametrize("text, action", [
+    (POLICY_TEXT, "block_for_user"), (AUTH_TEXT, "mark_credential_unhealthy"),
+    ("HTTP 400: maximum context length is 32768 tokens", "block_for_user"),
+    ("model produced an invalid tool call", "block_for_user"),
+])
+def test_recovery_never_calls_kanban_block_and_asks_through_ask_user(conn, board, tmp_path, monkeypatch, text, action):
+    """Whatever the question is about, the pass reaches the person through questions.ask_user (a comment on the
+    blocked card), so a `block` call, which Hermes refuses on a blocked card, never happens."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("recovery called hermes.kanban_block")
+
+    monkeypatch.setattr(hermes, "kanban_block", forbidden)
+    seen = []
+    real_ask = questions.ask_user
+    monkeypatch.setattr(questions, "ask_user", lambda *a, **k: seen.append((a, k)) or real_ask(*a, **k))
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", text)])
+
+    assert [d.action for d in _pass(conn, tmp_path)] == [action]
+
+    ((args, kwargs),) = seen
+    assert args[0] == "b" and args[1]["id"] == "w1" and args[2].endswith("?") and kwargs == {"conn": conn}
+    assert [m[0] for m in board.mutations] == ["comment"]
+
+
+def test_a_card_the_dispatcher_gave_up_on_is_asked_about_and_then_found_by_swarm_questions(conn, board, tmp_path):
+    """The whole point of the change: Hermes writes a `gave_up` event and no `blocked` event for this card, and the
+    question recovery puts on it must be one `swarm questions` and `swarm answer` can see and act on."""
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", POLICY_TEXT)], _events=[_gave_up(3, "no endpoints")])
+    assert questions.open_question(board.cards["w1"]).source == "gave_up"          # what a person would see before
+
+    assert [d.action for d in _pass(conn, tmp_path)] == ["block_for_user"]
+
+    (question,) = _asked(board)
+    asked = questions.open_question(board.cards["w1"])
+    assert (asked.source, asked.reason) == ("ases_comment", question)               # ASES's question is the newest
+    assert "never relaxes the data class" in asked.reason
+
+    assert _pass(conn, tmp_path) == []                                              # nothing more on later passes
+    assert _asked(board) == [question]
+
+    answered = questions.answer_question("b", "w1", "Use the paid provider.", conn=conn)   # and it can be answered
+    assert (answered.source, answered.question) == ("ases_comment", question)
+    assert board.cards["w1"]["status"] == "ready"
+    assert questions.open_question(board.cards["w1"]) is None
+
+
+def test_ask_user_failing_is_a_recovery_error_that_is_retried_and_counts_nothing(conn, board, tmp_path):
+    """recovery_error is only for a failure ask_user could not recover from: here even the comment is refused."""
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", POLICY_TEXT)])
+    board.fail[("comment", "w1")] = hermes.HermesCommandError(["kanban", "comment", "w1"], 1, "database is locked")
+
+    assert _pass(conn, tmp_path) == []
+    (error,) = _events_of(conn, "recovery_error")
+    assert (error["task_key"], error["card_id"], error["action"]) == ("T1", "w1", "block_for_user")
+    assert "database is locked" in error["error"]
+    assert _events_of(conn, "recovery_decision") == [] and _events_of(conn, "question_asked") == []
+
+    assert _pass(conn, tmp_path) == [] and len(_events_of(conn, "recovery_error")) == 1     # said once, retried
+
+    del board.fail[("comment", "w1")]
+    assert [d.action for d in _pass(conn, tmp_path)] == ["block_for_user"]
+    assert len(_asked(board)) == 1
+    (asked_event,) = _events_of(conn, "question_asked")
+    assert (asked_event["card_id"], asked_event["via"]) == ("w1", "commented")
+
+
+def test_an_auth_failure_is_recorded_asked_to_the_user_and_the_provider_is_marked_unhealthy(conn, board, tmp_path):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", AUTH_TEXT)])
 
@@ -1310,8 +1412,9 @@ def test_an_auth_failure_is_recorded_blocked_for_the_user_and_the_provider_is_ma
 
     assert [d.action for d in decisions] == ["mark_credential_unhealthy"]
     assert (decisions[0].provider, decisions[0].model) == ("xkiro", CODER_MODEL)
-    ((verb, card_id, reason),) = board.mutations
-    assert (verb, card_id) == ("block", "w1") and reason.endswith("?") and "credential" in reason
+    assert [(m[0], m[1]) for m in board.mutations] == [("comment", "w1")]
+    (reason,) = _asked(board)
+    assert reason.endswith("?") and "credential" in reason
     (unhealthy,) = _events_of(conn, "credential_unhealthy")
     assert (unhealthy["task_key"], unhealthy["provider"], unhealthy["model"], unhealthy["run_id"]) == \
         ("T1", "xkiro", CODER_MODEL, 7)
@@ -1320,12 +1423,16 @@ def test_an_auth_failure_is_recorded_blocked_for_the_user_and_the_provider_is_ma
     assert _lineage_row(conn, "T1") is None
 
 
-def test_the_credential_is_only_marked_when_the_block_went_through(conn, board, tmp_path):
+def test_the_credential_is_only_marked_when_the_question_went_through(conn, board, tmp_path):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", AUTH_TEXT)])
-    board.fail[("block", "w1")] = hermes.HermesCommandError(["kanban", "block", "w1"], 1, "database is locked")
+    board.fail[("comment", "w1")] = hermes.HermesCommandError(["kanban", "comment", "w1"], 1, "database is locked")
     assert _pass(conn, tmp_path) == []
     assert recovery.unhealthy_credentials(conn) == set() and _events_of(conn, "credential_unhealthy") == []
+
+    del board.fail[("comment", "w1")]
+    assert [d.action for d in _pass(conn, tmp_path)] == ["mark_credential_unhealthy"]
+    assert recovery.unhealthy_credentials(conn) == {("xkiro", "*")}
 
 
 def test_the_auth_failure_of_a_switched_card_names_the_model_it_was_switched_to(conn, board, tmp_path):
@@ -1348,18 +1455,21 @@ def test_the_failing_provider_is_found_from_the_role_when_the_runs_profile_maps_
     assert (decisions[0].provider, decisions[0].model) == ("xkiro", CODER_MODEL)   # T1 is a coder task
 
 
-def test_an_auth_failure_on_an_unknown_provider_still_blocks_but_marks_nothing(conn, board, tmp_path):
+def test_an_auth_failure_on_an_unknown_provider_still_asks_but_marks_nothing(conn, board, tmp_path):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", AUTH_TEXT)], model_override="mystery/model")
     decisions = _pass(conn, tmp_path)
     assert [(d.action, d.provider, d.model) for d in decisions] == \
         [("mark_credential_unhealthy", None, "mystery/model")]
-    assert [m[0] for m in board.mutations] == ["block"]
+    assert [m[0] for m in board.mutations] == ["comment"]
     assert _events_of(conn, "credential_unhealthy") == [] and recovery.unhealthy_credentials(conn) == set()
     assert [e["action"] for e in _events_of(conn, "recovery_decision")] == ["mark_credential_unhealthy"]
 
 
-def test_the_second_capability_failure_switches_the_model_then_unblocks(conn, board, tmp_path):
+def test_the_second_capability_failure_returns_a_switch_model_decision_and_applies_nothing(conn, board, tmp_path):
+    """ASES-REC-01 (19.2): a capability failure restarts from a fresh worktree and the second one also takes the next
+    model. So the switch is decided here, with the model and the provider filled in, and left to the controller to
+    do on the replacement card: the failed card is neither given the model in place nor unblocked."""
     _seed_task(conn, "T1", "w1")
     recovery.bump(conn, "p1", "T1", "capability_failures")            # the first one was fresh_attempt earlier
     board.cards["w1"] = _card("w1", [_run(7, "crashed", PROTOCOL_TEXT)])
@@ -1368,12 +1478,18 @@ def test_the_second_capability_failure_switches_the_model_then_unblocks(conn, bo
 
     assert [d.action for d in decisions] == ["switch_model"]
     assert (decisions[0].provider, decisions[0].model) == ("xkiro", CANDIDATE_1)
-    assert f"xkiro/{CANDIDATE_1}" in decisions[0].reason
-    assert board.mutations == [("set_model", "w1", CANDIDATE_1, "xkiro"), ("unblock", "w1")]
+    assert (decisions[0].task_key, decisions[0].card_id, decisions[0].run_id) == ("T1", "w1", 7)
+    assert f"xkiro/{CANDIDATE_1}" in decisions[0].reason and "fresh worktree" in decisions[0].reason
+    assert board.mutations == []                                       # no set-model, no unblock, no comment
+    assert "model_override" not in board.cards["w1"] and board.cards["w1"]["status"] == "blocked"
     assert _lineage_row(conn, "T1")["capability_failures"] == 2
     (record,) = _events_of(conn, "recovery_decision")
     assert (record["action"], record["model"], record["provider"], record["applied"]) == \
-        ("switch_model", CANDIDATE_1, "xkiro", True)
+        ("switch_model", CANDIDATE_1, "xkiro", False)
+    (target,) = _events_of(conn, "recovery_switch_target")             # the decided switch is remembered
+    assert (target["task_key"], target["card_id"], target["run_id"], target["provider"], target["model"]) == \
+        ("T1", "w1", 7, "xkiro", CANDIDATE_1)
+    assert _pass(conn, tmp_path) == []                                 # decided once: later passes return nothing
 
 
 def test_a_switch_moves_on_from_the_model_the_card_already_runs_on(conn, board, tmp_path):
@@ -1454,7 +1570,7 @@ def test_an_exhausted_budget_replans_once_then_asks_the_user(conn, board, tmp_pa
     board.cards["w1"]["_runs"].append(_run(8, "crashed", PROTOCOL_TEXT))
     asked = _pass(conn, tmp_path)
     assert [d.action for d in asked] == ["block_for_user"]
-    assert [m[0] for m in board.mutations] == ["block"] and board.mutations[0][2].endswith("?")
+    assert [m[0] for m in board.mutations] == ["comment"] and _asked(board)[0].endswith("?")
     assert _lineage_row(conn, "T1")["capability_failures"] == 4
 
 
@@ -1476,7 +1592,7 @@ def test_the_projects_replan_budget_turns_a_replan_into_a_question(conn, board, 
     decisions = _pass(conn, tmp_path, budgets={"replans_per_project": 1})
     assert [d.action for d in decisions] == ["block_for_user"]
     assert "re-plans" in decisions[0].reason and decisions[0].reason.endswith("?")
-    assert [m[0] for m in board.mutations] == ["block"]
+    assert [m[0] for m in board.mutations] == ["comment"]
 
     # With room left in the project's budget the same failure is a re-plan.
     board.mutations.clear()
@@ -1629,61 +1745,52 @@ def test_a_card_that_cannot_be_read_is_recorded_and_the_others_carry_on(conn, bo
     assert (recorded["task_key"], recorded["action"]) == ("T1", "show")
 
 
-def test_a_failed_switch_leaves_the_database_untouched_and_is_retried(conn, board, tmp_path):
+def test_a_switch_decision_that_could_not_be_recorded_is_made_again_on_the_same_model(
+    conn, board, tmp_path, monkeypatch,
+):
+    """The target is remembered before the decision is written. When the write fails the decision is made again on
+    the next pass, and by then the model may be pinned on the card: choosing "the next model after the current one"
+    again would return to the model that just failed twice. The remembered target is reused instead."""
     _seed_task(conn, "T1", "w1")
     recovery.bump(conn, "p1", "T1", "capability_failures")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", PROTOCOL_TEXT)])
-    board.fail[("set_model", "w1")] = hermes.HermesCommandError(["kanban", "set-model"], 1, "no such model")
+    real_bump = recovery.bump
 
-    assert _pass(conn, tmp_path) == []
-    assert _lineage_row(conn, "T1")["capability_failures"] == 1        # not counted: nothing was applied
-    assert _events_of(conn, "recovery_decision") == []
-    assert board.mutations == []                                       # and no unblock after a refused set-model
+    def broken_bump(*args, **kwargs):
+        raise RuntimeError("disk full")
 
-    del board.fail[("set_model", "w1")]
-    assert [d.action for d in _pass(conn, tmp_path)] == ["switch_model"]
-    assert _lineage_row(conn, "T1")["capability_failures"] == 2
-
-
-def test_a_switch_whose_unblock_failed_is_retried_on_the_same_model_not_flipped_back(conn, board, tmp_path):
-    """set-model went through and the unblock did not. By the next pass the card's override IS the new model, so
-    choosing "the next model after the current one" again would return to the model that just failed twice. The
-    target chosen the first time is remembered and reused."""
-    _seed_task(conn, "T1", "w1")
-    recovery.bump(conn, "p1", "T1", "capability_failures")
-    board.cards["w1"] = _card("w1", [_run(7, "crashed", PROTOCOL_TEXT)])
-    board.fail[("unblock", "w1")] = hermes.HermesCommandError(["kanban", "unblock", "w1"], 1, "database is locked")
-
-    assert _pass(conn, tmp_path) == []
-    assert board.mutations == [("set_model", "w1", CANDIDATE_1, "xkiro")]
-    assert board.cards["w1"]["model_override"] == CANDIDATE_1
+    monkeypatch.setattr(recovery, "bump", broken_bump)
+    with pytest.raises(RuntimeError):
+        _pass(conn, tmp_path)
     assert _events_of(conn, "recovery_decision") == [] and _lineage_row(conn, "T1")["capability_failures"] == 1
     (target,) = _events_of(conn, "recovery_switch_target")
     assert (target["task_key"], target["card_id"], target["run_id"], target["model"]) == ("T1", "w1", 7, CANDIDATE_1)
 
-    del board.fail[("unblock", "w1")]
+    board.cards["w1"]["model_override"], board.cards["w1"]["provider_override"] = CANDIDATE_1, "xkiro"
+    monkeypatch.setattr(recovery, "bump", real_bump)
     decisions = _pass(conn, tmp_path)
-    assert [(d.action, d.model) for d in decisions] == [("switch_model", CANDIDATE_1)]     # not CODER_MODEL
-    assert board.mutations == [("set_model", "w1", CANDIDATE_1, "xkiro")] * 2 + [("unblock", "w1")]
+    assert [(d.action, d.provider, d.model) for d in decisions] == [("switch_model", "xkiro", CANDIDATE_1)]
     assert len(_events_of(conn, "recovery_switch_target")) == 1                           # remembered once
     assert _lineage_row(conn, "T1")["capability_failures"] == 2
+    assert board.mutations == []
 
 
 def test_a_remembered_switch_target_belongs_to_one_failed_run_only(conn, board, tmp_path):
-    board.status_follows = False
     budgets = {"attempts_per_card": 6}
     _seed_task(conn, "T1", "w1")
     recovery.bump(conn, "p1", "T1", "capability_failures")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", PROTOCOL_TEXT)])
     assert [d.model for d in _pass(conn, tmp_path, budgets=budgets)] == [CANDIDATE_1]
 
-    # The card failed again on the new model. That is a NEW run, so the next model is chosen afresh from the one
-    # the card now runs on, not taken from the target remembered for run 7.
+    # The controller pinned that model on the card, and the card failed again on it. That is a NEW run, so the next
+    # model is chosen afresh from the one the card now runs on, not taken from the target remembered for run 7.
+    board.cards["w1"]["model_override"], board.cards["w1"]["provider_override"] = CANDIDATE_1, "xkiro"
     board.cards["w1"]["_runs"].append(_run(8, "crashed", PROTOCOL_TEXT))
     assert [d.model for d in _pass(conn, tmp_path, budgets=budgets)] == [CODER_MODEL]
     assert [(t["run_id"], t["model"]) for t in _events_of(conn, "recovery_switch_target")] == [
         (7, CANDIDATE_1), (8, CODER_MODEL),
     ]
+    assert board.mutations == []
 
 
 def test_a_failed_unblock_after_a_resume_is_retried_without_counting_twice(conn, board, tmp_path):
@@ -1710,7 +1817,7 @@ def test_unknown_failures_are_left_to_hermes_until_attempts_per_card_of_them_in_
     board.cards["w1"]["_runs"].append(_run(3, "crashed", ""))          # the third unknown failure in a row
     decisions = _pass(conn, tmp_path)
     assert [d.action for d in decisions] == ["block_for_user"]
-    assert [m[0] for m in board.mutations] == ["block"]
+    assert [m[0] for m in board.mutations] == ["comment"]
 
 
 def test_the_unknown_streak_is_broken_by_a_failure_of_any_other_kind(conn, board, tmp_path):
@@ -1741,7 +1848,7 @@ def test_the_unknown_streak_counts_through_rate_limited_runs(conn, board, tmp_pa
         _run(4, "rate_limited", ""), _run(5, "crashed", ""),
     ])
     assert [d.action for d in _pass(conn, tmp_path)] == ["block_for_user"]          # three unknowns in a row
-    assert [m[0] for m in board.mutations] == ["block"]
+    assert [m[0] for m in board.mutations] == ["comment"]
 
 
 def test_a_latest_run_that_was_rate_limited_is_a_rate_limit_not_an_unknown_failure(conn, board, tmp_path):
@@ -1786,8 +1893,9 @@ def test_a_secret_in_a_failed_runs_error_never_reaches_a_question_or_the_log(con
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [_run(7, "crashed", f"HTTP 401: Invalid API key {secret} for account")])
     _pass(conn, tmp_path)
-    ((_, _, reason),) = board.mutations
+    (reason,) = _asked(board)
     assert secret not in reason and "[redacted]" in reason
+    assert not any(secret in str(part) for mutation in board.mutations for part in mutation)   # nor in any comment
     everything = json.dumps([dict(r) for r in conn.execute("SELECT kind, payload FROM events")])
     assert secret not in everything
 
@@ -1797,7 +1905,7 @@ def test_a_question_is_ascii_one_line_and_short_even_for_a_hostile_error(conn, b
     error = f"HTTP 404 No endpoints found {ARROW} line one\nline two\t" + "z" * 900
     board.cards["w1"] = _card("w1", [_run(7, "crashed", error)])
     _pass(conn, tmp_path)
-    ((_, _, reason),) = board.mutations
+    (reason,) = _asked(board)
     assert reason.isascii() and "\n" not in reason and "\t" not in reason
     assert ESCAPED_ARROW in reason and len(reason) < 700 and reason.endswith("?")
 

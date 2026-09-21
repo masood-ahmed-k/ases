@@ -351,3 +351,389 @@ Noticed (to settle in wiring):
 - ASES's own past commits would trip this check if run through the swarm (fake tokens in tests, marker strings in code): the seeded
   fixtures need allow globs or a per-repo baseline if ASES ever builds itself.
 - `spec/requirements.yaml` rows for QG-02, QG-03 and GIT-07 still need updating once wired.
+
+# Round 5 (2026-09-21 and 2026-09-22): wiring, fake rig, evals, hardening, final gates, profiles
+
+Work orders: `r5_rules.md`, `r5_contracts.md`, `r5_wp_*.md`, plus `r3_wp_finalgates.md` and `r4_wp_profiles.md`.
+
+## Package QF: questions and escalation fix (`questions.py`, `recovery.py`, `report.py` and their tests), done
+
+Built: `OpenQuestion` and `open_question(card)` (four sources: `blocked`, `gave_up`, `block_loop`, `ases_comment`; newest signal wins, a
+comment beats an event on a tie; a later `unblocked` event or a later `ANSWER:` or `UNBLOCK:` comment means it was answered; pure;
+redacted and ASCII-escaped) and `ask_user(board, card, text, *, conn=None, author="ases")` returning `already_asked`, `blocked` or
+`commented` (`ready` and `running` go through `kanban_block(kind="needs_input")`, every other status and a refused block through a
+`ASES QUESTION:` comment). `list_questions` reads both the `blocked` and `triage` lanes; `answer_question` on a triage card posts the
+`ANSWER:` comment first and then raises `QuestionError` naming `hermes kanban specify <id>`. `recovery.process_failures` now uses
+`ask_user` for `block_for_user` and `mark_credential_unhealthy`, and returns `switch_model` UNAPPLIED (model and provider filled in, like
+`fresh_attempt`) with `recovery_switch_target` still recorded. `report.py` uses `open_question` and adds `cards.questions_by_source`.
+Tests in the three files went from 561 to 754. The builder fuzzed `open_question` and `ask_user` 20,000 cases each.
+
+Deviations:
+- `open_question` ignores a `blocked` event whose reason is `initial_status` (Hermes writes that event for every card created blocked,
+  so every merge card would otherwise be listed). The controller builder had a wrapper `controller._open_question` for the same thing;
+  it is now redundant but harmless.
+- `list_questions` lists a triage card with ANY open signal, including an `ASES QUESTION:` comment (else `ask_user` on a triage card
+  would create a question nobody sees).
+- `ask_user` raises `ValueError` for a blank question or a card with no id. The `gave_up` reason reads `gave up after N failure(s): <error>`.
+- An answer whose unblock failed now reads as answered, so `swarm answer` refuses a second try (it names `hermes kanban unblock <id>`).
+- No `question_answered` event on the triage path.
+
+Noticed:
+- Hermes keeps `block_recurrences` across an unblock and only `complete_task` clears it: a worker that uses an untyped `kanban_block`
+  gets ONE answered question per card, the second lands in triage where `swarm answer` can only comment. (The profile prompts tell
+  workers to use `--kind needs_input`, which does not avoid it: same kind repeats.)
+- `ask_user` on a `todo`, `scheduled`, `review` or `done` card posts a comment but holds nothing, and `open_question` cannot see it.
+- Blocking a `running` card releases the claim in the database but does not stop the live worker process.
+- `list_comments` sorts by `created_at` only, so same-second comments have no guaranteed order (ties broken by list position).
+- `hermes kanban unblock` on a triage card writes its `UNBLOCK:` comment BEFORE failing, so that question then reads as answered while
+  the card stays in triage.
+- `kanban_block` callers outside `questions.ask_user`: none in `src/`, apart from a worker prompt line at `controller.py:275`.
+
+## Package MR: merge queue, review lane, usage and gates wiring (`mergeq.py`, `review.py`, `usage.py`, `gates.py` and their tests), done
+
+Built: `MergeOutcome.stopped` and `merge_task(..., project=None, should_stop=None)` (polled before the candidate, before Gate 3 and
+before the fast-forward; the `merge_records` row is written only after the last poll, so a stop leaves it untouched; a raising
+`should_stop` counts as False and records `should_stop_error`); `build_candidate`, `fast_forward` and `revert` intents; the candidate
+upsert now resets `reverted`, `squash_commit` and `completed_at` (the reconcile builder's `done_but_reverted` bug); `MergeOutcome.detail`
+redacted whenever an outcome is built. `review.py`: `BranchCheck` kinds `tamper` and `tamper_check_error`, public `gate_config_paths`
+(one `git cat-file --batch-check`, blobs only), `tamper.check_range` wired into `check_branch` AND `check_branch_for_merge` (after the
+scope and binding checks, before any Gate 1 record is trusted, same merge-base as the scope check); `gate_before_review` sends a tamper
+result back like a red Gate 1 and does NOT send back a `tamper_check_error` (returns True; the merge-time check is authoritative and
+fails closed). `usage.py`: one `model_mismatch` event per session (detection only, written in the same savepoint as the usage row).
+`gates.run_gate` redacts command output before it is stored and returned. 92 new test functions (133 items); the four files went from
+324 to 457 tests.
+
+Deviations:
+- Provider attribution in `usage.py`: `hermes.session_usage` does not say which provider answered, so "determined" means a leading
+  `<provider>/` naming a configured provider, or exactly one other configured provider listing that model; else the profile's provider.
+- `check_branch_for_merge` does not call `check_branch`, so the tamper check was wired into both; `_check_scope` now returns
+  `(BranchCheck, base)`.
+- An extra `tamper_blocked` event from `gate_before_review` (the send-back is only a card comment and `report.py` shows events whose
+  kind contains "tamper").
+- The first `should_stop` poll comes before the wrong-checkout and `expected_head` refusals, so a halted project gets "stopped" and not
+  a failure that would open a fix card. No `run_gate` intent (review's signatures carry no project).
+- `tests/unit/test_usage.py` had CRLF line endings; normalised to LF as `.gitattributes` says.
+
+Noticed:
+- IMPORTANT: gate-config and assertion-weakening findings NEVER fire through the review wiring. The scope check runs first, so any path
+  that reaches the tamper check is already inside the task's touches, which tamper treats as allowed. Verified by experiment: a
+  `pytest.ini` edit is `out_of_scope` with touches `src/*` and `ok` with touches `*`, so a wildcard touches glob silently allows config
+  edits. ASES-QG-02 is enforced by the scope check alone. To make the tamper rule matter: pass only non-wildcard touches as
+  `allow_paths`, or reject wildcard touches (and touches naming gate config) at plan time (Gate 0).
+- `revert_merge` marks `reverted = 1` even when `git revert` fails and never aborts a conflicted revert (the primary checkout can be
+  left mid-revert). Nothing calls it (ASES-GIT-05 still partial). One-condition fix: `if ok and ...`.
+- `report.HEALTH_KINDS` lacks `model_mismatch`, `should_stop_error`, `tamper_check_error`, `tamper_blocked`.
+- `process_review_lane` re-runs `gate_before_review` on every pass for cards in review: a persistent tamper-check failure records one
+  `tamper_check_error` event per pass (the controller dedupes its own, review does not).
+- Concurrent full-suite runs by several builders share pytest's temp base directory and delete each other's dirs (spurious
+  `FileNotFoundError` failures).
+- Register rows to update once wired: ASES-QG-02, QG-03, GIT-07, REC-03, REC-04, REC-06, RTE-01, SEC-01. `gates.py` has an unused
+  import (`ases_db`).
+
+## Package FG: Gates 4 and 5 and the release report (`src/ases/finalgates.py`, `tests/unit/test_finalgates.py`), done
+
+Built: `TreeFinding`, `severity`/`blocking`/`advisory` (only `injection_pattern` is advisory and `skipped` an info note; everything
+else blocks), `format_finding`, `scan_text`, `scan_tree(repo, ref, ...)` (reads git objects with `ls-tree -z -l` plus `cat-file --batch`,
+never raises, a git failure is one `scan_error`), `GateOutcome`, `FinalizeResult`, `run_gate4` (built-in scan first; a blocking finding
+fails the gate WITHOUT running the plan's commands; then the plan's `gate4` profile; one combined row), `run_gate5` (the plan's `gate5`
+profile, else every distinct task command in first-seen order; nothing to run fails), `final_gate_question`, `release_summary`,
+`write_release_report` (`release.md` in ASCII plus `report.html`/`report.json` beside it; a failing project report is noted in
+`release.md`, which is still written), `finalize` (steps a to f, the four events and the intents, idempotent). 177 test functions
+(294 cases).
+
+Deviations:
+- `run_gate` is called with `conn=None` and the ONE row is always written by `bounds.record_final_gate` (only way it can be the combined
+  scan-plus-commands result and cover paths where no command runs).
+- Hooks (`scan`, `run_gate`, `run4`, `run5`, `build`, `is_finished`) default to None and resolve the real function at call time.
+- `finalize` beyond the spec: returns "finished" at once for a finished project; `not_ready` when the project is stopped or paused (checked
+  before each gate and before the report) or when the integration branch moved while the gates ran; a gate that raises returns `error`,
+  records no gate row and closes its intent with "aborted"; a failed report write is retried without re-running green gates.
+- Gate 5's fallback excludes the `gate4` profile. `tamper.py` keeps its artifact and secret-name lists private, so a subset is mirrored.
+- Injection rules: JS `child_process.exec` and `innerHTML` need a `${`; comment lines skipped; lines read to 2000 characters; added
+  `pickle.load(` and `+` concatenation. Not built: no Hermes audit or verify tool is called (the plan's commands are the mechanism);
+  no false-positive allowlist.
+
+Noticed:
+- IMPORTANT: Gate 4 FAILS on ASES's own repository (37 blocking `secret_in_tree` hits on fake `sk-` keys in tests and docs, 8 advisory
+  hits). Any project with sample keys in tests or docs fails Gate 4 with no override, and a repo that tracks `dist/` or `build/` fails
+  permanently. Gate 1's tamper check lets a task's touches allow such a path; Gate 4 has no equivalent (needs an allowlist in the plan).
+- `gates.run_gate` reports a failed worktree creation as a RED gate, not an infrastructure error: for a final gate that becomes
+  `gate_failed` and a pause instead of a retry.
+- `bounds.set_status(..., "paused", reason)` DROPS the reason (only `stopped` keeps it): the controller's gate-failure question survives
+  only in the `hermes.pause` call; the CLI needs it recorded somewhere (an event).
+- Two `stop_requested` again (`bounds` counts paused, `killswitch` does not); FG used bounds'.
+- The `intents` key is the project name (per the `intents.py` convention), so reconcile's label for a crashed gate does not say which
+  gate (the gate is in the intent's detail). Question counts in the release summary are database-wide (only `recovery_decision` carries a
+  project field). `release_summary` reads every task's work card through `bounds.evaluate_bounds`.
+- Gate 0 does not reserve the plan gate profile names `gate4` and `gate5`, so a task could use one as its focused gate.
+- The release-report folder timestamp is `20260921T120000Z` (from killswitch); the CLI's `_reports_dir` may use another format: check.
+- `spec/requirements.yaml` still lists ASES-TSK-04 as `not_covered`.
+
+## Package CL: command line version 2 (`cli.py`, `doctor.py`, `config.py`, `config/swarm.yaml` and their tests), done
+
+Built: `cli.py` rewritten with shared plumbing (`_lazy`, `_ascii`, `_reports_dir` with no colons in the timestamp and a numeric suffix on
+a same-second collision, `_run_lead`/`_LeadResult` factored out of `cmd_plan`, `_estimate_lines` shared by `approve` and `critique`) and
+every command of section 9.1: `questions`, `answer` (never echoes the answer), `status`, `report`, `critique` (Gate P, `--auto-replan`),
+`approve` (requires a critic PASS bound to the plan hash, or `--skip-critic` recorded as `critic_skipped`; shows the critic summary;
+`--deadline-minutes`), `run` (real reconcile at start: exit 5 or `--ignore-reconcile`; exit 4 stopped, paused or finished; Ctrl-C gives
+130), `stop`, `resume` (`--extend-minutes`), `init`, `eval`, `clean`, `retention`, `doctor`, `models`, `plan`. `_NOT_BUILT_YET` and
+`cmd_not_built_yet` are deleted. `doctor.py`: sandbox and profile-state rows (WARN while the sandbox is disabled, FAIL only when enabled
+and a check fails; the Docker placeholder is gone). `config.py`: `sandbox` and `retention` blocks validated through
+`SandboxPolicy.from_config`, unknown keys are errors. `config/swarm.yaml` gains documented `sandbox:` (`enabled: false`) and
+`retention:` (30 and 90). 325 tests in the four files (27 before), coverage of `cli.py` and `config.py` measured with `sys.settrace`.
+
+Deviations and extras:
+- `swarm report` writes the page and JSON only with `--html` or `--out` (`--out` inside the repo is refused before any work).
+- `approve` re-hashes the plan after the y/N answer and refuses if it changed (an edit made while the prompt waits would otherwise be
+  published unreviewed); `run` checks the stop or pause flag before each pass (a `swarm stop` from another terminal is honoured whichever
+  controller is behind `run_pass`); `run` with an invalid plan is a clean exit 1.
+- `--deadline-minutes` stores now + N minutes only after the user approves (a later `swarm run` gets a shorter window).
+- `swarm retention` defaults to the LONGER of `logs_days` and `reports_days` (`hardening.retention` takes one `days`).
+- `swarm resume` without `--repo` cannot reconcile (says so; the next `swarm run` reconciles); with a plan that fails Gate 0 it refuses.
+- `critique --auto-replan` does not feed a failed Gate 0 back to the Lead (prints the errors, exit 1).
+- The nemotron reviewers returned 403: the builder reviewed adversarially itself and found the approve hole and two smaller gaps.
+
+Noticed:
+- `killswitch.within_deadline` stays True when `hermes pause` failed, so a stop that left dispatch running can report success.
+- `bounds.set_status` keeps a reason only for `stopped`; the controller keeps a pause reason in a `project_paused` event.
+- Wiring `critic.critique_rounds_used` into `project_state.replans` would stop a project at once (`evaluate_bounds` uses `used >= limit`
+  and re-plans are a stop bound): NOT wired.
+- `profiles.plan_init` returns warning-only rows even for a converged home (`swarm init` counts only `actionable` rows).
+- `profiles.apply_init`'s default runner calls the real `hermes profile create`: no test may reach it through the CLI.
+- `swarm stop` with no known projects writes a `stopped` `project_state` row for the configured project name ("ases").
+- `reconcile.reconcile` needs a plan with `.tasks` and `.integration_branch` (an old test stand-in reported blocked, exit 5).
+- `bounds.start_project` runs before reconcile, so a run refused with exit 5 has already started the wall clock.
+
+## Package PF: profile scaffolding and role prompts (`src/ases/profiles.py`, `prompts/*.md`, `tests/unit/test_profiles.py`), done
+
+Built: eleven prompts (lead, coder, reviewer, tester, architect, backend, frontend, database, devops, security, debugger; ASCII, each
+under 4000 characters, the last line is the data-not-instructions sentence; `critic.md` untouched); `profiles.py` with `desired_profiles`
+(lead, coder-1 and reviewer active; coder-2, coder-3 and tester defined but inactive), `ProfileSpec`, `RoleDef`, `ROLE_TABLE`,
+`KNOWN_TOOLSETS`, `REVIEWER_FORBIDDEN_TOOLSETS`, `read_prompt`, `render_soul` (header, prompt, fixed footer), `current_state`
+(read-only; only checks that `.env` exists), `Change`, `pending()`, `format_changes()`, `plan_init`, `apply_init` (refuses without
+`confirmed=True`, backs up every file it changes, reads each write back), `verify_state`, `residual_risks()`, `ProfileError`. 153 test
+functions (226 cases); every Hermes home is a tmp dir and an autouse fixture repoints `HERMES_HOME`, `LOCALAPPDATA` and `Path.home()`.
+
+Both extra requirements were built: worker prompts block with `kind needs_input` and one precise question (and explain the triage
+lane), request review with `reviewer=` and metadata naming the full `commit_sha`; the reviewer and security prompts say the verdict
+metadata names the full commit sha.
+
+Decisions (the user may want to change these):
+- The Lead has NO `terminal` toolset (ASES-ROL-06: only implementation roles run commands; the blueprint wins over the work order).
+  `swarm plan` passes `-t file,terminal` itself, so nothing breaks today; add it to `_LEAD_TOOLSETS` to give the Lead a terminal.
+- Memory is off for the Lead as well as workers (the Lead plans across projects).
+- `plan_init` returns WARNING rows for what ASES will not fix itself (sandbox off, "needs credentials from the user", unmanaged
+  terminal keys, unset explicit kanban values); `Change.actionable` and `pending(plan)` separate them (the CLI already counts only
+  actionable rows).
+- With `include_global` only, the desired global state goes beyond the work order: `failure_limit` from `budgets.attempts_per_card`,
+  `dispatch_interval_seconds`, `review_dispatch` restored to true, `auto_decompose` false, `auto_promote_children` false, and a
+  `default_assignee` cleared.
+- An xKiro-type provider is matched by its endpoint; when missing it is written as a named `providers:` entry (base_url, key_env) plus
+  `model.provider`; an api_key is never written.
+- The argv is exactly as specified, so there is no `--no-alias`: Hermes will write a wrapper script into `~/.local/bin`.
+- NOT verified against the user's real profile configs (the rules kept the builder out of them): the first real `swarm init` dry run is
+  the first contact.
+
+Residual risk (kept visible in `RESIDUAL_RISKS`): Hermes 0.21.3 has one combined `file` toolset (read, write, patch, search) and no
+read-only one, and `agent.disabled_toolsets` removes only whole toolsets, so the Reviewer keeps write tools that its prompt forbids
+(it has no terminal, so it cannot commit; the controller believes only its own gate records). `verify_state` does not repeat it, so the
+doctor stays quiet; the CLI would have to print `profiles.residual_risks()`.
+
+Behaviours that may surprise: `kanban_request_changes` and `kanban_block` take no metadata in Hermes 0.21.3, so the reviewer prompt puts
+the section 13.3 structure in the reason text for CHANGES_REQUIRED and BLOCKED (only PASS via `kanban_complete` carries it in run
+metadata). Review-only cards (plan role reviewer) have no commit to name: the reviewer and security prompts say to follow the card's own
+"How to finish" steps. Keys found in the Hermes source: `memory.memory_enabled`, `memory.user_profile_enabled`, `memory.provider`, the
+`memory` toolset, and the top-level `worktree_sync` (read only by `hermes -w`).
+
+Noticed:
+- `kanban.auto_decompose` defaults to TRUE: the gateway dispatcher decomposes triage cards with an auxiliary model when one is configured
+  (triage cards appear when Hermes detects a block loop) and children auto-promote by default. That contradicts "ASES never runs
+  specify on its own"; it is in the opt-in global desired state.
+- `controller._finish_instructions` treats every role other than "coder" as a review-only card: a task with role tester (or backend etc.
+  once mapped) would get the wrong finishing text and its commit would never go to review. Needs a tester branch before the tester is enabled.
+- `worktree_sync` is NOT read by the kanban dispatcher: it always runs `git worktree add -b <branch> <path> HEAD` from the board repo,
+  so the controller must still verify each card's base commit.
+- `hermes profile create` (fresh) seeds the launch profile's model block and, for a custom provider, that provider's entry (which may
+  hold an inline key), writes a default SOUL.md and a placeholder `.env`, and seeds the bundled skills.
+- Hermes appends the kanban lifecycle tools to EVERY dispatcher-spawned worker regardless of the profile's toolset list.
+- Hermes writes `config.yaml` with `IndentDumper` and `allow_unicode=True`; ASES mirrors the layout but comments are lost (the backup
+  keeps the original bytes). `session_search` stays on the Reviewer as specified but arguably cuts against ASES-ROL-05 and ROL-07.
+
+## Package CT: controller loop version 2 (`controller.py`, `tests/unit/test_controller.py`, `tests/unit/test_controller_loop.py`), done
+
+Built: `create_cards_from_plan` (passes `max_retries` from `attempts_per_card`, inside a create-cards intent, and keeps the replacement
+card of a task that has had a fresh attempt on a re-approve); `process_merge_queue` (skips a task whose merge card has an open question,
+asks through `ask_user` and never calls `kanban_block` itself, redacts the fix-card body, events and question, gives fix cards
+`max_retries`, handles `stopped` outcomes and `tamper_check_error`, wraps merge-card completion in an intent); the new steps
+`process_recovery`, `_start_fresh_attempt`, `_request_replan`, `process_unpark` (with `_affordable_now` shared with the budget gate),
+`process_bounds`, `pause_and_report`, `process_provision`, `process_idle_worktrees`, `process_finalize`, `_halted`; and `run_pass`
+version 2 (order, per-step exception isolation and the summary contract of `r5_contracts.md`). 133 new test functions (153 items) in
+`test_controller_loop.py`; the 118 tests in `test_controller.py` keep their names (an autouse fixture makes the new steps inert). The
+builder also drove the REAL controller against the FK fake Hermes with scratch scenarios (not in the repo): capability failure to
+fresh attempt to merged and finished, second failure to model switch, the ask/wait/answer/ask-again loop on a merge card, and a
+wall-clock pause with the report all worked.
+
+Answer to the work order's question: YES, `recovery.process_failures` loses a decision when `_start_fresh_attempt` fails (it records the
+`recovery_decision` event and bumps the counter before the controller acts and never returns that run again). The builder added a
+controller-side redrive built from those events: `_pending_decisions` finds `fresh_attempt`, `switch_model` and `replan` decisions with
+no completion marker and `_redrive` carries them out on the next pass, dropping one if the card was resumed, answered or has a newer
+run. Tested with injected failures of create, link and archive: exactly one retry card, counted once.
+
+Deviations:
+- In `_start_fresh_attempt` the repoint together with `retry_card_created` is the LAST step (after the archive), the model pin comes right
+  after the create; the order in the work order was not crash-safe.
+- The lineage escalation step acts on review rounds only, once per round count, and skips running cards or cards with another open
+  question; fix cards escalate in the merge queue at the failure that would need a third fix card (table 17); attempts are decided by
+  `process_failures`.
+- Re-approve guard (Hermes ignores archived cards when it looks up an idempotency key, so a re-approve would have made a duplicate original).
+- The expected primary HEAD is set BEFORE completing a merge card, so a Hermes error while completing cannot look like an intruder.
+- Idle worktrees use the workspaces of ALL running cards on the board (avoids false positives). The budget-park event carries the same
+  reason text that goes to Hermes.
+
+Noticed:
+- Hermes 0.21.3 writes a `blocked` event with reason `initial_status` on every card created blocked (contradicts "no blocked event" in
+  `r2_rules.md`; FK's fake models it; QF's `open_question` now ignores it, and the controller has its own redundant guard).
+- BUG in the FK fake: `FakeHermes.fail_next` rejects every name once the fake is installed (it checks `inspect.isfunction` on bound
+  methods); the builder armed faults directly in scratch runs.
+- `gate_runs` has no project column: two projects that reuse a task key share the "latest gate output" lookup in the failure bundle.
+- Hermes call volume: each pass now makes roughly five `kanban_show` calls per task (recovery refresh, recovery failures, bounds wall
+  clock, merge queue twice); a per-pass card cache would cut it.
+- A project paused by the replan bound pauses AGAIN on the next pass after `swarm resume` unless the user raises `replans_per_project`
+  (the counter is not reset).
+- An answer that lands in the same second as the controller's next block reads as already answered under QF's tie rule (one extra
+  merge attempt and one extra question).
+
+## Package FK: acceptance rig (`src/ases/fakes/board.py`, `worker.py`, `provider.py`, `tests/unit/test_fakes.py`, `tests/acceptance/`), done
+
+Built: `FakeHermes(repo=None, *, board="ases-test", integration_branch="integration", now=None, scratch_root=None)`, an in-memory
+simulation of Hermes 0.21.3 ported from the real source (`kanban_db.py`, `kanban_db_dispatch.py`, `kanban_db_workspace.py`, `kanban.py`,
+`tools/kanban_tools.py`): every public function of `hermes.py` with the same signature (a test enforces parity), the worker side
+(`agent_request_review`, `agent_complete`, `agent_block`, `agent_request_changes`, `agent_comment`, `agent_heartbeat`, `agent_fail`,
+`agent_hang`), test helpers (`install`, `card`, `cards`, `events`, `comments`, `runs`, `worktree`, `live_workers`, `snapshot`, `describe`,
+`calls`, `fail_next`, `fail_spawn`, `tick`, `register_worker`, `defer`, `kill_worker`, `set_session_usage`); dispatch creates REAL git
+worktrees at `<primary>/.worktrees/<card id>`; fake worker pids start at 2,100,000,000 so a probe or kill can never hit a real process.
+`worker.py`: steps `Write`, `Delete`, `Commit`, `Untracked`, `RequestReview`, `Complete`, `Block`, `Crash`, `Timeout`, `Comment`,
+`Heartbeat` (+ `Append`, `Modify`, `RequestChanges`, `Sleep`, `Do`; `Sleep` keeps a card running across passes, which 22.5, 22.7 and 22.13
+need), personas `good_coder`, `slow_coder`, `wrong_coder`, `tampering_coder` (five kinds, checked against the real tamper and review
+code), `questioner`, `crasher`, `touches_coder`, `reviewer_pass`, `reviewer_changes`, `reviewer_wrong_commit`, `by_task_key`, `sequence`.
+`provider.py` extended (existing API and tests untouched): `delay_seconds`, `drop_connection`, `tool_call_response`, `slow_response`,
+`rate_limit`, `unauthorized`, `malformed_json`, a request log with credentials redacted, `assert_never_received` (fails by secret index
+and length, never printing the value), `hermes_endpoint_config`. `tests/acceptance/`: `conftest.py` (`World`, `make_world`, fixtures
+`world`, `world_factory`, `one_task_plan`, `create_cards`, `run_until`, `git`) and `test_scenarios_demo.py` with four scenarios (22.2
+merge order and one squash commit per task; a worker question listed, answered and unblocked, with a controller restart; waiting merge
+cards are not questions; 22.6 changes once and only the corrected commit merges). 162 tests in the rig (144 unit functions, 158 cases,
+4 acceptance). No xfail was needed. The builder also ran a merge conflict, fix card and final gates through the real controller from the
+scratchpad: it worked.
+
+Deviations:
+- `pause` does NOT stop `kanban_dispatch` by default: in the Hermes source only the gateway loop honours `hermes pause`; the CLI
+  `kanban dispatch` that `run_pass` calls does not (`gateway/kanban_watchers.py`, `_kanban_dispatch_allowed`). `tick()` stops while paused.
+  `cli_dispatch_honors_pause = True` gives the other reading.
+- `request_changes` carries no metadata in Hermes 0.21.3, so `reviewer_changes` puts the verdict in the reason text.
+- A card created blocked gets a `blocked` event with reason `initial_status` by default (real Hermes does; `r2_rules.md` was wrong);
+  `initial_block_event = False` gives the r2 reading.
+- Worktrees are cut from the integration branch NAME (real Hermes cuts from `HEAD`: identical while the primary stays on integration).
+- Not modelled: goal mode, attachments, `projects.db`, multiple boards, hand-off secret redaction, the respawn guard's PR-URL rule, the
+  systemic-crash shortcut, orphan reconciliation, the no-heartbeat sweep. Stricter than Hermes: a board other than the fake's raises.
+
+Noticed:
+- A worker that exits without a terminal kanban call trips its give-up and the card is promoted straight back to `ready` in the same
+  tick (`consecutive_failures` stays 1 and `recompute_ready` only holds a blocked card whose counter reached its limit): code that waits
+  for `blocked` after such a `gave_up` will not see it (pinned by a test).
+- `swarm stop` cannot stop `swarm run`'s own dispatch (`hermes pause` does not affect the CLI dispatch): `run_pass` must check the flag
+  itself (the CL and CT packages now do).
+- A reviewer that completes a card with a CHANGES_REQUIRED verdict dead-ends it (only `kanban_complete` carries metadata): the card goes
+  `done`, `process_merge_queue` refuses it once (`merge_refused_invalid_verdict`) and nothing sends it back. Read, not run.
+- `hermes.kanban_reopen_review`'s docstring is inaccurate (the CLI writes the reason AFTER the reopen succeeds).
+- `HermesCommandError.__init__` overwrites `self.args` with the argv and `super().__init__` resets it to `(message,)`.
+- `killswitch._inspect_card` reads `card["worker_pid"]` as a fallback; real task dicts have no such field (only runs do).
+- `FakeHermes.fail_next` rejects every name once the fake is installed (found by the CT builder).
+- An untracked `data/ases.db.bak-v3-20260921T224427Z` appeared: see the entry "the real database was migrated" below.
+
+## Package EV: evaluation harness (`src/ases/evals.py`, `src/ases/evalkit/`, `tests/unit/test_evals.py`), done
+
+Built: `evals.py` (1,398 lines: `RunRecord` with every Appendix D.2 metric as its own field, `Estimate`, `RunSummary`, `Regression`,
+`RoleValue`, `candidate_from_config` and `load_candidates` (an unknown `provider/model` label is an error that lists what is declared),
+`estimate`, `calendar_minutes`, `check_budget` (refuses when the day's quota cannot cover the run), `default_invoke` (the ONLY function
+that calls a model: `hermes -p P -z PROMPT -m M --provider X [-t tools] --usage-file F`, never raises), `run_eval` (dry run unless
+`spend=True`; each run in its own temp directory; raw output redacted; results flushed per run; one failing run never stops the rest),
+`load_run`, `render_report` (four tables per candidate by task, no combined score, ASCII), `compare`, `role_value`,
+`is_dynamic_router`, `recommend`, `main` with `list`, `run`, `report`, `compare` and an extra `role-value`; exit codes 0 ok, 1 usage or
+refusal, 2 regression) and `evalkit/` (keyword scoring, fence and JSON extraction, a tolerant diff applier that drops edits to tests and
+pytest config, pytest in a scrubbed environment, tasks E1 to E10 with deterministic scorers, E8 as a swarm descriptor plus
+`score_swarm_project`, E11 as a comparison descriptor). 198 tests (E6's reference tests kill all 10 seeded mutants, a weak file kills none).
+Nothing calls a model; nothing has run against a real provider.
+
+Deviations:
+- Request counting: a real Phase 2 usage file shows a plain one-shot call is 1 main call plus 1 auxiliary title-generation call (2 in
+  all) and Hermes's `oneshot.py` bills on `total_including_auxiliary`, so the usage report comes first and `session_usage` (main loop
+  only) is a last resort. Estimates: 2 requests per text task, E9 4, E3 13, E8 200. A report with no counts and no session means Hermes
+  failed before its agent ran (0 requests).
+- Extras: a per-run budget re-check before each run (status `stopped`, exit 1), `--profile`, `--candidate`, `--pinned`, the
+  `role-value` subcommand, test-only keyword arguments on `main`.
+- E9 is JSON tool-call emulation as specified (it does not reproduce Phase 2's real Hermes tool-call test). Model-written code (E4 to
+  E6) runs with the user's rights in a temp copy with credential-like environment variables removed; E3 gives the model Hermes's `file`
+  toolset, which can write (`list` and the dry-run plan say so).
+- `--provider` gets the ASES provider label; real usage files report `"provider": "custom"` for custom endpoints, so `--provider xkiro`
+  may be refused by Hermes (it would fail before any request, at no cost; a `hermes_provider` key in `models.yaml` fixes it).
+
+Noticed:
+- Hermes keeps auxiliary calls (title generation, compression, vision) in separate `session_model_usage` rows while
+  `sessions.api_call_count` is the main loop only. `usage.py` counts worker sessions from the latter, so the ledger probably UNDER-COUNTS
+  worker sessions: check with a real worker session.
+- `merge_records` has no `project` column, so `score_swarm_project` scopes by the project's task keys.
+- `config.py` now imports `sandbox` at import time (`evals.py` imports config lazily).
+
+## The real database was migrated (an accident, harmless so far)
+
+While wiring-checking, the EV builder ran `python -m ases.cli eval run` (a dry run) against the REAL config. The new auto-migrating
+`db.connect` upgraded the real `data/ases.db` from schema v3 to v7 (2026-09-21 22:44 UTC) and wrote a backup,
+`data/ases.db.bak-v3-20260921T224427Z`. Checked read-only on 2026-09-21: `PRAGMA integrity_check` is `ok` on both files; row counts are
+identical (plan_tasks 5, gate_runs 4, merge_records 3, events 15); the migration rows are 1 to 7; no eval or ledger rows were written.
+The database had last been opened on 2026-09-19 (schema 3), so the v4 to v7 steps ran for the first time. Nothing else touches the real
+path (the suite uses temp files; `test_cli_commands.py` only loads the real CONFIG files). `.gitignore` now also ignores
+`data/*.db.bak-*`. Restoring the backup is a copy of that file over `data/ases.db` (with no ASES process running), but keeping the
+upgraded database is what the next real run would do anyway.
+
+## Package HD: hardening and migrations (`src/ases/db.py`, `src/ases/hardening.py`, `tests/unit/test_db.py`, `tests/unit/test_hardening.py`, `docs/operations.md`, `docs/runbook.md`), done
+
+Built: `db.py` with `MigrationError`, `Migration`, `MIGRATIONS` (7 numbered migrations; `SCHEMA_VERSION` derived; `BACKUPS_KEPT = 5`),
+`latest_version`, `current_version`, `pending`, `backup_path` and a rewritten `connect` (each migration in its own `BEGIN IMMEDIATE`
+transaction that also records its `schema_migrations` row; the version is re-read under the write lock so two processes upgrading at
+once do not double-apply; a whole-file backup by the SQLite backup API before touching an existing non-empty database, pruned to 5; a
+NEWER database is refused untouched; a failed migration or backup raises `MigrationError` with the connection closed; a migration is
+never applied without its backup; version 7 only makes room: a nullable `project` column on `gate_runs`, `merge_records` and `events`
+plus two indexes). `hardening.py`: `clean` (dry run by default: `git worktree` cleanup of stale, leftover `ases-merge-*` candidate and
+finished-card worktrees, and deletion of `swarm/*` and `merge/*` branches that are proven merged), `retention` (files under `logs`,
+`reports`, `stops`, `evals` and old `ases.db.bak-*`), `retention_events`, `vacuum` and the `format_*` functions; every removal writes a
+`hardening_removed` event. Docs: `docs/operations.md` and `docs/runbook.md` (16 symptom, cause, action sections). 178 new tests.
+Self-review and seeded-bug testing (60 mutants against a scratch copy, 59 killed, 1 equivalent) because the nemotron reviewers returned 403.
+
+Facts and deviations:
+- The real `data/ases.db` was at schema 3 (rows 1 to 3), not 5 as the work order assumed, so the v1 to v3 upgrade paths are needed on
+  real data. The builder did not open the real database: it read the backup read-only and upgraded a temp copy (every row identical,
+  integrity ok, no foreign-key violations). See "The real database was migrated" above.
+- v1 is the schema-1 baseline (each object is defined once, in the migration that introduced it); a test proves a fresh database and
+  one upgraded from each of versions 1 to 6 have identical shape. v5 re-ensures the three `usage_ingested` attribution columns.
+- `git branch --merged` alone would clean nothing (ASES merges by squash): a branch is also deletable when its merge record is
+  completed, not reverted, names a squash commit that is in the integration branch, and every path the branch changed has the same
+  content in that commit. Squash-proven branches go with `git branch -D`, merged ones with `-d`. Dry run against the real test repo (temp
+  database, fake board): `swarm/G1-coder` proven, `swarm/G2-reviewer` merged, dirty `A1` worktree protected, unmerged `T1` kept.
+- `clean` also removes the worktree of a finished card (`<repo>/.worktrees/<card id>`, clean tree, task finished; switch off with
+  `card_worktrees=False`), leftover candidate worktrees must be at least an hour old with no open build or fast-forward intent, a branch
+  name that fits two task keys is skipped, it never removes the worktree it is pointed at, and it fails closed if the card list cannot
+  be read. A report directory is one retention entry aged by its newest file.
+- BUG found and fixed: two processes upgrading in the same second collided on the backup name and the second `os.replace` failed with
+  "Access denied" on Windows (caught by the suite's own four-process test; `_backup` now accepts an existing finished backup).
+
+Noticed:
+- `cli.py` never catches `db.MigrationError`: a database from a newer ASES, a failed migration or a failed backup surfaces as a
+  traceback from any command (fixed by the architect the same day: `main()` now prints one line and exits 1).
+- `cmd_answer`'s advice text says a second `swarm answer` can retry an answer whose unblock failed; `questions.answer_question`
+  refuses the second call and names `hermes kanban unblock <id>` (the runbook follows `questions.py`; fixed by the architect).
+- `events` is STATE, not just a log (critic verdicts, pause reasons and the release-report path are read from it), so `retention_events`
+  is dangerous while a project is live; no command calls it and `retention()` never touches events.
+- `merge_records` is keyed by `task_key` alone; the new `project` column exists but nothing writes it yet (`clean` uses
+  `project IS NULL OR project = ?`). `docs/architecture.md` around line 674 still describes `_ensure_columns`.
+- `hermes worktree prune` skips `t_*` kanban trees by design (`_KANBAN_RE` in `worktree_gc.py`), so ASES needs its own cleanup.
+- This account cannot create symlinks (link-safety tests fall back to Windows junctions).

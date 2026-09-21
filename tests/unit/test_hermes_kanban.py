@@ -154,3 +154,14 @@ def test_kanban_set_model_pins_or_clears(monkeypatch):
         ["kanban", "--board", "b", "set-model", "--provider", "xkiro", "t_1", "minimax/minimax-m3:free"],
         ["kanban", "--board", "b", "set-model", "t_2", "none"],
     ]
+
+
+def test_kanban_block_puts_the_kind_before_the_card_id_and_the_reason_after_a_double_dash(monkeypatch):
+    """Hermes's argparse rejects `block <id> --kind K -- <reason>`; the accepted order is options first."""
+    seen = _capture(monkeypatch)
+    hermes.kanban_block("b", "t_1", "should we use A or B?", kind="needs_input")
+    hermes.kanban_block("b", "t_2", "-x looks like a flag")
+    assert seen == [
+        ["kanban", "--board", "b", "block", "--kind", "needs_input", "t_1", "--", "should we use A or B?"],
+        ["kanban", "--board", "b", "block", "t_2", "--", "-x looks like a flag"],
+    ]

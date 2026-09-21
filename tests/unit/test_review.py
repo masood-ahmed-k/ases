@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from ases import db, gates, hermes, review
+from ases import db, gates, hermes, review, tamper
 
 
 def _git(*args, cwd):
@@ -37,6 +37,10 @@ def _branch_with_changes(repo, branch, files: dict):
     _git("add", "-A", cwd=repo)
     _git("commit", "-q", "-m", "work", cwd=repo)
     _git("checkout", "-q", "integration", cwd=repo)
+
+
+# A value shaped like a provider key, planted where the tamper check must find it and must never repeat it.
+_LEAK = "sk-or-v1-PLANTEDVALUE0123456789abcd"
 
 
 def test_in_scope_diff_passes_and_reaches_gate1(repo, tmp_path, monkeypatch):
@@ -298,6 +302,9 @@ def _scenario(repo, kind):
     if kind == "gate1_red":
         _branch_with_changes(repo, "swarm/red", {"src/a.py": "x=1\n"})
         return "swarm/red", ["src/*"], ["exit 1"]
+    if kind == "tamper":
+        _branch_with_changes(repo, "swarm/tamper", {"src/a.py": "x=1\n", "src/config.py": f"API_KEY = '{_LEAK}'\n"})
+        return "swarm/tamper", ["src/*"], ["echo gate-ok"]
     assert kind == "ok"
     _branch_with_changes(repo, "swarm/fine", {"src/a.py": "x=1\n"})
     return "swarm/fine", ["src/*"], ["echo gate-ok"]
@@ -403,7 +410,7 @@ def test_check_branch_trims_the_gate1_evidence_to_1500_characters(repo, tmp_path
     assert result.detail.rstrip().endswith("[exit 1]")
 
 
-@pytest.mark.parametrize("kind", ["ok", "unresolvable_branch", "no_merge_base", "out_of_scope", "gate1_red"])
+@pytest.mark.parametrize("kind", ["ok", "unresolvable_branch", "no_merge_base", "out_of_scope", "tamper", "gate1_red"])
 def test_check_branch_never_calls_hermes(kind, repo, tmp_path, monkeypatch):
     """check_branch is the decision only: the send-back to Hermes belongs to gate_before_review."""
     branch, touches, commands = _scenario(repo, kind)
@@ -416,7 +423,7 @@ def test_check_branch_never_calls_hermes(kind, repo, tmp_path, monkeypatch):
     assert result.ok is (kind == "ok")
 
 
-@pytest.mark.parametrize("kind", ["unresolvable_branch", "no_merge_base", "out_of_scope", "gate1_red"])
+@pytest.mark.parametrize("kind", ["unresolvable_branch", "no_merge_base", "out_of_scope", "tamper", "gate1_red"])
 def test_gate_before_review_sends_back_exactly_the_check_detail(kind, repo, tmp_path, monkeypatch):
     """gate_before_review is a wrapper: what it sends to reopen-review IS the check's detail, for every way
     a branch can fail (the texts themselves are pinned by the check_branch tests above)."""
@@ -1149,3 +1156,615 @@ def test_scope_is_still_checked_before_the_binding(repo, tmp_path):
     )
 
     assert result.kind == "out_of_scope"
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 5: the tamper check is part of Gate 1 (ASES-QG-03, ASES-QG-02, ASES-GIT-07). It runs after the scope check
+# and before Gate 1, in both the review lane and the merge queue, over the merge-base range the scope check used.
+# Real temp git repos throughout; the only fake is tamper.check_range where a test needs it to fail or to be watched.
+# ---------------------------------------------------------------------------------------------
+
+_TEST_FILE = "def test_a():\n    assert 1 == 1\n\n\ndef test_b():\n    assert 2 == 2\n"
+
+# name -> (files committed on integration first, what the branch changes (None deletes the file), the task's touches,
+# the finding kind the tamper check must report, and the path it must name)
+_TAMPER_SCENARIOS = {
+    "deleted-test-file": (
+        {"tests/test_a.py": _TEST_FILE}, {"tests/test_a.py": None}, ["tests/*"], "test_file_deleted",
+        "tests/test_a.py",
+    ),
+    "removed-test": (
+        {"tests/test_a.py": _TEST_FILE}, {"tests/test_a.py": "def test_a():\n    assert 1 == 1\n"}, ["tests/*"],
+        "test_deleted", "tests/test_a.py",
+    ),
+    "skip-marker": (
+        {"tests/test_a.py": _TEST_FILE},
+        {"tests/test_a.py": "import pytest\n\n\n@pytest.mark.skip\n" + _TEST_FILE}, ["tests/*"], "skip_marker",
+        "tests/test_a.py",
+    ),
+    "or-true": (
+        {"scripts/ci.sh": "#!/bin/sh\npytest -q\n"}, {"scripts/ci.sh": "#!/bin/sh\npytest -q || true\n"},
+        ["scripts/*"], "unconditional_pass", "scripts/ci.sh",
+    ),
+    "artifact": (
+        {}, {"src/__pycache__/a.cpython-311.pyc": "junk\n", "src/a.py": "x = 1\n"}, ["src/*"], "generated_artifact",
+        "src/__pycache__/a.cpython-311.pyc",
+    ),
+    "secret": ({}, {"src/config.py": f"API_KEY = '{_LEAK}'\n"}, ["src/*"], "secret_added", "src/config.py"),
+}
+
+
+def _commit_on_integration(repo, files: dict):
+    for path, content in files.items():
+        full = repo / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content, encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "base", cwd=repo)
+
+
+def _branch_with_edit(repo, branch, changes: dict):
+    """A branch that writes each path in `changes` (None deletes it); leaves the repo back on integration."""
+    _git("checkout", "-q", "-b", branch, cwd=repo)
+    for path, content in changes.items():
+        full = repo / path
+        if content is None:
+            full.unlink()
+        else:
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content, encoding="utf-8")
+    _git("add", "-A", "-f", cwd=repo)  # -f: a global ignore file must not hide the __pycache__ a test plants
+    _git("commit", "-q", "-m", "work", cwd=repo)
+    _git("checkout", "-q", "integration", cwd=repo)
+
+
+def _tamper_branch(repo, scenario, branch):
+    base_files, changes, touches, kind, path = _TAMPER_SCENARIOS[scenario]
+    if base_files:
+        _commit_on_integration(repo, base_files)
+    _branch_with_edit(repo, branch, changes)
+    return touches, kind, path
+
+
+def _events(conn, kind):
+    return [json.loads(r["payload"]) for r in conn.execute(
+        "SELECT payload FROM events WHERE kind = ? ORDER BY id", (kind,))]
+
+
+def _raise_in_check_range(monkeypatch, exc):
+    def boom(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(tamper, "check_range", boom)
+
+
+# --- what blocks: one real repo per kind that matters --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scenario", list(_TAMPER_SCENARIOS))
+def test_check_branch_blocks_each_kind_of_tampering_before_gate1_runs(scenario, repo, tmp_path, monkeypatch):
+    touches, kind, path = _tamper_branch(repo, scenario, "swarm/K1")
+    conn = db.connect(tmp_path / "ases.db")
+    attempts = _forbid_gate1(monkeypatch)
+
+    result = review.check_branch(repo, "swarm/K1", "integration", ["echo gate-ok"], touches, conn=conn, task_key="K1")
+
+    assert (result.ok, result.kind, result.head) == (False, "tamper", _head(repo, "swarm/K1"))
+    assert f"{kind} {path}" in result.detail
+    assert _LEAK not in result.detail and "PLANTEDVALUE" not in result.detail  # a finding never repeats a secret
+    assert attempts == [] and _gate_rows(conn, "K1") == []                      # Gate 1 was never reached
+
+
+@pytest.mark.parametrize("scenario", list(_TAMPER_SCENARIOS))
+def test_a_tampering_card_is_sent_back_exactly_like_a_red_gate1_with_the_findings_as_the_reason(
+    scenario, repo, tmp_path, monkeypatch,
+):
+    touches, kind, path = _tamper_branch(repo, scenario, "swarm/K2")
+    conn = db.connect(tmp_path / "ases.db")
+    reopened = []
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda b, c, r: reopened.append((b, c, r)))
+    _forbid_gate1(monkeypatch)
+    check = review.check_branch(repo, "swarm/K2", "integration", ["echo gate-ok"], touches, conn=conn, task_key="K2")
+
+    ok = review.gate_before_review(
+        "b", "t_k", repo, "swarm/K2", "integration", ["echo gate-ok"], touches, conn=conn, task_key="K2",
+    )
+
+    assert ok is False
+    assert reopened == [("b", "t_k", check.detail)]
+    assert f"{kind} {path}" in reopened[0][2] and _LEAK not in reopened[0][2]
+    assert _events(conn, "tamper_check_error") == []  # a finding is not an error of the check
+    # What was found is on record too (the send-back is only a comment on the card, and the report reads events).
+    assert _events(conn, "tamper_blocked") == [{
+        "task_key": "K2", "card_id": "t_k", "head": _head(repo, "swarm/K2"), "detail": check.detail,
+    }]
+
+
+@pytest.mark.parametrize("kind", ["unresolvable_branch", "no_merge_base", "out_of_scope", "gate1_red"])
+def test_only_a_tamper_send_back_records_a_tamper_blocked_event(kind, repo, tmp_path, monkeypatch):
+    branch, touches, commands = _scenario(repo, kind)
+    conn = db.connect(tmp_path / "ases.db")
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda b, c, r: None)
+
+    ok = review.gate_before_review("b", "t_x", repo, branch, "integration", commands, touches, conn=conn, task_key="X1")
+
+    assert ok is False
+    assert _events(conn, "tamper_blocked") == [] and _events(conn, "tamper_check_error") == []
+
+
+@pytest.mark.parametrize("scenario", list(_TAMPER_SCENARIOS))
+def test_the_merge_check_returns_the_tamper_result_even_with_a_green_gate1_record_for_the_head(
+    scenario, repo, tmp_path, monkeypatch,
+):
+    touches, kind, path = _tamper_branch(repo, scenario, "swarm/K3")
+    conn = db.connect(tmp_path / "ases.db")
+    head = _head(repo, "swarm/K3")
+    _record_gate(conn, "K3", head, "pass")  # the record may predate the check: it does not excuse the diff
+    attempts = _forbid_gate1(monkeypatch)
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/K3", "integration", ["echo gate-ok"], touches, conn=conn, task_key="K3",
+    )
+
+    assert (result.ok, result.kind, result.head) == (False, "tamper", head)
+    assert f"{kind} {path}" in result.detail
+    assert attempts == []
+    # The two checks read the same range with the same rules, so they say the same thing.
+    assert result == review.check_branch(
+        repo, "swarm/K3", "integration", ["echo gate-ok"], touches, conn=conn, task_key="K3",
+    )
+
+
+def test_the_reason_is_the_tamper_modules_own_findings_text(repo, tmp_path, monkeypatch):
+    touches, _kind, _path = _tamper_branch(repo, "skip-marker", "swarm/K4")
+    conn = db.connect(tmp_path / "ases.db")
+    _forbid_gate1(monkeypatch)
+    base = _git("merge-base", "integration", "swarm/K4", cwd=repo).stdout.strip()
+    findings = tamper.check_range(repo, base, _head(repo, "swarm/K4"), allow_paths=touches)
+
+    result = review.check_branch(repo, "swarm/K4", "integration", ["echo gate-ok"], touches, conn=conn, task_key="K4")
+
+    assert findings and len(tamper.format_findings(findings)) <= 1500
+    assert result.detail == tamper.format_findings(tamper.blocking(findings))
+
+
+def test_a_long_findings_text_is_trimmed_like_gate1_evidence_keeping_both_ends(repo, tmp_path):
+    names = {f"src/__pycache__/module_number_{i:02d}_with_a_long_name_to_fill_the_line.cpython-311.pyc": "x\n"
+             for i in range(25)}
+    _branch_with_edit(repo, "swarm/K5", names)
+    conn = db.connect(tmp_path / "ases.db")
+    base = _git("merge-base", "integration", "swarm/K5", cwd=repo).stdout.strip()
+    raw = tamper.format_findings(tamper.blocking(
+        tamper.check_range(repo, base, _head(repo, "swarm/K5"), allow_paths=["src/*"])))
+
+    result = review.check_branch(repo, "swarm/K5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="K5")
+
+    assert len(raw) > 1500 and result.kind == "tamper"
+    assert result.detail == review._evidence(raw) and len(result.detail) == 1500
+    assert "\n...[trimmed]...\n" in result.detail
+    assert result.detail.startswith("generated_artifact src/__pycache__/module_number_00")
+    assert re.search(r"\.\.\. and \d+ more$", result.detail)  # the tail, with the count of what was left out
+
+
+def test_only_blocking_findings_block_and_only_they_are_reported(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/K6", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _fake_gate1(monkeypatch, passed=True)
+    informational = tamper.Finding("large_file", "src/a.py", "just so you know", blocks=False)
+
+    monkeypatch.setattr(tamper, "check_range", lambda *a, **kw: [informational])
+    only_info = review.check_branch(repo, "swarm/K6", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="K6")
+
+    monkeypatch.setattr(
+        tamper, "check_range",
+        lambda *a, **kw: [informational, tamper.Finding("skip_marker", "src/a.py", "skip marker added: @skip", 3)],
+    )
+    mixed = review.check_branch(repo, "swarm/K6", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="K6")
+
+    assert (only_info.ok, only_info.kind) == (True, "ok")
+    assert (mixed.ok, mixed.kind) == (False, "tamper")
+    assert mixed.detail == "skip_marker src/a.py:3: skip marker added: @skip"
+
+
+def test_an_ordinary_change_with_new_tests_and_new_assertions_passes_the_tamper_check(repo, tmp_path):
+    _commit_on_integration(repo, {"tests/test_a.py": _TEST_FILE, "src/a.py": "x = 1\n"})
+    _branch_with_edit(repo, "swarm/K7", {
+        "tests/test_a.py": _TEST_FILE + "\n\ndef test_c():\n    assert double(3) == 6\n    assert double(4) == 8\n",
+        "src/a.py": "x = 2\n", "src/b.py": "y = 3\n",
+    })
+    conn = db.connect(tmp_path / "ases.db")
+
+    result = review.check_branch(
+        repo, "swarm/K7", "integration", ["echo gate-ok"], ["src/*", "tests/*"], conn=conn, task_key="K7",
+    )
+
+    assert (result.ok, result.kind) == (True, "ok")
+    assert _gate_rows(conn, "K7") == [("gate1", _head(repo, "swarm/K7"), "pass")]
+
+
+# --- the range, the allow paths and the gate config paths the tamper check is given ---------------------------------
+
+
+def _spy_check_range(monkeypatch):
+    seen = []
+    real = tamper.check_range
+
+    def spy(repo_arg, base, head, **kwargs):
+        seen.append((base, head, kwargs))
+        return real(repo_arg, base, head, **kwargs)
+
+    monkeypatch.setattr(tamper, "check_range", spy)
+    return seen
+
+
+def test_the_tamper_check_reads_the_range_the_scope_check_read_and_is_given_the_touches_and_gate_files(
+    repo, tmp_path, monkeypatch,
+):
+    """The branch is cut, then a test file lands on integration. Only a range that starts at the merge-base leaves
+    that file out (compared tip to tip it would read as a test the branch deleted). The spy pins the base to the
+    merge-base and the head to the resolved head, and the run pins that the range is really the branch's own."""
+    _branch_with_changes(repo, "swarm/G2", {"tools/check.py": "print('ok')\n", "src/a.py": "x = 1\n"})
+    cut_from = _head(repo, "integration")
+    _commit_on_integration(repo, {"tests/test_new.py": _TEST_FILE})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = _spy_check_range(monkeypatch)
+    touches = ["tools/*", "src/*"]
+
+    result = review.check_branch(
+        repo, "swarm/G2", "integration", ["python tools/check.py", "echo gate-ok"], touches, conn=conn, task_key="G2",
+    )
+
+    assert (result.ok, result.kind) == (True, "ok"), result.detail
+    (base, head, kwargs), = seen
+    assert head == _head(repo, "swarm/G2")
+    assert base == cut_from == _git("merge-base", "integration", "swarm/G2", cwd=repo).stdout.strip()
+    assert base != _head(repo, "integration")
+    assert kwargs["allow_paths"] == touches
+    assert list(kwargs["gate_config_paths"]) == ["tools/check.py"]
+
+
+def test_the_merge_check_gives_the_tamper_check_the_same_range_touches_and_gate_files(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/G3", {"tools/check.py": "print('ok')\n", "src/a.py": "x = 1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = _spy_check_range(monkeypatch)
+    touches = ["tools/*", "src/*"]
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/G3", "integration", ["python tools/check.py"], touches, conn=conn, task_key="G3",
+    )
+
+    assert result.ok is True
+    (base, head, kwargs), = seen
+    assert head == _head(repo, "swarm/G3") and base == _git("merge-base", "integration", "swarm/G3", cwd=repo).stdout.strip()
+    assert kwargs["allow_paths"] == touches and list(kwargs["gate_config_paths"]) == ["tools/check.py"]
+
+
+def test_a_gate_config_file_the_tasks_touches_name_is_allowed(repo, tmp_path):
+    """ASES-QG-02: changing test-runner configuration needs a plan task that allows it. This task's touches name
+    pytest.ini, so the change is the task's own and the tamper check lets it through."""
+    _commit_on_integration(repo, {"pytest.ini": "[pytest]\naddopts = -q\n", "src/a.py": "x = 1\n"})
+    _branch_with_edit(repo, "swarm/G4", {"pytest.ini": "[pytest]\naddopts = -q -x\n"})
+    conn = db.connect(tmp_path / "ases.db")
+
+    result = review.check_branch(
+        repo, "swarm/G4", "integration", ["echo gate-ok"], ["pytest.ini"], conn=conn, task_key="G4",
+    )
+
+    assert (result.ok, result.kind) == (True, "ok")
+
+
+def test_a_gate_config_file_the_tasks_touches_do_not_name_never_gets_past_the_scope_check(repo, tmp_path, monkeypatch):
+    """The other half of ASES-QG-02, and why it is enough: the scope check runs first, so a config change the task
+    does not name is refused as out_of_scope before the tamper check (which would report it too) is consulted."""
+    _commit_on_integration(repo, {"pytest.ini": "[pytest]\naddopts = -q\n", "src/a.py": "x = 1\n"})
+    _branch_with_edit(repo, "swarm/G5", {"pytest.ini": "[pytest]\naddopts = -q -x\n", "src/a.py": "x = 2\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = _spy_check_range(monkeypatch)
+
+    result = review.check_branch(repo, "swarm/G5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="G5")
+
+    assert (result.ok, result.kind) == (False, "out_of_scope") and "pytest.ini" in result.detail
+    assert seen == []
+
+
+def test_the_scope_check_comes_before_the_tamper_check_in_both_lanes(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/O1", {"src/config.py": f"API_KEY = '{_LEAK}'\n", "SECRETS.md": "oops\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = _spy_check_range(monkeypatch)
+
+    lane = review.check_branch(repo, "swarm/O1", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="O1")
+    queue = review.check_branch_for_merge(
+        repo, "swarm/O1", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="O1",
+    )
+
+    assert lane.kind == queue.kind == "out_of_scope"
+    assert seen == []
+
+
+def test_the_binding_checks_come_before_the_tamper_check_and_the_tamper_check_before_any_gate_record(
+    repo, tmp_path, monkeypatch,
+):
+    touches, _kind, _path = _tamper_branch(repo, "secret", "swarm/O2")
+    conn = db.connect(tmp_path / "ases.db")
+    head = _head(repo, "swarm/O2")
+    _forbid_gate1(monkeypatch)
+
+    def merge_check(reviewed):
+        return review.check_branch_for_merge(
+            repo, "swarm/O2", "integration", ["echo gate-ok"], touches, conn=conn, task_key="O2",
+            require_binding=True, reviewed_commit=reviewed,
+        )
+
+    assert merge_check(None).kind == "unbound_review"
+    assert merge_check("0" * 7).kind == "stale_review"
+    assert merge_check(head).kind == "tamper"                # the approval is bound to this commit, which tampers
+    _record_gate(conn, "O2", "1" * 40, "pass")               # a green record for an EARLIER commit, which would
+    assert merge_check(head).kind == "tamper"                # otherwise read as "stale_review": tamper wins
+
+
+# --- a check that could not run ---------------------------------------------------------------------------------------
+
+
+def test_a_tamper_check_that_cannot_run_is_a_tamper_check_error_and_gate1_is_not_run(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/E1", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: fatal: bad object"))
+    attempts = _forbid_gate1(monkeypatch)
+
+    result = review.check_branch(repo, "swarm/E1", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="E1")
+
+    assert result == review.BranchCheck(
+        ok=False, kind="tamper_check_error", detail="the tamper check could not run: git diff failed: fatal: bad object",
+        head=_head(repo, "swarm/E1"),
+    )
+    assert attempts == [] and _gate_rows(conn, "E1") == []
+
+
+def test_an_unexpected_failure_of_the_check_is_also_a_tamper_check_error_never_a_clean_pass(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/E2", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _raise_in_check_range(monkeypatch, RuntimeError("something broke inside the check"))
+    attempts = _forbid_gate1(monkeypatch)
+
+    result = review.check_branch(repo, "swarm/E2", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="E2")
+
+    assert (result.ok, result.kind) == (False, "tamper_check_error")
+    assert result.detail == "the tamper check could not run: RuntimeError: something broke inside the check"
+    assert attempts == []
+
+
+def test_the_error_reason_is_one_short_ascii_line_and_never_repeats_a_secret(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/E3", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _raise_in_check_range(monkeypatch, tamper.TamperCheckError(
+        f"git failed near caf{chr(0xE9)}\n  with a token {_LEAK}\n" + "x" * 500))
+    _forbid_gate1(monkeypatch)
+
+    result = review.check_branch(repo, "swarm/E3", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="E3")
+
+    assert result.kind == "tamper_check_error"
+    assert result.detail.isascii() and "\n" not in result.detail
+    assert "caf\\xe9" in result.detail and _LEAK not in result.detail and "[redacted]" in result.detail
+    assert len(result.detail) <= len("the tamper check could not run: ") + 300 + len("[redacted]")
+
+
+def test_gate_before_review_keeps_the_card_in_review_when_the_tamper_check_could_not_run(repo, tmp_path, monkeypatch):
+    """A check that failed to run says nothing about the card, and the merge-time check is authoritative and fails
+    closed. So the card is NOT sent back (no Hermes call at all), the failure is recorded, and it returns True."""
+    _branch_with_changes(repo, "swarm/E4", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: boom"))
+    _forbid_hermes(monkeypatch)
+    attempts = _forbid_gate1(monkeypatch)
+
+    ok = review.gate_before_review(
+        "b", "t_e", repo, "swarm/E4", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="E4",
+    )
+
+    assert ok is True and attempts == []
+    assert _events(conn, "tamper_check_error") == [{
+        "task_key": "E4", "card_id": "t_e", "head": _head(repo, "swarm/E4"),
+        "reason": "the tamper check could not run: git diff failed: boom",
+    }]
+
+
+def test_the_merge_check_returns_a_tamper_check_error_as_it_is_and_no_green_record_excuses_it(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/E5", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    head = _head(repo, "swarm/E5")
+    _record_gate(conn, "E5", head, "pass")
+    _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: boom"))
+    attempts = _forbid_gate1(monkeypatch)
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/E5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="E5",
+    )
+
+    assert result == review.BranchCheck(
+        ok=False, kind="tamper_check_error", detail="the tamper check could not run: git diff failed: boom", head=head,
+    )
+    assert attempts == [] and _events(conn, "tamper_check_error") == []  # recording it is the controller's decision
+
+
+# --- gate_config_paths --------------------------------------------------------------------------------------------
+
+
+_EXTENSIONS = [".sh", ".py", ".js", ".ts", ".mjs", ".cjs", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".mk",
+               ".bat", ".ps1", ".gradle"]
+
+
+@pytest.fixture
+def gate_repo(repo):
+    """A repo whose integration branch holds the files the gate commands below name. Returns (repo, head)."""
+    _commit_on_integration(repo, {
+        "tools/check.py": "print('ok')\n", "tools/my script.py": "print('ok')\n", "scripts/run.sh": "echo ok\n",
+        "pytest.ini": "[pytest]\n", "check.py": "print('ok')\n", "tests/test_a.py": _TEST_FILE,
+        "docs/notes.txt": "notes\n", "notes.txt": "notes\n", "README": "readme\n", "UP.PY": "print('ok')\n",
+        **{f"x{ext}": "content\n" for ext in _EXTENSIONS},
+    })
+    return repo, _head(repo, "integration")
+
+
+def test_gate_config_paths_finds_a_script_path(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["python tools/check.py"], repo, head) == ["tools/check.py"]
+    assert review.gate_config_paths(["bash scripts/run.sh -x"], repo, head) == ["scripts/run.sh"]
+
+
+def test_gate_config_paths_finds_a_config_file_with_no_path_separator(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["pytest -c pytest.ini"], repo, head) == ["pytest.ini"]
+    assert review.gate_config_paths(["python check.py"], repo, head) == ["check.py"]
+
+
+def test_gate_config_paths_skips_a_flag_even_when_it_names_a_real_file(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["pytest --rcfile=tools/check.py -c pytest.ini"], repo, head) == ["pytest.ini"]
+    assert review.gate_config_paths(["pytest -x -q --tb=short"], repo, head) == []
+
+
+def test_gate_config_paths_drops_a_path_that_is_not_in_the_commit(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["python tools/missing.py", "python check.py"], repo, head) == ["check.py"]
+
+
+def test_gate_config_paths_reads_the_commit_not_the_working_tree(gate_repo):
+    repo, head = gate_repo
+    _branch_with_edit(repo, "swarm/P1", {"tools/new_gate.py": "print('new')\n"})
+    branch_head = _head(repo, "swarm/P1")
+    (repo / "only_on_disk.py").write_text("print('x')\n", encoding="utf-8")   # untracked, never committed
+    (repo / "tools" / "check.py").unlink()                                     # gone from disk, still in the commit
+
+    assert review.gate_config_paths(["python only_on_disk.py"], repo, head) == []
+    assert review.gate_config_paths(["python tools/check.py"], repo, head) == ["tools/check.py"]
+    assert review.gate_config_paths(["python tools/new_gate.py"], repo, branch_head) == ["tools/new_gate.py"]
+    assert review.gate_config_paths(["python tools/new_gate.py"], repo, head) == []  # it is a later commit's file
+
+
+def test_gate_config_paths_reads_a_quoted_path_with_a_space_in_it(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(['python "tools/my script.py"'], repo, head) == ["tools/my script.py"]
+    assert review.gate_config_paths(["python 'tools/my script.py'"], repo, head) == ["tools/my script.py"]
+
+
+def test_gate_config_paths_finds_a_file_with_a_non_ascii_name(repo):
+    name = f"tools/caf{chr(0xE9)}.py"  # built at run time so that this test file stays pure ASCII
+    _commit_on_integration(repo, {name: "print('ok')\n"})
+
+    assert review.gate_config_paths([f"python {name}"], repo, _head(repo, "integration")) == [name]
+
+
+def test_gate_config_paths_does_not_count_a_directory_as_a_file(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["pytest tests/", "pytest tests"], repo, head) == []
+    assert review.gate_config_paths(["pytest tests/test_a.py"], repo, head) == ["tests/test_a.py"]
+
+
+def test_gate_config_paths_normalises_the_path_it_reports(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["python ./tools/check.py", "bash .//scripts/run.sh"], repo, head) == [
+        "tools/check.py", "scripts/run.sh"]
+    assert review.gate_config_paths(["python tools/./check.py", "python tools//check.py"], repo, head) == [
+        "tools/check.py"]
+    assert review.gate_config_paths(["python a/../check.py", "python tools/../tools/check.py"], repo, head) == [
+        "check.py", "tools/check.py"]
+
+
+def test_gate_config_paths_normalises_a_windows_path_to_forward_slashes(gate_repo):
+    """shlex reads the backslash of tools\\check.py as an escape (giving toolscheck.py), so a command with a
+    backslash is read a second time without escapes."""
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["python tools\\check.py"], repo, head) == ["tools/check.py"]
+    assert review.gate_config_paths(['python "tools\\my script.py"'], repo, head) == ["tools/my script.py"]
+
+
+def test_gate_config_paths_ignores_an_absolute_path_and_one_that_climbs_out_of_the_repo(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(
+        ["python /tools/check.py", "python //tools/check.py", "python ../tools/check.py", "python ../../check.py",
+         "ruff check ./", "ruff check ../", "ruff check ."], repo, head) == []
+
+
+def test_gate_config_paths_removes_duplicates_and_keeps_the_order_of_first_appearance(gate_repo):
+    repo, head = gate_repo
+
+    commands = ["python tools/check.py", "bash scripts/run.sh tools/check.py", "python ./tools/check.py", "pytest -c pytest.ini"]
+    assert review.gate_config_paths(commands, repo, head) == ["tools/check.py", "scripts/run.sh", "pytest.ini"]
+
+
+def test_gate_config_paths_knows_every_script_and_config_extension(gate_repo):
+    repo, head = gate_repo
+
+    commands = [f"run x{ext}" for ext in _EXTENSIONS]
+    assert review.gate_config_paths(commands, repo, head) == [f"x{ext}" for ext in _EXTENSIONS]
+    assert review.gate_config_paths(["python UP.PY"], repo, head) == ["UP.PY"]   # the extension is matched without case
+
+
+def test_gate_config_paths_needs_a_separator_or_a_known_extension(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["cat notes.txt", "cat README"], repo, head) == []        # exist, but neither
+    assert review.gate_config_paths(["cat docs/notes.txt"], repo, head) == ["docs/notes.txt"]  # a separator is enough
+
+
+def test_gate_config_paths_accepts_a_single_command_given_as_a_string(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths("python tools/check.py", repo, head) == ["tools/check.py"]
+
+
+def test_gate_config_paths_ignores_a_quoted_word_with_a_line_break_in_it(gate_repo):
+    """A newline in a batch name would start a second name, and a quoted word can carry one: it is dropped."""
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(['python "tools/check.py\nscripts/run.sh"'], repo, head) == []
+    assert review.gate_config_paths(['python "tools/check.py\rscripts/run.sh"'], repo, head) == []
+    assert review.gate_config_paths(['python "tools/check.py" "scripts/run.sh"'], repo, head) == [
+        "tools/check.py", "scripts/run.sh"]
+
+
+@pytest.mark.parametrize("commands", [
+    None, [], [None, 5, ["nested"], b"bytes"], ["python 'unterminated"], ["echo \"tools/check.py"],
+    ["python tools/check.py\x00x.py"], [""], ["   "], 12,
+], ids=["none", "empty", "not-strings", "unbalanced-single", "unbalanced-double", "nul", "empty-string", "blank", "int"])
+def test_gate_config_paths_never_raises_on_odd_commands(gate_repo, commands):
+    repo, head = gate_repo
+
+    result = review.gate_config_paths(commands, repo, head)
+
+    assert isinstance(result, list) and all(isinstance(p, str) for p in result)
+
+
+def test_gate_config_paths_finds_nothing_for_an_unbalanced_quote_rather_than_a_wrong_path(gate_repo):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["python 'unterminated"], repo, head) == []
+    assert review.gate_config_paths(["python tools/check.py 'oops"], repo, head) == ["tools/check.py"]  # str.split fallback
+    # Unbalanced AND a backslash: both readings fail to parse, and the plain split still finds the Windows path.
+    assert review.gate_config_paths(["python 'x tools\\check.py"], repo, head) == ["tools/check.py"]
+
+
+def test_gate_config_paths_never_raises_when_git_cannot_answer(gate_repo, tmp_path, monkeypatch):
+    repo, head = gate_repo
+
+    assert review.gate_config_paths(["python tools/check.py"], tmp_path / "not-a-repo", head) == []
+    assert review.gate_config_paths(["python tools/check.py"], repo, "0" * 40) == []
+    # An odd `head` finds nothing instead of reading the index (":path") or adding a name to the batch.
+    for odd in ("", None, "-x", ":", head + "\n:tools/check.py", "a b", head + "\0"):
+        assert review.gate_config_paths(["python tools/check.py"], repo, odd) == [], repr(odd)
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git is not installed")
+
+    monkeypatch.setattr(review.subprocess, "run", no_git)
+
+    assert review.gate_config_paths(["python tools/check.py"], repo, head) == []

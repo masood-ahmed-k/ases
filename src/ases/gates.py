@@ -25,6 +25,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from . import db as ases_db
+from . import events as events_mod
 from . import tamper as tamper_mod
 
 
@@ -69,6 +70,12 @@ def run_gate(
     gate_runs row are the same whichever runner ran the commands, so the controller's gate record means the
     same thing either way. A runner that raises is not caught: the worktree is still torn down, no row is
     written, and the caller decides what an infrastructure failure means (it is not a red gate).
+
+    ASES-SEC-01 ("nothing secret-shaped in stored gate output or in text handed to a card"): the command output
+    is redacted ONCE here (events.redact_text), before it is stored in gate_runs.detail and before it is returned
+    in GateResult.detail. Command output is the likeliest place for a secret (a failing test that prints its
+    environment, a tool that echoes a token), and every consumer copies GateResult.detail somewhere else: a card
+    comment, a fix-card body, a merge outcome. Redacting at the source means no consumer can forget to.
     """
     run_commands = runner if runner is not None else _run_commands
     tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="ases-gate-"))
@@ -79,17 +86,20 @@ def run_gate(
             capture_output=True, text=True, timeout=60,
         )
         if add.returncode != 0:
-            result = GateResult(gate_name, commit_sha, False,
-                                 f"could not create gate worktree: {add.stdout}{add.stderr}")
+            passed, output = False, f"could not create gate worktree: {add.stdout}{add.stderr}"
         else:
-            passed, detail = run_commands(worktree, commands, timeout_per_command)
-            result = GateResult(gate_name, commit_sha, passed, detail)
+            passed, output = run_commands(worktree, commands, timeout_per_command)
     finally:
         subprocess.run(
             ["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree)],
             capture_output=True, text=True, timeout=60,
         )
         shutil.rmtree(tmp_root, ignore_errors=True)
+
+    # A runner is expected to hand back text; anything else is passed through untouched rather than crashing a
+    # gate that already ran.
+    detail = events_mod.redact_text(output) if isinstance(output, str) else output
+    result = GateResult(gate_name, commit_sha, passed, detail)
 
     if conn is not None:
         conn.execute(

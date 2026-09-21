@@ -672,7 +672,7 @@ Phase 3 items that block parallel coders:
 
 - **Schema v5** (`db.py`): `usage_ingested`, `review_verdicts`, `integrity_state`, `lineage`, `project_state`,
   `intents`, and a small `_ensure_columns` step because `CREATE TABLE IF NOT EXISTS` cannot add a column to a table an
-  earlier version made.
+  earlier version made. (Replaced on 2026-09-22 by numbered, backed-up migrations: see the round 5 section below.)
 - **Real usage into the ledger** (ASES-CAP-03, `usage.py`, `hermes.session_usage`): every pass first counts each
   finished worker session once, attributed to its plan task; the outgoing card of a fix-card repoint is counted just
   before the repoint; ready coder cards are parked when the reviewer's provider cannot afford the review reserve.
@@ -786,6 +786,90 @@ provisioning for running cards; merge queue with a stop check between steps and 
 final gates and the release report once every merge card is done. New CLI commands: `questions`, `answer`, `status`, `report`,
 `critique`, a real `stop` and `resume`, `init`; `approve` requires a critic PASS for the exact plan hash; `run` reconciles for real
 at start.
+
+## Building the remaining phases, round 5: the modules are wired in, plus the fake rig, evals, hardening, final gates and profiles (2026-09-21 to 2026-09-22)
+
+The user said "lets continue development", and later to park the work once the agents finished. Nine builders ran in parallel with
+exclusive files (work orders `docs/work-orders/r5_*.md`, plus `r3_wp_finalgates.md` and `r4_wp_profiles.md`; every builder's
+deviations and findings are in `docs/work-orders/builder-findings.md`). As before, testing was set aside, so rounds 2 to 5 got no
+seeded-bug pass and no independent nemotron review (ultra and super returned 403 to several builders; they reviewed their own work
+adversarially, and the hardening builder ran 60 seeded-bug mutants on its own code: 59 killed, 1 equivalent). The suite now has
+5,277 (2 skipped) tests passing. Nothing has run against a real Hermes, a real board or a real container.
+
+Before dispatching, the design was checked against the real Hermes 0.21.3 source, which corrected the work orders: `block_task`
+accepts only a `running` or `ready` card (blocking a `blocked` merge card or a `todo` card fails AFTER leaving a comment); a
+dispatcher give-up is `blocked` with a `gave_up` event and no `blocked` event; a second block of the same kind after an unblock goes
+to `triage` (`block_loop_detected`, limit 2); `unblock` also returns a `scheduled` card to `ready`; `--max-retries 3` allows two
+retries; `hermes kanban block` needs `--kind` BEFORE the card id (argparse rejected the other order, checked offline). `hermes.py`
+(`kanban_block(kind=)`) and `events.py` (nvapi-, Stripe, AWS, Google, Bearer, JWT and PEM shapes; `redact_text`; a number, boolean or
+null under a credential-shaped key is kept) were changed by the architect. A shell heredoc turned `\b` into a backspace character and
+silently broke every secret pattern until a test failed; regex files are written with the Write and Edit tools.
+
+What each package delivered:
+- **Controller loop v2** (`controller.py`): `run_pass` now runs, in order: the stop flag, the primary-checkout guard, idle
+  worktrees (warnings), usage ingest, recovery (`process_recovery`: fresh-attempt and model-switch cards with the failure bundle,
+  re-plan questions, lineage escalation, and a redrive of any decision the controller could not carry out, because
+  `recovery.process_failures` counts a failure before the controller acts), bounds (a breached project bound pauses with a report),
+  the budget gate and un-parking (a card parked for budget returns to `ready` through `hermes kanban unblock` when it is affordable
+  again), the review lane, dispatch, `.env.ases` provisioning and lease sweeping, the merge queue (with a stop check between steps,
+  `ask_user` for escalations, redacted card bodies, `max_retries` on every card it creates) and finalization (Gates 4 and 5, the
+  release report). Steps that are not safety critical are isolated: an exception in one is an event, not a failed pass.
+- **Merge queue and review lane** (`mergeq.py`, `review.py`, `usage.py`, `gates.py`): `merge_task` polls a stop callable before the
+  candidate, Gate 3 and the fast-forward; writes build-candidate, fast-forward and revert intents; resets the merge record of a task
+  that is merged again after a revert (the reconcile builder's `done_but_reverted` bug); redacts its detail. The tamper check now runs
+  in the review lane and the merge-time check, `gate_config_paths` names the files a gate command uses, a check that could not run
+  fails closed at merge time and never sends a card back. Usage ingest records a `model_mismatch` event; gate output is redacted
+  before it is stored.
+- **Questions and escalation** (`questions.py`, `recovery.py`, `report.py`): a question is now what Hermes really produces: a
+  worker's block, a dispatcher give-up, the triage lane after a block loop, or an `ASES QUESTION:` comment on a card that cannot be
+  blocked again. `ask_user` is the one way the controller asks; `switch_model` is applied on a fresh card, not in place.
+- **Command line** (`cli.py`, `doctor.py`, `config.py`): `questions`, `answer`, `status`, `report`, `critique`, `approve` (needs a
+  critic PASS bound to the plan hash, or `--skip-critic`), `run` (real reconcile at start, exit code 5 when something cannot be
+  repaired, exit code 4 when stopped or paused), `stop`, `resume`, `init`, `eval`, `clean`, `retention`, `doctor`; every printed line
+  is ASCII. `config/swarm.yaml` gains a disabled `sandbox:` block and a `retention:` block.
+- **Migrations and hardening** (`db.py`, `hardening.py`, `docs/operations.md`, `docs/runbook.md`): numbered, backed-up migrations
+  (a newer database is refused; two processes upgrading at once are safe); version 7 only adds a nullable `project` column to
+  `gate_runs`, `merge_records` and `events`. `swarm clean` removes stale worktrees and squash-merged `swarm/*` branches, `swarm
+  retention` prunes old logs, reports, stop reports, evaluation runs and database backups. Both are dry runs by default.
+- **Final gates** (`finalgates.py`): Gate 4 (built-in tracked-tree scan plus the plan's `gate4` profile), Gate 5 (the plan's `gate5`
+  profile, else every distinct task command), the release report, and `finalize`.
+- **Profiles and prompts** (`profiles.py`, `prompts/`): the roster as data, eleven role prompts, and `swarm init` (dry run by
+  default; `--apply --yes` writes with backups; the kanban limits are an opt-in `--global`).
+- **Evaluation harness** (`evals.py`, `evalkit/`): tasks E1 to E11, a dry run unless `--spend-quota`, a per-run budget re-check, raw
+  results kept locally and redacted, a regression check, no combined score.
+- **Acceptance rig** (`fakes/board.py`, `fakes/worker.py`, `fakes/provider.py`, `tests/acceptance/`): an in-memory Hermes with the
+  real block, unblock, triage-loop and give-up rules and real git worktrees, scripted workers and personas (including the five
+  section 22.12 tampering attempts), a bigger fake provider, and two demonstration scenarios that drive the real controller.
+
+Real problems the builders found (each is a fix or a decision, none is fixed yet unless noted):
+- Through the review wiring the gate-configuration and assertion-weakening findings can never fire: the scope check runs first, so a
+  path that reaches the tamper check is already allowed by the task's touches, and a wildcard touches glob silently allows config
+  edits. Plan-time validation of touches (Gate 0) is needed.
+- Gate 4 fails on ASES's own repository (37 fake keys in tests and docs) and on any repository that tracks `dist/` or `build/`; it
+  has no allowlist.
+- A reviewer that completes a card with CHANGES_REQUIRED dead-ends it: only `kanban_complete` can carry verdict metadata, so the
+  card goes `done` and the merge queue refuses it once. `kanban_request_changes` and `kanban_block` take no metadata in 0.21.3, so
+  the reviewer prompt puts the structure in the reason text.
+- `hermes pause` does not stop the CLI dispatch that `run_pass` calls (only the gateway loop honours it), so the pass checks the
+  stop flag itself.
+- Hermes's `kanban.auto_decompose` defaults to true (it would decompose triage cards with an auxiliary model on its own), and its
+  `worktree_sync` key is not read by the kanban dispatcher, which always cuts worktrees from `HEAD`.
+- The Reviewer still has write tools (one combined `file` toolset), the Docker sandbox cannot run git inside a worktree-only mount
+  (a worktree's `.git` is a file pointing outside it), `docker_run_as_host_user` does nothing on native Windows, and Hermes silently
+  drops all container limits when its probe container fails to start.
+- The request ledger probably under-counts worker sessions: Hermes keeps auxiliary calls in separate rows.
+- `revert_merge` marks a merge reverted even when `git revert` fails, and nothing calls it (ASES-GIT-05 stays partial).
+- `gate_runs`, `merge_records` and `events` still have no working project scope (the column exists since migration 7, nothing writes
+  it); two projects that reuse a task key in one database collide in `merge_records`.
+- `bounds.set_status(paused)` drops the reason, each pass makes about five `kanban_show` calls per task, and a project paused by the
+  re-plan bound pauses again after `swarm resume` unless `replans_per_project` is raised.
+- The real `data/ases.db` was upgraded from schema 3 to 7 once (a builder ran the real CLI as a wiring check): backed up first,
+  integrity checked, every row identical, no data lost.
+
+Still to do: acceptance scenarios 22.3, 22.5, 22.7 to 22.16 on the rig (the rig only has two demonstrations), the project-scoping
+sweep, plan-time validation of touches, a Gate 4 allowlist, wiring the post-merge revert, the triage lane (ASES-LED-03), the
+decisions that wait on the user (Hermes global configuration, Docker, reviewer capacity, private-code provider, coder-2 and coder-3),
+and then the testing phase: real runs, failure paths, seeded-bug checks and independent review of everything built since round 1.
 
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 

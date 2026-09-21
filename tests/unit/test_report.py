@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 
 import pytest
 
-from ases import config, db, events, hermes, ledger, models, plan as plan_mod, report
+from ases import config, db, events, hermes, ledger, models, plan as plan_mod, questions, report
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
 NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)
@@ -99,14 +99,31 @@ def _build(conn, tmp_path, *, models_config=MODELS_CONFIG, now=NOW, project=None
 # --- the fake Hermes ------------------------------------------------------------------------------------------
 
 
-def _card(card_id, status, *, title=None, assignee="coder-1", events=None):
-    """A card as hermes.kanban_show returns it (the flat task plus _events)."""
+def _card(card_id, status, *, title=None, assignee="coder-1", events=None, comments=None):
+    """A card as hermes.kanban_show returns it (the flat task plus _events and _comments)."""
     return {"id": card_id, "status": status, "title": f"title of {card_id}" if title is None else title,
-            "assignee": assignee, "_events": events or []}
+            "assignee": assignee, "_events": events or [], "_comments": comments or []}
 
 
 def _blocked(reason, created_at=1):
     return {"kind": "blocked", "payload": {"reason": reason}, "created_at": created_at, "run_id": 1}
+
+
+def _gave_up(failures=3, error="boom", created_at=1):
+    """The `gave_up` event Hermes's dispatcher writes when its circuit breaker trips (and NO `blocked` event)."""
+    return {"kind": "gave_up", "payload": {"failures": failures, "error": error}, "created_at": created_at,
+            "run_id": None}
+
+
+def _loop(reason, created_at=1):
+    """The `block_loop_detected` event a repeated block writes when it sends a card to `triage`."""
+    return {"kind": "block_loop_detected", "payload": {"reason": reason, "kind": "needs_input"},
+            "created_at": created_at, "run_id": None}
+
+
+def _asked(text, created_at=1):
+    """The comment questions.ask_user writes on a card Hermes will not block."""
+    return {"author": "ases", "body": f"ASES QUESTION: {text}", "created_at": created_at}
 
 
 def _fake_hermes(monkeypatch, cards, *, failing=(), error=None):
@@ -931,6 +948,172 @@ def test_questions_on_a_work_card_and_a_merge_card_are_all_counted(conn, tmp_pat
     assert rep["cards"]["open_questions"] == 2
     assert [q["kind"] for q in rep["cards"]["questions"]] == ["work", "merge"]
     assert "Cards: 2 todo, 1 blocked (2 questions); merge queue 0/3 done" in report.render_status(rep)
+
+
+def test_every_source_of_a_question_is_counted_and_reported_by_source(conn, tmp_path, monkeypatch):
+    """Blocked with a reason, given up on by the dispatcher (no `blocked` event), sent to triage by an unblock loop,
+    and asked by ASES as a comment on a merge card Hermes will not block: four cards, four sources."""
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(
+        w1=_card("w1", "blocked", events=[_blocked("which db?")]),
+        w2=_card("w2", "blocked", events=[_gave_up(3, "HTTP 503")]),
+        w3=_card("w3", "triage", events=[_loop("which port?")]),
+        m1=_card("m1", "blocked", assignee=None, comments=[_asked("merge failed twice: retry or stop?")]),
+    ))
+
+    cards = _build(conn, tmp_path)["cards"]
+
+    assert cards["open_questions"] == 4
+    assert [(q["card_id"], q["task_key"], q["kind"], q["question"]) for q in cards["questions"]] == [
+        ("w1", "T1", "work", "which db?"),
+        ("m1", "T1", "merge", "merge failed twice: retry or stop?"),
+        ("w2", "T2", "work", "gave up after 3 failure(s): HTTP 503"),
+        ("w3", "T3", "work", "which port?"),
+    ]
+    assert cards["questions_by_source"] == {"blocked": 1, "gave_up": 1, "block_loop": 1, "ases_comment": 1}
+    assert list(cards["questions_by_source"]) == ["blocked", "gave_up", "block_loop", "ases_comment"]
+    assert cards["counts"] == {"blocked": 2, "triage": 1}
+
+
+def test_a_merge_card_created_blocked_is_no_question_even_with_the_blocked_event_hermes_writes_for_it(
+    conn, tmp_path, monkeypatch,
+):
+    """Hermes 0.21.3 records the creation of a card with initial_status blocked as a `blocked` event whose reason is
+    "initial_status". The controller creates every merge card that way, so a report that counted it would show every
+    task as waiting on a question."""
+    _seed_tasks(conn)
+    creation = {"kind": "blocked", "payload": {"reason": "initial_status", "status": "blocked", "actor": "ases"},
+                "created_at": 1, "run_id": None}
+    _fake_hermes(monkeypatch, _quiet_board(**{
+        f"m{n}": _card(f"m{n}", "blocked", assignee=None, events=[creation]) for n in (1, 2, 3)
+    }))
+
+    cards = _build(conn, tmp_path)["cards"]
+
+    assert cards["open_questions"] == 0 and cards["questions"] == [] and cards["questions_by_source"] == {}
+    assert cards["merge_queue"]["counts"] == {"blocked": 3}
+
+
+def test_questions_by_source_lists_only_the_sources_that_occur_and_counts_repeats(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(
+        w1=_card("w1", "blocked", events=[_gave_up(2, "a")]), w2=_card("w2", "blocked", events=[_gave_up(3, "b")]),
+        w3=_card("w3", "blocked", events=[_blocked("which db?")]),
+    ))
+    assert _build(conn, tmp_path)["cards"]["questions_by_source"] == {"blocked": 1, "gave_up": 2}
+
+    _fake_hermes(monkeypatch, _quiet_board())
+    cards = _build(conn, tmp_path)["cards"]
+    assert cards["questions_by_source"] == {} and cards["open_questions"] == 0
+
+
+def test_a_question_keeps_its_shape_and_the_source_is_only_in_the_counts(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(w1=_card("w1", "blocked", events=[_gave_up(3, "boom")])))
+    cards = _build(conn, tmp_path)["cards"]
+    assert cards["questions"] == [{"card_id": "w1", "task_key": "T1", "kind": "work",
+                                   "question": "gave up after 3 failure(s): boom"}]
+    assert set(cards) >= {"open_questions", "questions", "questions_by_source"}
+    json.dumps(cards)
+
+
+def test_a_triage_card_is_a_question_only_when_something_was_asked_on_it(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(
+        w1=_card("w1", "triage", events=[]),                     # an agent-proposed card waiting for validation
+        w2=_card("w2", "triage", events=[_loop("which port?")]),
+    ))
+    cards = _build(conn, tmp_path)["cards"]
+    assert [q["card_id"] for q in cards["questions"]] == ["w2"] and cards["open_questions"] == 1
+    assert cards["questions_by_source"] == {"block_loop": 1} and cards["counts"] == {"todo": 1, "triage": 2}
+
+
+@pytest.mark.parametrize("card_kwargs", [
+    {"events": [_blocked("q?", 100), {"kind": "unblocked", "payload": None, "created_at": 200}]},
+    {"events": [_blocked("q?", 100)], "comments": [{"author": "user", "body": "ANSWER: use sqlite", "created_at": 200}]},
+    {"events": [_gave_up(3, "boom", 100)],
+     "comments": [{"author": "default", "body": "UNBLOCK: retry", "created_at": 200}]},
+    {"comments": [_asked("q?", 100), {"author": "user", "body": "ANSWER: use sqlite", "created_at": 200}]},
+], ids=["unblocked-event", "answer-comment", "unblock-comment", "asked-then-answered"])
+def test_a_question_that_was_answered_is_not_counted_even_while_the_card_still_reads_blocked(
+    conn, tmp_path, monkeypatch, card_kwargs,
+):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(w1=_card("w1", "blocked", **card_kwargs)))
+    cards = _build(conn, tmp_path)["cards"]
+    assert cards["open_questions"] == 0 and cards["questions_by_source"] == {} and cards["counts"]["blocked"] == 1
+
+
+@pytest.mark.parametrize("card_events, source, question", [
+    ([_blocked("worker asked", 100), _gave_up(2, "boom", 200)], "gave_up", "gave up after 2 failure(s): boom"),
+    ([_gave_up(2, "boom", 100), _blocked("worker asked", 200)], "blocked", "worker asked"),
+], ids=["gave-up-is-newer", "blocked-is-newer"])
+def test_the_newer_of_a_gave_up_and_a_blocked_event_decides_the_question_and_its_source(
+    conn, tmp_path, monkeypatch, card_events, source, question,
+):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(w1=_card("w1", "blocked", events=card_events)))
+    cards = _build(conn, tmp_path)["cards"]
+    assert [q["question"] for q in cards["questions"]] == [question]
+    assert cards["questions_by_source"] == {source: 1}
+
+
+def test_the_report_uses_the_one_rule_of_the_questions_module_and_has_none_of_its_own(conn, tmp_path, monkeypatch):
+    """`swarm questions`, `swarm answer`, the recovery loop and this report must not be able to drift apart."""
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(w1=_card("w1", "blocked"), w2=_card("w2", "ready")))
+    seen = []
+
+    def fake_open_question(card):
+        seen.append((card["id"], card["status"]))
+        return questions.OpenQuestion("patched?", 9, "gave_up") if card["id"] == "w1" else None
+
+    monkeypatch.setattr(questions, "open_question", fake_open_question)
+    cards = _build(conn, tmp_path)["cards"]
+
+    assert not hasattr(report, "_open_question")
+    assert ("w1", "blocked") in seen and ("w2", "ready") in seen                    # every card read goes through it
+    assert [q["question"] for q in cards["questions"]] == ["patched?"]
+    assert cards["questions_by_source"] == {"gave_up": 1}
+
+
+def test_a_question_in_the_data_is_redacted_and_ascii_whatever_its_source(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    text = f"why {SECRET} caf\N{LATIN SMALL LETTER E WITH ACUTE}?"
+    _fake_hermes(monkeypatch, _quiet_board(
+        w1=_card("w1", "blocked", events=[_gave_up(3, text)]),
+        m1=_card("m1", "blocked", assignee=None, comments=[_asked(text)]),
+    ))
+    cards = _build(conn, tmp_path)["cards"]
+    assert [q["question"] for q in cards["questions"]] == [      # T1's work card, then its merge card
+        "gave up after 3 failure(s): why [redacted] caf" + chr(92) + "xe9?", "why [redacted] caf" + chr(92) + "xe9?",
+    ]
+    assert all(q["question"].isascii() for q in cards["questions"])
+
+
+def test_the_status_line_attaches_the_questions_to_triage_when_no_work_card_is_blocked(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(w1=_card("w1", "triage", events=[_loop("which port?")])))
+    rep = _build(conn, tmp_path)
+    assert "Cards: 2 todo, 1 triage (1 question); merge queue 0/3 done" in report.render_status(rep)
+    assert "Work cards" in report.render_text(rep) and "which port?" in report.render_text(rep)
+
+
+def test_the_status_line_keeps_the_questions_on_blocked_when_both_are_present(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(
+        w1=_card("w1", "triage", events=[_loop("which port?")]), w2=_card("w2", "blocked", events=[_gave_up()]),
+    ))
+    assert "Cards: 1 todo, 1 blocked (2 questions), 1 triage; merge queue 0/3 done" in report.render_status(
+        _build(conn, tmp_path))
+
+
+def test_a_gave_up_question_is_in_the_terminal_report_and_the_page(conn, tmp_path, monkeypatch):
+    _seed_tasks(conn)
+    _fake_hermes(monkeypatch, _quiet_board(w1=_card("w1", "blocked", events=[_gave_up(3, "HTTP 503 <b>")])))
+    rep = _build(conn, tmp_path)
+    assert "gave up after 3 failure(s): HTTP 503 <b>" in report.render_text(rep)
+    assert "gave up after 3 failure(s): HTTP 503 &lt;b&gt;" in report.render_html(rep)
 
 
 def test_the_cards_line_reads_like_the_blueprints_example(scenario_report):

@@ -31,6 +31,7 @@ from . import hermes as hermes_mod
 from . import ledger
 from . import models as models_mod
 from . import plan as plan_mod
+from . import questions as questions_mod
 
 # Section 15: where the board, runs and worker logs already are (ASES does not rebuild them).
 HERMES_DASHBOARD_URL = "http://127.0.0.1:9119"
@@ -99,17 +100,6 @@ def _parse_ts(text) -> datetime | None:
         return _utc(datetime.fromisoformat(text.strip()))
     except ValueError:
         return None
-
-
-def _epoch(value) -> int:
-    """`value` as whole epoch seconds, 0 when it is missing or not a number. Hermes hands timestamps over as ints
-    and, in places, as numeric strings, so both are read."""
-    if isinstance(value, bool):
-        return 0
-    try:
-        return max(0, int(float(value)))
-    except (TypeError, ValueError, OverflowError):
-        return 0
 
 
 def _clip(text: str, limit: int | None) -> str:
@@ -426,53 +416,34 @@ def _card_view(board: str, card_id: str | None) -> tuple[dict, dict | None]:
     return summary, card
 
 
-def _open_question(card: dict) -> str | None:
-    """The question a blocked card is asking, or None. The same rule as questions.list_questions for whether a
-    card asks anything, so this report and `swarm questions` agree on the cards both look at: the reason of the
-    card's LATEST `blocked` event (by created_at, then position), and only when that reason is a non-empty
-    string. A merge card the controller created blocked, to wait for its work card, has no such event and asks
-    nothing; a card blocked twice reports the newer question, and an empty reason on the newer block means the
-    block now asks nothing. (This report only looks at each task's current work and merge card, so a stray card
-    that `swarm questions` finds through a parent link or its title is not counted here.)"""
-    blocks = [
-        ((_epoch(event.get("created_at")), position), event)
-        for position, event in enumerate(card.get("_events") or [])
-        if isinstance(event, dict) and event.get("kind") == "blocked"
-    ]
-    if not blocks:
-        return None
-    payload = max(blocks, key=lambda item: item[0])[1].get("payload")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except (ValueError, RecursionError):
-            payload = None
-    reason = payload.get("reason") if isinstance(payload, dict) else None
-    if not isinstance(reason, str) or not reason.strip():
-        return None
-    return reason.strip()
-
-
 def _cards_panel(board: str, plan: plan_mod.Plan, task_rows: dict) -> dict:
     """Section 15.2 Cards: for every plan task its CURRENT work card (plan_tasks.work_card_id, which follows a fix
     card once one is opened) and its merge card, with status and assignee from Hermes, then the status counts,
     the open questions and the merge queue. `counts` is over the work cards, the cards that carry the task;
     merge cards are created blocked and only wait, so counting them would read as a wall of blocked cards, and
-    they are summarised by `merge_queue` (done over total) instead. Open questions are counted over both kinds,
-    because a merge card the controller blocked on purpose (fix-card budget spent) is a question for the user."""
-    tasks, questions = [], []
+    they are summarised by `merge_queue` (done over total) instead.
+
+    Open questions are the blocked and triage cards for which questions.open_question finds a question: the one
+    rule that `swarm questions`, `swarm answer` and the recovery loop use, so this report cannot drift from them. A
+    card blocked with a reason, one the dispatcher gave up on, one an unblock loop sent to triage and one ASES left
+    a question on all count, and `questions_by_source` says how many of each (only the sources that occur). They are
+    counted over both kinds of card, because a merge card the controller blocked on purpose (fix-card budget spent)
+    is a question for the user. (This report only looks at each task's current work and merge card, so a stray card
+    that `swarm questions` finds through a parent link or its title is not counted here.)"""
+    tasks, questions, sources = [], [], []
     for task in plan.tasks:
         row = task_rows.get(task.key)
         views = {}
         for kind in ("work", "merge"):
             summary, card = _card_view(board, row[f"{kind}_card_id"] if row is not None else None)
             views[kind] = summary
-            question = _open_question(card) if summary["status"] == "blocked" else None
-            if question is not None:
+            asked = questions_mod.open_question(card) if card is not None else None
+            if asked is not None:
                 questions.append({
                     "card_id": summary["id"], "task_key": task.key, "kind": kind,
-                    "question": _clip(question, _QUESTION_CHARS),
+                    "question": _clip(asked.reason, _QUESTION_CHARS),
                 })
+                sources.append(asked.source)
         tasks.append({
             "task_key": task.key,
             "title": views["work"]["title"] or task.title,
@@ -482,6 +453,7 @@ def _cards_panel(board: str, plan: plan_mod.Plan, task_rows: dict) -> dict:
             "merge": views["merge"],
         })
     merge_statuses = [item["merge"]["status"] for item in tasks]
+    order = {name: number for number, name in enumerate(questions_mod.SOURCES)}
     return {
         "board": board,
         "dashboard": HERMES_DASHBOARD_URL,
@@ -492,6 +464,10 @@ def _cards_panel(board: str, plan: plan_mod.Plan, task_rows: dict) -> dict:
         },
         "open_questions": len(questions),
         "questions": questions,
+        "questions_by_source": {
+            source: sources.count(source)
+            for source in sorted(set(sources), key=lambda name: (order.get(name, len(order)), name))
+        },
     }
 
 
@@ -653,15 +629,17 @@ def _bound_text(bound: dict) -> str:
 
 def _status_summary(cards: dict) -> str:
     """"3 done, 1 running, 1 blocked (1 question)": the work cards' status counts, with the open questions
-    attached to the blocked count. Questions can also sit on a merge card the controller blocked, and then no
-    work card need be blocked, so they are named on their own in that case."""
+    attached to the blocked count, or to the triage count when no work card is blocked (a question can sit on a card
+    an unblock loop sent to Hermes's triage lane). Questions can also sit on a merge card the controller blocked,
+    and then no work card need be blocked or in triage, so they are named on their own in that case."""
     questions = cards["open_questions"]
     label = f"{questions} question" + ("" if questions == 1 else "s")
+    holder = "blocked" if "blocked" in cards["counts"] else "triage"
     parts = []
     attached = False
     for status, number in cards["counts"].items():
         text = f"{number} {status}"
-        if status == "blocked" and questions:
+        if status == holder and questions:
             text += f" ({label})"
             attached = True
         parts.append(text)

@@ -2,16 +2,25 @@
 
 Kept separate from cli.py so the checks are unit-testable without going through argv. Each check
 returns a DoctorCheck with an honest status: PASS/WARN/FAIL for things Phase 1 can actually verify,
-PENDING for things that legitimately don't exist until a later phase (role profiles, the gateway
-dispatcher, the Docker sandbox) -- a PENDING check is not a hidden failure, it's a true statement about
-where the project is in the phase plan (section 16), and it must say so rather than pretend to be green.
+PENDING for things that legitimately don't exist until a later phase (the gateway dispatcher, a
+sandbox the user has not enabled) -- a PENDING check is not a hidden failure, it's a true statement
+about where the project is in the phase plan (section 16), and it must say so rather than pretend to be green.
 
 Overall status is FAIL only if any single check is FAIL; WARN and PENDING never fail the run on their
 own, matching the exit-code convention `hermes doctor` itself uses (0 = healthy enough to proceed).
+
+Two families of rows come from other modules and are deliberately soft:
+  * the profile state (profiles.verify_state): each problem is one WARN row and never a FAIL, because a
+    machine that has not had `swarm init --apply` run on it is still usable;
+  * the sandbox (sandbox.doctor_checks): WARN rows while config/swarm.yaml says `sandbox: enabled: false`
+    (Docker is off until the user starts it, ASES-SEC-03), and FAIL only once the config says it is enabled
+    and a check fails, because then the workers really are meant to run inside it.
 """
 from __future__ import annotations
 
 import dataclasses
+import importlib
+import inspect
 import pathlib
 import subprocess
 import sys
@@ -19,6 +28,7 @@ import sys
 from . import config as ases_config
 from . import hermes as hermes_mod
 from . import models as models_mod
+from . import sandbox as sandbox_mod
 
 Status = str  # "pass" | "warn" | "fail" | "pending"
 
@@ -162,12 +172,152 @@ def _check_gateway_dispatcher() -> DoctorCheck:
     )
 
 
-def _check_docker_sandbox() -> DoctorCheck:
-    return DoctorCheck(
-        "docker_sandbox", "pending",
-        "Docker terminal backend is a Phase 5 requirement (ASES-SEC-03), not checked before then",
-        ("ASES-SEC-03",),
-    )
+_SANDBOX_IDS = ("ASES-SEC-03", "ASES-CFG-04")
+_PROFILE_IDS = ("ASES-ROL-02", "ASES-ROL-07", "ASES-ARC-08")
+# The roles that are not workers when profiles.desired_profiles cannot say: the lead plans and the reviewer only
+# has the Kanban verdict tools and read access (ASES-ROL-05), so neither runs a worker's shell.
+_NON_WORKER_ROLES = ("lead", "reviewer")
+
+
+def _takes(func, name: str) -> bool:
+    """Does `func` take a keyword argument called `name` (or any, through **kwargs)? False when its signature cannot
+    be read."""
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+def _load_profiles_module() -> tuple[object | None, DoctorCheck | None]:
+    """(the ases.profiles module, None), or (None, the row to show instead). The module belongs to another
+    package and a machine may not have it yet, so a missing one is PENDING (a true statement about the build) and
+    a broken one is a WARN; neither may crash the doctor."""
+    try:
+        return importlib.import_module(f"{__package__}.profiles"), None
+    except ImportError as exc:
+        return None, DoctorCheck(
+            "profile_state", "pending",
+            f"the profiles module is not part of this build yet, so the Hermes profile state was not verified ({exc})",
+            _PROFILE_IDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - a module that fails to load costs one row, not the doctor
+        return None, DoctorCheck(
+            "profile_state", "warn",
+            f"the profiles module failed to load, so the Hermes profile state was not verified: "
+            f"{type(exc).__name__}: {exc}",
+            _PROFILE_IDS,
+        )
+
+
+def _check_profile_state(project: ases_config.ProjectConfig, models_config: dict, profiles_mod) -> list[DoctorCheck]:
+    """ASES-ROL-02, ASES-ROL-07, ASES-ARC-08: one WARN row per problem profiles.verify_state reports (a worker
+    with the memory toolset, a reviewer with a terminal, a missing SOUL.md, a model mismatch, missing kanban
+    limits). Never a FAIL: a machine that has not had `swarm init --apply` run on it is still usable, and the
+    hard requirements have their own rows (role_profiles, reviewer_diversity).
+
+    With the sandbox enabled the terminal blocks are checked against the policy of config/swarm.yaml (its image and
+    limits), when verify_state takes one; without it verify_state falls back to the image the profile names itself."""
+    enabled = bool(getattr(project, "sandbox_enabled", False))
+    kwargs: dict = {"sandbox_enabled": enabled}
+    if enabled and _takes(profiles_mod.verify_state, "policy"):
+        try:
+            kwargs["policy"] = sandbox_mod.SandboxPolicy.from_config(project.sandbox_policy_config())
+        except Exception:  # noqa: BLE001 - a bad sandbox block has its own row (sandbox_config)
+            pass
+    try:
+        problems = profiles_mod.verify_state(
+            project, models_config, project.hermes_native_home, _repo_root() / "prompts", **kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 - a doctor row never crashes the doctor
+        return [DoctorCheck(
+            "profile_state", "warn", f"could not verify the profile state: {type(exc).__name__}: {exc}", _PROFILE_IDS,
+        )]
+    problems = [str(problem) for problem in (problems or [])]
+    if not problems:
+        return [DoctorCheck(
+            "profile_state", "pass", "the Hermes profiles are in the desired state (swarm init has nothing to change)",
+            _PROFILE_IDS,
+        )]
+    return [
+        DoctorCheck(f"profile_state[{number}]", "warn", f"{problem} (`swarm init` shows the fix)", _PROFILE_IDS)
+        for number, problem in enumerate(problems, start=1)
+    ]
+
+
+def _worker_profile_names(project: ases_config.ProjectConfig, models_config: dict, profiles_mod) -> list[str]:
+    """The profiles whose terminal must run inside the sandbox. profiles.desired_profiles is the source of truth:
+    `swarm init` puts the Docker terminal block on an ACTIVE worker that has the terminal toolset (the reviewer is a
+    worker too, since the dispatcher spawns it, but it has no terminal), and the doctor asks about exactly those, so
+    the two cannot disagree and a green doctor is reachable. Without the module every role except the lead and the
+    reviewer counts, and a profile that also plays the lead or the reviewer is left out."""
+    if profiles_mod is not None:
+        try:
+            specs = profiles_mod.desired_profiles(project, models_config)
+            names = [
+                str(spec.name) for spec in specs
+                if getattr(spec, "worker", False) and getattr(spec, "active", True)
+                and "terminal" in (getattr(spec, "toolsets", None) or ("terminal",))
+            ]
+        except Exception:  # noqa: BLE001 - fall back to the role map below
+            names = []
+        if names:
+            return list(dict.fromkeys(names))
+    excluded = {project.roles.get(role) for role in _NON_WORKER_ROLES}
+    names: list[str] = []
+    for role, profile in project.roles.items():
+        if role in _NON_WORKER_ROLES or profile in excluded or profile in names:
+            continue
+        names.append(profile)
+    return names
+
+
+def _check_sandbox(project: ases_config.ProjectConfig, models_config: dict, profiles_mod) -> list[DoctorCheck]:
+    """ASES-SEC-03, ASES-CFG-04: `sandbox.doctor_checks` as rows (Docker reachable, the pinned image present, each
+    worker profile's terminal block compliant). The sandbox is OFF by default until the user has Docker running,
+    so while config/swarm.yaml says `enabled: false` a failing check is only a WARN and the first row says the
+    sandbox is off; once it says `enabled: true` a failing check is a FAIL, because the workers are then meant to
+    run inside it. The rows never contain a secret (sandbox.doctor_checks documents that)."""
+    enabled = bool(getattr(project, "sandbox_enabled", False))
+    bad = "fail" if enabled else "warn"
+    if enabled:
+        rows = [DoctorCheck(
+            "sandbox_enabled", "pass", "sandbox: enabled: true in config/swarm.yaml; the rows below must be green",
+            _SANDBOX_IDS,
+        )]
+    else:
+        rows = [DoctorCheck(
+            "sandbox_enabled", "pending",
+            "sandbox is not enabled in config/swarm.yaml (Docker is off until the user starts it): workers run on "
+            "the local backend, so ASES-SEC-03 is not met yet, and the sandbox rows below are warnings",
+            _SANDBOX_IDS,
+        )]
+    try:
+        policy = sandbox_mod.SandboxPolicy.from_config(project.sandbox_policy_config())
+        profile_dirs = [
+            project.hermes_native_home / "profiles" / name
+            for name in _worker_profile_names(project, models_config, profiles_mod)
+        ]
+        results = sandbox_mod.doctor_checks(policy, profile_dirs, home=pathlib.Path.home())
+    except sandbox_mod.SandboxConfigError as exc:
+        return rows + [DoctorCheck("sandbox_config", bad, f"config/swarm.yaml sandbox: {exc}", _SANDBOX_IDS)]
+    except Exception as exc:  # noqa: BLE001 - a probe never crashes the doctor
+        return rows + [DoctorCheck(
+            "sandbox_checks", bad, f"could not run the sandbox checks: {type(exc).__name__}: {exc}", _SANDBOX_IDS,
+        )]
+    if enabled and not policy.image:
+        rows.append(DoctorCheck(
+            "sandbox_image_configured", "fail",
+            "sandbox.enabled is true but config/swarm.yaml names no sandbox.image: workers need a pinned image "
+            "with the project toolchain (ASES-SEC-03)",
+            _SANDBOX_IDS,
+        ))
+    for name, ok, detail in results:
+        detail = str(detail)
+        if not ok and not enabled:
+            detail += " (sandbox not enabled, so only a warning)"
+        rows.append(DoctorCheck(str(name), "pass" if ok else bad, detail, _SANDBOX_IDS))
+    return rows
 
 
 def _check_model_registry(conn) -> list[DoctorCheck]:
@@ -294,6 +444,7 @@ def _check_no_secrets_in_output(report_text_so_far: str) -> DoctorCheck:
 
 
 def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> DoctorReport:
+    profiles_mod, profiles_unavailable = _load_profiles_module()
     checks: list[DoctorCheck] = [
         _check_environment_decision(project),
         _check_not_under_onedrive(project),
@@ -304,10 +455,12 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> Doctor
         _check_hermes_version(project),
         _check_hermes_doctor(),
         _check_gateway_dispatcher(),
-        _check_docker_sandbox(),
+        *_check_sandbox(project, models_config, profiles_mod),
         *_check_model_registry(conn),
         _check_role_profiles(project),
         _check_reviewer_diversity(project),
+        *([profiles_unavailable] if profiles_unavailable is not None
+          else _check_profile_state(project, models_config, profiles_mod)),
         _check_limits_table(models_config),
     ]
     # The secrets check needs to see everything decided above it, so it runs last, over the detail text

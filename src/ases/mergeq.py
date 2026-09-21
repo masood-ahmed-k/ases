@@ -6,17 +6,32 @@ merge card is done. A post-merge failure reverts the squash commit rather than l
 
 The controller is the only thing that ever writes to the integration branch (ASES-GIT-02) -- this
 module is where that happens; nothing else in ASES calls `git merge` or `git push` on it.
+
+Two things wrap those steps (round 5). The kill switch (ASES-REC-06: "stop the merge queue between steps") is a
+`should_stop` callable polled between the steps, so a stop request ends the merge at a step boundary and never in
+the middle of one. And when the caller names a project, the steps write intent records (ASES-REC-03/04: "Every
+multi-step action writes an intent record before acting and a completion record after ... build a candidate,
+fast-forward ... revert"), so a crash between the two leaves an open intent that reconcile-on-start can read.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import pathlib
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from datetime import datetime, timezone
 
+from . import events as events_mod
 from . import gates as gates_mod
+from . import intents as intents_mod
+
+# The three places merge_task asks whether to stop, named for the "stopped by the kill switch before <step>" text.
+STEP_CANDIDATE = "building the candidate"
+STEP_GATE3 = "Gate 3"
+STEP_FAST_FORWARD = "the fast-forward"
 
 
 class MergeConflict(Exception):
@@ -28,7 +43,14 @@ class MergeOutcome:
     """The result of one merge_task call. Three shapes matter to a caller: a real merge (merged=True with
     squash_commit set), a refusal (merged=False), and a recorded no-op (merged=True with squash_commit None
     and gate3_result "skipped"). The no-op means the branch added nothing to the integration branch and the
-    caller passed allow_empty: no commit was made, nothing was gated, and the integration branch did not move."""
+    caller passed allow_empty: no commit was made, nothing was gated, and the integration branch did not move.
+
+    A fourth shape is a stop (`stopped=True`, merged=False): the caller's should_stop callable said stop at one of
+    the three checkpoints, so nothing was merged and nothing failed. It is not a refusal: there is no branch
+    problem to fix, so a caller must not open a fix card or spend budget for it.
+
+    `detail` is redacted when the outcome is built (ASES-SEC-01): it carries git and gate output, and the
+    controller copies it into events and fix-card bodies. Doing it here means no producer of an outcome can forget."""
     merged: bool
     candidate_sha: str | None
     squash_commit: str | None
@@ -38,6 +60,13 @@ class MergeOutcome:
     # between building it and the fast-forward: a genuine race, the one refusal the controller may retry for
     # free (2026-09-19 fix). Every other outcome, including every other refused fast-forward, leaves it False.
     integration_moved: bool = False
+    # True ONLY when should_stop asked for a halt at a checkpoint (ASES-REC-06). The candidate was discarded and no
+    # merge_records row was written or changed for it; candidate_sha, squash_commit and gate3_result are None.
+    stopped: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.detail, str):
+            object.__setattr__(self, "detail", events_mod.redact_text(self.detail))
 
 
 def _git(args: list[str], cwd: pathlib.Path, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -56,10 +85,42 @@ def _resolve(repo: pathlib.Path, rev: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def _intent(conn, project: str | None, kind: str, task_key: str, detail: str | None = None):
+    """The intent record of ASES-REC-03/04 around one step: intents.intent (write before, complete only if the body
+    finished, leave it open when the body raises) when the caller gave both a project and a connection, else a
+    no-op, so a call without them (a unit test, a one-off merge) behaves exactly as it did before intents existed.
+    A step that RETURNS, including a refusal, finished cleanly and completes its intent; only an exception or a
+    crash leaves it open, which is what reconcile-on-start looks for."""
+    if conn is None or project is None:
+        return contextlib.nullcontext()
+    return intents_mod.intent(conn, project, kind, task_key, detail)
+
+
+def _stop_requested(should_stop: Callable[[], bool] | None, conn, task_key: str, step: str) -> bool:
+    """Ask the caller whether to stop before `step` (ASES-REC-06). No callable means never stop. A callable that
+    raises counts as "keep going" (a broken kill-switch reader must not be able to block merging) and is recorded
+    as a should_stop_error event, so it is visible instead of silent."""
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception as exc:  # noqa: BLE001 - any failure of the caller's callable is treated the same way
+        if conn is not None:
+            events_mod.record(conn, "should_stop_error", {
+                "task_key": task_key, "step": step, "error": f"{type(exc).__name__}: {exc}"[:300],
+            })
+        return False
+
+
+def _stopped(step: str) -> MergeOutcome:
+    return MergeOutcome(False, None, None, None, f"stopped by the kill switch before {step}", stopped=True)
+
+
 def merge_task(
     repo: pathlib.Path, integration_branch: str, work_branch: str, task_key: str,
     gate3_commands: list[str], *, conn=None, commit_message: str | None = None, allow_empty: bool = False,
-    expected_head: str | None = None,
+    expected_head: str | None = None, project: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> MergeOutcome:
     """ASES-GIT-04: squash candidate on integration HEAD -> Gate 3 -> fast-forward -> done.
     A merge conflict or a red Gate 3 leaves the integration branch untouched and returns merged=False;
@@ -88,7 +149,29 @@ def merge_task(
     `expected_head` closes the time-of-check gap (2026-09-19): the caller checked and gate-ran ONE commit of the
     work branch (review.check_branch_for_merge), and a commit pushed after that must not ride in unchecked. With
     it given, the branch must still be at exactly that commit, else the merge is refused (nothing is built);
-    and the squash is taken from that SHA itself, not from the branch name, so there is no window at all."""
+    and the squash is taken from that SHA itself, not from the branch name, so there is no window at all.
+
+    ASES-REC-06 (`should_stop`): "stop the merge queue between steps". A zero-argument callable, polled before the
+    candidate is built, before Gate 3 and before the fast-forward, in that order. When it says True the
+    candidate worktree is removed, no merge_records row is written or changed (the row is only written once the
+    last checkpoint has passed, so there is no half row to clean up), and the outcome is merged=False,
+    stopped=True with detail "stopped by the kill switch before <step>". Gate 3, once started, is never
+    interrupted: the stop takes effect at the next boundary. A callable that raises is treated as False and
+    recorded as a should_stop_error event (a broken kill-switch reader must not be able to block merging).
+
+    ASES-REC-03/04 (`project`): with a project name (and a connection) the candidate build plus Gate 3 run inside
+    an intent of kind build_candidate and the fast-forward inside one of kind fast_forward, both keyed by the
+    task. The intent is completed only when the step finished (an exception or a crash leaves it open for
+    reconcile-on-start), and a step that ends in a refusal has finished. Without a project no intent is written.
+
+    ASES-REC-04 (found by the reconcile builder, 2026-09-21): a NEW candidate for a task resets `reverted`,
+    `squash_commit` and `completed_at` on its merge_records row. Before, a merge that was reverted, fixed and
+    merged again kept reverted=1 forever, so reconcile.check() reported done_but_reverted for a healthy merge.
+    Only a new candidate build resets the row: a call that ends before one exists (a wrong checkout, a moved
+    branch, a conflict, an empty diff, a red secret scan) leaves whatever row the task already has untouched."""
+    if _stop_requested(should_stop, conn, task_key, STEP_CANDIDATE):
+        return _stopped(STEP_CANDIDATE)
+
     # Before mkdtemp and before any worktree, so refusing here leaves nothing behind to clean up.
     head = _git(["symbolic-ref", "--short", "-q", "HEAD"], repo)
     current_branch = head.stdout.strip() if head.returncode == 0 else ""
@@ -121,120 +204,172 @@ def merge_task(
     tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="ases-merge-"))
     candidate = tmp_root / "candidate"
     try:
-        base_sha = _head_sha(repo)
-        add = _git(["worktree", "add", "--detach", str(candidate), integration_branch], repo)
-        if add.returncode != 0:
-            return MergeOutcome(False, None, None, None, f"could not create candidate worktree: {add.stderr}")
-
-        squash = _git(["merge", "--squash", squash_ref], candidate)
-        if squash.returncode != 0:
-            _git(["merge", "--abort"], candidate)
-            return MergeOutcome(False, None, None, None, f"merge conflict: {squash.stdout}{squash.stderr}")
-
-        # Empty or not is decided from the index (2026-09-19). --quiet implies --exit-code: 0 means nothing
-        # is staged, 1 means something is, and any other code is git failing to answer, which is reported
-        # rather than guessed at (guessing "empty" would silently record a merge that never happened).
-        staged = _git(["diff", "--cached", "--quiet"], candidate)
-        if staged.returncode not in (0, 1):
-            return MergeOutcome(
-                False, None, None, None,
-                f"could not tell whether squashing {work_branch} staged any changes (git diff --cached "
-                f"--quiet exited {staged.returncode}): {staged.stdout}{staged.stderr}",
+        with _intent(conn, project, intents_mod.KIND_BUILD_CANDIDATE, task_key,
+                     f"squash {work_branch} onto {integration_branch}"):
+            candidate_sha, early = _build_candidate(
+                repo, integration_branch, work_branch, squash_ref, task_key, candidate, commit_message,
+                allow_empty, conn,
             )
-        if staged.returncode == 0:
-            if not allow_empty:
-                # Refused here instead of by attempting the commit: git's own text for that failure is only
-                # "Not currently on any branch. nothing to commit", which says nothing about why.
-                return MergeOutcome(
-                    False, None, None, None,
-                    f"nothing to commit: squashing {work_branch} onto {integration_branch} staged no changes "
-                    f"(an empty diff: the branch has no commit that adds anything to the integration tip)",
-                )
+            if early is not None:
+                return early
+
+            if _stop_requested(should_stop, conn, task_key, STEP_GATE3):
+                return _stopped(STEP_GATE3)
+            gate_result = gates_mod.run_gate(
+                candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key,
+            )
+            # The last checkpoint comes BEFORE the merge_records row is written, so a stop here leaves the row
+            # exactly as it was. A red gate never reaches the fast-forward, so it has nothing left to stop.
+            if gate_result.passed and _stop_requested(should_stop, conn, task_key, STEP_FAST_FORWARD):
+                return _stopped(STEP_FAST_FORWARD)
             if conn is not None:
-                # Same upsert idiom as the Gate 3 record below, but complete in this one write: there is no
-                # fast-forward left to wait for, and reconcile (ASES-REC-04) wants completed_at on a done merge
-                # card. candidate_sha is the integration tip the empty squash was built on. A retry rewrites
-                # every column the no-op owns, so running it twice leaves one identical row.
-                conn.execute(
-                    "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
-                    "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, ?) "
-                    "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
-                    "gate3_result=excluded.gate3_result, squash_commit=NULL, "
-                    "completed_at=excluded.completed_at",
-                    (task_key, base_sha, "skipped", datetime.now(timezone.utc).isoformat(timespec="seconds")),
-                )
-            return MergeOutcome(True, None, None, "skipped", "no changes to merge (review-only task)")
+                _record_candidate(conn, task_key, candidate_sha, gate_result.passed)
+            if not gate_result.passed:
+                return MergeOutcome(False, candidate_sha, None, "fail", gate_result.detail)
 
-        msg = commit_message or f"{task_key}: merge {work_branch}"
-        commit = _git(["commit", "-q", "-m", msg], candidate)
-        if commit.returncode != 0:
-            # Emptiness was decided from the index above, so a commit that fails NOW had staged changes and was
-            # refused for another reason (no usable git identity, a hook). It used to be labelled "nothing to
-            # commit" here, which sent whoever read the failure looking for an empty diff that was not there.
-            return MergeOutcome(False, None, None, None, f"commit failed: {commit.stdout}{commit.stderr}")
-
-        candidate_sha = _head_sha(candidate)
-
-        diff = _git(["diff", f"{base_sha}..{candidate_sha}"], candidate).stdout
-        secret_findings = gates_mod.scan_for_secrets(diff)
-        if secret_findings:
-            return MergeOutcome(False, candidate_sha, None, None,
-                                 "secret scan failed (ASES-SEC-01): " + "; ".join(secret_findings))
-
-        gate_result = gates_mod.run_gate(
-            candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key,
-        )
-        if conn is not None:
-            conn.execute(
-                "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
-                "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, NULL) "
-                "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
-                "gate3_result=excluded.gate3_result",
-                (task_key, candidate_sha, "pass" if gate_result.passed else "fail"),
-            )
-        if not gate_result.passed:
-            return MergeOutcome(False, candidate_sha, None, "fail", gate_result.detail)
-
-        ff = _git(["merge", "--ff-only", candidate_sha], repo)
-        if ff.returncode != 0:
-            # Fail safe rather than force. But "refused" alone does not mean the tip moved (2026-09-19 fix):
-            # git also refuses --ff-only over a dirty primary checkout whose uncommitted changes the merge
-            # would overwrite, or an index.lock, with the tip exactly where it was. The candidate was
-            # squashed onto the integration tip as of worktree creation, so its parent IS that tip; the
-            # branch moved iff it is somewhere else now. Only that evidence earns the free retry, so if
-            # either lookup fails the answer is "not moved".
-            parent = _resolve(repo, f"{candidate_sha}^")
-            tip_now = _resolve(repo, integration_branch)
-            moved = bool(parent) and bool(tip_now) and tip_now != parent
-            if moved:
-                detail = (f"fast-forward refused, integration branch moved ('{integration_branch}' was "
-                          f"{parent[:12]} when the candidate was built, is now {tip_now[:12]}): {ff.stderr}")
-            elif parent and tip_now:
-                detail = (f"fast-forward refused although the integration branch did NOT move (still "
-                          f"{tip_now[:12]}); this is not a race, a dirty or wrong-branch primary checkout "
-                          f"is the likely cause: {ff.stderr}")
-            else:
-                detail = (f"fast-forward refused and git could not confirm whether the integration branch "
-                          f"moved (treated as NOT moved, so no free retry); a dirty or wrong-branch primary "
-                          f"checkout is a likely cause: {ff.stderr}")
-            return MergeOutcome(False, candidate_sha, None, "pass", detail, integration_moved=moved)
-
-        if conn is not None:
-            conn.execute(
-                "UPDATE merge_records SET squash_commit = ?, completed_at = ? WHERE task_key = ?",
-                (candidate_sha, datetime.now(timezone.utc).isoformat(timespec="seconds"), task_key),
-            )
-        return MergeOutcome(True, candidate_sha, candidate_sha, "pass", "merged")
+        with _intent(conn, project, intents_mod.KIND_FAST_FORWARD, task_key,
+                     f"fast-forward {integration_branch} to {candidate_sha}"):
+            return _fast_forward(repo, integration_branch, candidate_sha, task_key, conn)
     finally:
         _git(["worktree", "remove", "--force", str(candidate)], repo)
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
-def revert_merge(repo: pathlib.Path, squash_commit: str, *, conn=None, task_key: str = "") -> bool:
+def _build_candidate(
+    repo: pathlib.Path, integration_branch: str, work_branch: str, squash_ref: str, task_key: str,
+    candidate: pathlib.Path, commit_message: str | None, allow_empty: bool, conn,
+) -> tuple[str | None, MergeOutcome | None]:
+    """Squash `squash_ref` onto the integration tip in the throwaway worktree `candidate`, commit it, and scan the
+    diff for secrets. Returns (candidate_sha, None) when there is a candidate commit ready for Gate 3, or (None,
+    outcome) when merge_task is already done: a refusal (no worktree, a conflict, an empty diff with allow_empty
+    False, a failed commit, a secret) or the recorded no-op. Nothing here touches the real integration branch."""
+    base_sha = _head_sha(repo)
+    add = _git(["worktree", "add", "--detach", str(candidate), integration_branch], repo)
+    if add.returncode != 0:
+        return None, MergeOutcome(False, None, None, None, f"could not create candidate worktree: {add.stderr}")
+
+    squash = _git(["merge", "--squash", squash_ref], candidate)
+    if squash.returncode != 0:
+        _git(["merge", "--abort"], candidate)
+        return None, MergeOutcome(False, None, None, None, f"merge conflict: {squash.stdout}{squash.stderr}")
+
+    # Empty or not is decided from the index (2026-09-19). --quiet implies --exit-code: 0 means nothing
+    # is staged, 1 means something is, and any other code is git failing to answer, which is reported
+    # rather than guessed at (guessing "empty" would silently record a merge that never happened).
+    staged = _git(["diff", "--cached", "--quiet"], candidate)
+    if staged.returncode not in (0, 1):
+        return None, MergeOutcome(
+            False, None, None, None,
+            f"could not tell whether squashing {work_branch} staged any changes (git diff --cached "
+            f"--quiet exited {staged.returncode}): {staged.stdout}{staged.stderr}",
+        )
+    if staged.returncode == 0:
+        if not allow_empty:
+            # Refused here instead of by attempting the commit: git's own text for that failure is only
+            # "Not currently on any branch. nothing to commit", which says nothing about why.
+            return None, MergeOutcome(
+                False, None, None, None,
+                f"nothing to commit: squashing {work_branch} onto {integration_branch} staged no changes "
+                f"(an empty diff: the branch has no commit that adds anything to the integration tip)",
+            )
+        if conn is not None:
+            # Same upsert idiom as the Gate 3 record (_record_candidate), but complete in this one write: there is
+            # no fast-forward left to wait for, and reconcile (ASES-REC-04) wants completed_at on a done merge
+            # card. candidate_sha is the integration tip the empty squash was built on. A retry rewrites every
+            # column the no-op owns, so running it twice leaves one identical row. reverted is one of them: this
+            # is a new candidate build too, so it starts the row over (see merge_task's ASES-REC-04 note).
+            conn.execute(
+                "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
+                "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, ?) "
+                "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
+                "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, "
+                "completed_at=excluded.completed_at",
+                (task_key, base_sha, "skipped", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            )
+        return None, MergeOutcome(True, None, None, "skipped", "no changes to merge (review-only task)")
+
+    msg = commit_message or f"{task_key}: merge {work_branch}"
+    commit = _git(["commit", "-q", "-m", msg], candidate)
+    if commit.returncode != 0:
+        # Emptiness was decided from the index above, so a commit that fails NOW had staged changes and was
+        # refused for another reason (no usable git identity, a hook). It used to be labelled "nothing to
+        # commit" here, which sent whoever read the failure looking for an empty diff that was not there.
+        return None, MergeOutcome(False, None, None, None, f"commit failed: {commit.stdout}{commit.stderr}")
+
+    candidate_sha = _head_sha(candidate)
+
+    diff = _git(["diff", f"{base_sha}..{candidate_sha}"], candidate).stdout
+    secret_findings = gates_mod.scan_for_secrets(diff)
+    if secret_findings:
+        return None, MergeOutcome(False, candidate_sha, None, None,
+                                   "secret scan failed (ASES-SEC-01): " + "; ".join(secret_findings))
+    return candidate_sha, None
+
+
+def _record_candidate(conn, task_key: str, candidate_sha: str, passed: bool) -> None:
+    """Write the merge_records row for a candidate that has been through Gate 3. A NEW candidate starts the row
+    over: reverted, squash_commit and completed_at are reset, because they describe the previous merge of this task
+    (a revert, a fix card and a second merge is the case that used to leave reverted=1 behind). The fast-forward
+    fills squash_commit and completed_at in again once it lands."""
+    conn.execute(
+        "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
+        "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, NULL) "
+        "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
+        "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, completed_at=NULL",
+        (task_key, candidate_sha, "pass" if passed else "fail"),
+    )
+
+
+def _fast_forward(
+    repo: pathlib.Path, integration_branch: str, candidate_sha: str, task_key: str, conn,
+) -> MergeOutcome:
+    """Advance the real integration branch to the gated candidate, or refuse without forcing anything, and
+    complete the merge_records row when it lands."""
+    ff = _git(["merge", "--ff-only", candidate_sha], repo)
+    if ff.returncode != 0:
+        # Fail safe rather than force. But "refused" alone does not mean the tip moved (2026-09-19 fix):
+        # git also refuses --ff-only over a dirty primary checkout whose uncommitted changes the merge
+        # would overwrite, or an index.lock, with the tip exactly where it was. The candidate was
+        # squashed onto the integration tip as of worktree creation, so its parent IS that tip; the
+        # branch moved iff it is somewhere else now. Only that evidence earns the free retry, so if
+        # either lookup fails the answer is "not moved".
+        parent = _resolve(repo, f"{candidate_sha}^")
+        tip_now = _resolve(repo, integration_branch)
+        moved = bool(parent) and bool(tip_now) and tip_now != parent
+        if moved:
+            detail = (f"fast-forward refused, integration branch moved ('{integration_branch}' was "
+                      f"{parent[:12]} when the candidate was built, is now {tip_now[:12]}): {ff.stderr}")
+        elif parent and tip_now:
+            detail = (f"fast-forward refused although the integration branch did NOT move (still "
+                      f"{tip_now[:12]}); this is not a race, a dirty or wrong-branch primary checkout "
+                      f"is the likely cause: {ff.stderr}")
+        else:
+            detail = (f"fast-forward refused and git could not confirm whether the integration branch "
+                      f"moved (treated as NOT moved, so no free retry); a dirty or wrong-branch primary "
+                      f"checkout is a likely cause: {ff.stderr}")
+        return MergeOutcome(False, candidate_sha, None, "pass", detail, integration_moved=moved)
+
+    if conn is not None:
+        conn.execute(
+            "UPDATE merge_records SET squash_commit = ?, completed_at = ? WHERE task_key = ?",
+            (candidate_sha, datetime.now(timezone.utc).isoformat(timespec="seconds"), task_key),
+        )
+    return MergeOutcome(True, candidate_sha, candidate_sha, "pass", "merged")
+
+
+def revert_merge(
+    repo: pathlib.Path, squash_commit: str, *, conn=None, task_key: str = "", project: str | None = None,
+) -> bool:
     """ASES-GIT-05: a post-merge failure reverts the squash commit rather than leaving the
-    integration branch red."""
-    result = _git(["revert", "--no-edit", squash_commit], repo)
-    ok = result.returncode == 0
-    if conn is not None and task_key:
-        conn.execute("UPDATE merge_records SET reverted = 1 WHERE task_key = ?", (task_key,))
+    integration branch red.
+
+    ASES-REC-03/04 (`project`): with a project name (and a connection) the revert runs inside an intent of kind
+    revert keyed by `task_key`, the shape reconcile-on-start reads ("a revert was started for the task"). It is
+    completed when this function returns and left open when it raises or the process dies, so a crash between
+    `git revert` and the merge_records update is found and settled from git."""
+    with _intent(conn, project, intents_mod.KIND_REVERT, task_key, f"revert {squash_commit}"):
+        result = _git(["revert", "--no-edit", squash_commit], repo)
+        ok = result.returncode == 0
+        if conn is not None and task_key:
+            conn.execute("UPDATE merge_records SET reverted = 1 WHERE task_key = ?", (task_key,))
     return ok

@@ -560,3 +560,265 @@ def test_review_budget_asks_about_the_reviewers_provider_and_not_the_coders(conn
     _fill(conn, 45)                                             # now the reviewer's is nearly out
 
     assert usage.review_budget(conn, models, _project(tmp_path)).can_afford is False
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-RTE-01: "No hidden fallback; the provider and model actually used are recorded". A session that ran on a
+# model other than the one pinned for its profile is DETECTED (one model_mismatch event per session) and still
+# counted; nothing is failed or stopped.
+# ---------------------------------------------------------------------------------------------
+
+
+def _mismatches(conn):
+    return [json.loads(r["payload"]) for r in conn.execute(
+        "SELECT payload FROM events WHERE kind = 'model_mismatch' ORDER BY id")]
+
+
+def _with_models(*extra_rows):
+    """MODELS plus more rows, for a test that needs a second provider to list a model."""
+    return {**MODELS, "providers": {**MODELS["providers"], "other": {"limits": {}}},
+            "models": [*MODELS["models"], *extra_rows]}
+
+
+def _ingest_with(conn, tmp_path, models):
+    return usage.ingest_run_usage("b", PLAN, _project(tmp_path), models, conn=conn)
+
+
+def test_a_session_on_another_model_records_exactly_one_model_mismatch_event(conn, tmp_path, monkeypatch):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    asked = _fake_exports(monkeypatch, {"S1": _export("S1", "qwen/some-other-model:free", 4)})
+
+    assert _ingest(conn, tmp_path) == ["S1"]
+
+    assert _mismatches(conn) == [{
+        "profile": "coder-1", "expected": CODER_MODEL, "actual": "qwen/some-other-model:free", "session_id": "S1",
+    }]
+    # Detection only: the session is still counted (an unknown model stays with the profile's provider).
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 4
+    assert [r["provider"] for r in _rows(conn)] == ["xkiro"]
+
+    assert _ingest(conn, tmp_path) == []            # a second pass never looks at the session again...
+    assert len(_mismatches(conn)) == 1              # ...so it can never record its mismatch twice
+    assert asked == [("coder-1", "S1")]
+
+
+def test_two_sessions_on_wrong_models_record_one_event_each(conn, tmp_path, monkeypatch):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S_A", "coder-1"), _run("S_B", "reviewer")]})
+    _fake_exports(monkeypatch, {
+        "S_A": _export("S_A", "vendor/model-a:free", 1), "S_B": _export("S_B", "vendor/model-b:free", 2),
+    })
+
+    _ingest(conn, tmp_path)
+
+    assert _mismatches(conn) == [
+        {"profile": "coder-1", "expected": CODER_MODEL, "actual": "vendor/model-a:free", "session_id": "S_A"},
+        {"profile": "reviewer", "expected": REVIEWER_MODEL, "actual": "vendor/model-b:free", "session_id": "S_B"},
+    ]
+
+
+def test_no_model_mismatch_when_the_sessions_ran_on_the_pinned_models(conn, tmp_path, monkeypatch):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S_CODER", "coder-1"), _run("S_REVIEW", "reviewer")]})
+    _fake_exports(monkeypatch, {
+        "S_CODER": _export("S_CODER", CODER_MODEL, 12), "S_REVIEW": _export("S_REVIEW", REVIEWER_MODEL, 37),
+    })
+
+    _ingest(conn, tmp_path)
+
+    assert _mismatches(conn) == []
+    assert _count(conn, "usage_ingested") == 2
+
+
+@pytest.mark.parametrize("model", ["", None, "   "], ids=["empty", "missing", "blank"])
+def test_a_session_that_reports_no_model_is_not_a_mismatch(conn, tmp_path, monkeypatch, model):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", model, 3)})
+
+    assert _ingest(conn, tmp_path) == ["S1"]
+
+    assert _mismatches(conn) == []
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 3
+
+
+@pytest.mark.parametrize("reported", [
+    f"xkiro/{CODER_MODEL}", f"XKIRO/{CODER_MODEL}", f"  {CODER_MODEL}  ",
+], ids=["prefixed", "prefixed-any-case", "padded"])
+def test_a_leading_provider_name_on_the_reported_model_is_looked_past(conn, tmp_path, monkeypatch, reported):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", reported, 5)})
+
+    _ingest(conn, tmp_path)
+
+    assert _mismatches(conn) == []
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 5
+
+
+def test_a_leading_provider_name_on_the_pinned_model_is_looked_past_too(conn, tmp_path, monkeypatch):
+    """The config can spell the pinned model with its provider in front while Hermes reports it without."""
+    models = {**MODELS, "models": [
+        {**m, "model": f"openrouter/{REVIEWER_MODEL}"} if m["role_class"] == "reviewer" else m
+        for m in MODELS["models"]
+    ]}
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "reviewer")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", REVIEWER_MODEL, 7)})
+
+    _ingest_with(conn, tmp_path, models)
+
+    assert _mismatches(conn) == []
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 7
+
+
+def test_a_prefix_naming_another_configured_provider_is_a_mismatch_counted_against_that_provider(
+    conn, tmp_path, monkeypatch,
+):
+    """The same model name, but through OpenRouter's door: the coder's requests went to a provider with a 50 a day
+    cap, and that is where they must be counted. The event keeps both strings exactly as they were."""
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", f"openrouter/{CODER_MODEL}", 5)})
+
+    _ingest(conn, tmp_path)
+
+    assert _mismatches(conn) == [{
+        "profile": "coder-1", "expected": CODER_MODEL, "actual": f"openrouter/{CODER_MODEL}", "session_id": "S1",
+    }]
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 5
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 0
+    assert [(r["provider"], r["model"]) for r in _rows(conn)] == [("openrouter", f"openrouter/{CODER_MODEL}")]
+    ingested = conn.execute("SELECT payload FROM events WHERE kind = 'usage_ingested'").fetchone()
+    assert json.loads(ingested["payload"])["provider"] == "openrouter"
+
+
+def test_a_model_only_one_other_provider_lists_is_counted_against_that_provider(conn, tmp_path, monkeypatch):
+    # The coder profile's session reports the reviewer's model, which only OpenRouter lists.
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", REVIEWER_MODEL, 6)})
+
+    _ingest(conn, tmp_path)
+
+    assert len(_mismatches(conn)) == 1
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 6
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 0
+
+
+def test_a_model_two_other_providers_list_stays_with_the_profiles_provider(conn, tmp_path, monkeypatch):
+    """No evidence which of the two answered, so nothing moves between quotas on a guess."""
+    models = _with_models({"provider": "other", "model": REVIEWER_MODEL, "role_class": "reviewer_candidate",
+                           "pinned": False})
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", REVIEWER_MODEL, 6)})
+
+    _ingest_with(conn, tmp_path, models)
+
+    assert len(_mismatches(conn)) == 1
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 6
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 0
+
+
+def test_a_model_the_profiles_own_provider_also_lists_stays_with_the_profiles_provider(conn, tmp_path, monkeypatch):
+    # xkiro lists the lead's model too, so a coder session on it is a different model but not a different provider,
+    # even though OpenRouter lists the same name.
+    models = _with_models({"provider": "openrouter", "model": "qwen/qwen3.8-max:free", "role_class": "lead_candidate",
+                           "pinned": False})
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", "qwen/qwen3.8-max:free", 9)})
+
+    _ingest_with(conn, tmp_path, models)
+
+    assert len(_mismatches(conn)) == 1
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 9
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 0
+
+
+def test_a_model_no_provider_lists_stays_with_the_profiles_provider(conn, tmp_path, monkeypatch):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "reviewer")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", "brand/new-model:free", 2)})
+
+    _ingest(conn, tmp_path)
+
+    assert len(_mismatches(conn)) == 1
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 2
+
+
+def test_a_provider_name_is_not_a_prefix_unless_it_is_followed_by_a_slash(conn, tmp_path, monkeypatch):
+    """`openrouterish/x` starts with the word openrouter but names no provider, and is not the pinned model."""
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", "openrouterish/some-model", 2)})
+
+    _ingest(conn, tmp_path)
+
+    assert len(_mismatches(conn)) == 1
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 2
+    assert ledger.usage_today_for_provider(conn, "openrouter") == 0
+
+
+def test_the_model_mismatch_event_waits_for_an_export_that_works(conn, tmp_path, monkeypatch):
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    exports = {"S1": None}
+    _fake_exports(monkeypatch, exports)
+
+    assert _ingest(conn, tmp_path) == []
+    assert _mismatches(conn) == []
+
+    exports["S1"] = _export("S1", "vendor/model-a:free", 3)
+
+    assert _ingest(conn, tmp_path) == ["S1"]
+    assert [m["session_id"] for m in _mismatches(conn)] == ["S1"]
+
+
+def test_a_failing_mismatch_write_rolls_the_whole_session_back_and_it_is_retried(conn, tmp_path, monkeypatch):
+    """The event goes in the same savepoint as the usage row and the ledger increment: a failure at the last write
+    leaves none of the three, so the session is counted (and flagged) on the next call instead of half of it."""
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", "vendor/model-a:free", 3)})
+    real_record = events.record
+
+    def flaky(_conn, kind, payload=None):
+        if kind == "model_mismatch":
+            raise sqlite3.OperationalError("database is locked")
+        return real_record(_conn, kind, payload)
+
+    monkeypatch.setattr(events, "record", flaky)
+    with pytest.raises(sqlite3.OperationalError):
+        _ingest(conn, tmp_path)
+
+    assert _rows(conn) == []
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 0
+    assert _count(conn, "events") == 0
+    assert not conn.in_transaction
+
+    monkeypatch.setattr(events, "record", real_record)
+
+    assert _ingest(conn, tmp_path) == ["S1"]
+    assert len(_mismatches(conn)) == 1
+    assert ledger.usage_today_for_provider(conn, "xkiro") == 3
+
+
+def test_a_model_mismatch_only_reads_and_records_it_never_touches_a_card(conn, tmp_path, monkeypatch):
+    """Detection only: no card is blocked, reclaimed, commented on or failed. Any Hermes call other than the two
+    reads this module makes fails the test."""
+    _seed_task(conn, "T1", "w1")
+    _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
+    _fake_exports(monkeypatch, {"S1": _export("S1", "vendor/model-a:free", 3)})
+
+    def boom(*args, **kwargs):
+        raise AssertionError("a model mismatch must not change anything on the board")
+
+    for name in dir(hermes):
+        if name.startswith("kanban_") and name != "kanban_show":
+            monkeypatch.setattr(hermes, name, boom)
+
+    assert _ingest(conn, tmp_path) == ["S1"]
+    assert len(_mismatches(conn)) == 1

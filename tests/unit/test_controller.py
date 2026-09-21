@@ -7,6 +7,7 @@ import pytest
 
 from ases import config, controller, db, events, hermes, mergeq, plan as plan_mod, review as review_mod
 from ases import guards as guards_mod
+from ases import questions as questions_mod
 from ases import usage as usage_mod
 
 
@@ -14,6 +15,25 @@ def _git_ok(*args, cwd):
     result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     return result
+
+
+@pytest.fixture(autouse=True)
+def _round5_steps_are_inert(monkeypatch):
+    """Loop version 2 added steps to run_pass (idle worktrees, recovery, bounds, unpark, provisioning, final gates) and
+    a question channel to the merge queue (questions.open_question and ask_user). The tests in THIS file are about the
+    older parts of the controller, and several of them run run_pass or the merge queue with fake boards and plans that
+    have no repository, no ases_home and no Hermes behind them, so the new steps do nothing here: without this a
+    forgotten stub would fall through to a real `hermes` subprocess. The new steps have tests of their own in
+    test_controller_loop.py. Tests that are about a question or a step replace these stubs."""
+    monkeypatch.setattr(controller, "process_idle_worktrees", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_recovery", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_bounds", lambda *a, **kw: (False, None))
+    monkeypatch.setattr(controller, "process_unpark", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_provision", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_finalize", lambda *a, **kw: None)
+    monkeypatch.setattr(questions_mod, "open_question", lambda card: None, raising=False)
+    monkeypatch.setattr(questions_mod, "ask_user", lambda *a, **kw: "commented", raising=False)
+
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
 
@@ -570,6 +590,9 @@ def test_merge_conflict_creates_a_fix_card_not_a_block_only(tmp_path, monkeypatc
 
 
 def test_fix_card_budget_exhausted_escalates_to_block(tmp_path, monkeypatch):
+    """The escalation is a question put through questions.ask_user (a merge card is created blocked, and real Hermes
+    refuses to block a blocked card), never a direct hermes.kanban_block. (Kept under its old name: it used to assert
+    on hermes.kanban_block itself.)"""
     repo = _repo_with_conflict(tmp_path)
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=0)
 
@@ -579,13 +602,18 @@ def test_fix_card_budget_exhausted_escalates_to_block(tmp_path, monkeypatch):
     ))
     monkeypatch.setattr(hermes, "kanban_link", lambda *a: None)
     blocked = []
-    monkeypatch.setattr(hermes, "kanban_block", lambda board, cid, reason: blocked.append((cid, reason)))
+    monkeypatch.setattr(hermes, "kanban_block", lambda *a, **kw: blocked.append(a))
+    asked = []
+    monkeypatch.setattr(questions_mod, "ask_user", lambda board, card, text, *, conn=None, author="ases": (
+        asked.append((card["id"], text)) or "commented"))
 
     controller.process_merge_queue("b", repo, plan, project, conn=conn)
 
-    assert len(blocked) == 1
-    assert blocked[0][0] == pair.merge_card_id
-    assert "budget" in blocked[0][1].lower()
+    assert blocked == []  # kanban_block is never called on a merge card
+    assert len(asked) == 1
+    assert asked[0][0] == pair.merge_card_id
+    assert "budget" in asked[0][1].lower()
+    assert asked[0][1].rstrip().endswith("How should this be resolved?")
     fix_cards = [c for c in created if "fix" in c["title"]]
     assert fix_cards == []  # budget was 0 -- no fix card, straight to escalation
 
@@ -686,10 +714,13 @@ def _board_state(monkeypatch, pair, *, project_id=REAL_HERMES_PROJECT_ID, branch
 def _record_card_actions(monkeypatch):
     """Replace every hermes call process_merge_queue can make on the merge card with a recorder, so a
     test can assert none happened (and a bug can never fall through to a real `hermes` subprocess)."""
-    actions = {"link": [], "block": [], "complete": []}
+    actions = {"link": [], "block": [], "complete": [], "ask": []}
     monkeypatch.setattr(hermes, "kanban_link", lambda board, parent, child: actions["link"].append((parent, child)))
     monkeypatch.setattr(hermes, "kanban_block", lambda board, cid, reason: actions["block"].append((cid, reason)))
     monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: actions["complete"].append((cid, kw)))
+    # The controller puts every question to a person through questions.ask_user; "ask" is where those land.
+    monkeypatch.setattr(questions_mod, "ask_user", lambda board, card, text, *, conn=None, author="ases": (
+        actions["ask"].append((card["id"], text)) or "commented"), raising=False)
     return actions
 
 
@@ -701,10 +732,10 @@ def _script_merge_task(monkeypatch, *outcomes):
     queue = list(outcomes)
 
     def fake(repo, integration_branch, work_branch, task_key, gate3_commands, *, conn=None, commit_message=None,
-             allow_empty=False, expected_head=None):
+             allow_empty=False, expected_head=None, project=None, should_stop=None):
         calls.append({"integration_branch": integration_branch, "work_branch": work_branch, "task_key": task_key,
                       "commit_message": commit_message, "allow_empty": allow_empty,
-                      "expected_head": expected_head})
+                      "expected_head": expected_head, "project": project, "should_stop": should_stop})
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
     monkeypatch.setattr(mergeq, "merge_task", fake)
@@ -842,7 +873,8 @@ def test_fix_cards_chain_and_each_merge_attempt_follows_the_current_card(tmp_pat
     assert fix2["project"] == REAL_HERMES_PROJECT_ID  # read off fix1, the card being fixed in round 2
     assert [c["work_branch"] for c in calls] == ["swarm/T1-coder", "swarm/T1-fix1", "swarm/T1-fix2"]
     assert actions["link"] == [(fix1["id"], pair.merge_card_id), (fix2["id"], pair.merge_card_id)]
-    assert [cid for cid, _ in actions["block"]] == [pair.merge_card_id]  # budget (2) spent -> escalated
+    assert [cid for cid, _ in actions["ask"]] == [pair.merge_card_id]  # budget (2) spent -> a question, once
+    assert actions["block"] == []  # ...put through ask_user, never kanban_block on the merge card
     row = _task_row(conn)
     assert row["work_card_id"] == fix2["id"]
     assert row["fix_cards"] == 2
@@ -880,7 +912,7 @@ def test_benign_fast_forward_race_retries_next_poll_without_a_fix_card(tmp_path,
     assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == []
 
     assert _fix_cards(created) == []
-    assert actions == {"link": [], "block": [], "complete": []}  # the merge card is left exactly as it was
+    assert actions == {"link": [], "block": [], "complete": [], "ask": []}  # the merge card is left exactly as it was
     row = _task_row(conn)
     assert row["fix_cards"] == 0
     assert row["work_card_id"] == pair.work_card_id  # nothing was repointed either
@@ -954,7 +986,8 @@ def test_ff_refusal_with_the_integration_tip_unmoved_blocks_once_the_fix_budget_
     assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
 
     assert _fix_cards(created) == []
-    ((blocked_id, reason),) = actions["block"]
+    ((blocked_id, reason),) = actions["ask"]
+    assert actions["block"] == []
     assert blocked_id == pair.merge_card_id
     assert "budget" in reason.lower() and "did NOT move" in reason
     kinds = [e["kind"] for e in events.recent(conn)]
@@ -1163,7 +1196,7 @@ def test_review_only_task_with_an_empty_branch_completes_its_merge_card_as_a_no_
 
     assert merged == ["T1"]
     assert actions == {
-        "link": [], "block": [],
+        "link": [], "block": [], "ask": [],
         "complete": [(pair.merge_card_id, {"result": NO_OP_RESULT,
                                            "metadata": {"squash_commit": None, "no_op": True}})],
     }
@@ -1470,7 +1503,7 @@ def test_a_card_its_own_implementer_completed_is_refused_not_merged(tmp_path, mo
     assert merged == []
     assert calls == []  # merge_task was never reached, on either poll
     assert unreviewed == ["T1"]
-    assert actions == {"link": [], "block": [], "complete": []}  # the merge card was left exactly as it was
+    assert actions == {"link": [], "block": [], "complete": [], "ask": []}  # the merge card was left exactly as it was
     assert _fix_cards(created) == []  # a refusal is not a merge failure: no fix card,
     assert _task_row(conn)["fix_cards"] == 0  # and no fix budget spent
     # Recorded once for the card, not once per poll.
@@ -1991,7 +2024,8 @@ def test_a_failed_check_after_the_fix_budget_is_spent_blocks_the_merge_card(tmp_
 
     controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
 
-    assert [cid for cid, _ in actions["block"]] == [pair.merge_card_id]
+    assert [cid for cid, _ in actions["ask"]] == [pair.merge_card_id]
+    assert actions["block"] == []
     assert _fix_cards(created) == []
 
 

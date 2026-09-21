@@ -1,3 +1,5 @@
+import dataclasses
+import json
 import pathlib
 import subprocess
 import tempfile
@@ -5,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ases import db, gates, mergeq
+from ases import db, gates, hermes, intents, mergeq, reconcile
 
 
 def _git(*args, cwd):
@@ -575,3 +577,691 @@ def test_the_squash_is_taken_from_the_checked_sha_even_if_the_branch_moves_after
 
     assert outcome.merged is True
     assert (repo / "new.txt").exists() and not (repo / "late.txt").exists()
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 5. The kill switch between steps (ASES-REC-06), intent records around the steps (ASES-REC-03/04), a new
+# candidate starting the merge_records row over (ASES-REC-04), and a secret-free detail (ASES-SEC-01). Real git
+# throughout; the fakes are gates.run_gate where a test needs to see inside the window around it, and _git where a
+# test needs a git command to fail or to leak.
+# ---------------------------------------------------------------------------------------------
+
+SECRET = "sk-or-v1-PLANTEDVALUE0123456789abcd"
+
+
+def _intent_rows(conn):
+    return [dict(r) for r in conn.execute(
+        "SELECT project, kind, key, detail, completed_at FROM intents ORDER BY id")]
+
+
+def _open_intent_kinds(conn):
+    return [r["kind"] for r in conn.execute("SELECT kind FROM intents WHERE completed_at IS NULL ORDER BY id")]
+
+
+def _payloads(conn, kind):
+    return [json.loads(r["payload"]) for r in conn.execute(
+        "SELECT payload FROM events WHERE kind = ? ORDER BY id", (kind,))]
+
+
+def _worktree_count(repo):
+    return len([ln for ln in _git_ok("worktree", "list", cwd=repo).stdout.splitlines() if ln.strip()])
+
+
+def _seed_reverted_row(conn, task_key):
+    """A merge_records row as an earlier, completed and then reverted merge of the task leaves it."""
+    conn.execute(
+        "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, completed_at) "
+        "VALUES (?, 'old-candidate', 'pass', 'old-squash', 1, '2026-01-01T00:00:00+00:00')", (task_key,))
+    return dict(_merge_row(conn, task_key))
+
+
+class _Polls:
+    """A should_stop that answers from a script (False once the script runs out) and counts how often it was asked."""
+
+    def __init__(self, *answers):
+        self.answers, self.calls = list(answers), 0
+
+    def __call__(self):
+        answer = self.answers[self.calls] if self.calls < len(self.answers) else False
+        self.calls += 1
+        return answer
+
+
+def _forbid_gate3(monkeypatch):
+    attempts = []
+
+    def boom(*args, **kwargs):
+        attempts.append(args)
+        raise AssertionError("Gate 3 must not run here")
+
+    monkeypatch.setattr(gates, "run_gate", boom)
+    return attempts
+
+
+def _spy_mkdtemp(monkeypatch):
+    made = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def spy(*args, **kwargs):
+        made.append(pathlib.Path(real_mkdtemp(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(mergeq.tempfile, "mkdtemp", spy)
+    return made
+
+
+# --- MergeOutcome ---------------------------------------------------------------------------------------------
+
+
+def test_merge_outcome_gains_a_last_field_stopped_that_defaults_to_false():
+    names = [f.name for f in dataclasses.fields(mergeq.MergeOutcome)]
+    assert names == ["merged", "candidate_sha", "squash_commit", "gate3_result", "detail", "integration_moved",
+                     "stopped"]
+    plain = mergeq.MergeOutcome(False, None, None, None, "refused")
+    assert plain.stopped is False and plain.integration_moved is False
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        plain.stopped = True
+
+
+def test_no_ordinary_outcome_is_marked_stopped(repo, tmp_path):
+    _make_work_branch(repo, "swarm/N1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    merged = mergeq.merge_task(repo, "integration", "swarm/N1", "N1", ["echo ok"], conn=conn, should_stop=lambda: False)
+    refused = mergeq.merge_task(repo, "integration", "swarm/N1", "N1", ["echo ok"], conn=conn)  # already merged
+
+    assert merged.merged is True and merged.stopped is False
+    assert refused.merged is False and refused.stopped is False
+
+
+# --- the stop checkpoints (ASES-REC-06) ----------------------------------------------------------------------
+
+
+def test_a_stop_before_the_candidate_is_built_builds_nothing(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/S1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    tip = _tip(repo)
+    calls = []
+    real_git = mergeq._git
+
+    def spy_git(args, cwd, timeout=60):
+        calls.append(list(args))
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", spy_git)
+    made = _spy_mkdtemp(monkeypatch)
+    attempts = _forbid_gate3(monkeypatch)
+    polls = _Polls(True)
+
+    outcome = mergeq.merge_task(
+        repo, "integration", "swarm/S1", "S1", ["echo ok"], conn=conn, project="p1", should_stop=polls,
+    )
+
+    assert outcome == mergeq.MergeOutcome(
+        False, None, None, None, "stopped by the kill switch before building the candidate", stopped=True,
+    )
+    assert polls.calls == 1
+    assert [c for c in calls if c[0] == "worktree"] == [] and made == [] and attempts == []
+    assert _tip(repo) == tip and _worktree_count(repo) == 1
+    assert _merge_row(conn, "S1") is None
+    assert _intent_rows(conn) == []  # nothing had started, so there is nothing to record
+
+
+def test_a_stop_before_gate3_removes_the_candidate_and_leaves_the_record_as_it_was(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/S2", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    seeded = _seed_reverted_row(conn, "S2")
+    tip = _tip(repo)
+    made = _spy_mkdtemp(monkeypatch)
+    attempts = _forbid_gate3(monkeypatch)
+    polls = _Polls(False, True)
+
+    outcome = mergeq.merge_task(
+        repo, "integration", "swarm/S2", "S2", ["echo ok"], conn=conn, project="p1", should_stop=polls,
+    )
+
+    assert outcome == mergeq.MergeOutcome(False, None, None, None, "stopped by the kill switch before Gate 3", stopped=True)
+    assert polls.calls == 2 and attempts == []
+    assert _tip(repo) == tip and not (repo / "new.txt").exists()
+    assert made and all(not path.exists() for path in made)  # the candidate's temp directory is gone...
+    assert _worktree_count(repo) == 1                        # ...and so is its worktree registration
+    assert dict(_merge_row(conn, "S2")) == seeded            # not one column of the earlier row changed
+    # The stop is a clean end: the build step is closed, so reconcile has nothing to look at.
+    assert [(r["kind"], bool(r["completed_at"])) for r in _intent_rows(conn)] == [("build_candidate", True)]
+
+
+@pytest.mark.parametrize("seed", [True, False], ids=["existing-row", "no-row"])
+def test_a_stop_before_the_fast_forward_discards_a_gated_candidate_and_writes_no_row(repo, tmp_path, seed):
+    """Gate 3 ran and was green, so the temptation is to record it. It is not recorded: the row is only written
+    after the last checkpoint, so a stop here leaves no half row (a pass with no squash commit) behind."""
+    _make_work_branch(repo, "swarm/S3", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    seeded = _seed_reverted_row(conn, "S3") if seed else None
+    tip = _tip(repo)
+    polls = _Polls(False, False, True)
+
+    outcome = mergeq.merge_task(
+        repo, "integration", "swarm/S3", "S3", ["echo ok"], conn=conn, project="p1", should_stop=polls,
+    )
+
+    assert outcome == mergeq.MergeOutcome(
+        False, None, None, None, "stopped by the kill switch before the fast-forward", stopped=True,
+    )
+    assert polls.calls == 3
+    assert _tip(repo) == tip and not (repo / "new.txt").exists() and _worktree_count(repo) == 1
+    row = _merge_row(conn, "S3")
+    assert (dict(row) if row is not None else None) == seeded
+    # Gate 3 really ran (its own record, in gate_runs, is the gate's and stays), and only the build step was opened.
+    assert conn.execute("SELECT gate, result FROM gate_runs WHERE task_key = 'S3'").fetchall()[0]["result"] == "pass"
+    assert [(r["kind"], bool(r["completed_at"])) for r in _intent_rows(conn)] == [("build_candidate", True)]
+
+
+def test_the_checkpoints_are_polled_before_the_candidate_before_gate3_and_before_the_fast_forward(
+    repo, tmp_path, monkeypatch,
+):
+    _make_work_branch(repo, "swarm/S4", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    log = []
+    real_git = mergeq._git
+
+    def spy_git(args, cwd, timeout=60):
+        if args[:2] == ["worktree", "add"]:
+            log.append("candidate")
+        if args[:2] == ["merge", "--ff-only"]:
+            log.append("fast-forward")
+        return real_git(args, cwd, timeout)
+
+    def fake_gate(candidate, sha, name, commands, **kwargs):
+        log.append("gate3")
+        return gates.GateResult(name, sha, True, "green")
+
+    def poll():
+        log.append("poll")
+        return False
+
+    monkeypatch.setattr(mergeq, "_git", spy_git)
+    monkeypatch.setattr(gates, "run_gate", fake_gate)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/S4", "S4", ["echo ok"], conn=conn, should_stop=poll)
+
+    assert outcome.merged is True and outcome.stopped is False
+    assert log == ["poll", "candidate", "poll", "gate3", "poll", "fast-forward"]
+
+
+def test_a_red_gate3_is_not_asked_about_the_fast_forward_and_still_writes_its_record(repo, tmp_path):
+    """There is no fast-forward left to stop after a red gate, so the third checkpoint is never reached, and the
+    failure is what it always was: merged False, not stopped, with the fail recorded."""
+    _make_work_branch(repo, "swarm/S5", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    polls = _Polls(False, False, True)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/S5", "S5", ["exit 1"], conn=conn, should_stop=polls)
+
+    assert outcome.merged is False and outcome.stopped is False and outcome.gate3_result == "fail"
+    assert polls.calls == 2
+    assert _merge_row(conn, "S5")["gate3_result"] == "fail"
+
+
+@pytest.mark.parametrize("answer", [True, 1, "yes"])
+def test_any_true_ish_answer_from_should_stop_is_a_stop(repo, tmp_path, answer):
+    _make_work_branch(repo, "swarm/S6", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/S6", "S6", ["echo ok"], conn=conn,
+                                should_stop=lambda: answer)
+
+    assert outcome.stopped is True and outcome.merged is False
+
+
+@pytest.mark.parametrize("answer", [False, 0, None, ""])
+def test_any_false_ish_answer_from_should_stop_lets_the_merge_go_ahead(repo, tmp_path, answer):
+    _make_work_branch(repo, "swarm/S7", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/S7", "S7", ["echo ok"], conn=conn,
+                                should_stop=lambda: answer)
+
+    assert outcome.merged is True and outcome.stopped is False
+
+
+def test_a_should_stop_that_raises_is_treated_as_false_and_recorded_as_an_event(repo, tmp_path):
+    _make_work_branch(repo, "swarm/S8", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    def broken():
+        raise RuntimeError("kill switch state unreadable")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/S8", "S8", ["echo ok"], conn=conn, should_stop=broken)
+
+    assert outcome.merged is True and outcome.stopped is False  # a broken reader does not block merging
+    events = _payloads(conn, "should_stop_error")
+    assert [e["step"] for e in events] == ["building the candidate", "Gate 3", "the fast-forward"]
+    assert all(e["task_key"] == "S8" for e in events)
+    assert all(e["error"] == "RuntimeError: kill switch state unreadable" for e in events)
+
+
+def test_a_should_stop_that_raises_with_no_connection_still_lets_the_merge_go_ahead(repo):
+    _make_work_branch(repo, "swarm/S9", "new.txt", "hello\n")
+
+    def broken():
+        raise RuntimeError("boom")
+
+    assert mergeq.merge_task(repo, "integration", "swarm/S9", "S9", ["echo ok"], should_stop=broken).merged is True
+
+
+def test_the_stop_wins_over_a_refusal_the_merge_would_otherwise_report(repo, tmp_path):
+    """A halted project must get "stopped", not a failure that would open a fix card: here the primary checkout
+    is on the wrong branch, which is a refusal when nothing is asking for a stop."""
+    _make_work_branch(repo, "swarm/S10", "new.txt", "hello\n")
+    _git_ok("checkout", "-q", "-b", "elsewhere", cwd=repo)
+    conn = db.connect(tmp_path / "ases.db")
+
+    stopped = mergeq.merge_task(repo, "integration", "swarm/S10", "S10", ["echo ok"], conn=conn,
+                                should_stop=lambda: True)
+    refused = mergeq.merge_task(repo, "integration", "swarm/S10", "S10", ["echo ok"], conn=conn)
+
+    assert stopped.stopped is True and "refuses" not in stopped.detail
+    assert refused.stopped is False and "refuses" in refused.detail
+
+
+# --- intent records around the steps (ASES-REC-03/04) ----------------------------------------------------------
+
+
+def test_a_merge_with_a_project_writes_an_intent_around_the_build_and_gate3_and_another_around_the_fast_forward(
+    repo, tmp_path, monkeypatch,
+):
+    _make_work_branch(repo, "swarm/I1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    seen = {}
+    real_git = mergeq._git
+
+    def fake_gate(candidate, sha, name, commands, **kwargs):
+        seen["at_gate3"] = _open_intent_kinds(conn)
+        return gates.GateResult(name, sha, True, "green")
+
+    def spy_git(args, cwd, timeout=60):
+        if args[:2] == ["merge", "--ff-only"]:
+            seen["at_fast_forward"] = _open_intent_kinds(conn)
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(gates, "run_gate", fake_gate)
+    monkeypatch.setattr(mergeq, "_git", spy_git)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/I1", "I1", ["echo ok"], conn=conn, project="p1")
+
+    assert outcome.merged is True
+    # Open while the step runs, and only that step: the build's intent is closed before the fast-forward opens its own.
+    assert seen == {"at_gate3": ["build_candidate"], "at_fast_forward": ["fast_forward"]}
+    rows = _intent_rows(conn)
+    assert [(r["project"], r["kind"], r["key"]) for r in rows] == [
+        ("p1", "build_candidate", "I1"), ("p1", "fast_forward", "I1"),
+    ]
+    assert all(r["completed_at"] for r in rows)
+    assert "swarm/I1" in rows[0]["detail"] and outcome.candidate_sha in rows[1]["detail"]
+    assert intents.open_intents(conn, "p1") == []
+
+
+def test_no_intent_is_written_without_a_project(repo, tmp_path):
+    _make_work_branch(repo, "swarm/I2", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    assert mergeq.merge_task(repo, "integration", "swarm/I2", "I2", ["echo ok"], conn=conn).merged is True
+
+    assert _intent_rows(conn) == []
+
+
+def test_a_project_without_a_connection_merges_and_has_nowhere_to_write_an_intent(repo):
+    _make_work_branch(repo, "swarm/I3", "new.txt", "hello\n")
+
+    assert mergeq.merge_task(repo, "integration", "swarm/I3", "I3", ["echo ok"], project="p1").merged is True
+
+
+def test_a_gate3_that_raises_leaves_the_build_intent_open_and_still_cleans_up(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/I4", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    tip = _tip(repo)
+    made = _spy_mkdtemp(monkeypatch)
+
+    def exploding(*args, **kwargs):
+        raise RuntimeError("docker daemon is not running")
+
+    monkeypatch.setattr(gates, "run_gate", exploding)
+
+    with pytest.raises(RuntimeError, match="docker daemon"):
+        mergeq.merge_task(repo, "integration", "swarm/I4", "I4", ["echo ok"], conn=conn, project="p1")
+
+    # The step died half way, which is exactly what an open intent is for: reconcile reads it back by kind and key.
+    open_now = intents.open_intents(conn, "p1")
+    assert [(i["kind"], i["key"]) for i in open_now] == [("build_candidate", "I4")]
+    assert _tip(repo) == tip and _merge_row(conn, "I4") is None
+    assert made and all(not path.exists() for path in made) and _worktree_count(repo) == 1
+
+
+def test_a_fast_forward_that_raises_leaves_its_intent_open_and_the_build_intent_completed(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/I5", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    real_git = mergeq._git
+
+    def dying_git(args, cwd, timeout=60):
+        if args[:2] == ["merge", "--ff-only"]:
+            raise subprocess.TimeoutExpired(args, timeout)
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", dying_git)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        mergeq.merge_task(repo, "integration", "swarm/I5", "I5", ["echo ok"], conn=conn, project="p1")
+
+    assert [(r["kind"], bool(r["completed_at"])) for r in _intent_rows(conn)] == [
+        ("build_candidate", True), ("fast_forward", False),
+    ]
+    row = _merge_row(conn, "I5")  # the gated candidate is on record, never completed: the shape reconcile redoes
+    assert row["gate3_result"] == "pass" and row["squash_commit"] is None and row["completed_at"] is None
+
+
+@pytest.mark.parametrize("scenario", ["red-gate", "conflict", "empty-diff", "refused-fast-forward"])
+def test_a_step_that_ends_in_a_refusal_has_finished_so_its_intents_are_completed(repo, tmp_path, monkeypatch, scenario):
+    """Only an exception or a crash leaves an intent open. A refusal is a clean end of the step: the state is
+    consistent and the caller has the outcome, so nothing is left for reconcile-on-start to look at."""
+    conn = db.connect(tmp_path / "ases.db")
+    gate = ["echo ok"]
+    if scenario == "red-gate":
+        _make_work_branch(repo, "swarm/I6", "new.txt", "hello\n")
+        gate = ["exit 1"]
+    elif scenario == "conflict":
+        _git_ok("checkout", "-q", "-b", "swarm/I6", cwd=repo)
+        (repo / "base.txt").write_text("branch version\n", encoding="utf-8")
+        _git_ok("commit", "-aqm", "conflicting edit", cwd=repo)
+        _git_ok("checkout", "-q", "integration", cwd=repo)
+        (repo / "base.txt").write_text("integration version\n", encoding="utf-8")
+        _git_ok("commit", "-aqm", "diverge", cwd=repo)
+    elif scenario == "empty-diff":
+        _branch_at_tip(repo, "swarm/I6")
+    else:
+        _make_work_branch(repo, "swarm/I6", "new.txt", "hello\n")
+        monkeypatch.setattr(gates, "run_gate", _racing_gate(repo))
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/I6", "I6", gate, conn=conn, project="p1")
+
+    assert outcome.merged is False
+    rows = _intent_rows(conn)
+    assert rows and all(r["completed_at"] for r in rows)
+    assert intents.open_intents(conn, "p1") == []
+    if scenario == "refused-fast-forward":
+        assert [r["kind"] for r in rows] == ["build_candidate", "fast_forward"]
+    else:
+        assert [r["kind"] for r in rows] == ["build_candidate"]
+
+
+def test_a_recorded_no_op_is_inside_the_build_intent_and_completes_it(repo, tmp_path):
+    _branch_at_tip(repo, "swarm/I7")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/I7", "I7", ["echo ok"], conn=conn, project="p1",
+                                allow_empty=True)
+
+    assert outcome.merged is True and outcome.squash_commit is None
+    assert [(r["kind"], bool(r["completed_at"])) for r in _intent_rows(conn)] == [("build_candidate", True)]
+
+
+def test_the_early_refusals_open_no_intent(repo, tmp_path):
+    """A wrong checkout and a moved branch are refused before anything is built, so there is no step to record."""
+    _make_work_branch(repo, "swarm/I8", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    moved = mergeq.merge_task(repo, "integration", "swarm/I8", "I8", ["echo ok"], conn=conn, project="p1",
+                              expected_head="0" * 40)
+    _git_ok("checkout", "-q", "-b", "elsewhere", cwd=repo)
+    wrong = mergeq.merge_task(repo, "integration", "swarm/I8", "I8", ["echo ok"], conn=conn, project="p1")
+
+    assert moved.merged is False and wrong.merged is False
+    assert _intent_rows(conn) == []
+
+
+# --- revert_merge and its intent --------------------------------------------------------------------------------
+
+
+def test_revert_merge_writes_a_revert_intent_around_git_revert_and_completes_it(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/V1", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+    merged = mergeq.merge_task(repo, "integration", "swarm/V1", "V1", ["echo ok"], conn=conn)
+    seen = {}
+    real_git = mergeq._git
+
+    def spy_git(args, cwd, timeout=60):
+        if args[0] == "revert":
+            seen["open"] = _open_intent_kinds(conn)
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", spy_git)
+
+    ok = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="V1", project="p1")
+
+    assert ok is True and seen["open"] == ["revert"]
+    rows = _intent_rows(conn)
+    assert [(r["project"], r["kind"], r["key"]) for r in rows] == [("p1", "revert", "V1")]
+    assert rows[0]["completed_at"] and merged.squash_commit in rows[0]["detail"]
+    assert _merge_row(conn, "V1")["reverted"] == 1
+    assert not (repo / "new.txt").exists()
+
+
+def test_revert_merge_leaves_its_intent_open_when_git_raises(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/V2", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+    merged = mergeq.merge_task(repo, "integration", "swarm/V2", "V2", ["echo ok"], conn=conn)
+    real_git = mergeq._git
+
+    def dying_git(args, cwd, timeout=60):
+        if args[0] == "revert":
+            raise subprocess.TimeoutExpired(args, timeout)
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", dying_git)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="V2", project="p1")
+
+    open_now = intents.open_intents(conn, "p1")
+    assert [(i["kind"], i["key"]) for i in open_now] == [("revert", "V2")]
+    assert _merge_row(conn, "V2")["reverted"] == 0  # the record update never ran: reconcile settles it from git
+
+
+def test_revert_merge_writes_no_intent_without_a_project_or_a_connection(repo, tmp_path):
+    _make_work_branch(repo, "swarm/V3", "a.txt", "x\n")
+    _make_work_branch(repo, "swarm/V4", "b.txt", "y\n")
+    conn = db.connect(tmp_path / "ases.db")
+    first = mergeq.merge_task(repo, "integration", "swarm/V3", "V3", ["echo ok"], conn=conn)
+    second = mergeq.merge_task(repo, "integration", "swarm/V4", "V4", ["echo ok"], conn=conn)
+
+    assert mergeq.revert_merge(repo, second.squash_commit, conn=conn, task_key="V4") is True   # a connection only
+    assert mergeq.revert_merge(repo, first.squash_commit, project="p1") is True                # a project only
+
+    assert _intent_rows(conn) == []
+    assert _merge_row(conn, "V4")["reverted"] == 1 and _merge_row(conn, "V3")["reverted"] == 0
+
+
+# --- a new candidate starts the merge_records row over (ASES-REC-04) --------------------------------------------
+
+
+def test_a_new_candidate_after_a_revert_resets_reverted_squash_commit_and_completed_at(repo, tmp_path):
+    _make_work_branch(repo, "swarm/F1", "new.txt", "v1\n")
+    conn = db.connect(tmp_path / "ases.db")
+    first = mergeq.merge_task(repo, "integration", "swarm/F1", "F1", ["echo ok"], conn=conn)
+    assert first.merged is True
+    assert mergeq.revert_merge(repo, first.squash_commit, conn=conn, task_key="F1") is True
+    reverted = _merge_row(conn, "F1")
+    assert (reverted["reverted"], reverted["squash_commit"]) == (1, first.squash_commit) and reverted["completed_at"]
+
+    _make_work_branch(repo, "swarm/F1-fix1", "new.txt", "v2\n")  # the fix card's branch, cut from the reverted tip
+    second = mergeq.merge_task(repo, "integration", "swarm/F1-fix1", "F1", ["echo ok"], conn=conn)
+
+    assert second.merged is True and second.squash_commit != first.squash_commit
+    row = _merge_row(conn, "F1")
+    assert row["reverted"] == 0                                # the bug: this stayed 1 forever
+    assert (row["candidate_sha"], row["squash_commit"], row["gate3_result"]) == (
+        second.candidate_sha, second.squash_commit, "pass")
+    _assert_utc_seconds_timestamp(row["completed_at"])
+    assert (repo / "new.txt").read_text(encoding="utf-8") == "v2\n"
+
+
+def test_a_re_merged_task_no_longer_reads_as_done_but_reverted_to_reconcile(repo, tmp_path, monkeypatch):
+    """The symptom the reconcile builder found: reconcile.check() reported done_but_reverted for a healthy merge."""
+    _make_work_branch(repo, "swarm/F2", "new.txt", "v1\n")
+    conn = db.connect(tmp_path / "ases.db")
+    conn.execute(
+        "INSERT INTO plan_tasks (project, task_key, work_card_id, merge_card_id, role, created_at) "
+        "VALUES ('p1', 'F2', 'w_F2', 'm_F2', 'coder', datetime('now'))")
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, card_id: {"id": card_id, "status": "done"})
+    first = mergeq.merge_task(repo, "integration", "swarm/F2", "F2", ["echo ok"], conn=conn)
+    mergeq.revert_merge(repo, first.squash_commit, conn=conn, task_key="F2")
+    # Control: with the row as the revert left it and the card done, reconcile does see the problem.
+    assert [f.kind for f in reconcile.check("b", "p1", conn=conn)] == ["done_but_reverted"]
+
+    _make_work_branch(repo, "swarm/F2-fix1", "new.txt", "v2\n")
+    assert mergeq.merge_task(repo, "integration", "swarm/F2-fix1", "F2", ["echo ok"], conn=conn).merged is True
+
+    assert reconcile.check("b", "p1", conn=conn) == []
+
+
+def test_a_red_gate3_on_a_new_candidate_also_starts_the_row_over(repo, tmp_path):
+    _make_work_branch(repo, "swarm/F3", "new.txt", "v1\n")
+    conn = db.connect(tmp_path / "ases.db")
+    first = mergeq.merge_task(repo, "integration", "swarm/F3", "F3", ["echo ok"], conn=conn)
+    mergeq.revert_merge(repo, first.squash_commit, conn=conn, task_key="F3")
+    _make_work_branch(repo, "swarm/F3-fix1", "new.txt", "v2\n")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/F3-fix1", "F3", ["exit 1"], conn=conn)
+
+    assert outcome.merged is False and outcome.gate3_result == "fail"
+    row = _merge_row(conn, "F3")
+    assert (row["gate3_result"], row["candidate_sha"]) == ("fail", outcome.candidate_sha)
+    assert (row["reverted"], row["squash_commit"], row["completed_at"]) == (0, None, None)
+
+
+def test_a_recorded_no_op_also_starts_the_row_over(repo, tmp_path):
+    _branch_at_tip(repo, "swarm/F4")
+    conn = db.connect(tmp_path / "ases.db")
+    _seed_reverted_row(conn, "F4")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/F4", "F4", ["echo ok"], conn=conn, allow_empty=True)
+
+    assert outcome.merged is True and outcome.squash_commit is None
+    row = _merge_row(conn, "F4")
+    assert (row["reverted"], row["squash_commit"], row["gate3_result"]) == (0, None, "skipped")
+    _assert_utc_seconds_timestamp(row["completed_at"])
+
+
+def test_a_call_that_ends_before_a_new_candidate_exists_leaves_a_completed_row_untouched(repo, tmp_path):
+    """Only a new candidate build resets the row. Every call below ends before one exists (or, for the secret, before
+    Gate 3), and the row of the task's earlier, completed, NOT reverted merge must come out of each unchanged."""
+    _make_work_branch(repo, "swarm/U1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    first = mergeq.merge_task(repo, "integration", "swarm/U1", "U1", ["echo ok"], conn=conn)
+    assert first.merged is True
+    before = dict(_merge_row(conn, "U1"))
+    assert before["reverted"] == 0 and before["squash_commit"] and before["completed_at"]
+
+    root = _git_ok("rev-list", "--max-parents=0", "HEAD", cwd=repo).stdout.strip()
+    _git_ok("checkout", "-q", "-b", "swarm/U1-conflict", root, cwd=repo)
+    (repo / "new.txt").write_text("a different new.txt\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "conflicting add", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    _make_work_branch(repo, "swarm/U1-secret", "config.py", f"API_KEY = '{SECRET}'\n")
+
+    calls = {
+        "already merged (nothing to commit)": lambda: mergeq.merge_task(
+            repo, "integration", "swarm/U1", "U1", ["echo ok"], conn=conn),
+        "a conflict": lambda: mergeq.merge_task(
+            repo, "integration", "swarm/U1-conflict", "U1", ["echo ok"], conn=conn),
+        "a planted secret": lambda: mergeq.merge_task(
+            repo, "integration", "swarm/U1-secret", "U1", ["echo ok"], conn=conn),
+        "the branch moved after the checks": lambda: mergeq.merge_task(
+            repo, "integration", "swarm/U1", "U1", ["echo ok"], conn=conn, expected_head="0" * 40),
+        "a stop before the candidate": lambda: mergeq.merge_task(
+            repo, "integration", "swarm/U1", "U1", ["echo ok"], conn=conn, should_stop=lambda: True),
+    }
+    for label, call in calls.items():
+        outcome = call()
+        assert outcome.merged is False, label
+        assert dict(_merge_row(conn, "U1")) == before, label
+
+    _git_ok("checkout", "-q", "-b", "elsewhere", cwd=repo)  # and a primary checkout that is on the wrong branch
+    assert mergeq.merge_task(repo, "integration", "swarm/U1", "U1", ["echo ok"], conn=conn).merged is False
+    assert dict(_merge_row(conn, "U1")) == before
+
+
+# --- a secret-free detail (ASES-SEC-01) -------------------------------------------------------------------------
+
+
+def test_a_merge_outcome_redacts_secret_shaped_text_in_its_detail_when_it_is_built():
+    outcome = mergeq.MergeOutcome(False, None, None, None, f"gate said: key={SECRET} and more")
+
+    assert SECRET not in outcome.detail and "PLANTEDVALUE" not in outcome.detail
+    assert outcome.detail == "gate said: key=[redacted] and more"
+    clean = mergeq.MergeOutcome(True, "a" * 40, "a" * 40, "pass", "merged")
+    assert clean.detail == "merged"
+    assert mergeq.MergeOutcome(False, None, None, None, None).detail is None  # not text: nothing to redact, no crash
+
+
+def test_a_failed_commit_never_carries_a_secret_from_gits_output_into_the_outcome(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/R1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    real_git = mergeq._git
+
+    def leaky_git(args, cwd, timeout=60):
+        if args[0] == "commit":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr=f"pre-commit hook: token {SECRET}\n")
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", leaky_git)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/R1", "R1", ["echo ok"], conn=conn)
+
+    assert outcome.merged is False and outcome.detail.startswith("commit failed:")
+    assert SECRET not in outcome.detail and "[redacted]" in outcome.detail
+
+
+def test_a_red_gate3_never_carries_a_secret_from_the_gate_output_into_the_outcome(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/R2", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    monkeypatch.setattr(
+        gates, "run_gate",
+        lambda candidate, sha, name, commands, **kw: gates.GateResult(name, sha, False, f"FAILED env dump {SECRET}"),
+    )
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/R2", "R2", ["echo ok"], conn=conn)
+
+    assert outcome.merged is False and outcome.gate3_result == "fail"
+    assert outcome.detail == "FAILED env dump [redacted]"
+
+
+def test_a_refused_fast_forward_never_carries_a_secret_from_gits_stderr_into_the_outcome(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/R3", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    real_git = mergeq._git
+
+    def leaky_git(args, cwd, timeout=60):
+        if args[:2] == ["merge", "--ff-only"]:
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr=f"fatal: remote said {SECRET}\n")
+        return real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(mergeq, "_git", leaky_git)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/R3", "R3", ["echo ok"], conn=conn)
+
+    assert outcome.merged is False and outcome.gate3_result == "pass"
+    assert SECRET not in outcome.detail and "remote said [redacted]" in outcome.detail
+
+
+def test_a_real_gate3_that_prints_a_secret_is_redacted_in_the_outcome_and_in_gate_runs(repo, tmp_path):
+    """End to end with no fakes: the real gate runner (which redacts what it stores and returns) under merge_task."""
+    _make_work_branch(repo, "swarm/R4", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/R4", "R4", [f"echo leaked {SECRET}", "exit 1"], conn=conn)
+
+    assert outcome.merged is False and outcome.gate3_result == "fail"
+    stored = conn.execute("SELECT detail FROM gate_runs WHERE task_key = 'R4'").fetchone()["detail"]
+    assert SECRET not in outcome.detail and SECRET not in stored
+    assert "[redacted]" in outcome.detail and "[redacted]" in stored

@@ -42,6 +42,36 @@ def provider_for_profile(
     return None
 
 
+def _strip_provider(model: str, provider: str) -> str:
+    """`model` without a leading `<provider>/`, compared without regard to case. A router can report the model
+    it served with its own name in front (`xkiro/qwen/qwen3-coder-plus:free`) or without it, and both spell the
+    same model, so ASES-RTE-01's comparison has to look past that prefix."""
+    prefix = f"{provider}/"
+    return model[len(prefix):] if model.lower().startswith(prefix.lower()) else model
+
+
+def _provider_actually_hit(actual: str, pinned: policy.ProfileProvider, models_config: dict) -> str:
+    """The provider a session that ran on an UNEXPECTED model most likely hit, else the profile's own provider.
+    Only the model string is known here (hermes.session_usage does not say which provider answered), so the
+    provider is "determined" in two ways and no more: the model starts with `<provider>/` naming a configured
+    provider, or exactly one configured provider lists that model in models_config and the profile's own
+    provider does not. Anything else (an unknown model, a model two providers list, one the profile's own
+    provider lists too) stays with the profile's provider: a guess would move requests between two quotas on
+    no evidence."""
+    lowered = actual.lower()
+    for name in models_config.get("providers") or {}:
+        if lowered.startswith(f"{name}/".lower()):
+            return name
+    hosts = {
+        row["provider"] for row in models_config.get("models") or []
+        if isinstance(row, dict) and row.get("provider") and row.get("model")
+        and _strip_provider(row["model"], row["provider"]) == _strip_provider(actual, row["provider"])
+    }
+    if pinned.provider in hosts or len(hosts) != 1:
+        return pinned.provider
+    return next(iter(hosts))
+
+
 def _has_ended(run: dict) -> bool:
     return run.get("ended_at") not in (None, "")
 
@@ -81,7 +111,17 @@ def _ingest_run(
 ) -> str | None:
     """Count one run's session into the ledger if it qualifies. Returns the session id when it was counted.
     `attribution` is (plan project, task key, card id): recorded with the row so requests can be summed per plan
-    task lineage (ASES-REC-02); (None, None, None) when the caller does not know."""
+    task lineage (ASES-REC-02); (None, None, None) when the caller does not know.
+
+    ASES-RTE-01 ("No hidden fallback; the provider and model actually used are recorded"): the session's model
+    is compared with the model pinned for its profile (a leading `<provider>/` is looked past on both sides).
+    A session that ran on a different model records ONE `model_mismatch` event (profile, expected, actual,
+    session_id) in the same savepoint as its usage_ingested row. That row is written once per session and this
+    function returns early when it exists, so the event can never be recorded twice for a session, and one that
+    could not be exported records nothing until it can. This is detection only: no card is failed, no run is
+    stopped. The usage is still counted, against the provider the model says it hit when that can be told
+    (_provider_actually_hit), else against the profile's own provider. A session that reports no model at all
+    is not a mismatch (the pinned model is assumed, as before)."""
     if not _has_ended(run):
         return None
     session_id = _worker_session_id(run)
@@ -98,21 +138,31 @@ def _ingest_run(
         return None  # export failed: record nothing, so the next call tries this session again
 
     requests = int(usage.get("api_call_count") or 0)
-    model = usage.get("model") or pinned.model
+    reported = usage.get("model")
+    model = reported or pinned.model
+    provider = pinned.provider
+    mismatch = None
+    if isinstance(reported, str) and reported.strip() and (
+        _strip_provider(reported.strip(), pinned.provider) != _strip_provider(pinned.model.strip(), pinned.provider)
+    ):
+        provider = _provider_actually_hit(reported.strip(), pinned, models_config)
+        mismatch = {"profile": profile, "expected": pinned.model, "actual": reported, "session_id": session_id}
     with _atomic(conn):
         conn.execute(
             "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
             "output_tokens, ingested_at, project, task_key, card_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)",
-            (session_id, profile, pinned.provider, model, requests,
+            (session_id, profile, provider, model, requests,
              int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), *attribution),
         )
         if requests > 0:
-            ledger.record_usage(conn, pinned.provider, model, requests)
+            ledger.record_usage(conn, provider, model, requests)
         events.record(conn, "usage_ingested", {
-            "session_id": session_id, "profile": profile, "provider": pinned.provider,
+            "session_id": session_id, "profile": profile, "provider": provider,
             "model": model, "requests": requests,
         })
+        if mismatch is not None:
+            events.record(conn, "model_mismatch", mismatch)
     return session_id
 
 
