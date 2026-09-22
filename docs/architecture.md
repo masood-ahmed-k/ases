@@ -869,7 +869,8 @@ Real problems the builders found (each is a fix or a decision, none is fixed yet
 Still to do: acceptance scenarios 22.3, 22.5, 22.7 to 22.16 on the rig (the rig only has two demonstrations), the project-scoping
 sweep, plan-time validation of touches, a Gate 4 allowlist, wiring the post-merge revert, the triage lane (ASES-LED-03), the
 decisions that wait on the user (Hermes global configuration, Docker, reviewer capacity, private-code provider, coder-2 and coder-3),
-and then the testing phase: real runs, failure paths, seeded-bug checks and independent review of everything built since round 1.
+and then testing at zero quota only: on 2026-09-22 the user said not to burn xKiro tokens on tests, so there are no real runs
+unless they ask for one; the fake rig, seeded-bug checks and an independent review cover everything built since round 1.
 
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
