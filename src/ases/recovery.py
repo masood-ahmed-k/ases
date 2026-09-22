@@ -411,6 +411,19 @@ ACTIONS = frozenset({
 INFRA_BACKOFF_BASE_SECONDS = 30
 INFRA_BACKOFF_CAP_SECONDS = 900
 
+# Round 7 (ASES-REC-01, bug 3): how long _recover_task waits, after a `ready` card's latest run ended, before
+# treating an auth- or quota-shaped failure on it as needing recovery (see _recover_task's own docstring for
+# why a ready card is looked at at all). Hermes's own respawn guard for these two kinds
+# (kanban_db_dispatch.check_respawn_guard's `blocker_auth` rule, read from the installed 0.21.3 source: once
+# task.last_failure_error matches an auth/quota-shaped regex, the guard holds the card in `ready` with NO
+# timer of its own) never lifts on its own, so this is not a wait for anything Hermes will eventually do.
+# It is ASES's own margin against a run that only just ended, on the chance Hermes's dispatcher has not even
+# had one tick yet to apply the guard. Reuses INFRA_BACKOFF_BASE_SECONDS's own 30 s rather than inventing a
+# new number: real Hermes's DEFAULT_CRASH_GRACE_SECONDS (kanban_db.py) independently agrees at 30 s for the
+# related "has this worker really gone quiet" judgment, so 30 s is at least as patient as Hermes's own
+# thresholds for a comparable question.
+READY_RESPAWN_SETTLE_SECONDS = INFRA_BACKOFF_BASE_SECONDS
+
 
 @dataclasses.dataclass(frozen=True)
 class Decision:
@@ -636,8 +649,14 @@ def next_model(
             continue
         if data_class is not None:
             declared = row.get("data_policy") or (providers.get(provider) or {}).get("data_policy")
+            # ASES-PRV-04 (round 7, package POLICY): check_data_class now requires an explicit, non-empty
+            # verified_at for private/confidential, not just a compatible policy string -- found broken here by
+            # POLICY itself (a file it does not own): without this, EVERY candidate was treated as a violation
+            # for those two data classes, so next_model silently returned None instead of a real switch target.
+            verified_at = row.get("data_policy_verified_at") or (providers.get(provider) or {}).get(
+                "data_policy_verified_at")
             try:
-                policy.check_data_class(data_class, provider, declared)
+                policy.check_data_class(data_class, provider, declared, verified_at=verified_at)
             except policy.DataPolicyViolation:
                 continue
         return provider, model
@@ -959,15 +978,34 @@ def _adjust(
 def _recover_task(
     board, plan, project, models_config, task, card_id, card, bounds, now_ts, conn,
 ) -> Decision | None:
-    """process_failures for one task: None when there is nothing to do, or nothing was done this pass."""
-    if card.get("status") != "blocked":
-        return None
+    """process_failures for one task: None when there is nothing to do, or nothing was done this pass.
+
+    Normally only acts on a `blocked` card. Round 7 (ASES-REC-01, bug 3) widens this for exactly two failure
+    kinds: Hermes's own dispatcher respawn guard (kanban_db_dispatch.check_respawn_guard's `blocker_auth` rule)
+    can hold a card whose last failure reads like an auth or quota wall in `ready` FOREVER instead of ever
+    blocking it (confirmed against the installed 0.21.3 source: that rule has no expiry of its own), so such a
+    card used to never reach this function at all, however many passes polled it -- this module's own docstring
+    and process_failures's used to say so outright. AUTH and QUOTA (read classify_run's own table) are the ONLY
+    two kinds widened past `blocked` here: anything else on a `ready` card (infrastructure, capability, a
+    runtime overrun, ...) is Hermes's own ordinary retry in progress, and reacting to it here would be exactly
+    the false positive this fix must avoid causing. A settle window since the failed run ended
+    (READY_RESPAWN_SETTLE_SECONDS) keeps this from racing a run that only just finished, in case Hermes's own
+    dispatcher has not even had one tick yet to apply blocker_auth. Once the widened gate lets a `ready` card
+    through, it takes the exact same classification/decision/apply path below that a `blocked` card always has:
+    there is nothing else here that needs to know which status let it in."""
+    status = card.get("status")
     index, run = _latest_run(card)
     if run is None:
         return None
     kind = classify_run(run)
     if kind is FailureKind.NONE:
         return None       # includes a worker's deliberate question: the latest run's outcome is `blocked`
+    if status != "blocked":
+        if status != "ready" or kind not in (FailureKind.AUTH, FailureKind.QUOTA):
+            return None
+        ended = _epoch(run.get("ended_at"))
+        if ended is None or now_ts < ended + READY_RESPAWN_SETTLE_SECONDS:
+            return None   # no end time to judge by, or still inside the settle window: wait for a later pass
     run_id = run.get("id") if run.get("id") is not None else f"#{index}"
     if _already_decided(conn, plan.project, task.key, card_id, run_id):
         return None
@@ -1075,9 +1113,11 @@ def process_failures(
     chose, so that a decision that has to be made again does not choose again.
 
     Not covered here: a review-round or fix-card budget that is spent is not a failed run. After
-    refresh_review_rounds(), call escalation(load_lineage(...), Bounds.from_budgets(...)) for that. A card that
-    Hermes never blocks (its dispatcher's respawn guard holds it in `ready`, or a repeated block sends it to
-    `triage`) is not seen either."""
+    refresh_review_rounds(), call escalation(load_lineage(...), Bounds.from_budgets(...)) for that. A repeated
+    block that sends a card to `triage` is not seen either. A card Hermes's dispatcher respawn guard holds in
+    `ready` IS now seen (round 7, bug 3), but only for an auth- or quota-shaped last failure, and only once a
+    settle window has passed since that run ended: see _recover_task's own docstring for exactly which two
+    kinds and why the window exists."""
     now_ts = time.time() if now is None else _epoch(now)
     if now_ts is None:
         raise ValueError(f"now must be epoch seconds or a datetime, got {now!r}")

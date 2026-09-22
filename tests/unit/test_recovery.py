@@ -1029,11 +1029,21 @@ def test_next_model_never_leaves_the_data_class_when_it_is_given_one():
     assert recovery.next_model(MODELS, "coder", "xkiro", CODER_MODEL, data_class="private") is None
     models = {"providers": {"x": {"data_policy": "unknown"}}, "models": [
         {"provider": "x", "model": "current", "role_class": "coder", "pinned": True},
-        {"provider": "x", "model": "cleared", "role_class": "coder_candidate", "data_policy": "no_training"},
+        {"provider": "x", "model": "cleared", "role_class": "coder_candidate", "data_policy": "no_training",
+         "data_policy_verified_at": "2026-09-22"},
     ]}
     assert recovery.next_model(models, "coder", "x", "current", data_class="private") == ("x", "cleared")
     assert recovery.next_model(models, "coder", "x", "current", data_class="confidential") is None
     assert recovery.next_model(models, "coder", "x", "current", data_class="not-a-class") is None
+
+    # ASES-PRV-04 (round 7): a compatible policy string alone is no longer enough for private/confidential --
+    # without a recorded data_policy_verified_at, next_model must treat the candidate as unsafe, same as an
+    # incompatible policy, never silently skip the verification requirement.
+    unverified = {"providers": {"x": {"data_policy": "unknown"}}, "models": [
+        {"provider": "x", "model": "current", "role_class": "coder", "pinned": True},
+        {"provider": "x", "model": "cleared", "role_class": "coder_candidate", "data_policy": "no_training"},
+    ]}
+    assert recovery.next_model(unverified, "coder", "x", "current", data_class="private") is None
 
 
 def test_unhealthy_credentials_reads_the_event_log_and_a_restore_clears_a_provider(conn):
@@ -1691,6 +1701,82 @@ def test_the_current_work_card_is_the_one_read_not_the_original(conn, board, tmp
     board.cards["fix1"] = _card("fix1", [_run(9, "crashed", POLICY_TEXT)])
     decisions = _pass(conn, tmp_path)
     assert [(d.card_id, d.run_id, d.action) for d in decisions] == [("fix1", 9, "block_for_user")]
+
+
+# ---------------------------------------------------------------------------------------------
+# _recover_task: a `ready` card after an auth- or quota-shaped failure (round 7, ASES-REC-01, bug 3)
+# ---------------------------------------------------------------------------------------------
+# AC-A's round 6 finding, and process_failures's own old docstring, said plainly that a card Hermes's
+# dispatcher respawn guard holds in `ready` (kanban_db_dispatch.check_respawn_guard's blocker_auth rule,
+# which never expires on its own) never reached recovery at all, however many passes polled it. _pass's
+# default `now` (ENDED + 10_000) is already comfortably past READY_RESPAWN_SETTLE_SECONDS (30 s), so every
+# test below except the settle-window one itself is well past it.
+
+
+def test_a_ready_card_with_a_stale_auth_failure_is_recovered_like_a_blocked_one(conn, board, tmp_path):
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", AUTH_TEXT)], status="ready")
+
+    decisions = _pass(conn, tmp_path)
+
+    assert [d.action for d in decisions] == ["mark_credential_unhealthy"]
+    assert (decisions[0].provider, decisions[0].model) == ("xkiro", CODER_MODEL)
+    # questions.ask_user's OWN logic (not this module's), unchanged by this fix: a `ready` card, unlike a
+    # `blocked` merge card, is not already blocked, so real Hermes accepts `kanban block --kind needs_input`
+    # for it, which is a MORE useful outcome than the comment-only fallback a blocked card needs (a real,
+    # actionable block a person sees, not just a comment).
+    assert [(m[0], m[1], m[3]) for m in board.mutations] == [("block", "w1", "needs_input")]
+    (unhealthy,) = _events_of(conn, "credential_unhealthy")
+    assert (unhealthy["task_key"], unhealthy["provider"]) == ("T1", "xkiro")
+    assert recovery.unhealthy_credentials(conn) == {("xkiro", "*")}
+
+
+def test_a_ready_card_with_a_stale_quota_failure_is_recovered_like_a_blocked_one(conn, board, tmp_path):
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", QUOTA_TEXT)], status="ready")
+
+    decisions = _pass(conn, tmp_path)
+
+    assert [d.action for d in decisions] == ["park"]
+    assert [m[:2] for m in board.mutations] == [("schedule", "w1")]
+
+
+@pytest.mark.parametrize("text", [CRASH_TEXT, PROTOCOL_TEXT])
+def test_a_ready_card_with_an_infra_or_capability_failure_is_not_touched(conn, board, tmp_path, text):
+    """Only AUTH and QUOTA are widened past `blocked` (see _recover_task's own docstring): an
+    infrastructure- or capability-shaped failure on a `ready` card is Hermes's own ordinary retry in
+    progress (CRASH_TEXT classifies as infrastructure, PROTOCOL_TEXT as capability), and reacting to either
+    here would be exactly the false positive this fix must avoid."""
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", text)], status="ready")
+
+    assert _pass(conn, tmp_path) == []
+    assert board.mutations == []
+    assert _lineage_row(conn, "T1") is None   # not even counted: the gate returns before any counter is touched
+
+
+def test_a_ready_cards_auth_failure_still_within_the_settle_window_is_not_touched_yet(conn, board, tmp_path):
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "crashed", AUTH_TEXT)], status="ready")
+
+    assert _pass(conn, tmp_path, now=ENDED + recovery.READY_RESPAWN_SETTLE_SECONDS - 1) == []
+    assert board.mutations == []
+
+    # The moment the settle window has fully elapsed, the very same failure is recovered.
+    decisions = _pass(conn, tmp_path, now=ENDED + recovery.READY_RESPAWN_SETTLE_SECONDS)
+    assert [d.action for d in decisions] == ["mark_credential_unhealthy"]
+
+
+def test_a_ready_card_with_no_run_at_all_is_unaffected(conn, board, tmp_path):
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [], status="ready")
+    assert _pass(conn, tmp_path) == [] and board.mutations == []
+
+
+def test_a_ready_card_whose_latest_run_succeeded_is_unaffected(conn, board, tmp_path):
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card("w1", [_run(7, "completed", summary="all done")], status="ready")
+    assert _pass(conn, tmp_path) == [] and board.mutations == []
 
 
 def test_tasks_with_no_card_yet_are_skipped_and_other_projects_are_not_touched(conn, board, tmp_path):

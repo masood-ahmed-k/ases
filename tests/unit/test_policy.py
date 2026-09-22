@@ -10,8 +10,8 @@ def test_public_allows_anything():
 
 
 @pytest.mark.parametrize("data_policy", ["no_training", "local_only", "zero_data_retention"])
-def test_private_allows_safe_policies(data_policy):
-    policy.check_data_class("private", "some_provider", data_policy)
+def test_private_allows_safe_policies_once_verified(data_policy):
+    policy.check_data_class("private", "some_provider", data_policy, verified_at="2026-09-19")
 
 
 @pytest.mark.parametrize("data_policy", [
@@ -19,13 +19,52 @@ def test_private_allows_safe_policies(data_policy):
 ])
 def test_private_rejects_unsafe_policies(data_policy):
     with pytest.raises(policy.DataPolicyViolation, match="private"):
-        policy.check_data_class("private", "openrouter", data_policy)
+        policy.check_data_class("private", "openrouter", data_policy, verified_at="2026-09-19")
 
 
-def test_confidential_only_allows_local():
-    policy.check_data_class("confidential", "local_ollama", "local_only")
+def test_confidential_only_allows_local_once_verified():
+    policy.check_data_class("confidential", "local_ollama", "local_only", verified_at="2026-09-19")
     with pytest.raises(policy.DataPolicyViolation, match="confidential"):
-        policy.check_data_class("confidential", "openrouter", "no_training")
+        policy.check_data_class("confidential", "openrouter", "no_training", verified_at="2026-09-19")
+
+
+# --- ASES-PRV-04: private/confidential also need an explicitly recorded verification date -----------------
+
+
+@pytest.mark.parametrize("data_class, data_policy", [
+    ("private", "no_training"), ("private", "local_only"), ("private", "zero_data_retention"),
+    ("confidential", "local_only"),  # the only policy in policy._SAFE_FOR_CONFIDENTIAL
+])
+def test_a_compatible_policy_with_no_verification_date_is_still_refused(data_class, data_policy):
+    """ASES-PRV-04: 'private/confidential projects require an EXPLICITLY VERIFIED provider data policy'.
+    A policy string that would otherwise qualify is not enough on its own for the two stricter classes; the
+    default (verified_at omitted) must still raise, naming the missing field, not the unrelated policy
+    string (which is not the problem here)."""
+    with pytest.raises(policy.DataPolicyViolation, match="no recorded verification date") as caught:
+        policy.check_data_class(data_class, "some_provider", data_policy)
+    assert "some_provider" in str(caught.value)
+    assert "data_policy_verified_at" in str(caught.value)
+
+
+@pytest.mark.parametrize("data_class", ["private", "confidential"])
+def test_a_verification_date_of_empty_string_is_treated_as_missing(data_class):
+    data_policy = "local_only"  # safe for both private and confidential
+    with pytest.raises(policy.DataPolicyViolation, match="no recorded verification date"):
+        policy.check_data_class(data_class, "some_provider", data_policy, verified_at="")
+
+
+def test_public_never_needs_a_verification_date():
+    """ASES-PRV-04 only tightens private/confidential; public is unaffected, with or without the keyword."""
+    policy.check_data_class("public", "openrouter", "some_free_endpoints_train")
+    policy.check_data_class("public", "openrouter", "some_free_endpoints_train", verified_at=None)
+
+
+def test_an_unsafe_policy_is_still_refused_for_its_own_reason_even_with_a_verification_date():
+    """The policy-string check runs first: a provider that is not confirmed safe at all is refused for that
+    reason, not silently waved through just because someone recorded a verification date for it."""
+    with pytest.raises(policy.DataPolicyViolation, match="not confirmed safe") as caught:
+        policy.check_data_class("private", "openrouter", "some_free_endpoints_train", verified_at="2026-09-19")
+    assert "no recorded verification date" not in str(caught.value)
 
 
 def test_unknown_data_class_raises():

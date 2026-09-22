@@ -217,30 +217,23 @@ def test_22_15_triage_lists_and_validates_the_card_and_archive_card_moves_it_out
     assert (payload["card_id"], payload["decision"]) == (card["id"], "archive")
 
 
-def test_22_15_finding_triage_promote_card_does_not_work_on_a_genuinely_triage_status_card(world):
-    """FINDING (see the report): triage.promote_card calls hermes.kanban_promote unconditionally (even with
-    force=True, which only skips its own validate() gate, not this call). FakeHermes.kanban_promote, in turn,
-    calls _promote_task, whose docstring says plainly, reading the real Hermes source: "kanban_db.
-    promote_task: todo or blocked to ready" -- triage is not one of the two statuses promote_task accepts, on
-    the fake OR, per that same read of the real source, on real Hermes 0.21.3 either. So calling
-    triage.promote_card on a card that is actually sitting in Hermes's triage status raises
-    HermesCommandError ("... is 'triage'; promote only applies to 'todo' or 'blocked'") every time, not just
-    in this fake: this looks like a real, reproducible gap in triage.py as landed this round, not a fake-
-    board quirk, and is asserted here rather than skipped so it is not lost. archive_card (tested above) is
-    unaffected: kanban_archive/archive_task accepts any non-archived status, triage included."""
+def test_22_15_promote_card_now_works_on_a_genuinely_triage_status_card(world):
+    """Round 6 found a real gap here (see the round 6 section of builder-findings.md): triage.promote_card called
+    hermes.kanban_promote, which only accepts a card already in todo/blocked, so it always failed on a card
+    genuinely sitting in triage. The user was asked and chose "option A": ASES may call Hermes's own
+    `specify` (an auxiliary-model call) from promote_card, and only from there (r7_wp_specify.md, round 7).
+    That is now built: promote_card calls hermes.kanban_specify, which moves triage -> todo (real Hermes's
+    only mechanism for a card to leave triage at all), and this test asserts the FIXED behavior in place of
+    the gap round 6 documented."""
     card = _put_card_directly_in_triage(
         world, title="T1: a follow-up the coder noticed",
         body="Investigate the slow test in test_foo.py; it looks flaky, not just slow.",
     )
 
-    with pytest.raises(hermes_mod.HermesCommandError, match="promote only applies to 'todo' or 'blocked'"):
-        triage_mod.promote_card(
-            world.board, card["id"], conn=world.conn, project=world.plan.project, reason="looks worth doing",
-        )
-    # force=True skips triage.validate()'s own gate, not the underlying hermes.kanban_promote call, so it
-    # fails the exact same way: the problem is not that validate() refused it.
-    with pytest.raises(hermes_mod.HermesCommandError, match="promote only applies to 'todo' or 'blocked'"):
-        triage_mod.promote_card(
-            world.board, card["id"], conn=world.conn, project=world.plan.project, reason="forced", force=True,
-        )
-    assert world.fake.card(card["id"])["status"] == "triage"  # left exactly where it was: neither call took effect
+    triage_mod.promote_card(
+        world.board, card["id"], conn=world.conn, project=world.plan.project, reason="looks worth doing",
+    )
+
+    assert world.fake.card(card["id"])["status"] == "todo"  # kanban_specify's real landing status, not "ready"
+    events = [e for e in world.fake.events(card["id"]) if e["kind"] == "specified"]
+    assert events, "the real Hermes kanban_specify call (via the fake) left no trace of moving the card"

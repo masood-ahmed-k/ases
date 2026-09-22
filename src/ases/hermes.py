@@ -294,6 +294,84 @@ def kanban_reclaim(board: str, card_id: str, *, reason: str | None = None) -> No
     _kanban(board, args)
 
 
+@dataclasses.dataclass(frozen=True)
+class SpecifyResult:
+    """What `hermes kanban specify <id> --json` reported (fields read from `hermes_cli/kanban_specify.py`'s
+    `SpecifyOutcome` and `hermes_cli/kanban.py`'s `_cmd_specify` -> `_run_triage_sweep`, 2026-09-22).
+
+    ok is True exactly when the auxiliary LLM (`auxiliary.triage_specifier`) produced a usable title/body
+    and Hermes moved the card `triage` -> `todo` (`kanban_db.specify_triage_task`); reason is Hermes's own
+    text, never invented here, explaining the outcome either way (on success it is the literal word
+    "specified"; on failure it is one of "unknown task id", "task is not in triage (status=...)", "LLM
+    error: <type>", "LLM returned an empty response", "LLM response missing title and body", or "task moved
+    out of triage before promotion" (a race), read verbatim from `kanban_specify.py`). new_title is the
+    tightened title Hermes wrote when the auxiliary model's reply included one; it can be None even when ok
+    is True (the reply had no usable "title" key, which `specify_task` treats as a normal outcome, not an
+    error), and is always None when ok is False."""
+    ok: bool
+    reason: str | None
+    new_title: str | None
+
+
+def kanban_specify(board: str, card_id: str, *, author: str | None = None, timeout: int = 120) -> SpecifyResult:
+    """Runs `hermes kanban specify <card_id> [--author NAME] --json`. NEVER pass `--all`: ASES specifies one
+    card at a time, per r7_wp_specify.md. This is the ONE real, live auxiliary-model call this file makes
+    once a user actually runs it for real (r7_rules.md's round 7 exception, "option A", 2026-09-22, and only
+    from `triage.promote_card`); every other wrapper in this module stays exactly as it was.
+
+    `timeout` defaults to 120 seconds (not `_kanban`'s own 30 second default, which is sized for a plain
+    database operation): `kanban_specify.py`'s own `specify_task` passes `timeout or 120` to the auxiliary
+    LLM call it makes, so 120 is Hermes's own real default for this exact call, not a guess.
+
+    `--author` is passed only when given; when omitted, Hermes computes its own default author (the active
+    profile, or "user", read from `kanban.py`'s own `_profile_author`), the same "only pass what you have"
+    convention as `kanban_comment`. There is no free-text argument here to `--`-guard (`specify` takes only
+    `task_id`, `--author`, `--json`, plus the `--all`/`--tenant` sweep flags ASES never uses), unlike
+    `kanban_comment`/`kanban_block`, whose free-text argument DOES need one.
+
+    Deliberately does NOT reuse `_kanban`/`_kanban_json`. Real Hermes behaviour, confirmed by reading
+    `hermes_cli/kanban.py`'s `_run_triage_sweep` for the single-task_id path (not `--all`) that ASES always
+    takes (2026-09-22): EVERY ok=False outcome (task not found, task not in triage, no auxiliary client
+    configured, the model call itself failing, an empty or unusable reply, or the promotion losing a race)
+    is printed as one line of JSON on stdout, `{"task_id", "ok": false, "reason": "...", "new_title": null}`,
+    and the CLI THEN exits 1 (`_run_triage_sweep`: for a single id, `return 0 if ok_count == 1 else 1`).
+    There is no zero-exit path for ok=false here, only zero-exit-and-ok=true or nonzero-exit-and-ok=false.
+    This is a correction to this package's own work order, which asked whether ok=false was "a JSON success
+    with ok: false inside it, or a nonzero CLI exit code": it is the latter, exit 1, with the JSON diagnostic
+    still on stdout. A plain "any nonzero exit raises" rule (every OTHER wrapper's convention, since none of
+    them has a JSON-success-shaped nonzero exit) would make an expected ok=false outcome indistinguishable
+    from a genuine Hermes/infrastructure failure, which is exactly the distinction this function exists to
+    preserve for `triage.promote_card` (see SpecifyResult's docstring). So the rule actually implemented is:
+    parse stdout as the four-field JSON object regardless of exit code (0 or 1); when it parses to that
+    shape, trust its own "ok" field and never raise for that case (Hermes's own contract for specify is "try
+    to make sense of this, tell me if you could not," not "do this or fail," per the package file); only
+    raise HermesCommandError when stdout does NOT parse to that shape at all, or the exit code is something
+    other than 0 or 1 (a genuine crash, a bad board, hermes missing from PATH, or an argparse usage error,
+    none of which prints this JSON shape). Malformed JSON is never given special leniency: json.loads is
+    left to raise on it exactly as every other `_kanban_json` caller in this file already does, and that
+    ValueError is what triggers the HermesCommandError below (not caught and re-interpreted as ok=false)."""
+    args = ["specify", card_id]
+    if author:
+        args += ["--author", author]
+    args += ["--json"]
+    full_args = ["kanban", "--board", board, *args]
+    result = _run(full_args, timeout=timeout)
+    output = result.stdout + result.stderr
+    if result.returncode not in (0, 1):
+        raise HermesCommandError(full_args, result.returncode, output)
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        raise HermesCommandError(full_args, result.returncode, output) from None
+    if not isinstance(payload, dict) or not {"ok", "reason", "new_title"} <= payload.keys():
+        raise HermesCommandError(full_args, result.returncode, output)
+    return SpecifyResult(
+        ok=bool(payload.get("ok")),
+        reason=payload.get("reason") or None,
+        new_title=payload.get("new_title") or None,
+    )
+
+
 def pause(reason: str | None = None, timeout: int = 20) -> None:
     """ASES-REC-06: halts NEW dispatch/cron/gateway turns. Never kills work already in flight --
     that's Hermes's own documented behavior for `hermes pause`, not a gap here."""

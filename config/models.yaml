@@ -4,6 +4,15 @@
 #
 # context_length: null means undeclared/unverified (ASES-MOD-02). swarm doctor WARNs on every such row
 # until a smoke test or an explicit number here confirms the Hermes floor of 65536 tokens.
+#
+# ASES-PRV-04 (section 21.2): "private/confidential projects require an EXPLICITLY VERIFIED provider data
+# policy" -- a data_policy string alone is not enough for those two data classes. Two OPTIONAL fields, same
+# convention as verified_on above (a source and a date, never invented): data_policy_verified_at (an ISO
+# date string, quoted) records WHEN a human actually checked the data_policy line below it, and
+# data_policy_source (a URL or a short note) records WHERE that check came from. Both are commented out
+# below, next to each provider's data_policy, showing the shape; filling in a real date is a human decision
+# (policy.check_data_class refuses private/confidential for a provider with no data_policy_verified_at, even
+# one whose data_policy string would otherwise qualify).
 
 providers:
   # unorouter (base_url https://api.unorouter.com/v1) was removed entirely 2026-09-19, per an explicit
@@ -27,6 +36,10 @@ providers:
     quota_endpoint: /api/v1/key
     require_parameters: true
     data_policy: some_free_endpoints_train
+    # data_policy_verified_at: "2026-09-17"    # ASES-PRV-04 shape, not a live value: set only once a human
+    # data_policy_source: "<url or note>"      # has actually re-checked the data_policy line above and can
+    #                                           # cite where (this provider is not yet safe for
+    #                                           # private/confidential regardless: see policy._SAFE_FOR_PRIVATE).
     verified_on: "2026-09-17"
 
   xkiro:
@@ -52,6 +65,8 @@ providers:
                                                # forwards_to_upstreams_that_may_train) -- see the
                                                # gpt-5.6-terra model row below for the one specific
                                                # routed model actually checked end-to-end.
+    # data_policy_verified_at: "2026-09-19"    # ASES-PRV-04 shape, not a live value (see the openrouter block
+    # data_policy_source: "<url or note>"      # above for what these two fields mean).
     verified_on: "2026-09-19"
 
   opencode_free:
@@ -60,6 +75,8 @@ providers:
     key_env: null                   # served anonymously: no key, no credential pool
     limits: {}
     data_policy: unknown
+    # data_policy_verified_at: "2026-09-17"    # ASES-PRV-04 shape, not a live value (see the openrouter block
+    # data_policy_source: "<url or note>"      # above for what these two fields mean).
     verified_on: "2026-09-17"
     status: blocked                 # 2026-09-18: HTTP 403 "OpenCode's free tier can only be used
                                      # from within OpenCode" -- confirmed against nemotron-3-ultra-free.

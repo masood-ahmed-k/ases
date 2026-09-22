@@ -46,7 +46,9 @@ and the blueprint disagree, the blueprint wins: build to the blueprint and tell 
   `kanban_dispatch`, `kanban_complete`, `kanban_block(board, id, reason)`, `kanban_schedule(board, id, reason)`,
   `kanban_unblock(board, id, reason=None)`, `kanban_comment(board, id, text, author=None)`,
   `kanban_promote`, `kanban_archive(board, ids)`, `kanban_set_model(board, id, model, provider=)`,
-  `kanban_reclaim(board, id, reason=)`, `kanban_reopen_review`, `pause(reason)`, `resume()`, `session_usage(profile, sid)`.
+  `kanban_reclaim(board, id, reason=)`, `kanban_reopen_review`, `pause(reason)`, `resume()`, `session_usage(profile, sid)`,
+  and `kanban_specify(board, id, author=, timeout=120)` (round 7, 2026-09-22, "option A": this one auxiliary-model call
+  is now made for real, but ONLY from `triage.promote_card`, never anywhere else; see r7_rules.md).
   A card's status is one of triage, todo, scheduled, ready, running, blocked, review, done, archived.
 - `src/ases/events.py` (`record(conn, kind, payload)`, `redact`, `recent`), `ledger.py`, `policy.py`
   (`resolve_assignee`, `profile_provider(role, models_config)`, `check_budget`), `config.py` (`ProjectConfig`:

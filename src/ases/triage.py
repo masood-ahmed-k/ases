@@ -38,15 +38,21 @@ and carries no open question (questions.open_question returns None for it): a `t
 
   list_triage_cards  the agent-proposed cards of one plan, oldest first
   validate           the lightest shape check a proposal must pass before a human/controller accepts it
-  promote_card        hermes.kanban_promote, gated by validate unless force=True, then record_decision
+  promote_card        hermes.kanban_specify, gated by validate unless force=True, then record_decision
   archive_card         hermes.kanban_archive, then record_decision
   record_decision      the triage_decision event, and the lineage charge to the task that raised the card
   format_triage         the plain-ASCII text `swarm triage` prints
 
-The outside calls are the hermes module (list, show, promote, archive), questions.open_question (to tell a
+The outside calls are the hermes module (list, show, specify, archive), questions.open_question (to tell a
 proposal apart from a question), recovery.bump (the lineage charge) and the events table. Nothing here calls a
-provider, and nothing here calls `hermes kanban specify` or `hermes kanban decompose` (r2_rules.md: "ASES never
-runs specify/decompose on its own").
+provider directly.
+
+ROUND 7 (r7_rules.md, the user's explicit "option A" decision, 2026-09-22): promote_card now calls
+`hermes.kanban_specify`, which is a REAL, live auxiliary-model call once a user actually runs it for real (not
+zero-quota in production; still zero-quota in every test here, see test_triage.py's FakeBoard). Round 6's own
+note above, that nothing here calls `hermes kanban specify`, is now stale for exactly this one call from exactly
+this one function; r2_rules.md carries the matching one-sentence correction. `hermes kanban decompose` is still
+never called anywhere in this file: the user's decision was specify only, not decompose.
 """
 from __future__ import annotations
 
@@ -370,7 +376,7 @@ def record_decision(
 
 def promote_card(
     board: str, card_id: str, *, conn: sqlite3.Connection, project: str, raised_by_task: str | None = None,
-    reason: str | None = None, force: bool = False,
+    reason: str | None = None, force: bool = False, author: str | None = None,
     plan: plan_mod.Plan | None = None, known_roles=None,
 ) -> None:
     """ASES-LED-03: promotes a validated proposal out of triage. Refuses with TriageError, before Hermes is
@@ -380,8 +386,29 @@ def promote_card(
     for this function did not list them, so they default to None: a caller with a plan on hand can pass them for
     the fuller check, and `force=True` needs neither).
 
-    hermes.kanban_promote(board, card_id, reason=reason) runs first, then record_decision(..., PROMOTE, ...): a
-    promote that fails leaves nothing recorded, and a failure of either propagates."""
+    ROUND 7 (r7_rules.md, the user's "option A" decision): this now calls
+    `hermes.kanban_specify(board, card_id, author=author)`, Hermes's own auxiliary-model triage specifier, NOT
+    `hermes.kanban_promote`. Round 6 found `kanban_promote` could never work here: Hermes's `promote` only moves
+    `todo`/`blocked` to `ready` and refuses a genuinely `triage`-status card outright, so the old call always
+    raised on the one card shape this function exists to handle (ASES-LED-03's known bug, spec/requirements.yaml).
+    `kanban_specify` hands the card's title/body to Hermes's auxiliary model, which either tightens them and
+    moves the card `triage` -> `todo` (never straight to `ready`: ordinary `todo` -> `ready` promotion, via
+    `recompute_ready`/dependency satisfaction, takes it from there afterwards, the same as any other card), or
+    reports it could not make sense of the proposal. `author`, when given, is the name recorded on Hermes's own
+    audit comment for the specify call; it is unrelated to `reason`, which is ASES's own audit text below.
+
+    On a `SpecifyResult` with `ok=True`: record_decision(conn, project, card_id, Decision.PROMOTE, reason=reason,
+    raised_by_task=raised_by_task) runs exactly as before -- `reason` here is ASES's OWN audit reason for its
+    events table; it is never sent to Hermes, since `kanban_specify` takes no reason argument, only `author`. On
+    a `SpecifyResult` with `ok=False`: raises TriageError naming Hermes's own reason verbatim (never invented
+    here) and records NOTHING, matching every other refusal path in this module (a refusal leaves the card
+    untouched, including archive_card's and this function's own validate() refusal above).
+
+    `force=True` still bypasses ONLY this module's OWN validate() check above; it does NOT and CANNOT bypass
+    Hermes's own auxiliary-model judgment inside `specify`. If Hermes says no (`SpecifyResult.ok=False`),
+    `force=True` does not help: this is a real change in what `force` means here since round 6, whose docstring
+    implied `force` always got the card promoted -- that is no longer true now that a second, Hermes-side
+    judgment sits in the path after ASES's own check."""
     if not force:
         result = validate(board, card_id, conn=conn, plan=plan, known_roles=known_roles)
         if not result.ok:
@@ -389,7 +416,9 @@ def promote_card(
                 f"card {card_id} refused: " + "; ".join(result.problems)
                 + " (a human can override this with force=True)"
             )
-    hermes_mod.kanban_promote(board, card_id, reason=reason)
+    outcome = hermes_mod.kanban_specify(board, card_id, author=author)
+    if not outcome.ok:
+        raise TriageError(f"card {card_id} refused by hermes kanban specify: {outcome.reason or 'no reason given'}")
     record_decision(conn, project, card_id, Decision.PROMOTE, reason=reason, raised_by_task=raised_by_task)
 
 

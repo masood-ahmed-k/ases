@@ -427,6 +427,46 @@ def _check_limits_table(models_config: dict) -> DoctorCheck:
     return DoctorCheck("limits_displayed", "pass", "; ".join(lines), ("ASES-CAP-01",))
 
 
+def _check_key_pooling(models_config: dict) -> DoctorCheck:
+    """ASES-CFG-02/CFG-03 (section 10.2, verified_by: Inspection): both requirements are genuinely about the
+    user's account-management behaviour, which ASES has no way to enforce (it cannot know whether two
+    provider entries share a real-world account). What IS buildable from ASES's own config: two or more
+    provider entries in config/models.yaml pointing at the same `key_env` (the NAME of the environment
+    variable that holds the key, docs/operations.md section 7.2 -- ASES never holds the value) is a signal of
+    exactly the "same-account key pool" anti-pattern the requirement warns about, because two DIFFERENT
+    providers sharing one key are, in the case that matters, the same account under two names.
+
+    A single provider used by several profiles (a coder and a reviewer both drawing on one OpenRouter key) is
+    normal and is explicitly NOT what this warns about, so only a key_env shared ACROSS providers counts.
+    Always a WARN, never a FAIL: two providers can legitimately share a key without being the pool this
+    requirement means (Inspection, not a machine-checkable fact), and the row names only the key_env NAME
+    (the same thing config/models.yaml itself shows), never a secret value -- it passes
+    _check_no_secrets_in_output the same as every other row."""
+    by_key_env: dict[str, list[str]] = {}
+    for name, entry in (models_config.get("providers") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        key_env = entry.get("key_env")
+        if not key_env:  # None (served anonymously, e.g. opencode_free) or empty: nothing to pool
+            continue
+        by_key_env.setdefault(str(key_env), []).append(str(name))
+    pooled = {key: sorted(names) for key, names in by_key_env.items() if len(names) > 1}
+    if not pooled:
+        return DoctorCheck(
+            "key_pooling", "pass",
+            "no two providers in config/models.yaml share the same key_env",
+            ("ASES-CFG-02", "ASES-CFG-03"),
+        )
+    detail = "; ".join(f"{key}: {', '.join(names)}" for key, names in sorted(pooled.items()))
+    return DoctorCheck(
+        "key_pooling", "warn",
+        f"provider(s) share a key_env in config/models.yaml, a same-account key-pool signal -- prefer one "
+        f"key per provider and several distinct real providers instead, never a shared key across provider "
+        f"names (ASES-CFG-02/CFG-03, docs/operations.md): {detail}",
+        ("ASES-CFG-02", "ASES-CFG-03"),
+    )
+
+
 def _check_no_secrets_in_output(report_text_so_far: str) -> DoctorCheck:
     import os
     secret_env_names = [
@@ -462,6 +502,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> Doctor
         *([profiles_unavailable] if profiles_unavailable is not None
           else _check_profile_state(project, models_config, profiles_mod)),
         _check_limits_table(models_config),
+        _check_key_pooling(models_config),
     ]
     # The secrets check needs to see everything decided above it, so it runs last, over the detail text
     # of every other check plus the raw hermes doctor output already folded into hermes_doctor's detail.

@@ -1,9 +1,11 @@
 """triage.py: agent-proposed cards in triage, validated and promoted or archived (ASES-LED-03).
 
-The four hermes kanban functions it uses (list, show, promote, archive) are faked over an in-memory board, and
+The four hermes kanban functions it uses (list, show, specify, archive) are faked over an in-memory board, and
 the database is a temp sqlite file with plan_tasks rows inserted directly, so nothing here touches a real board,
-a real card or a provider. Real Hermes 0.21.3 facts this fake matches (read from the installed
-hermes-agent source, 2026-09-21, read-only, never run):
+a real card or a provider: FakeBoard.kanban_specify never calls an auxiliary model, it only returns a scripted
+hermes.SpecifyResult (round 7, r7_rules.md: promote_card's one real, live call happens only when a user actually
+runs it for real, never in a test). Real Hermes 0.21.3 facts this fake matches (read from the installed
+hermes-agent source, 2026-09-21 and 2026-09-22, read-only, never run):
 
   - A dispatcher-spawned WORKER can call the `kanban_create` tool itself, in-process
     (tools/kanban_tools.py:_handle_create, registered with _check_kanban_mode, NOT in
@@ -15,6 +17,10 @@ hermes-agent source, 2026-09-21, read-only, never run):
     caller's OWN kanban_create call passes the separate boolean `triage=True`. hermes_cli/kanban_db.py's
     VALID_INITIAL_STATUSES = {"running", "blocked"} does not even include "triage" as a legal initial_status
     value. See test_the_real_worker_side_proposal_mechanism_is_documented below.
+  - `hermes kanban specify <id> [--author] --json`, for a single (non --all) task id, prints
+    {"task_id", "ok", "reason", "new_title"} as one JSON line on stdout either way, then exits 0 when ok is
+    true and 1 when ok is false (hermes_cli/kanban.py:_run_triage_sweep); it moves a card triage -> todo, never
+    straight to ready (hermes_cli/kanban_db.py:specify_triage_task). FakeBoard.kanban_specify mirrors both.
 """
 import copy
 import json
@@ -80,22 +86,27 @@ def _card(
 
 
 class FakeBoard:
-    """hermes.kanban_list, kanban_show, kanban_promote and kanban_archive over a dict of cards, installed with
+    """hermes.kanban_list, kanban_show, kanban_specify and kanban_archive over a dict of cards, installed with
     monkeypatch. `calls` records every call in order.
 
-    kanban_promote moves a card to "ready" (Hermes: "Promote a todo/blocked card to ready"); kanban_archive
-    moves every card given to "archived" (soft: the card stays in `cards`, matching hermes.kanban_archive's own
-    "Hermes keeps them"). Fill `unreadable` or `list_error`/`promote_error`/`archive_error` to make Hermes
-    misbehave."""
+    kanban_specify moves a card to "todo", never straight to "ready" (Hermes's own specify_triage_task:
+    triage -> todo, ordinary todo -> ready promotion happens afterwards, the same as any other card), and
+    returns a scripted hermes.SpecifyResult(ok=True, reason="specified", new_title=None) by default, matching
+    Hermes's own real reason text on success; kanban_archive moves every card given to "archived" (soft: the
+    card stays in `cards`, matching hermes.kanban_archive's own "Hermes keeps them"). Fill `unreadable` or
+    `list_error`/`specify_error`/`archive_error` to make Hermes misbehave outright (an exception), or set
+    `specify_result` to a hermes.SpecifyResult to script a normal ok=True/ok=False outcome without an
+    exception (the round 7 distinction promote_card exists to make: see hermes.kanban_specify's docstring)."""
 
     def __init__(self, monkeypatch, *cards):
         self.cards = {card["id"]: card for card in cards}
         self.calls = []
         self.unreadable = set()
         self.list_error = None
-        self.promote_error = None
+        self.specify_error = None
+        self.specify_result = None
         self.archive_error = None
-        for name in ("kanban_list", "kanban_show", "kanban_promote", "kanban_archive"):
+        for name in ("kanban_list", "kanban_show", "kanban_specify", "kanban_archive"):
             monkeypatch.setattr(hermes, name, getattr(self, name))
 
     def kanban_list(self, board, *, status=None, assignee=None):
@@ -113,11 +124,14 @@ class FakeBoard:
             raise hermes.HermesCommandError(["kanban", "show", card_id], 1, "no such card")
         return copy.deepcopy(self.cards[card_id])
 
-    def kanban_promote(self, board, card_id, reason=None):
-        self.calls.append(("promote", card_id, reason))
-        if self.promote_error:
-            raise self.promote_error
-        self.cards[card_id]["status"] = "ready"
+    def kanban_specify(self, board, card_id, *, author=None, timeout=120):
+        self.calls.append(("specify", card_id, author))
+        if self.specify_error:
+            raise self.specify_error
+        if self.specify_result is not None:
+            return self.specify_result
+        self.cards[card_id]["status"] = "todo"
+        return hermes.SpecifyResult(ok=True, reason="specified", new_title=None)
 
     def kanban_archive(self, board, card_ids):
         self.calls.append(("archive", list(card_ids)))
@@ -366,18 +380,45 @@ def test_a_structured_proposal_with_bad_touches_or_acceptance_is_rejected(monkey
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_promote_card_calls_hermes_then_records_the_decision_and_bumps_lineage(conn, monkeypatch):
+def test_promote_card_calls_kanban_specify_then_records_the_decision_and_bumps_lineage(conn, monkeypatch):
     _seed_task(conn, "T1", "w_1", "m_1")
     board = FakeBoard(monkeypatch, _card("x_1", "T1: a"))
 
-    triage.promote_card("b", "x_1", conn=conn, project="p1", raised_by_task="T1", reason="looks good")
+    triage.promote_card("b", "x_1", conn=conn, project="p1", raised_by_task="T1", reason="looks good", author="lead")
 
-    assert board.calls == [("show", "x_1"), ("promote", "x_1", "looks good")]
-    assert board.cards["x_1"]["status"] == "ready"
+    # "looks good" is ASES's own audit reason (goes to record_decision's events row below); it is never sent
+    # to hermes.kanban_specify, which takes no reason argument, only author.
+    assert board.calls == [("show", "x_1"), ("specify", "x_1", "lead")]
+    assert board.cards["x_1"]["status"] == "todo"  # specify lands in todo, not ready: see promote_card's docstring
     (decided,) = _payloads(conn, "triage_decision")
     assert decided == {"card_id": "x_1", "decision": "promote", "reason": "looks good", "raised_by_task": "T1"}
     lineage = recovery.load_lineage(conn, "p1", "T1")
     assert lineage.infra_failures == 1
+
+
+def test_promote_card_without_an_author_omits_it_from_the_hermes_call(conn, monkeypatch):
+    board = FakeBoard(monkeypatch, _card("x_1", "T1: a"))
+
+    triage.promote_card("b", "x_1", conn=conn, project="p1")
+
+    assert ("specify", "x_1", None) in board.calls
+
+
+def test_promote_card_raises_when_hermes_specify_declines_and_records_nothing(conn, monkeypatch):
+    """Hermes's own auxiliary-model judgment said no (SpecifyResult.ok=False): promote_card raises TriageError
+    naming Hermes's own reason verbatim, and leaves the card and the audit trail untouched, the same as any
+    other refusal path in this module."""
+    _seed_task(conn, "T1", "w_1", "m_1")
+    board = FakeBoard(monkeypatch, _card("x_1", "T1: a"))
+    board.specify_result = hermes.SpecifyResult(ok=False, reason="LLM returned an empty response", new_title=None)
+
+    with pytest.raises(TriageError, match="LLM returned an empty response"):
+        triage.promote_card("b", "x_1", conn=conn, project="p1", raised_by_task="T1")
+
+    assert board.cards["x_1"]["status"] == "triage"
+    assert _payloads(conn, "triage_decision") == []
+    lineage = recovery.load_lineage(conn, "p1", "T1")
+    assert lineage.infra_failures == 0
 
 
 def test_promote_card_with_no_raised_by_task_never_touches_lineage(conn, monkeypatch):
@@ -399,7 +440,7 @@ def test_promote_card_refuses_an_invalid_proposal_and_leaves_the_card_untouched(
     with pytest.raises(TriageError, match="x_1"):
         triage.promote_card("b", "x_1", conn=conn, project="p1")
 
-    assert board.names() == ["show"]  # validate's own read only, no promote call
+    assert board.names() == ["show"]  # validate's own read only, no specify call
     assert board.cards["x_1"]["status"] == "triage"
     assert _payloads(conn, "triage_decision") == []
 
@@ -409,8 +450,22 @@ def test_promote_card_force_bypasses_a_validation_refusal(conn, monkeypatch):
 
     triage.promote_card("b", "x_1", conn=conn, project="p1", force=True)
 
-    assert board.cards["x_1"]["status"] == "ready"
-    assert ("promote", "x_1", None) in board.calls
+    assert board.cards["x_1"]["status"] == "todo"
+    assert ("specify", "x_1", None) in board.calls
+
+
+def test_promote_card_force_bypasses_validate_but_not_a_hermes_side_decline(conn, monkeypatch):
+    """force=True only skips THIS module's own validate() check; it cannot make Hermes's own auxiliary-model
+    judgment inside specify say yes. This is a real behavior change from round 6, whose docstring implied
+    force always got the card promoted."""
+    board = FakeBoard(monkeypatch, _card("x_1", "T1: a", body=""))  # would fail ASES's own validate() too
+    board.specify_result = hermes.SpecifyResult(ok=False, reason="task is not in triage (status='todo')", new_title=None)
+
+    with pytest.raises(TriageError, match="task is not in triage"):
+        triage.promote_card("b", "x_1", conn=conn, project="p1", force=True)
+
+    assert board.names() == ["specify"]  # force skipped validate()'s own "show" read entirely
+    assert _payloads(conn, "triage_decision") == []
 
 
 def test_promote_card_forwards_plan_and_known_roles_to_validate(conn, monkeypatch):

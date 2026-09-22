@@ -240,6 +240,88 @@ def test_no_secrets_check_passes_when_clean(monkeypatch):
     assert check.status == "pass"
 
 
+# --- ASES-CFG-02/CFG-03: same-account key pooling, detected as a shared key_env across providers -----------
+
+
+def test_key_pooling_passes_when_no_two_providers_share_a_key_env():
+    models_config = {
+        "providers": {
+            "a": {"key_env": "A_API_KEY"},
+            "b": {"key_env": "B_API_KEY"},
+            "anonymous": {"key_env": None},  # served with no key at all (opencode_free): never flagged
+        },
+    }
+
+    check = doctor._check_key_pooling(models_config)
+
+    assert check.status == "pass"
+    assert check.requirement_ids == ("ASES-CFG-02", "ASES-CFG-03")
+
+
+def test_key_pooling_warns_when_two_different_providers_share_a_key_env():
+    models_config = {
+        "providers": {
+            "openrouter": {"key_env": "SHARED_KEY"},
+            "some-other-router": {"key_env": "SHARED_KEY"},
+            "unpooled": {"key_env": "UNPOOLED_API_KEY"},
+        },
+    }
+
+    check = doctor._check_key_pooling(models_config)
+
+    assert check.status == "warn"  # advisory only, never a FAIL: Inspection, not a machine-checkable fact
+    assert "SHARED_KEY" in check.detail
+    assert "openrouter" in check.detail and "some-other-router" in check.detail
+    assert "unpooled" not in check.detail and "UNPOOLED_API_KEY" not in check.detail
+
+
+def test_key_pooling_does_not_flag_one_provider_used_by_multiple_profiles():
+    """A single provider is one config entry regardless of how many Hermes profiles draw on its key -- that
+    is normal (a coder and a reviewer both on the same OpenRouter key) and is explicitly not what
+    ASES-CFG-02/03 warns about; only a key_env shared ACROSS DIFFERENT provider entries counts."""
+    models_config = {"providers": {"openrouter": {"key_env": "OPENROUTER_API_KEY"}}}
+
+    check = doctor._check_key_pooling(models_config)
+
+    assert check.status == "pass"
+
+
+def test_key_pooling_never_prints_a_secret_value(monkeypatch):
+    monkeypatch.setenv("SHARED_KEY", "totally-secret-value-123")
+    models_config = {"providers": {
+        "a": {"key_env": "SHARED_KEY"}, "b": {"key_env": "SHARED_KEY"},
+    }}
+
+    check = doctor._check_key_pooling(models_config)
+    no_secrets = doctor._check_no_secrets_in_output(check.detail)
+
+    assert check.status == "warn"
+    assert "totally-secret-value-123" not in check.detail  # only the key_env NAME is shown, never its value
+    assert no_secrets.status == "pass"
+
+
+def test_key_pooling_is_wired_into_the_report_and_warns_on_a_real_pool(tmp_path, monkeypatch):
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    pooled_models_config = {
+        **MODELS_CONFIG,
+        "providers": {
+            **MODELS_CONFIG["providers"],
+            "unorouter-2": {"key_env": "SHARED_KEY", "data_policy": "unknown"},
+            "unorouter-3": {"key_env": "SHARED_KEY", "data_policy": "unknown"},
+        },
+    }
+    models.sync_from_config(conn, pooled_models_config)
+
+    report = doctor.run(project, pooled_models_config, conn)
+
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["key_pooling"].status == "warn"
+    assert "unorouter-2" in by_name["key_pooling"].detail and "unorouter-3" in by_name["key_pooling"].detail
+    assert report.checks[-1].name == "no_secrets_in_output"  # the secrets check still runs last
+
+
 # --- the rows other modules feed: profiles.verify_state and sandbox.doctor_checks ---------------------------
 
 

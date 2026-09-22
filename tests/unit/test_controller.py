@@ -37,6 +37,22 @@ def _round5_steps_are_inert(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _empty_board_lineage_by_default(monkeypatch):
+    """Round 7 (ASES-REC-03, bug 1): create_cards_from_plan's board-native fallback
+    (controller._board_current_work_card) reads hermes.kanban_show and calls hermes.kanban_link whenever a
+    task's plan_tasks row does not exist yet -- which is every ordinary FIRST-time card creation too (a fresh
+    plan_tasks table has no row for any task yet), not only the database-deleted recovery scenario the fix
+    targets, and not only in tests that call create_cards_from_plan directly: _setup_one_task and similar
+    helpers below call it internally, before the test gets a chance to install its own kanban_show/kanban_link.
+    An empty lineage here (no fix or retry card exists) is the correct default for a task nothing has been
+    done to yet, matching every test in this file that predates round 7. A test about the board-lineage
+    fallback itself, or about kanban_show/kanban_link for some other reason, replaces this with its own
+    monkeypatch.setattr call afterward, which simply overrides it for that test."""
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: {"id": cid, "_parents": []})
+    monkeypatch.setattr(hermes, "kanban_link", lambda board, parent, child: None)
+
+
+@pytest.fixture(autouse=True)
 def _post_merge_check_passes(monkeypatch):
     """Round 6 (ASES-GIT-05): process_merge_queue re-runs Gate 3 on the new integration HEAD right after a real
     merge. Every test below that is not about it gets a stub that always passes, so a scripted MergeOutcome's
@@ -158,6 +174,7 @@ def test_create_cards_from_plan_wires_dependencies_on_merge_cards(tmp_path, monk
     conn = db.connect(tmp_path / "ases.db")
     counter = _FakeCounter()
     created = []
+    links = []
 
     def fake_create(board, title, **kwargs):
         card = {"id": counter.next_id("t"), "title": title, **kwargs}
@@ -165,6 +182,7 @@ def test_create_cards_from_plan_wires_dependencies_on_merge_cards(tmp_path, monk
         return card
 
     monkeypatch.setattr(hermes, "kanban_create", fake_create)
+    monkeypatch.setattr(hermes, "kanban_link", lambda board, parent, child: links.append((parent, child)))
 
     pairs = controller.create_cards_from_plan(
         "b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn
@@ -175,11 +193,15 @@ def test_create_cards_from_plan_wires_dependencies_on_merge_cards(tmp_path, monk
     # T2's work card depends on T1's MERGE card, not T1's work card (ASES-TSK-02).
     t2_work = next(c for c in created if c["title"].startswith("T2:") and "merge" not in c["title"])
     assert t2_work["parent"] == [t1.merge_card_id]
-    # merge cards are created scratch, blocked, parented to their own work card.
+    # merge cards are created scratch, blocked. A genuinely new task's merge card has no board history yet
+    # (round 7 bug 1's _board_current_work_card sees an empty lineage), so it is created first with no
+    # parent, and its own work card is wired to it with an explicit kanban_link afterward rather than a
+    # parent= argument at creation time -- the same end state (the merge card's own parent is its work
+    # card) either way, which is what this checks.
     t1_merge = next(c for c in created if c["title"] == "T1: merge")
-    assert t1_merge["parent"] == [t1.work_card_id]
     assert t1_merge["initial_status"] == "blocked"
     assert t1_merge["workspace"] == "scratch"
+    assert (t1.work_card_id, t1.merge_card_id) in links
 
 
 def test_create_cards_from_plan_assigns_correct_profile(tmp_path, monkeypatch):
@@ -296,6 +318,187 @@ def _plan_task_row(conn, plan, task_key):
         "SELECT work_card_id, merge_card_id, fix_cards FROM plan_tasks WHERE project = ? AND task_key = ?",
         (plan.project, task_key),
     ).fetchone()
+
+
+class _LineageBoard:
+    """A minimal board model rich enough for the round 7 bug 1 tests below (ASES-REC-03): idempotent,
+    archive-aware kanban_create (a repeated idempotency_key returns the newest NON-archived match, exactly
+    like ases.fakes.board.FakeHermes and, per hermes_cli/kanban_db.py, real Hermes), kanban_show with
+    `_parents` and `created_at`, kanban_link and kanban_archive. Everything else about a real board (workers,
+    dispatch, runs, ...) is irrelevant to create_cards_from_plan and is not modelled. created_at is a plain
+    counter, not a wall clock: only its ORDER matters to _board_current_work_card, per its own docstring."""
+
+    def __init__(self):
+        self.cards: dict[str, dict] = {}
+        self.links: list[tuple[str, str]] = []
+        self._seq = 0
+
+    def create(self, board, title, **kwargs):
+        key = kwargs.get("idempotency_key")
+        if key is not None:
+            matches = [c for c in self.cards.values()
+                       if c.get("idempotency_key") == key and c["status"] != "archived"]
+            if matches:
+                return dict(matches[-1])
+        self._seq += 1
+        card = {
+            "id": f"c{self._seq}", "title": title, "status": kwargs.get("initial_status") or "ready",
+            "created_at": self._seq, "idempotency_key": key,
+        }
+        self.cards[card["id"]] = card
+        for parent in kwargs.get("parent") or []:
+            self.links.append((parent, card["id"]))
+        return dict(card)
+
+    def show(self, board, card_id):
+        card = dict(self.cards[card_id])
+        card["_parents"] = [p for p, c in self.links if c == card_id]
+        return card
+
+    def link(self, board, parent_id, child_id):
+        self.links.append((parent_id, child_id))
+
+    def archive(self, board, card_ids):
+        for card_id in card_ids:
+            self.cards[card_id]["status"] = "archived"
+
+
+def _stub_lineage_board(monkeypatch):
+    fake = _LineageBoard()
+    monkeypatch.setattr(hermes, "kanban_create", fake.create)
+    monkeypatch.setattr(hermes, "kanban_show", fake.show)
+    monkeypatch.setattr(hermes, "kanban_link", fake.link)
+    monkeypatch.setattr(hermes, "kanban_archive", fake.archive)
+    return fake
+
+
+def test_board_current_work_card_reads_an_empty_lineage_as_a_genuinely_new_task(tmp_path, monkeypatch):
+    fake = _stub_lineage_board(monkeypatch)
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+
+    current_id, merge, fix_cards_seen = controller._board_current_work_card("b", "proj1", plan, "T1", conn=conn)
+
+    assert current_id is None and fix_cards_seen == 0
+    assert merge["title"] == "T1: merge" and merge["status"] == "blocked"
+    assert fake.show("b", merge["id"])["_parents"] == []
+
+
+def test_board_current_work_card_prefers_the_newest_non_archived_lineage_member(tmp_path, monkeypatch):
+    """The scenario builder-findings.md's AC-G report names: a fix card (never archived) and, layered on top
+    of it, a retry card that archives the fix card. created_at order (not id, not link order: see the
+    function's own docstring for why) must pick the retry card, and fix_cards_seen must count the fix card
+    even though it is no longer current."""
+    fake = _stub_lineage_board(monkeypatch)
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+
+    original = fake.create("b", "T1: scaffold", idempotency_key="ases-work-t3-T1")
+    merge = fake.create("b", "T1: merge", initial_status="blocked", idempotency_key="ases-merge-t3-T1")
+    fake.link("b", original["id"], merge["id"])
+    fix1 = fake.create("b", "T1: fix (round 1)", idempotency_key="ases-fix-t3-T1-1")
+    fake.link("b", fix1["id"], merge["id"])
+    retry1 = fake.create("b", "T1: retry 1", idempotency_key="ases-retry-t3-T1-1")
+    fake.link("b", retry1["id"], merge["id"])
+    fake.archive("b", [fix1["id"]])   # _start_fresh_attempt archives the card it replaces
+
+    current_id, merge_again, fix_cards_seen = controller._board_current_work_card(
+        "b", "proj1", plan, "T1", conn=conn)
+
+    assert current_id == retry1["id"]
+    assert merge_again["id"] == merge["id"]
+    assert fix_cards_seen == 1
+
+
+def test_reapprove_after_the_database_is_deleted_finds_a_fix_card_not_the_stale_original(tmp_path, monkeypatch):
+    """Round 7 bug 1, the first of the two cases builder-findings.md's AC-G report names (search
+    "ASES-PRV-01"... no, search "AC-G" for bug 1's origin per r7_wp_fixes.md): once the ASES database is
+    deleted (test 22.15's own scenario, "create twice ... and once more after deleting the ASES database"),
+    the plain "no existing row" path used to call kanban_create with the ORIGINAL work card's idempotency
+    key. Hermes's idempotency lookup happily finds it (a fix never archives the card it replaces), so
+    plan_tasks silently reverted to the STALE, superseded original -- no duplicate card, but wrong
+    bookkeeping, exactly test_22_15_a_fix_card_is_forgotten_after_the_database_is_deleted's own finding.
+    _board_current_work_card now asks the board instead."""
+    fake = _stub_lineage_board(monkeypatch)
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+
+    first = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+    t1 = next(p for p in first if p.task_key == "T1")
+
+    # Reproduce exactly what process_merge_queue's _handle_merge_failure does on a failed merge: a fix card,
+    # linked as an EXTRA parent of the merge card, plan_tasks repointed (the original is NEVER archived).
+    fix_card = fake.create(
+        "b", "T1: fix (round 1)", assignee="coder-1", workspace="worktree", branch="swarm/T1-fix1",
+        project="proj1", body="fix it", parent=[t1.work_card_id],
+        idempotency_key="ases-fix-t3-T1-1", max_retries=3, max_runtime="45m",
+    )
+    fake.link("b", fix_card["id"], t1.merge_card_id)
+    conn.execute(
+        "UPDATE plan_tasks SET fix_cards = fix_cards + 1, work_card_id = ? WHERE project = ? AND task_key = ?",
+        (fix_card["id"], plan.project, "T1"),
+    )
+    card_count_before = len(fake.cards)
+
+    conn.execute("DELETE FROM plan_tasks")   # what deleting the ASES database (test 22.15's scenario) leaves
+
+    third = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    assert len(fake.cards) == card_count_before   # the board still has each card exactly once: no duplicate
+    t1_third = next(p for p in third if p.task_key == "T1")
+    assert t1_third.work_card_id == fix_card["id"]        # the RIGHT card: the fix card, not the stale original
+    assert t1_third.work_card_id != t1.work_card_id
+    assert t1_third.merge_card_id == t1.merge_card_id
+    row = _plan_task_row(conn, plan, "T1")
+    assert row["work_card_id"] == fix_card["id"]
+    assert row["fix_cards"] == 1   # the budget counter is recovered from the board too, not reset to 0
+
+
+def test_reapprove_after_the_database_is_deleted_finds_a_retry_card_with_no_duplicate(tmp_path, monkeypatch):
+    """Round 7 bug 1's second, more serious case (builder-findings.md's AC-G report: "not directly exercised
+    by round 6's acceptance suite, only implied by reading the same code path"; r7_wp_fixes.md asks for a
+    test of this case specifically). _start_fresh_attempt ARCHIVES the card it replaces, so once the local
+    signals are silent, calling kanban_create with the ORIGINAL idempotency key no longer finds it (Hermes
+    ignores an archived card by key) and used to create a genuine SECOND, duplicate work card for the same
+    task. _board_current_work_card must ask the board BEFORE that call, not after: once a duplicate exists
+    there is no way to undo it."""
+    fake = _stub_lineage_board(monkeypatch)
+    plan = plan_mod.parse_and_validate(PLAN_RAW, known_roles=set(ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+
+    first = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+    t1 = next(p for p in first if p.task_key == "T1")
+
+    # Reproduce exactly what _start_fresh_attempt does on a capability failure: a retry card, linked as an
+    # EXTRA parent of the merge card, the OLD card archived, plan_tasks repointed.
+    retry_card = fake.create(
+        "b", "T1: retry 1", assignee="coder-1", workspace="worktree", branch="swarm/T1-retry1",
+        project="proj1", body="try again", parent=[],
+        idempotency_key="ases-retry-t3-T1-1", max_retries=3, max_runtime="45m",
+    )
+    fake.link("b", retry_card["id"], t1.merge_card_id)
+    fake.archive("b", [t1.work_card_id])
+    events.record(conn, "retry_card_created", {
+        "project": plan.project, "task_key": "T1", "old_card": t1.work_card_id, "new_card": retry_card["id"], "n": 1,
+    })
+    conn.execute(
+        "UPDATE plan_tasks SET work_card_id = ? WHERE project = ? AND task_key = ?",
+        (retry_card["id"], plan.project, "T1"),
+    )
+    card_count_before = len(fake.cards)
+
+    conn.execute("DELETE FROM plan_tasks")
+
+    third = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, _project(tmp_path), conn=conn)
+
+    # The real bug: the board used to gain a genuine second work card for T1 here.
+    assert len(fake.cards) == card_count_before
+    t1_third = next(p for p in third if p.task_key == "T1")
+    assert t1_third.work_card_id == retry_card["id"]
+    assert t1_third.work_card_id != t1.work_card_id
+    assert fake.cards[t1.work_card_id]["status"] == "archived"   # still archived, never resurrected
+    row = _plan_task_row(conn, plan, "T1")
+    assert row["work_card_id"] == retry_card["id"]
 
 
 def test_reapprove_keeps_the_fix_card_repoint(tmp_path, monkeypatch):

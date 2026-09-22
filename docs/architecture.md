@@ -954,6 +954,46 @@ for `triage.promote_card`, which needs a design decision first (does "promote" a
 `specify`/`decompose` auxiliary-model path, which `r2_rules.md` currently says ASES never runs on its own, or something else)
 rather than a mechanical patch.
 
+## Round 7, wave 1: the specify decision, three real bugs fixed, docs and policy scaffolding (2026-09-22)
+
+The user asked what was left to build, was told about the pending design question on `triage.promote_card` and the register's
+never-built items, and answered all three in one message: "option A" (ASES may call Hermes's own `specify`, only from
+`promote_card`), "fix all the bugs", and "build all" of the never-built list. Four builders ran (work orders
+`docs/work-orders/r7_rules.md` + `r7_wp_*.md`), still under the zero-quota rule for every test; one real Hermes call
+(`kanban_specify`) is now authorized in PRODUCT code, for the first time since that rule was set, narrowly and only from that one
+function. Two architect fixes landed directly (both small, both blocking, both found independently by two builders each): a gap in
+`FakeHermes` (it had no `kanban_specify` method, so adding the real wrapper broke every acceptance test until the fake caught up),
+and a regression the stricter data-policy check caused in `recovery.next_model` (it stopped passing the new required field, so it
+silently treated every switch-model candidate as unsafe for a private/confidential project). Suite: 5,478 passed, 2 skipped, 0 failed.
+
+- **SPECIFY** (`hermes.py`, `triage.py`): `hermes.kanban_specify`, confirmed against the real Hermes source down to the exact exit
+  code convention (an `ok: false` decline is exit code 1 with JSON still on stdout, not a zero-exit JSON field) and every real
+  failure reason string Hermes can return. `triage.promote_card` now actually works on a genuinely triage-status card, which it
+  never could before this round.
+- **FIXES** (`controller.py`, `recovery.py`): the fix/retry-card pointer no longer goes stale (or duplicates) after the ASES
+  database is deleted and cards are recreated -- `create_cards_from_plan` now asks the BOARD directly when its own bookkeeping is
+  silent, using the merge card's parent lineage disambiguated by each candidate's `created_at` (never by id or list order: real
+  Hermes card ids are random, only the fake board's happen to be sequential, which the builder's report flags precisely for
+  anyone building similar logic later). The per-pass budget gate now also checks the project's data class before dispatching a
+  card, parking a violation with its own reason prefix that is deliberately never auto-unparked. A card stuck `ready` after an
+  auth- or quota-shaped failure that never tripped Hermes's own retry breaker is no longer invisible to recovery.
+- **POLICY** (`cli.py`, `policy.py`, `config.py`, `doctor.py`): the Lead is now asked to write `docs/ases/contracts/`,
+  `docs/ases/decisions/` and `AGENTS.md` (confirmed, by reading the installed Hermes source, that it genuinely auto-loads
+  `AGENTS.md` at session start -- with the caveat that it is first-match-wins against `.hermes.md`/`HERMES.md`); a compatible
+  provider data-policy string is no longer enough on its own for a private/confidential project, an explicit, recorded
+  verification date is now required; `swarm doctor` warns when two different providers share the same key (never when one
+  provider serves several profiles).
+- **AC-D** (`tests/acceptance/test_22_8_merge_conflict.py`): the sixteenth and last blueprint acceptance scenario. Proved Gate 0's
+  overlap serialization, a real git-level merge conflict resolved by a fix card, and CORE's round 6 post-merge revert trigger,
+  including a full re-run of the real gate command against every commit in the final history to prove the integration branch is
+  green everywhere except the one seeded, verified-bad commit -- not assumed.
+
+Every "not_covered" row on the register the user asked to build is now `in_progress` except the two greenfield-bootstrapping rows
+(ASES-GIT-10/11), deliberately held for wave 2, since bootstrapping an empty repository needs `controller.py`/`cli.py`, which this
+wave already had in flight. Wave 2 (`r7_wp_wave2_roles.md`, already written) also fixes a related bug the investigation surfaced:
+six places in `controller.py` hardcode `role == "coder"`, which would silently mistreat a Tester role's card (no review, no merge,
+treated as a review-only no-op) the moment a project actually enables one.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of

@@ -2240,6 +2240,27 @@ class FakeHermes:
             self._add_comment(card_id, author or self.default_author, " ".join([text]).strip())
 
     @_controller_call
+    def kanban_specify(
+        self, board: str, card_id: str, *, author: str | None = None, timeout: int = 120,
+    ) -> "_hermes.SpecifyResult":
+        """`hermes.kanban_specify` reimplemented at the fake's own public-function boundary (round 7 fix): `install()`
+        replaces the whole real function, so this returns exactly the `SpecifyResult` shape the real one parses from
+        `specify --json`, never the `_Refused`/`HermesCommandError` machinery `_cli` gives every OTHER kanban wrapper.
+        A structural decline (unknown card, not in `triage`) is `ok=False` with the same reason string real Hermes
+        would print, returned normally, never raised -- matching `hermes.kanban_specify`'s own documented contract
+        that an `ok=False` outcome is a normal result, not a Hermes/infrastructure failure. There is no real
+        auxiliary model here, so a card that structurally CAN be specified always succeeds (`ok=True`, `new_title`
+        None: the fake never invents a retitle), which is the only outcome a test can usefully assert against."""
+        task = self._tasks.get(card_id)
+        if task is None:
+            return _hermes.SpecifyResult(ok=False, reason="unknown task id", new_title=None)
+        if task.status != "triage":
+            return _hermes.SpecifyResult(ok=False, reason=f"task is not in triage (status={task.status!r})", new_title=None)
+        task.status = "todo"
+        self._event(task.id, "specified", {"changed_fields": []})
+        return _hermes.SpecifyResult(ok=True, reason="specified", new_title=None)
+
+    @_controller_call
     def kanban_promote(self, board: str, card_id: str, reason: str | None = None) -> None:
         args = ["promote", card_id]
         if reason:

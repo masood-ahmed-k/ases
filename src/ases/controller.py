@@ -113,7 +113,18 @@ def create_cards_from_plan(
 
     A task that has had a fresh attempt (a `retry_card_created` event) keeps the work card plan_tasks names on a
     re-approve, and its original work card is not created again: that card was archived, and Hermes does not find an
-    archived card by its idempotency key, so the create would have made a duplicate."""
+    archived card by its idempotency key, so the create would have made a duplicate.
+
+    Round 7 (ASES-REC-03, bug 1): the guard above only works while the plan_tasks ROW ITSELF still exists, to
+    read fix_cards / _has_retry_card from. Deleting the ASES database (test 22.15's own scenario: create twice,
+    delete the database, create a third time) deletes that row too, so both local signals go silent even though a
+    fix or retry card may still be the task's real current card on the (unchanged) board. Falling into the `else`
+    branch there used to assume "no fix/retry card exists" and call kanban_create with the ORIGINAL idempotency
+    key, which is wrong two different ways: for a task with a FIX card (never archived), Hermes's idempotency
+    lookup still finds the original and plan_tasks silently reverts to the stale, superseded card; for a task with
+    a RETRY card (the original was archived by _start_fresh_attempt), the lookup finds nothing and a genuine
+    duplicate work card gets created. See `_board_current_work_card`'s own docstring for the board-native signal
+    this now asks instead, whenever the local row is missing or names no card."""
     pairs: dict[str, CardPair] = {}
     order = plan_mod.topological_order(plan)
     reviewer_profile = _reviewer_profile(project)
@@ -128,13 +139,18 @@ def create_cards_from_plan(
             existing = conn.execute(
                 "SELECT work_card_id FROM plan_tasks WHERE project = ? AND task_key = ?", (plan.project, key),
             ).fetchone()
+            merge = None
+            fix_cards_seed = 0
             if existing is not None and existing["work_card_id"] and _has_retry_card(conn, plan.project, key):
                 # A fresh attempt (_start_fresh_attempt) ARCHIVED the original work card and pointed plan_tasks at its
                 # replacement. Hermes ignores an archived card when it looks a key up, so creating "the original"
                 # again would make a duplicate work card, and the upsert below would forget the replacement. The
                 # task's current card is the one plan_tasks names, so that is what a re-approve keeps.
                 work = {"id": existing["work_card_id"]}
-            else:
+            elif existing is not None and existing["work_card_id"]:
+                # Unchanged fast path: the row exists and names a card, and the SQL upsert below's own CASE WHEN
+                # already protects a fix card's repoint once a plan_tasks row exists to read fix_cards from, so an
+                # ordinary idempotent create is safe here too.
                 work = hermes_mod.kanban_create(
                     board, f"{key}: {task.title}", assignee=assignee, workspace="worktree",
                     branch=f"swarm/{key}-{task.role}", project=project_id,
@@ -142,30 +158,114 @@ def create_cards_from_plan(
                     idempotency_key=f"ases-work-{plan.project}-{key}", max_retries=attempts,
                     max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
                 )
-            merge = hermes_mod.kanban_create(
-                board, f"{key}: merge", workspace="scratch", project=project_id,
-                body=f"Merge candidate for {key}. Controller-owned; never assigned to an agent.",
-                parent=[work["id"]], initial_status="blocked",
-                idempotency_key=f"ases-merge-{plan.project}-{key}",
-            )
+            else:
+                # The local signal is silent (row missing, or present but naming no card): ask the board instead
+                # of assuming "no fix/retry card exists" (round 7 bug 1, see the docstring above).
+                current_id, merge, fix_cards_seed = _board_current_work_card(board, project_id, plan, key, conn=conn)
+                if current_id is None:
+                    # Genuinely never created before: the merge card _board_current_work_card just made (or found
+                    # empty) has no parent yet, so the original work card is made and linked in explicitly, the
+                    # same end state the parent=[work["id"]] argument below gives the common case.
+                    work = hermes_mod.kanban_create(
+                        board, f"{key}: {task.title}", assignee=assignee, workspace="worktree",
+                        branch=f"swarm/{key}-{task.role}", project=project_id,
+                        body=_work_card_body(task, reviewer_profile), parent=parent_merge_ids or None,
+                        idempotency_key=f"ases-work-{plan.project}-{key}", max_retries=attempts,
+                        max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
+                    )
+                    hermes_mod.kanban_link(board, work["id"], merge["id"])
+                else:
+                    work = {"id": current_id}
+            if merge is None:
+                merge = hermes_mod.kanban_create(
+                    board, f"{key}: merge", workspace="scratch", project=project_id,
+                    body=f"Merge candidate for {key}. Controller-owned; never assigned to an agent.",
+                    parent=[work["id"]], initial_status="blocked",
+                    idempotency_key=f"ases-merge-{plan.project}-{key}",
+                )
             pairs[key] = CardPair(key, work["id"], merge["id"])
             # work_card_id is the task's CURRENT card: process_merge_queue repoints it at each fix card it
             # opens and bumps fix_cards in the same statement. A re-approve must not undo that, and it gets
             # the ORIGINAL work card id back from the idempotent create above, so the incoming id is only
-            # taken while no fix card has been spent for this task (2026-09-19 fix).
+            # taken while no fix card has been spent for this task (2026-09-19 fix). fix_cards_seed is 0 for
+            # every path except the board-derived one above, which seeds a freshly INSERTed row with the fix
+            # count the board lineage actually shows, instead of silently resetting that budget counter to
+            # zero (round 7 bug 1); it has no effect on the ON CONFLICT branch, which never touches fix_cards.
             conn.execute(
                 "INSERT INTO plan_tasks (project, task_key, work_card_id, merge_card_id, role, touches, "
-                "gate_profile, estimated_requests, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+                "gate_profile, estimated_requests, fix_cards, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "datetime('now')) "
                 "ON CONFLICT(project, task_key) DO UPDATE SET "
                 "work_card_id=CASE WHEN plan_tasks.fix_cards > 0 THEN plan_tasks.work_card_id "
                 "ELSE excluded.work_card_id END, "
                 "merge_card_id=excluded.merge_card_id",
                 (plan.project, key, work["id"], merge["id"], task.role,
-                 json.dumps(list(task.touches)), task.gate_profile, task.estimated_requests),
+                 json.dumps(list(task.touches)), task.gate_profile, task.estimated_requests, fix_cards_seed),
             )
             events.record(conn, "cards_created", {"task_key": key, "work": work["id"], "merge": merge["id"]})
 
     return list(pairs.values())
+
+
+def _board_current_work_card(
+    board: str, project_id: str, plan: plan_mod.Plan, key: str, *, conn,
+) -> tuple[str | None, dict, int]:
+    """ASES-REC-03 (round 7 bug 1): the board-native fallback create_cards_from_plan uses once the local
+    plan_tasks signals for a task have gone silent (the row is missing, typically because the ASES database
+    itself was deleted, or present but names no card). Returns (current_work_card_id, merge_card,
+    fix_cards_seen).
+
+    Every fix card (_handle_merge_failure) and retry card (_start_fresh_attempt) a task has ever had is linked
+    as an EXTRA parent of the task's MERGE card, alongside the original work card (create_cards_from_plan links
+    it there when the merge card is first made). The merge card's `_parents` is therefore the task's complete
+    card lineage, and the merge card itself is NEVER archived (only a work/fix/retry card is, in
+    _start_fresh_attempt), so its own idempotency key (ases-merge-<project>-<key>) is always safe to
+    fetch-or-create here with no risk of ever making a duplicate merge card.
+
+    This does NOT use `_parents`' order, or the card ids, to find "the newest" member: real Hermes ids are
+    `t_` + 4 random bytes (hermes_cli/kanban_db.py's `_new_task_id`, confirmed against the installed 0.21.3
+    source), and `kanban_show`'s `_parents` comes back `ORDER BY parent_id` (hermes_cli/kanban_db.py's
+    `_linked_ids`), alphabetic by id, not by creation time -- FakeHermes's own sequential `t_%08x` ids happen
+    to sort the same as they were created, which would make this look right against the fake while being wrong
+    against a real board. What every card dict DOES carry, on both, is its own `created_at`
+    (kanban_show/TASK_FIELDS): a fresh fix or retry card is always created strictly after the card it replaces,
+    and an archived card is always superseded by (so older than) whatever replaced it, so the lineage member
+    with the latest `created_at` is always the live one. A non-archived member is preferred when there is one
+    (the normal case); the whole lineage being archived should never happen given how _start_fresh_attempt only
+    ever archives the single card it is replacing, but the newest member overall is used rather than returning
+    nothing if it somehow did.
+
+    current_work_card_id is None when the merge card itself is genuinely new (nothing has ever been linked to
+    it): the caller creates the original work card itself, the same as it always has, and links it in.
+    fix_cards_seen is how many lineage members are titled like a fix card (create_cards_from_plan's own
+    "<key>: fix (round N)"), so a freshly INSERTed plan_tasks row can seed its fix_cards counter to match the
+    board's real history instead of silently resetting that budget to zero."""
+    merge = hermes_mod.kanban_create(
+        board, f"{key}: merge", workspace="scratch", project=project_id,
+        body=f"Merge candidate for {key}. Controller-owned; never assigned to an agent.",
+        initial_status="blocked", idempotency_key=f"ases-merge-{plan.project}-{key}",
+    )
+    lineage_ids = hermes_mod.kanban_show(board, merge["id"]).get("_parents") or []
+    if not lineage_ids:
+        return None, merge, 0
+
+    fix_title = re.compile(rf"^{re.escape(key)}: fix \(round \d+\)$")
+    fix_cards_seen = 0
+    best_id = best_at = None
+    newest_id = newest_at = None
+    for card_id in lineage_ids:
+        card = hermes_mod.kanban_show(board, card_id)
+        if fix_title.match(card.get("title") or ""):
+            fix_cards_seen += 1
+        at = _number(card.get("created_at"))
+        if newest_at is None or at >= newest_at:
+            newest_id, newest_at = card_id, at
+        if card.get("status") == "archived":
+            continue
+        if best_at is None or at >= best_at:
+            best_id, best_at = card_id, at
+    current_id = best_id if best_id is not None else newest_id
+    return current_id, merge, fix_cards_seen
 
 
 def _scope_lines(task: plan_mod.PlanTask) -> list[str]:
@@ -369,7 +469,7 @@ def process_budget_gate(
         if row is None:
             continue
         task = plan.task(row["task_key"])
-        ok, reason = _affordable_now(conn, task, models_config, budgets, review_afford)
+        ok, reason = _affordable_now(conn, task, models_config, budgets, review_afford, project)
         if not ok:
             hermes_mod.kanban_schedule(board, card["id"], reason)
             parked.append(task.key)
@@ -378,25 +478,57 @@ def process_budget_gate(
 
 
 # The reasons process_budget_gate parks a card with, which is how process_unpark knows a scheduled card is one of
-# ours: a card someone else scheduled (a person, a cron job) must never be unblocked by the controller.
+# ours: a card someone else scheduled (a person, a cron job) must never be unblocked by the controller. A
+# "data class:" park (ASES-PRV-01/03, round 7 bug 2) is DELIBERATELY not one of these, and must never be added
+# here: ASES-PRV-03 says the controller must never relax the project's data class to keep work flowing, so a
+# data-class park must never auto-resume the way a budget park does the moment some other provider's usage
+# frees up. process_unpark's prefix check below already excludes it correctly, just by _affordable_now using a
+# different prefix for it; keep it that way.
 _PARK_PREFIXES = ("budget:", "review budget")
 
 
 def _affordable_now(
     conn, task: plan_mod.PlanTask, models_config: dict, budgets: dict, review_afford=None,
+    project: ases_config.ProjectConfig | None = None,
 ) -> tuple[bool, str]:
     """ASES-CAP-03: (True, "") when this task's card may run now, else (False, the reason it is parked with).
 
-    Two questions, in this order: can the task's own provider afford its estimated requests (after the daily
-    reserve), and, for a coder task when `review_afford` is given, can the REVIEWER's provider afford the review
-    pass its finished work will need (usage.review_budget). A role with no pinned provider has nothing to check
-    and is affordable. The reasons start with `budget:` and `review budget`, which is what _PARK_PREFIXES matches.
+    Three questions, in this order: when `project` is given, is the task's resolved provider still safe for the
+    project's declared data_class (ASES-PRV-01, round 7 bug 2, checked first, mirroring Gate P's own order,
+    "enforced before any other routing rule"); can the task's own provider afford its estimated requests (after
+    the daily reserve); and, for a coder task when `review_afford` is given, can the REVIEWER's provider afford
+    the review pass its finished work will need (usage.review_budget). A role with no pinned provider has
+    nothing to check and is affordable. The reasons start with `budget:`, `review budget` or `data class:`, the
+    first two of which are what _PARK_PREFIXES matches (see the comment above it for why the third is not).
+
+    Round 7 (ASES-PRV-01, bug 2): cli.cmd_approve's Gate P check (_estimate_lines) only ever runs once, at
+    plan-approval time, so a provider that becomes (or, on a mis-approved plan, always was) unsafe for the
+    project's data_class was never re-checked once a card was actually about to run -- confirmed empirically by
+    round 6's ASES-PRV-01 finding: process_budget_gate called only policy.check_budget, never check_data_class.
+    When `project` is given this now asks policy.check_data_class the same way cmd_approve does, building
+    provider_policies/provider_verified_at from models_config["providers"] inline (the same
+    {name: p.get("data_policy")} / {name: p.get("data_policy_verified_at")} cmd_approve's own _estimate_lines
+    builds; models_config is already a parameter here, so no new one is threaded through just for this). A
+    DataPolicyViolation never raises past this function: it parks, exactly like an ordinary budget shortfall
+    does, through the same (bool, reason) shape the caller already handles.
 
     Shared by process_budget_gate (park a ready card) and process_unpark (release a parked one): one rule, so the
-    two can never disagree about the same card on the same ledger."""
+    two can never disagree about the same card on the same ledger. `project` is the same optional parameter
+    process_budget_gate already threads through for the review-budget half; process_unpark now passes it too, so
+    a data-class park is recognised by neither as anything it should ever resume."""
     pp = policy.profile_provider(task.role, models_config)
     if pp is None:
         return True, ""
+    if project is not None:
+        providers = models_config.get("providers", {})
+        provider_data_policy = (providers.get(pp.provider) or {}).get("data_policy")
+        provider_verified_at = (providers.get(pp.provider) or {}).get("data_policy_verified_at")
+        try:
+            policy.check_data_class(
+                project.data_class, pp.provider, provider_data_policy, verified_at=provider_verified_at,
+            )
+        except policy.DataPolicyViolation as exc:
+            return False, f"data class: {exc}"
     afford = policy.check_budget(
         conn, models_config["providers"], pp.provider, task.estimated_requests, budgets=budgets,
     )
@@ -1467,6 +1599,14 @@ def process_unpark(
     recomputed with the SAME code the gate uses (_affordable_now), and a card that is affordable now is unblocked
     with the reason "budget available again" and recorded as `card_unparked`. Returns the task keys unparked.
 
+    Round 7 (ASES-PRV-01/03, bug 2): a "data class:" park is DELIBERATELY excluded by the prefix check above (it
+    is not one of _PARK_PREFIXES, see the comment on it), so a card _affordable_now parked for its provider's data
+    policy is never even considered here, let alone unblocked: ASES-PRV-03 forbids relaxing the project's data
+    class to keep work flowing, and this loop's whole point is picking work back up automatically. `project` is
+    passed into _affordable_now below too (belt and braces, since a card that WAS parked for budget could in
+    principle also now fail the data-class check if the project's declared data_class or the provider's policy
+    changed underneath it), but the prefix check above is what actually keeps a data-class park untouched.
+
     A card that cannot be read or unblocked is recorded (unpark_error, once per message) and the rest carry on."""
     review_afford = usage_mod.review_budget(conn, models_config, project) if project is not None else None
     unparked = []
@@ -1481,7 +1621,7 @@ def process_unpark(
             reason = _latest_scheduled_reason(hermes_mod.kanban_show(board, card["id"]))
             if reason is None or not reason.lstrip().startswith(_PARK_PREFIXES):
                 continue
-            ok, _ = _affordable_now(conn, task, models_config, budgets, review_afford)
+            ok, _ = _affordable_now(conn, task, models_config, budgets, review_afford, project)
             if not ok:
                 continue
             hermes_mod.kanban_unblock(board, card["id"], reason="budget available again")

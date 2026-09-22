@@ -654,6 +654,27 @@ def test_plan_writes_the_prompt_with_the_absolute_paths_and_reports_the_file(wor
     assert "done" in out and f"wrote {world.plan_file.resolve()}" in out
 
 
+def test_plan_prompt_asks_the_lead_to_write_contracts_decisions_and_agents_md(world, monkeypatch):
+    """ASES-GIT-15 (section 8.5): 'Contracts and decisions therefore live in the repository ... an AGENTS.md
+    at the root, which Hermes loads automatically from the working directory.' A substring assertion is
+    enough here -- the prose belongs to the prompt, not to this test."""
+    prompts = []
+
+    def lead(repo, prompt):
+        prompts.append(prompt)
+        world.plan_file.write_text("{}", encoding="utf-8")
+        return cli._LeadResult(True, 0, "done")
+
+    monkeypatch.setattr(cli, "_run_lead", lead)
+
+    cli.main(["plan", "--repo", str(world.repo), "--request", "Build a todo app"])
+
+    (prompt,) = prompts
+    assert "docs/ases/contracts/" in prompt and "ASES-GIT-15" in prompt
+    assert "docs/ases/decisions/" in prompt
+    assert "AGENTS.md" in prompt
+
+
 def test_plan_exits_1_when_the_lead_wrote_no_plan(world, monkeypatch, capsys):
     world.plan_file.unlink()
     monkeypatch.setattr(cli, "_run_lead", lambda repo, prompt: cli._LeadResult(True, 0, "done"))
@@ -982,6 +1003,76 @@ def test_critique_output_is_ascii_for_reviewer_text(world, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------------------------
+# _scaffolding_warnings (ASES-GIT-15, section 8.5)
+# ---------------------------------------------------------------------------------------------
+
+
+def _write_contract(repo, name="api.md", text="boundary"):
+    d = repo / "docs" / "ases" / "contracts"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(text, encoding="utf-8")
+
+
+def _write_decision(repo, name="d1.md", text="decision"):
+    d = repo / "docs" / "ases" / "decisions"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(text, encoding="utf-8")
+
+
+def _write_agents_md(repo, text="This project builds a todo app."):
+    (repo / "AGENTS.md").write_text(text, encoding="utf-8")
+
+
+def test_scaffolding_warnings_is_empty_when_all_three_are_present(world):
+    _write_contract(world.repo)
+    _write_decision(world.repo)
+    _write_agents_md(world.repo)
+
+    assert cli._scaffolding_warnings(world.repo) == []
+
+
+def test_scaffolding_warnings_names_each_missing_path_never_refusing(world):
+    warnings = cli._scaffolding_warnings(world.repo)  # nothing written at all yet (world only seeds plan.json)
+
+    assert len(warnings) == 3
+    assert any("docs/ases/contracts/" in w and "ASES-GIT-15" in w for w in warnings)
+    assert any("docs/ases/decisions/" in w for w in warnings)
+    assert any("AGENTS.md" in w for w in warnings)
+
+
+def test_scaffolding_warnings_treats_an_empty_directory_as_missing(world):
+    (world.repo / "docs" / "ases" / "contracts").mkdir(parents=True)
+    (world.repo / "docs" / "ases" / "decisions").mkdir(parents=True)
+    _write_agents_md(world.repo)
+
+    warnings = cli._scaffolding_warnings(world.repo)
+
+    assert len(warnings) == 2
+    assert any("docs/ases/contracts/" in w for w in warnings)
+    assert any("docs/ases/decisions/" in w for w in warnings)
+
+
+def test_scaffolding_warnings_treats_an_empty_agents_md_as_missing(world):
+    _write_contract(world.repo)
+    _write_decision(world.repo)
+    (world.repo / "AGENTS.md").write_text("   \n", encoding="utf-8")
+
+    warnings = cli._scaffolding_warnings(world.repo)
+
+    assert len(warnings) == 1 and "AGENTS.md" in warnings[0]
+
+
+def test_scaffolding_warnings_reports_only_what_is_actually_missing(world):
+    _write_contract(world.repo)
+    _write_decision(world.repo)
+    # AGENTS.md is still missing
+
+    warnings = cli._scaffolding_warnings(world.repo)
+
+    assert len(warnings) == 1 and "AGENTS.md" in warnings[0]
+
+
+# ---------------------------------------------------------------------------------------------
 # approve (Gate P: ASES-REV-03, ASES-CTL-01)
 # ---------------------------------------------------------------------------------------------
 
@@ -1229,6 +1320,42 @@ def test_approve_refuses_a_provider_the_data_class_does_not_allow(world, monkeyp
     assert "Gate P REFUSED (ASES-PRV-01)" in _console(capsys)[1]
 
 
+def test_approve_refuses_a_private_plan_whose_provider_has_a_policy_but_no_verification_date(
+    world, monkeypatch, capsys,
+):
+    """ASES-PRV-04: xkiro's data_policy (no_training) is compatible with data_class=private on its own, but
+    MODELS_CONFIG never gives it a data_policy_verified_at, so Gate P must still refuse, and the message must
+    name the real, specific problem (no recorded verification date), not the unrelated policy string."""
+    calls = _approve_world(world, monkeypatch)
+    project = _project(world.tmp, data_class="private")
+    monkeypatch.setattr(cli, "_load_project", lambda: project)
+    _record_pass(world)
+
+    assert cli.main(_approve_argv(world, "--yes")) == 1
+
+    assert calls == []
+    err = _console(capsys)[1]
+    assert "Gate P REFUSED (ASES-PRV-01)" in err
+    assert "no recorded verification date" in err and "data_policy_verified_at" in err
+
+
+def test_approve_accepts_a_private_plan_once_every_provider_has_a_verified_policy(world, monkeypatch, capsys):
+    calls = _approve_world(world, monkeypatch)
+    project = _project(world.tmp, data_class="private")
+    monkeypatch.setattr(cli, "_load_project", lambda: project)
+    models_config = copy.deepcopy(MODELS_CONFIG)
+    models_config["providers"]["xkiro"]["data_policy_verified_at"] = "2026-09-19"
+    models_config["providers"]["openrouter"]["data_policy"] = "no_training"
+    models_config["providers"]["openrouter"]["data_policy_verified_at"] = "2026-09-19"
+    monkeypatch.setattr(cli, "_load_models_config", lambda: models_config)
+    _record_pass(world)
+
+    assert cli.main(_approve_argv(world, "--yes")) == 0
+
+    assert calls != []
+    assert "Gate P REFUSED" not in _console(capsys)[1]
+
+
 def test_approve_refuses_a_plan_the_days_quota_cannot_afford(world, monkeypatch, capsys):
     calls = _approve_world(world, monkeypatch)
     ledger.record_usage(world.conn, "openrouter", "review-model", n=50)  # the whole daily cap
@@ -1267,6 +1394,42 @@ def test_approve_prints_what_gate_0_serialized(world, monkeypatch, capsys):
     assert cli.main(_approve_argv(world, "--yes")) == 0
 
     assert "Gate 0 serialized T2 after T1" in _console(capsys)[0]
+
+
+def test_approve_prints_a_scaffolding_warning_for_each_missing_path_before_the_yes_no_prompt(
+    world, monkeypatch, capsys,
+):
+    calls = _approve_world(world, monkeypatch)
+    _record_pass(world)
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "y")
+
+    assert cli.main(_approve_argv(world)) == 0  # ASES-GIT-15 is Inspection: never a refusal
+
+    out, _ = _console(capsys)
+    lines = out.splitlines()
+    warning_lines = [i for i, line in enumerate(lines) if line.startswith("WARNING:")]
+    prompt_line_index = next(i for i, line in enumerate(lines) if "About to publish" in line)
+    assert len(warning_lines) == 3
+    assert all(i < prompt_line_index for i in warning_lines)  # shown before the y/N prompt, not after
+    assert any("docs/ases/contracts/" in lines[i] for i in warning_lines)
+    assert any("docs/ases/decisions/" in lines[i] for i in warning_lines)
+    assert any("AGENTS.md" in lines[i] for i in warning_lines)
+    assert bool(calls)  # it never refused the plan over this
+
+
+def test_approve_prints_no_scaffolding_warning_when_all_three_paths_are_present(world, monkeypatch, capsys):
+    _approve_world(world, monkeypatch)
+    _record_pass(world)
+    (world.repo / "docs" / "ases" / "contracts").mkdir(parents=True)
+    (world.repo / "docs" / "ases" / "contracts" / "api.md").write_text("x", encoding="utf-8")
+    (world.repo / "docs" / "ases" / "decisions").mkdir(parents=True)
+    (world.repo / "docs" / "ases" / "decisions" / "d1.md").write_text("x", encoding="utf-8")
+    (world.repo / "AGENTS.md").write_text("context for every worker", encoding="utf-8")
+
+    assert cli.main(_approve_argv(world, "--yes")) == 0
+
+    assert "WARNING:" not in _console(capsys)[0]
 
 
 # ---------------------------------------------------------------------------------------------

@@ -1076,3 +1076,180 @@ frozenset, captured once at import time (before any test's monkeypatching can ha
 frozen set instead of a live lookup. One regression test added (`test_fail_next_can_still_be_armed_after_install`), also checking
 that a real method of the fake that is NOT a hermes-module function (`card`) is still correctly rejected. `test_fakes.py`: 159 passed.
 `tests/acceptance/test_scenarios_demo.py`: 4 passed (unaffected). Full merged-tree suite run separately to confirm no wider impact.
+
+# Round 7 (2026-09-22): the specify wiring, three real bugs, docs/policy scaffolding, plus wave 2 queued
+
+Work orders: `r7_rules.md`, `r7_wp_*.md`. User decisions this round: "option A" for triage.promote_card (ASES may call Hermes's own
+`specify`, only from there), "fix all the bugs", "build all" of the never-built register items.
+
+## Package AC-D: acceptance 22.8 (merge conflict) (`tests/acceptance/test_22_8_merge_conflict.py`), done
+
+Built: Gate 0 serializing overlapping touches with no explicit depends_on (confirming ASES-GIT-08's real behavior for this exact
+shape); a real git-level conflict (two tasks with genuinely disjoint touches, one scripted with `fw.Do` to reset its branch to a
+stale base before committing, honestly simulating a race Gate 0's static check cannot see) getting a fix card as an extra PARENT of
+the merge card (confirmed `kanban_link(board, parent_id, child_id)` makes the fix card the parent, the merge card the child -- the
+opposite of what the builder first assumed) and merging cleanly afterward; a seeded post-merge failure caught by CORE's round 6
+`gate3-postmerge` re-check, reverted for real (`mergeq.revert_merge`), a fix card opened, and the integration branch proven green at
+every OTHER commit by re-running the real gate command against each one in `git log` (not assumed). 3 tests, deterministic across 12
+runs.
+
+Hardest part solved: pre-merge and post-merge Gate 3 for one task's OWN merge run the identical commands against the literal same
+commit SHA, so no git-content construction can force a genuine pre-pass/post-fail split for a single task's own merge. What
+genuinely changes between the two calls is one SQLite column (`merge_records.squash_commit`, NULL then set, exactly at the
+fast-forward); the seeded gate command reads that column from the real ASES database and only starts checking file content once it
+is set, modelling "Gate 3 was green a moment before a regression became visible" honestly, with the seeded-bad commit explicitly
+proven to fail the full-history green-walk (not a vacuous check).
+
+CONFIRMED BLOCKING GAP (found while AC-D was setting up, before it could run anything): `FakeHermes.install()` now fails for EVERY
+acceptance test, old and new alike, with `AttributeError: FakeHermes has no kanban_specify(): add it ... to ases.fakes.board`.
+Package SPECIFY (running in parallel this round) added `hermes.kanban_specify`, but its work order never mentioned
+`src/ases/fakes/board.py`, so nothing in round 7 is assigned to add the matching fake method. **This must be fixed (a
+`kanban_specify` method on `FakeHermes`) before any acceptance test, existing or new, can pass again.** AC-D worked around it with a
+scratch-only, never-shipped monkeypatch to verify its own logic, and left `board.py` untouched per the standing rule (report a
+needed change in someone else's file, never make it).
+
+Noticed: the blueprint's own text (ASES-GIT-09) describes a reconciliation card for a NEUTRAL profile with BOTH conflicting cards as
+parents for a true two-sided conflict; the real `_handle_merge_failure` only ever builds the simpler single-parent fix-card path.
+Not news: `spec/requirements.yaml`'s own ASES-GIT-09 row is already `partial` and already names this gap.
+
+## Package SPECIFY: kanban_specify wiring, Option A (`src/ases/hermes.py`, `src/ases/triage.py`), done
+
+Built: `hermes.SpecifyResult` (ok, reason, new_title) and `hermes.kanban_specify(board, card_id, *, author=None, timeout=120)`
+(120s default timeout, deliberately does NOT reuse `_kanban`/`_kanban_json` since a Hermes-side "no" from the auxiliary model is a
+NORMAL outcome on exit code 1 with parseable JSON, not a failure to raise on -- only an unparseable result or an unexpected exit
+code raises `HermesCommandError`); `triage.promote_card` now calls `kanban_specify` instead of the always-broken `kanban_promote`,
+gains an `author` parameter, records the promote decision only on `ok=True`, raises `TriageError` with Hermes's own reason on
+`ok=False` and records nothing, and `force=True` is now documented as bypassing only ASES's own `validate()`, never Hermes's
+auxiliary-model judgment. 68 new/changed tests in the two owned test files, both fully passing.
+
+Confirmed via the real Hermes source, with exact citations: `ok:false` is a NONZERO (1) CLI exit code with the JSON still on stdout,
+not a zero-exit JSON field (`kanban.py:1221-1222`); the exact field names (`task_id`, `ok`, `reason`, `new_title`,
+`kanban_output.py:81-82`); the real failure reason strings Hermes emits (`kanban_specify.py`: "unknown task id", "task is not in
+triage", "auxiliary client unavailable", "LLM error: <type>", "LLM returned an empty response", "LLM response missing title and
+body", "task moved out of triage before promotion" -- a race); and that NO CLI path exists for a manual title/body that skips the
+auxiliary model (`_triage_sweep_args` exposes only `task_id`, `--all`, `--tenant`, `--author`, `--json`) -- ASES's use is inherently
+auto/auxiliary-LLM only, confirming the user's decision was the only real option.
+
+Correction: the work order assumed the stale "ASES never calls specify" sentence was in `r2_rules.md`'s "What already exists"
+section; it is actually in `r5_rules.md:35`. SPECIFY added the authorized correction to `r2_rules.md` anyway (the first file every
+builder reads) but could not touch `r5_rules.md` (outside its file list) -- the architect should fix that sentence directly.
+
+CONFIRMED the blocking gap AC-D found independently: adding `hermes.kanban_specify` makes `FakeHermes.install()` raise
+`AttributeError` for every test that installs it (`board.py`'s own design: it fails loudly for any hermes.py function it has no
+matching method for), breaking 22 acceptance tests plus 3 `test_fakes.py` tests that assert full coverage. SPECIFY sketched the fix
+(a `kanban_specify` method on `FakeHermes`, modeled on `kanban_promote`/`_promote_task`, returning `ok=False` rather than raising
+`_Refused` for a normal decline) but did not apply it, since `fakes/board.py` is outside its file list. **Architect must fix this
+before anything else runs the acceptance suite.**
+
+Two failures in the full-suite run were confirmed NOT SPECIFY's: `test_policy.py` (4, a concurrent edit by package POLICY mid-run,
+confirmed by the renamed test functions already on disk) and `test_recovery.py` (1, owned by FIXES, not investigated per the
+standing rule).
+
+## Architect fix: FakeHermes.kanban_specify (`src/ases/fakes/board.py`), done
+
+Applied directly (small, well-specified by two independent builders: AC-D found the blocking gap, SPECIFY sketched the fix).
+`FakeHermes.kanban_specify(board, card_id, *, author=None, timeout=120) -> hermes.SpecifyResult`: an unknown card or one not in
+`triage` returns `ok=False` with the real Hermes reason string, WITHOUT raising (matching `hermes.kanban_specify`'s own contract
+that a decline is a normal result, not a `_Refused`/`HermesCommandError`-shaped failure -- the one wrapper this round that does NOT
+go through `_cli`'s exception machinery for its "no" case); a structurally valid triage card always succeeds (no real auxiliary
+model to consult), moving `triage` -> `todo` and recording a `specified` event. `test_fakes.py`: 159 passed (confirms
+`test_every_public_hermes_function_has_a_fake_with_the_same_signature` now covers it). Acceptance suite re-run in progress to
+confirm the 22 previously-broken tests are fixed.
+
+## Architect follow-up: kanban_specify fix confirmed against the acceptance suite, one stale test updated
+
+Re-ran `tests/acceptance/` after the `FakeHermes.kanban_specify` fix: 39 passed, 2 failed (down from the 22+9 broken by the gap).
+Both remaining failures are EXPECTED, not new bugs: they are round 6's own acceptance tests that were written to explicitly
+DOCUMENT the two bugs round 7 is fixing.
+- `test_22_15_finding_triage_promote_card_does_not_work_on_a_genuinely_triage_status_card` documented the exact
+  `triage.promote_card` bug SPECIFY just fixed (Option A). Since the fix already landed in the working tree, this test's premise is
+  now wrong. UPDATED directly (renamed to `test_22_15_promote_card_now_works_on_a_genuinely_triage_status_card`, asserts the FIXED
+  behavior: the card lands in `todo`, per real Hermes's own `kanban_specify` mechanism, not `ready`) and confirmed passing.
+- `test_22_16_the_per_pass_budget_gate_has_no_data_class_awareness_this_is_a_genuine_gap` documents the per-pass data-class gap
+  package FIXES is fixing (bug 2). Left UNCHANGED for now, since FIXES has not landed yet: once it does, this test needs the same
+  treatment (its `assert parked == []` will need to become `assert parked == ['T1']` with the right reason, since the gap it
+  documents will no longer exist). This is architect follow-up work, not any single round 7 package's job, since the file belongs
+  to round 6's (already committed) AC-G package.
+
+## Package FIXES: three real controller/recovery bugs (`controller.py`, `recovery.py` and their tests), done
+
+Built: `controller._board_current_work_card(board, project_id, plan, key, *, conn)` (asks the BOARD, not the ASES database, which
+card is a task's real current one, by reading the merge card's `_parents` lineage and each member's OWN `created_at` field -- see
+the critical finding below on why `created_at` and not id/list order); `create_cards_from_plan` uses it whenever the local
+`plan_tasks` row is missing or names no card (bug 1: fix and retry cards are no longer forgotten or duplicated after a database
+delete; it also recovers the `fix_cards` budget counter from board lineage, beyond the literal ask, since it's the same read).
+`_affordable_now` gains an optional `project` parameter and checks `policy.check_data_class` BEFORE the budget check, parking with
+a `"data class: ..."` reason on violation, deliberately kept OUT of `_PARK_PREFIXES` so `process_unpark` can never auto-resume a
+data-class park (bug 2: pinned by a dedicated test). `recovery._recover_task`'s gate widened: a `ready` card whose latest run is
+AUTH- or QUOTA-classified, past a 30-second settle window (`recovery.READY_RESPAWN_SETTLE_SECONDS`, reusing
+`INFRA_BACKOFF_BASE_SECONDS`), is now recovered exactly like a blocked one; every other failure kind on a `ready` card is left
+alone (bug 3). Each owned file run standalone: 128/128, 161/161, 296/297 (585/586; the one failure is POLICY's concurrent edit to
+`policy.check_data_class`, confirmed via `git stash` isolation to have zero of FIXES's own changes present, not investigated
+further per the standing rule).
+
+CRITICAL FINDING for anyone building board-native recovery logic in the future: real Hermes card ids are RANDOM
+(`"t_" + secrets.token_hex(4)`), not sequential, and `kanban_show`'s `_parents` comes back alphabetically by id, which only
+happens to equal creation order on the FAKE board (whose ids ARE sequential). A board-native "which card is current" reader that
+trusted id or parent-list order would pass every test against the fake and silently pick the WRONG card on a real board. FIXES's
+own `_board_current_work_card` deliberately uses each candidate's own `created_at` field instead, precisely to avoid this trap.
+
+Bug-specific answers: bug 1's board signal is the merge card's parent lineage, disambiguated by `created_at`; bug 2 never
+auto-unparks a data-class violation (separate prefix, deliberately excluded); bug 3's 30-second settle window reuses the existing
+infra-backoff base, and real Hermes's own `DEFAULT_CRASH_GRACE_SECONDS` independently agrees at 30s for a comparable judgment.
+
+Noticed, not fixed (both are stale-test-needs-updating items in round 6's AC-G file, `tests/acceptance/test_22_15_idempotent.py`,
+which no round 7 package owns):
+1. `test_22_15_a_fix_card_is_forgotten_after_the_database_is_deleted` builds its fix card with `parent=[t1.work_card_id]` but never
+   calls the `kanban_link(fix_card, merge_card)` step `_handle_merge_failure` always performs in reality -- the exact signal the
+   fix reads. Because the fixture is missing that link, the test still passes (falls back to the only lineage member) but no
+   longer genuinely exercises the fixed scenario. Needs the missing `kanban_link` call added to actually verify the fix.
+2. `test_22_16_the_per_pass_budget_gate_has_no_data_class_awareness_this_is_a_genuine_gap` (already flagged by the architect
+   above) needs updating now that bug 2 is fixed: `parked == []` should become `parked == ['T1']` with the `data class:` prefix.
+
+## Architect follow-up: the 22.16 data-class test updated now that FIXES's bug 2 has landed
+
+`test_22_16_the_per_pass_budget_gate_has_no_data_class_awareness_this_is_a_genuine_gap` documented exactly the gap FIXES just
+closed. Updated directly (renamed to `..._now_parks_a_card_whose_provider_turned_data_class_unsafe`, asserts the FIXED behavior:
+`parked == ["T1"]`, the card lands `scheduled` with a `"data class:"`-prefixed reason event, and a follow-up `process_unpark` call
+confirms it is NEVER auto-resumed, per ASES-PRV-03). Both this file and `test_22_15_idempotent.py` now pass in full.
+
+## Package POLICY: docs scaffolding, data-policy verification, key-pool doctor checks (`cli.py`, `policy.py`, `config.py`, `doctor.py`), done
+
+Built: `cli.cmd_plan`'s Lead prompt now asks for `docs/ases/contracts/`, `docs/ases/decisions/`, `AGENTS.md` (ASES-GIT-15);
+`cli._scaffolding_warnings(repo)` (WARN, never refuse, for each missing/empty path) printed by `cmd_approve` before the y/N prompt;
+`policy.check_data_class(..., *, verified_at=None)` now requires an explicit, non-empty `verified_at` for `private`/`confidential`
+(a compatible policy string alone is no longer enough -- ASES-PRV-04's "explicitly verified"), `public` unaffected;
+`config._validate_data_policy_verification_fields` (the two new optional provider fields, `data_policy_verified_at` an ISO date,
+`data_policy_source` a string, validated only when present); `doctor._check_key_pooling` (WARN when two DIFFERENT providers share a
+`key_env`, never flags one provider used by multiple profiles, never prints a secret value). `config/models.yaml` and
+`docs/operations.md` documented. 26 new/changed tests across four files, all passing standalone. Full suite (after the transient
+FIXES/SPECIFY collision cleared): 756 passed in the affected modules, 1 reproducible failure (below), confirmed to be a real
+consequence of this package's own change, correctly left for the architect since it needed `recovery.py` (owned by FIXES, already
+finished by the time this was found).
+
+CONFIRMED FACT (read from the installed Hermes source, with citations): Hermes DOES auto-load `AGENTS.md` from the working
+directory at session start (`agent/prompt_builder.py:1696`, `build_context_files_prompt()`; called from
+`agent/system_prompt.py:640-651`), exactly as the blueprint claims -- but it is FIRST-MATCH-WINS against `.hermes.md`/`HERMES.md`/
+`AGENTS.override.md`: if a project ever has one of those, its `AGENTS.md` is silently NOT loaded. Worth knowing for later.
+`key_env` (not `hermes_secret_ref`/`secret_ref`) is the real field name for "which environment variable holds this provider's key".
+
+CONFIRMED REGRESSION, not fixed by POLICY (needed `recovery.py`, owned by FIXES, already finished): `recovery.py`'s `next_model`
+calls `policy.check_data_class(data_class, provider, declared)` WITHOUT `verified_at`, so once POLICY's stricter check landed, EVERY
+candidate model is now treated as a violation for `private`/`confidential` projects, even a fully compatible one --
+`next_model` silently returns `None` instead of a real switch target, breaking
+`test_recovery.py::test_next_model_never_leaves_the_data_class_when_it_is_given_one`. Fix: thread `verified_at=
+(providers.get(provider) or {}).get("data_policy_verified_at")` into that call, mirroring the existing `declared =
+row.get("data_policy") or (providers.get(provider) or {}).get("data_policy")` fallback immediately above it. THIS IS A REAL BUG
+THAT MUST BE FIXED before committing round 7.
+
+Noticed, not fixed (out of scope for this package): `cli._estimate_lines` only reads the PROVIDER-level `data_policy`/
+`data_policy_verified_at`, never a per-model override (`models[].data_policy` can override the provider's policy per
+`docs/operations.md`); a separate, pre-existing gap.
+
+## Architect fix: recovery.next_model's ASES-PRV-04 regression (`src/ases/recovery.py`, `tests/unit/test_recovery.py`)
+
+Applied POLICY's own prescribed fix directly: `next_model` now threads `verified_at=(row or provider's own)
+data_policy_verified_at` into its `check_data_class` call, mirroring the existing `declared` policy-string fallback immediately
+above it. Updated `test_next_model_never_leaves_the_data_class_when_it_is_given_one`'s fixture to add a
+`data_policy_verified_at` field where the test expects a switch to succeed, and added one new assertion proving the reverse: a
+policy-compatible but UNVERIFIED candidate is correctly treated as unsafe, not silently allowed. `test_recovery.py`: 297 passed.

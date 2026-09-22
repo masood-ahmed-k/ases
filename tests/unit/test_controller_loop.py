@@ -664,12 +664,13 @@ def test_a_stopped_merge_is_not_a_failure_and_ends_the_queue_for_this_pass(tmp_p
     ready_to_merge(w, "T2")
     stub_check(monkeypatch)
     calls = script_merge(monkeypatch, _STOPPED)
+    w.board.calls.clear()  # setup's own card creation (round 7's board-lineage check) is not what this checks
 
     assert controller.process_merge_queue("b", w.repo, w.plan, w.project, conn=w.conn) == []
 
     assert [c["task_key"] for c in calls] == ["T1"]  # T2 was never attempted
     assert w.row("T1")["fix_cards"] == 0 and w.row("T1")["work_card_id"] == w.work("T1")
-    assert w.board.calls_of("kanban_create")[-1][1]["idempotency_key"].startswith("ases-merge-")  # no fix card
+    assert w.board.calls_of("kanban_create") == []  # no fix card
     assert "merge_failed" not in kinds(w.conn) and "fix_card_created" not in kinds(w.conn)
     (event,) = payloads(w.conn, "merge_stopped")
     assert event["task_key"] == "T1" and "kill switch" in event["detail"]
@@ -1111,7 +1112,10 @@ def test_a_fresh_attempt_does_the_bookkeeping_in_a_safe_order(tmp_path, monkeypa
 
     order = [name for name in w.board.writes()]
     assert order[-4:] == ["kanban_create", "kanban_link", "ingest", "kanban_archive"]
-    assert w.board.calls_of("kanban_link")[0][0] == ("b", new_id, w.merge())     # extra parent of the MERGE card
+    # [-1], not [0]: round 7's board-lineage check (bug 1) already linked each task's work card to its
+    # merge card during make_world's own setup, so this fresh attempt's own link is the LAST one, not the
+    # first, in the call log.
+    assert w.board.calls_of("kanban_link")[-1][0] == ("b", new_id, w.merge())     # extra parent of the MERGE card
     assert ingested == [(w.work(), "t3", "T1")]                                   # the OUTGOING card is ingested
     assert w.board.calls_of("kanban_archive")[0][0] == ("b", [w.work()])          # the OLD card is archived
     assert at_archive["work"] == w.work()                                         # ...before the repoint
@@ -1961,6 +1965,98 @@ def test_the_gate_and_unpark_agree_about_the_same_card(tmp_path, monkeypatch):
     w.conn.execute("DELETE FROM requests_ledger")             # the provider's day rolled over
     assert unpark(w, CAPPED_MODELS) == ["T1"]
     assert controller.process_budget_gate("b", w.plan, CAPPED_MODELS, conn=w.conn, budgets={}) == []
+
+
+# =============================================================================================================
+# _affordable_now, process_budget_gate and process_unpark: the data-class check (round 7, ASES-PRV-01/03, bug 2)
+# =============================================================================================================
+
+# xkiro's declared policy is not in policy._SAFE_FOR_PRIVATE (the same real fact test_recovery.py's MODELS
+# uses), so a coder pinned to it fails check_data_class for data_class="private" every time.
+UNSAFE_FOR_PRIVATE_MODELS = {
+    "providers": {"xkiro": {"data_policy": "router_ztr_upstream_varies"}},
+    "models": [{"provider": "xkiro", "model": "coder-m", "role_class": "coder", "pinned": True}],
+}
+
+
+def test_affordable_now_parks_for_a_data_class_violation_when_project_is_given(tmp_path, monkeypatch):
+    """ASES-PRV-01, confirmed empirically by round 6 (ASES-PRV-01 finding): before this fix,
+    process_budget_gate's per-pass check never looked at data_class at all, only budget."""
+    w = make_world(tmp_path, monkeypatch)
+    private_project = dataclasses.replace(w.project, data_class="private")
+
+    ok, reason = controller._affordable_now(
+        w.conn, coder_task(w), UNSAFE_FOR_PRIVATE_MODELS, {}, None, private_project)
+
+    assert ok is False
+    assert reason.startswith("data class: ")
+    assert "xkiro" in reason and "private" in reason
+
+
+def test_affordable_now_skips_the_data_class_check_when_project_is_not_given(tmp_path, monkeypatch):
+    """Backward compatible: `project` is a new, optional parameter, and every caller that has not been
+    updated to pass one (there is none left in this codebase, but a future one is possible) keeps the old
+    behaviour exactly, rather than refusing every card because it cannot resolve a data_class."""
+    w = make_world(tmp_path, monkeypatch)
+    assert controller._affordable_now(w.conn, coder_task(w), UNSAFE_FOR_PRIVATE_MODELS, {}) == (True, "")
+
+
+def test_affordable_now_checks_the_data_class_before_the_budget(tmp_path, monkeypatch):
+    """ASES-PRV-01: "enforced before any other routing rule", the same order Gate P's own cli.cmd_approve
+    check follows. A task that is BOTH unaffordable and data-class-unsafe is parked for the data-class
+    reason, not the budget one: the budget half is never even reached, let alone recorded."""
+    w = make_world(tmp_path, monkeypatch)
+    ledger.record_usage(w.conn, "xkiro", "coder-m", n=10_000)   # would also fail an ordinary budget check
+    private_project = dataclasses.replace(w.project, data_class="private")
+
+    ok, reason = controller._affordable_now(
+        w.conn, coder_task(w), UNSAFE_FOR_PRIVATE_MODELS, {}, None, private_project)
+
+    assert ok is False and reason.startswith("data class: ")
+
+
+def test_process_budget_gate_parks_a_card_whose_provider_fails_the_data_class(tmp_path, monkeypatch):
+    w = make_world(tmp_path, monkeypatch)
+    w.board.cards[w.work()]["status"] = "ready"
+    private_project = dataclasses.replace(w.project, data_class="private")
+
+    parked = controller.process_budget_gate(
+        "b", w.plan, UNSAFE_FOR_PRIVATE_MODELS, conn=w.conn, budgets={}, project=private_project)
+
+    assert parked == ["T1"]
+    assert w.board.cards[w.work()]["status"] == "scheduled"
+    (event,) = payloads(w.conn, "card_parked_for_budget")
+    assert event["task_key"] == "T1" and event["reason"].startswith("data class: ")
+
+
+def test_a_data_class_parked_card_is_never_unparked_even_once_it_would_be_affordable(tmp_path, monkeypatch):
+    """ASES-PRV-03 ("The controller MUST NOT relax the class to keep work flowing"): a "data class:" reason
+    is deliberately NOT one of controller._PARK_PREFIXES, so process_unpark's own prefix filter skips it
+    before ever asking _affordable_now again, the same way it already skips a card someone else scheduled.
+    MODELS here is an ordinary, affordable, data-class-irrelevant model set: if this card were EVER going to
+    be picked back up automatically, this is exactly the models argument that would do it."""
+    w = make_world(tmp_path, monkeypatch)
+    park(w, "T1", "data class: provider 'xkiro' (data_policy='router_ztr_upstream_varies') is not confirmed "
+                  "safe for data_class=private; needs one of ['local_only', 'no_training', 'zero_data_retention'], "
+                  "or use a local model")
+
+    assert unpark(w, MODELS) == []
+    assert w.board.cards[w.work()]["status"] == "scheduled"
+
+
+def test_unpark_does_not_resume_a_budget_park_that_has_since_become_data_class_unsafe(tmp_path, monkeypatch):
+    """Belt and braces (process_unpark's own docstring): a card parked for an ordinary budget reason still
+    passes the _PARK_PREFIXES filter, but if the project's data_class or the provider's policy changed
+    underneath it in the meantime, _affordable_now (given the same `project` process_unpark now threads
+    through) refuses it on the SECOND check too, so it is correctly left parked either way."""
+    w = make_world(tmp_path, monkeypatch)
+    park(w, "T1", "budget: exhausted")
+    private_project = dataclasses.replace(w.project, data_class="private")
+
+    assert controller.process_unpark(
+        "b", w.plan, UNSAFE_FOR_PRIVATE_MODELS, conn=w.conn, budgets=w.project.budgets, project=private_project,
+    ) == []
+    assert w.board.cards[w.work()]["status"] == "scheduled"
 
 
 # =============================================================================================================

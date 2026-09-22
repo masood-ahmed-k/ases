@@ -104,6 +104,79 @@ def test_load_models_config_returns_the_parsed_file_and_refuses_a_missing_one(tm
         config.load_models_config(tmp_path / "nope.yaml")
 
 
+# --- providers.<name>.data_policy_verified_at / data_policy_source (ASES-PRV-04) ----------------
+
+
+def test_data_policy_verification_fields_parse_when_present(tmp_path):
+    p = _write(tmp_path / "models.yaml", (
+        "providers:\n"
+        "  a:\n"
+        "    data_policy: no_training\n"
+        "    data_policy_verified_at: \"2026-09-19\"\n"
+        "    data_policy_source: \"https://example.com/privacy\"\n"
+        "models: []\n"
+    ))
+
+    raw = config.load_models_config(p)
+
+    assert raw["providers"]["a"]["data_policy_verified_at"] == "2026-09-19"
+    assert raw["providers"]["a"]["data_policy_source"] == "https://example.com/privacy"
+
+
+def test_data_policy_verification_fields_are_absent_safe(tmp_path):
+    """No data_policy_verified_at/data_policy_source at all: fine to load (a public-class project never
+    needs them; policy.check_data_class is what enforces them for private/confidential)."""
+    p = _write(tmp_path / "models.yaml", "providers:\n  a:\n    data_policy: unknown\nmodels: []\n")
+
+    raw = config.load_models_config(p)
+
+    assert raw["providers"]["a"].get("data_policy_verified_at") is None
+    assert raw["providers"]["a"].get("data_policy_source") is None
+
+
+def test_a_malformed_verification_date_is_a_config_error_naming_the_provider(tmp_path):
+    p = _write(tmp_path / "models.yaml", (
+        "providers:\n  a:\n    data_policy: no_training\n    data_policy_verified_at: not-a-date\nmodels: []\n"
+    ))
+
+    with pytest.raises(config.ConfigError, match="providers.a.data_policy_verified_at"):
+        config.load_models_config(p)
+
+
+def test_an_unquoted_yaml_date_is_refused_not_silently_accepted(tmp_path):
+    """An unquoted YAML date scalar parses as a datetime.date object, not a string: refused with a message
+    that tells the author to quote it, rather than silently doing the wrong thing."""
+    p = _write(tmp_path / "models.yaml", (
+        "providers:\n  a:\n    data_policy: no_training\n    data_policy_verified_at: 2026-09-19\nmodels: []\n"
+    ))
+
+    with pytest.raises(config.ConfigError, match="providers.a.data_policy_verified_at"):
+        config.load_models_config(p)
+
+
+def test_a_non_string_verification_source_is_a_config_error(tmp_path):
+    p = _write(tmp_path / "models.yaml", (
+        "providers:\n  a:\n    data_policy: no_training\n    data_policy_source: 12345\nmodels: []\n"
+    ))
+
+    with pytest.raises(config.ConfigError, match="providers.a.data_policy_source"):
+        config.load_models_config(p)
+
+
+def test_the_shipped_models_yaml_still_loads_and_documents_the_new_fields_as_comments(tmp_path):
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "config" / "models.yaml"
+    text = path.read_text(encoding="utf-8")
+    raw = config.load_models_config(path)
+
+    # documented as comments, not live values (a real verification date is a human decision, not this file's)
+    assert "data_policy_verified_at" in text and "data_policy_source" in text
+    for provider in raw["providers"].values():
+        assert provider.get("data_policy_verified_at") is None
+    assert text.isascii()
+
+
 def test_db_path_is_ases_db_under_ases_home(tmp_path):
     cfg = config.load_swarm_config(_write(tmp_path / "swarm.yaml", VALID_SWARM))
 

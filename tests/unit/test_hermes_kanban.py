@@ -165,3 +165,116 @@ def test_kanban_block_puts_the_kind_before_the_card_id_and_the_reason_after_a_do
         ["kanban", "--board", "b", "block", "--kind", "needs_input", "t_1", "--", "should we use A or B?"],
         ["kanban", "--board", "b", "block", "t_2", "--", "-x looks like a flag"],
     ]
+
+
+# ---------------------------------------------------------------------------------------------------------
+# kanban_specify (round 7): the one real auxiliary-model call this file makes, only from triage.promote_card.
+# Real shape confirmed by reading hermes_cli/kanban.py's _run_triage_sweep and hermes_cli/kanban_specify.py's
+# specify_task, 2026-09-22: a single (non --all) call prints {"task_id", "ok", "reason", "new_title"} as one
+# JSON line on stdout EITHER WAY, then exits 0 when ok is true and 1 when ok is false -- there is no zero-exit
+# ok:false case for a single task_id.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _fake_run_with_kwargs(monkeypatch, returncode, stdout, stderr=""):
+    """Installs hermes._run, returns a list that records (args, kwargs) for every call."""
+    seen = []
+
+    def fake_run(args, **kw):
+        seen.append((args, kw))
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(hermes, "_run", fake_run)
+    return seen
+
+
+def test_kanban_specify_argv_shape_with_author_and_json(monkeypatch):
+    seen = _fake_run_with_kwargs(
+        monkeypatch, 0, json.dumps({"task_id": "t_1", "ok": True, "reason": "specified", "new_title": "Fix the thing"}),
+    )
+
+    hermes.kanban_specify("b", "t_1", author="lead")
+
+    assert seen[0][0] == ["kanban", "--board", "b", "specify", "t_1", "--author", "lead", "--json"]
+
+
+def test_kanban_specify_without_an_author_omits_the_flag(monkeypatch):
+    seen = _fake_run_with_kwargs(
+        monkeypatch, 0, json.dumps({"task_id": "t_1", "ok": True, "reason": "specified", "new_title": None}),
+    )
+
+    hermes.kanban_specify("b", "t_1")
+
+    assert seen[0][0] == ["kanban", "--board", "b", "specify", "t_1", "--json"]
+
+
+def test_kanban_specify_defaults_to_a_120_second_timeout_not_the_30_second_kanban_default(monkeypatch):
+    seen = _fake_run_with_kwargs(
+        monkeypatch, 0, json.dumps({"task_id": "t_1", "ok": True, "reason": "specified", "new_title": None}),
+    )
+
+    hermes.kanban_specify("b", "t_1")
+
+    assert seen[0][1]["timeout"] == 120
+
+
+def test_kanban_specify_an_explicit_timeout_is_forwarded(monkeypatch):
+    seen = _fake_run_with_kwargs(
+        monkeypatch, 0, json.dumps({"task_id": "t_1", "ok": True, "reason": "specified", "new_title": None}),
+    )
+
+    hermes.kanban_specify("b", "t_1", timeout=300)
+
+    assert seen[0][1]["timeout"] == 300
+
+
+def test_kanban_specify_a_zero_exit_with_ok_true_returns_the_reason_and_new_title(monkeypatch):
+    _fake_run_with_kwargs(
+        monkeypatch, 0,
+        json.dumps({"task_id": "t_1", "ok": True, "reason": "specified", "new_title": "Add rate limiting"}),
+    )
+
+    result = hermes.kanban_specify("b", "t_1")
+
+    assert result == hermes.SpecifyResult(ok=True, reason="specified", new_title="Add rate limiting")
+
+
+def test_kanban_specify_a_nonzero_exit_with_ok_false_in_the_json_does_not_raise(monkeypatch):
+    """The real single-task exit code for an ok=false outcome is 1, not 0 (read from _run_triage_sweep):
+    kanban_specify must not treat this as a HermesCommandError, since it is Hermes's normal "could not make
+    sense of this" outcome, not an infrastructure failure."""
+    _fake_run_with_kwargs(
+        monkeypatch, 1,
+        json.dumps({"task_id": "t_1", "ok": False, "reason": "task is not in triage (status='todo')", "new_title": None}),
+    )
+
+    result = hermes.kanban_specify("b", "t_1")
+
+    assert result == hermes.SpecifyResult(ok=False, reason="task is not in triage (status='todo')", new_title=None)
+
+
+def test_kanban_specify_a_nonzero_exit_with_no_parseable_json_raises(monkeypatch):
+    """A genuine failure (hermes crashed, bad board, argparse usage error): no {"task_id", "ok", ...} shape on
+    stdout at all, so this must raise, unlike the ok=false case above."""
+    _fake_run_with_kwargs(monkeypatch, 2, "", stderr="kanban: specify requires a task id or --all")
+
+    with pytest.raises(hermes.HermesCommandError):
+        hermes.kanban_specify("b", "t_1")
+
+
+def test_kanban_specify_malformed_json_on_a_zero_exit_raises(monkeypatch):
+    """Malformed JSON gets no special leniency here: json.loads is left to raise, same as every other
+    _kanban_json caller in this file, and that failure surfaces as HermesCommandError."""
+    _fake_run_with_kwargs(monkeypatch, 0, "not json")
+
+    with pytest.raises(hermes.HermesCommandError):
+        hermes.kanban_specify("b", "t_1")
+
+
+def test_kanban_specify_json_missing_the_expected_keys_raises(monkeypatch):
+    """Valid JSON that is not the {"task_id", "ok", "reason", "new_title"} shape (e.g. some unrelated object)
+    must not be silently coerced into an ok=false result."""
+    _fake_run_with_kwargs(monkeypatch, 1, json.dumps({"unexpected": "shape"}))
+
+    with pytest.raises(hermes.HermesCommandError):
+        hermes.kanban_specify("b", "t_1")

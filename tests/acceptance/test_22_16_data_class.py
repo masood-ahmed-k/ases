@@ -25,6 +25,7 @@ wins but a disagreement is reported).
 from __future__ import annotations
 
 import dataclasses
+import json
 import pathlib
 
 import pytest
@@ -190,29 +191,20 @@ def test_22_16_private_refuses_a_training_on_inputs_provider_at_gate_p(tmp_path)
     assert "trains-on-input" in estimate.policy_violation and "private" in estimate.policy_violation
 
 
-def test_22_16_the_per_pass_budget_gate_has_no_data_class_awareness_this_is_a_genuine_gap(world_factory):
-    """FINDING, read directly from controller.py rather than assumed (the report names this explicitly, as
-    r6_wp_ac_g.md asks): controller.process_budget_gate, and the _affordable_now helper beneath it, call
-    ONLY policy.check_budget. Neither calls policy.check_data_class, and nothing else in controller.run_pass's
-    per-pass loop does either for an ordinary "ready" card: the only two call sites of check_data_class in
-    the whole codebase are cli._estimate_lines (Gate P, once, at swarm approve time) and
-    recovery.next_model (called from recovery.process_failures's _adjust, itself called every pass, but only
-    on the ACTION_SWITCH_MODEL decision, which fires only after a card's SECOND capability failure in a row --
-    never on the ordinary path of dispatching a "ready" card that has not failed at all).
-
-    So the blueprint's guarantee ("cards must never be routed to a provider marked as training on inputs,
-    even when every other provider is exhausted: they park instead") is enforced exactly once, at plan
-    approval. A card whose pinned provider is data-class-unsafe, once past that one check (imagine the
-    provider's declared policy changing afterwards, or Gate P having been bypassed), is treated by
-    process_budget_gate exactly like any other affordable card on every later pass: nothing here parks it for
-    a data-class reason, ever. This test intentionally asserts that CURRENT, real behaviour, per
-    r6_wp_ac_g.md's explicit instruction to test what the code actually does rather than an aspirational
-    per-pass re-check that does not exist; see the report for the exact function and line."""
+def test_22_16_the_per_pass_budget_gate_now_parks_a_card_whose_provider_turned_data_class_unsafe(world_factory):
+    """Round 6 found a real gap here (see the round 6 section of builder-findings.md, ASES-PRV-01): the per-pass
+    budget gate never re-checked a card's provider against the project's data class, only Gate P did, once, at
+    approval time. Round 7's package FIXES closed it: controller._affordable_now now calls
+    policy.check_data_class FIRST (mirroring Gate P's own order, "enforced before any other routing rule"),
+    parking with a "data class:" reason on violation, through the SAME process_budget_gate/process_unpark path
+    an ordinary budget shortfall uses -- except a data-class park is deliberately excluded from _PARK_PREFIXES,
+    so process_unpark can never auto-resume it (ASES-PRV-03: the controller must never relax the data class to
+    keep work flowing). This test asserts the FIXED behavior in place of the gap round 6 documented."""
     world = world_factory(plan_raw=PRIVATE_PLAN, models_config=dict(_TRAINS_ON_INPUT_MODELS_CONFIG))
     # As if this project had been approved under a data class that later needed tightening to private, or
     # Gate P's one-time check had been bypassed (--skip-critic skips only the critic, never this check, so in
     # the real system this specific combination cannot arise post-approval today; the point here is what the
-    # per-pass gate does or does not check once a card is already on the board).
+    # per-pass gate does once a card whose provider is unsafe is already on the board).
     world.project = dataclasses.replace(world.project, data_class="private")
     t1 = world.create_cards()["T1"]
     assert world.fake.card(t1.work_card_id)["status"] == "ready"
@@ -222,6 +214,15 @@ def test_22_16_the_per_pass_budget_gate_has_no_data_class_awareness_this_is_a_ge
         project=world.project,
     )
 
-    assert parked == []  # process_budget_gate never looked at data_class: nothing here found a reason to park
-    assert world.fake.card(t1.work_card_id)["status"] == "ready"  # left exactly where it was
-    assert not [e for e in events.recent(world.conn, limit=200) if e["kind"] == "card_parked_for_budget"]
+    assert parked == ["T1"]  # process_budget_gate now finds and acts on the data-class violation
+    assert world.fake.card(t1.work_card_id)["status"] == "scheduled"
+    park_events = [e for e in events.recent(world.conn, limit=200) if e["kind"] == "card_parked_for_budget"]
+    assert park_events and json.loads(park_events[0]["payload"])["reason"].startswith("data class:")
+
+    # ASES-PRV-03: never auto-unparked, even once the ordinary budget side of the same check would allow it.
+    unparked = controller_mod.process_unpark(
+        world.board, world.plan, world.models_config, conn=world.conn, budgets=world.project.budgets,
+        project=world.project,
+    )
+    assert unparked == []
+    assert world.fake.card(t1.work_card_id)["status"] == "scheduled"  # left exactly where it was

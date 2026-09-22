@@ -75,7 +75,7 @@ from any command; a Hermes command that fails is a one-line message and exit cod
 
 | Command | What it does | Reads / writes |
 | --- | --- | --- |
-| `swarm doctor` | Runs the environment checks and prints one row each: `[PASS]`, `[WARN]`, `[FAIL]` or `[PEND]`. Exit 1 only when a row is a FAIL. Rows cover: the environment decision, not under OneDrive, git long paths and `.gitattributes` (native Windows), Python and git versions, Hermes version against the pin (a mismatch is a WARN), `hermes doctor`, the gateway dispatcher, the Hermes profile state (warnings only), the sandbox (warnings until it is enabled), the model registry, role profiles, reviewer diversity. | writes the model registry rows |
+| `swarm doctor` | Runs the environment checks and prints one row each: `[PASS]`, `[WARN]`, `[FAIL]` or `[PEND]`. Exit 1 only when a row is a FAIL. Rows cover: the environment decision, not under OneDrive, git long paths and `.gitattributes` (native Windows), Python and git versions, Hermes version against the pin (a mismatch is a WARN), `hermes doctor`, the gateway dispatcher, the Hermes profile state (warnings only), the sandbox (warnings until it is enabled), the model registry, role profiles, reviewer diversity, key pooling (ASES-CFG-02/03, warning only). | writes the model registry rows |
 | `swarm models` | Lists the model registry: declared context length, smoke test result, pinned or not. | reads `config/models.yaml`, the database |
 | `swarm init [--apply] [--yes] [--global] [--sandbox] [--include-inactive] [--reuse-credentials-from PROFILE]` | Brings the Hermes profiles to the state ASES needs. Dry run unless `--apply`; `--apply` needs `--yes`. Never reads or prints a credential; `--reuse-credentials-from` copies only the one variable named by the provider's `key_env`. | Hermes profiles under `hermes.native_home` (backups next to each changed file) |
 | `swarm plan --repo R --request T` | Asks the Lead profile to write `docs/ases/plan.json`. Slow on a free provider (30 minute timeout). | `R/docs/ases/plan.json` |
@@ -211,6 +211,7 @@ Two files in `config/`. Both are read on every command, so an edit takes effect 
 | `providers.<name>.limits` | `rpm`, `per_model_rpm` (pacing), `per_day`, or `per_day_default` with `per_day_after_credits` (the daily request cap). Empty means no known cap. |
 | `providers.<name>.credits_purchased` | Selects `per_day_after_credits`. Flip it only after you have actually bought credits. **Needs your approval** (spends money). |
 | `providers.<name>.data_policy` | Compared with `project.data_class`. |
+| `providers.<name>.data_policy_verified_at`, `data_policy_source` | Optional. ASES-PRV-04: a `private`/`confidential` project needs more than a compatible `data_policy` string -- it needs an explicitly verified one. `data_policy_verified_at` is the ISO date (quoted) a human actually checked `data_policy`, `data_policy_source` is a URL or short note saying where. Absent is fine for a `public` project; `policy.check_data_class` refuses `private`/`confidential` for a provider with a compatible policy but no `data_policy_verified_at`. |
 | `providers.<name>.status`, `verified_on`, `quota_endpoint`, `require_parameters` | Notes and provider switches. |
 | `models[].provider`, `models[].model` | The pair, as the provider spells the model. |
 | `models[].context_length` | Declared context. `null` means undeclared: `swarm doctor` warns until it is at least 64,000. |
@@ -221,6 +222,17 @@ Two files in `config/`. Both are read on every command, so an edit takes effect 
 
 The numbers in this file were read from the providers' own pages and change. Re-verify them before relying on them for
 capacity planning, and update `verified_on` when you do.
+
+**Key pooling (ASES-CFG-02/03, section 10.2).** Prefer one key per provider, and prefer several distinct, legitimate
+providers over trying to stretch one further. A pool of keys on the SAME real-world account does not create extra
+quota on the free paths this project uses (each provider's limits are per account, not per key), so pooling keys is
+wasted complexity, not more capacity. Never create or rotate an account to get around a limit or an abuse control --
+that is a violation of the provider's own terms, not a supported way to run ASES. Both rules are about your
+account-management behavior, which ASES cannot see or enforce directly; what it CAN check from its own config is the
+one signal visible there: two DIFFERENT provider entries in `config/models.yaml` pointing at the same `key_env`. That
+is a real, if imperfect, proxy for "the same account under two provider names", so `swarm doctor` WARNs on it (the
+`key_pooling` row) without ever failing the run over it -- one provider used by several profiles is normal and is not
+what this flags.
 
 ## 8. The request ledger and parking
 

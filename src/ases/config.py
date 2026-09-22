@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import datetime
 import pathlib
 
 import yaml
@@ -192,6 +193,42 @@ def load_swarm_config(path: str | pathlib.Path) -> ProjectConfig:
     )
 
 
+def _validate_data_policy_verification_fields(providers: dict) -> None:
+    """ASES-PRV-04 / ASES-VER-01's convention (a source and a verification date, never invented): two
+    OPTIONAL fields per provider entry, `data_policy_verified_at` (an ISO date string: WHEN a human checked
+    the provider's `data_policy`) and `data_policy_source` (a short string: a URL or a note saying WHO/WHERE
+    that check came from). Neither is required (a public-class project never needs them, and policy.py's
+    check_data_class is where private/confidential actually enforce `data_policy_verified_at`'s presence);
+    this only validates the SHAPE of whichever of the two is present, so a typo is caught at load time
+    rather than silently accepted and only noticed when a private-class approval is refused for a reason
+    that does not mention the real problem."""
+    if not isinstance(providers, dict):
+        return
+    for name, entry in providers.items():
+        if not isinstance(entry, dict):
+            continue
+        verified_at = entry.get("data_policy_verified_at")
+        if verified_at is not None:
+            if not isinstance(verified_at, str):
+                raise ConfigError(
+                    f"config/models.yaml: providers.{name}.data_policy_verified_at must be an ISO date "
+                    f"string (quote it, e.g. \"2026-09-19\"), got {verified_at!r}"
+                )
+            try:
+                datetime.date.fromisoformat(verified_at)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"config/models.yaml: providers.{name}.data_policy_verified_at is not a valid ISO "
+                    f"date ({verified_at!r}): {exc}"
+                ) from exc
+        source = entry.get("data_policy_source")
+        if source is not None and not isinstance(source, str):
+            raise ConfigError(
+                f"config/models.yaml: providers.{name}.data_policy_source must be a string (a URL or a "
+                f"short note), got {source!r}"
+            )
+
+
 def load_models_config(path: str | pathlib.Path) -> dict:
     path = pathlib.Path(path)
     if not path.exists():
@@ -199,6 +236,7 @@ def load_models_config(path: str | pathlib.Path) -> dict:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if "providers" not in raw or "models" not in raw:
         raise ConfigError("config/models.yaml must have top-level 'providers' and 'models' keys")
+    _validate_data_policy_verification_fields(raw["providers"])
     return raw
 
 
