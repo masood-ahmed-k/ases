@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import pytest
 
 from ases import bounds, config, controller, db, events, guards, hermes, intents, ledger, mergeq
+from ases import gates as gates_mod
 from ases import plan as plan_mod
 from ases import questions, recovery, report
 from ases import review as review_mod
@@ -83,6 +84,32 @@ def _no_real_hermes(monkeypatch):
     monkeypatch.setattr(hermes, "_run", refuse)
     yield
     assert reached == []
+
+
+@pytest.fixture(autouse=True)
+def _post_merge_check_passes(monkeypatch):
+    """Round 6 (ASES-GIT-05): process_merge_queue re-runs Gate 3 on the new integration HEAD right after a real
+    merge, through gates_mod.run_gate. Most tests here script mergeq.merge_task (script_merge) rather than using a
+    real repository, so a fake squash_commit such as "cand1" is never a real commit gates_mod.run_gate could check
+    out. Tests about the post-merge check itself replace this stub (see stub_post_merge_gate)."""
+    def lenient(repo, commit_sha, gate_name, commands, *, conn=None, task_key="", project=None,
+                timeout_per_command=120, runner=None):
+        return gates_mod.GateResult(gate_name, commit_sha, True, "ok")
+
+    monkeypatch.setattr(gates_mod, "run_gate", lenient)
+
+
+def stub_post_merge_gate(monkeypatch, *, passed, detail="gate3-postmerge output"):
+    """Replace gates_mod.run_gate with a recorder that answers `passed`/`detail` and remembers every call."""
+    calls = []
+
+    def fake(repo, commit_sha, gate_name, commands, *, conn=None, task_key="", project=None,
+              timeout_per_command=120, runner=None):
+        calls.append({"commit_sha": commit_sha, "gate_name": gate_name, "task_key": task_key, "project": project})
+        return gates_mod.GateResult(gate_name, commit_sha, passed, detail)
+
+    monkeypatch.setattr(gates_mod, "run_gate", fake)
+    return calls
 
 
 def failed_run(run_id=1, error="protocol violation: the worker exited without a terminal kanban call",
@@ -679,6 +706,55 @@ def test_the_halt_flag_is_read_before_each_task(tmp_path, monkeypatch):
 
     assert merged == ["T1"] and calls == ["T1"]
     assert "merge_queue_halted" in kinds(w.conn)
+
+
+# --- round 6: the post-merge check and revert trigger (ASES-GIT-05) -----------------------------------------
+
+def test_post_merge_revert_opens_a_fix_card_and_leaves_the_merge_card_open(tmp_path, monkeypatch):
+    w = make_world(tmp_path, monkeypatch)
+    ready_to_merge(w)
+    stub_check(monkeypatch)
+    script_merge(monkeypatch, _MERGED)
+    stub_post_merge_gate(monkeypatch, passed=False, detail="a later task's merge broke this")
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: mergeq.RevertOutcome(True, "revsha", "reverted"))
+
+    merged = controller.process_merge_queue("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert merged == []
+    assert w.board.cards[w.merge()]["status"] == "blocked"  # never completed: still blocked, as it started
+    assert w.row()["fix_cards"] == 1
+    assert kinds(w.conn).count("post_merge_reverted") == 1
+    assert "merge_failed" in kinds(w.conn) and "fix_card_created" in kinds(w.conn)
+    assert "integrity_violation" not in kinds(w.conn)
+    assert guards.expected_head(w.conn, "t3") == "revsha"
+
+
+def test_post_merge_revert_failure_halts_the_run_via_run_pass(tmp_path, monkeypatch):
+    """End to end through the real process_merge_queue AND run_pass (not PassRig, which stubs the merge queue
+    itself): a post-merge revert that cannot repair the branch must stop the pass before dispatch or finalize."""
+    w = make_world(tmp_path, monkeypatch)
+    ready_to_merge(w)
+    stub_check(monkeypatch)
+    script_merge(monkeypatch, _MERGED)
+    stub_post_merge_gate(monkeypatch, passed=False)
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: mergeq.RevertOutcome(False, None, "still broken"))
+    monkeypatch.setattr(guards, "check_primary_checkout", lambda *a, **kw: guards.GuardResult(True, (), "abc", "integration"))
+    for name in ("process_idle_worktrees", "process_recovery", "process_unpark", "process_provision",
+                 "process_review_lane"):
+        monkeypatch.setattr(controller, name, lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_bounds", lambda *a, **kw: (False, None))
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: [])
+    dispatched = []
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: dispatched.append(1) or {})
+    finalized = []
+    monkeypatch.setattr(controller, "process_finalize", lambda *a, **kw: finalized.append(1) or None)
+
+    summary = controller.run_pass("b", w.repo, w.plan, w.project, {"providers": {}, "models": []}, conn=w.conn)
+
+    assert summary["integrity"] and "T1" in summary["integrity"][0]
+    assert dispatched == [1]  # dispatch runs BEFORE the merge queue in run_pass's order, so it already happened
+    assert finalized == []    # but finalize, AFTER the merge queue, never runs on an unrepaired branch
+    assert summary["merged"] == [] and summary["finished"] is False
 
 
 def test_a_halted_project_does_not_even_read_the_board(tmp_path, monkeypatch):
@@ -2291,13 +2367,16 @@ class PassRig:
             problems = () if rig.guard_ok else ("dirty: ?? stray.txt",)
             return guards.GuardResult(rig.guard_ok, problems, "abc", integration_branch)
 
-        def merge(board, repo, plan, project, *, conn, unreviewed=None, models_config=None):
+        def merge(board, repo, plan, project, *, conn, unreviewed=None, models_config=None, integrity=None):
             rig.order.append("merge")
             rig.args["merge"] = ((board, repo, plan, project), {"conn": conn, "unreviewed": unreviewed,
-                                                                "models_config": models_config})
+                                                                "models_config": models_config,
+                                                                "integrity": integrity})
             if "merge" in rig.raises:
                 raise rig.raises["merge"]
             unreviewed.append("T7")
+            if rig.results.get("merge_integrity") and integrity is not None:
+                integrity.extend(rig.results["merge_integrity"])
             return rig.results["merge"]
 
         monkeypatch.setattr(guards, "check_primary_checkout", guard)
@@ -2467,7 +2546,7 @@ def test_run_pass_reports_a_failed_final_gate_and_the_pause_it_caused(tmp_path, 
 def test_run_pass_reports_a_stop_that_landed_during_the_merge_queue(tmp_path, monkeypatch):
     rig = PassRig(tmp_path, monkeypatch)
 
-    def merge(board, repo, plan, project, *, conn, unreviewed=None, models_config=None):
+    def merge(board, repo, plan, project, *, conn, unreviewed=None, models_config=None, integrity=None):
         bounds.set_status(conn, "p", "stopped", "swarm stop")      # the kill switch, mid-pass
         return []
 

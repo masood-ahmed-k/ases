@@ -56,6 +56,17 @@ import time
 
 from .. import hermes as _hermes
 
+# The public function names of the REAL hermes module, captured once at import time, before any test's `install()`
+# call can have monkeypatched `hermes.<name>` into one of this class's own bound methods. `fail_next` validates
+# against this frozen set instead of a live `getattr(_hermes, name)` (round 6 fix): after `install()`, every
+# `hermes.<name>` IS a bound method of the fake, so `inspect.isfunction` on it is always False and `fail_next`
+# could never be armed for ANY name in a test built on `install()` -- found independently by two round 6 builders
+# (package CT and package AC-C), both of whom had to arm faults another way as a workaround.
+_HERMES_PUBLIC_NAMES = frozenset(
+    name for name, function in inspect.getmembers(_hermes, inspect.isfunction)
+    if not name.startswith("_") and function.__module__ == _hermes.__name__
+)
+
 # ---------------------------------------------------------------------------------------------
 # Constants, all read from Hermes 0.21.3 (see the module docstring for the files)
 # ---------------------------------------------------------------------------------------------
@@ -609,9 +620,13 @@ class FakeHermes:
         self, name: str, *, card_id: str | None = None, error: Exception | None = None, times: int = 1,
     ) -> None:
         """Make the next `times` calls of hermes function `name` raise `error` (default a HermesCommandError) BEFORE they
-        change anything. With `card_id`, only a call that names that card fails; the others pass through."""
-        function = getattr(_hermes, name, None)
-        if not (inspect.isfunction(function) and not name.startswith("_")):
+        change anything. With `card_id`, only a call that names that card fails; the others pass through.
+
+        Works whether or not `install(monkeypatch)` has already run: validated against `_HERMES_PUBLIC_NAMES` (captured
+        at import time), never against `hermes.<name>`'s live value, which `install()` replaces with a bound method of
+        this class (round 6 fix: the old check rejected every name once installed, since a bound method is never an
+        `inspect.isfunction`)."""
+        if name not in _HERMES_PUBLIC_NAMES:
             raise ValueError(f"{name!r} is not a public function of the hermes module")
         with self._lock:
             self._armed.append(_Armed(name, card_id, error, int(times)))

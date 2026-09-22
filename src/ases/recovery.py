@@ -41,6 +41,11 @@ module acts on are `blocked` already (Hermes's circuit breaker gave up on them a
 1 after it has left its comment behind (checked against the 0.21.3 source, 2026-09-21), so the question goes on the
 card as a comment instead, which `swarm questions` finds, and a question already open comes back as
 "already_asked" and is not put twice.
+
+Round 6 fix: `recovery.Bounds` used to be its own 4-field dataclass with a lenient `from_budgets` (a bad value fell
+back to the default). It is now an alias of `bounds.Bounds` (bounds.py's own 8-field, strictly-parsed dataclass,
+the single source of truth for section 9.3's bounds), kept for backward compatibility; prefer importing
+`bounds.Bounds` directly in new code.
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
+from . import bounds as bounds_mod
 from . import config as ases_config
 from . import events
 from . import hermes as hermes_mod
@@ -357,36 +363,18 @@ def refresh_review_rounds(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Conn
     return added
 
 
-@dataclasses.dataclass
-class Bounds:
-    """The per-task and per-project bounds of section 9.3, with the blueprint's defaults."""
-    attempts_per_card: int = 3
-    review_rounds_per_task: int = 3
-    fix_cards_per_task: int = 2
-    replans_per_project: int = 2
-
-    @classmethod
-    def from_budgets(cls, budgets: dict | None) -> Bounds:
-        """The bounds out of `project.budgets` (config/swarm.yaml). A missing key, or one that is not a number,
-        takes the section 9.3 default, so an old or partial config still bounds the loop."""
-        budgets = budgets or {}
-        defaults = cls()
-
-        def read(name: str) -> int:
-            try:
-                return int(budgets.get(name, getattr(defaults, name)))
-            except (TypeError, ValueError):
-                return getattr(defaults, name)
-
-        return cls(
-            attempts_per_card=read("attempts_per_card"),
-            review_rounds_per_task=read("review_rounds_per_task"),
-            fix_cards_per_task=read("fix_cards_per_task"),
-            replans_per_project=read("replans_per_project"),
-        )
+# recovery.Bounds is now an alias of bounds.Bounds, not a second, independently-defined class (that was the bug:
+# this module used to keep its own 4-field Bounds with a lenient from_budgets, while bounds.py had an 8-field
+# Bounds with a strict one, for the same section 9.3 concept). bounds.Bounds is a superset (8 fields vs. 4) with
+# the same names and defaults for the 4 this module reads, so exhausted() and decide() are unaffected by the
+# extra fields, and the strict parser now wins: a present budget value that is a bool, negative, or not already
+# an int now raises ValueError instead of silently falling back to the default (bounds.Bounds.from_budgets's
+# docstring explains why: a typo should stop the project at load time, not quietly mean "no bound"). A genuinely
+# MISSING key still takes the section 9.3 default exactly as before.
+Bounds = bounds_mod.Bounds
 
 
-def exhausted(lineage: Lineage, bounds: Bounds) -> str | None:
+def exhausted(lineage: Lineage, bounds: bounds_mod.Bounds) -> str | None:
     """The name of the FIRST lineage budget that has run out, or None (ASES-REC-02: "When a lineage budget runs
     out, the Lead may re-plan that task once ... After that the controller blocks the task with a question for
     the user"). Checked in the order review_rounds, fix_cards, attempts:
@@ -470,7 +458,7 @@ _BUDGET_LABELS = {
 }
 
 
-def escalation(lineage: Lineage, bounds: Bounds) -> Decision | None:
+def escalation(lineage: Lineage, bounds: bounds_mod.Bounds) -> Decision | None:
     """The response when a lineage budget has run out, or None while none has (ASES-REC-02, section 9.3 "Escalate to
     the Lead where allowed, then a blocked card for the user"): a `replan` while the task has not been re-planned
     yet (the Lead may re-plan it ONCE, with the full failure bundle), a `block_for_user` question after that.
@@ -497,7 +485,7 @@ def escalation(lineage: Lineage, bounds: Bounds) -> Decision | None:
 
 
 def decide(
-    kind: FailureKind | str, lineage: Lineage, bounds: Bounds, *,
+    kind: FailureKind | str, lineage: Lineage, bounds: bounds_mod.Bounds, *,
     provider_reset_text: str = "the next UTC midnight", consecutive_unknown: int = 0,
 ) -> Decision:
     """The response to one failure of `kind` (ASES-REC-01, ASES-REC-02, blueprint 19.1, 19.2, 19.3, 11.1). Pure.
@@ -1093,7 +1081,7 @@ def process_failures(
     now_ts = time.time() if now is None else _epoch(now)
     if now_ts is None:
         raise ValueError(f"now must be epoch seconds or a datetime, got {now!r}")
-    bounds = Bounds.from_budgets(project.budgets)
+    bounds = bounds_mod.Bounds.from_budgets(project.budgets)
     decisions: list[Decision] = []
     for task in plan.tasks:
         row = conn.execute(

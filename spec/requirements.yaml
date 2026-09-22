@@ -152,10 +152,14 @@ requirements:
   section: '4.3'
   verified_by: 22.5, 22.9
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts
-    kanban.max_in_progress (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global
-    state; `swarm init --global` shows it and applies it only after `--apply --yes`. Not applied: it changes
-    the user''s whole Hermes.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven (22.5): three cards ran simultaneously with three
+    distinct worktrees, branches, profiles and lease-assigned port blocks/compose names, and a fourth stayed
+    queued by max_in_progress, through the real controller and dispatcher. Still not applied to the user''s
+    real Hermes (swarm init --global remains dry-run only, unchanged from round 5). Earlier note: BUILT AND
+    WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts kanban.max_in_progress
+    (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global state; `swarm init
+    --global` shows it and applies it only after `--apply --yes`. Not applied: it changes the user''s whole
+    Hermes.'
 - id: ASES-MOD-01
   requirement: Model IDs are discovered, and a capability record is kept per model
   section: '5'
@@ -211,18 +215,25 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: partial
-  note: 'Three layers, all unit-tested: cmd_approve checks the whole plan''s budget at Gate P;
-    controller.process_budget_gate re-checks every ready card on every pass and parks it with hermes kanban
-    schedule when the budget is gone; and, since 2026-09-19, the ledger sees REAL usage:
-    usage.ingest_run_usage runs first in every pass and counts each finished worker session once (Hermes
-    session export, api_call_count, idempotent through the usage_ingested table, attributed to the plan task
-    so lineage requests can be summed), and the outgoing card of a fix-card repoint is ingested just before
-    the repoint. The review half of the requirement is applied too: ready coder cards are parked when the
-    REVIEWER''s provider cannot afford the review reserve (the reserve is counted once, not twice). This
-    closes the gap an adversarial review found (record_usage had no production caller; one review really used
-    37 of OpenRouter''s 50 daily free requests unseen). Left partial: a card parked for budget is not yet
-    unparked when the provider''s window resets (a human or cron action today), a backlog is charged to the
-    day it is first ingested, and none of this has run in a real dispatch yet.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.9): a card over the daily budget is
+    parked (scheduled, budget: reason), an independent affordable task proceeds normally, several idle passes
+    show exactly one card_parked_for_budget event with no thrashing and the fake provider never started, the
+    report shows the reset time, no purchase language appears anywhere, and after the simulated UTC-midnight
+    reset the card unparks and completes with the other task''s state intact. Left partial: the review-reserve
+    half and the daily-reset arithmetic against a REAL Hermes/provider are still unverified, and ledger.py has
+    no injectable clock (tests must monkeypatch ledger._today directly). Earlier note: Three layers, all
+    unit-tested: cmd_approve checks the whole plan''s budget at Gate P; controller.process_budget_gate
+    re-checks every ready card on every pass and parks it with hermes kanban schedule when the budget is gone;
+    and, since 2026-09-19, the ledger sees REAL usage: usage.ingest_run_usage runs first in every pass and
+    counts each finished worker session once (Hermes session export, api_call_count, idempotent through the
+    usage_ingested table, attributed to the plan task so lineage requests can be summed), and the outgoing
+    card of a fix-card repoint is ingested just before the repoint. The review half of the requirement is
+    applied too: ready coder cards are parked when the REVIEWER''s provider cannot afford the review reserve
+    (the reserve is counted once, not twice). This closes the gap an adversarial review found (record_usage
+    had no production caller; one review really used 37 of OpenRouter''s 50 daily free requests unseen). Left
+    partial: a card parked for budget is not yet unparked when the provider''s window resets (a human or cron
+    action today), a backlog is charged to the day it is first ingested, and none of this has run in a real
+    dispatch yet.'
 - id: ASES-CAP-04
   requirement: Gate P shows estimated requests per provider and the calendar time
   section: '5.4'
@@ -328,12 +339,21 @@ requirements:
   section: '8.1'
   verified_by: '22.8'
   status: partial
-  note: 'Downgraded from covered 2026-09-19 by an adversarial pipeline review, independently verified
-    against the real source. The "stays runnable" half is genuinely covered: merge_task''s conflict and
-    red-Gate-3 paths return before touching the real integration branch, confirmed in tests. The
-    "post-merge failures are reverted" half is not: mergeq.revert_merge exists and has its own unit
-    test, but nothing in src/ases ever calls it -- controller.process_merge_queue only calls merge_task,
-    so a merge that lands and is later found broken has no automatic trigger for the revert.'
+  note: 'ROUND 6 (2026-09-22, zero quota): The post-merge revert trigger is now wired: after every real coder
+    merge, Gate 3 re-runs on the new integration HEAD (gate3-postmerge); green proceeds as before;
+    red-and-revert-succeeds takes the ordinary fix-card path; red-and-revert-also-fails halts the run
+    (integrity_violation). mergeq.revert_merge itself is fixed to only mark reverted=1 on a real git success
+    and to run `git revert --abort` on a conflicted revert rather than leaving the primary checkout
+    mid-revert. Acceptance-proven for the crash-safety half via 22.7''s reconcile scenarios. Left partial: a
+    real post-merge failure triggering an ACTUAL revert has not been exercised in a real run, only in unit and
+    crash-simulation tests, and the merge_records primary-key collision below (a different bug) is a separate,
+    still-open risk for two projects reusing a task key. Earlier note: Downgraded from covered 2026-09-19 by
+    an adversarial pipeline review, independently verified against the real source. The "stays runnable" half
+    is genuinely covered: merge_task''s conflict and red-Gate-3 paths return before touching the real
+    integration branch, confirmed in tests. The "post-merge failures are reverted" half is not:
+    mergeq.revert_merge exists and has its own unit test, but nothing in src/ases ever calls it --
+    controller.process_merge_queue only calls merge_task, so a merge that lands and is later found broken has
+    no automatic trigger for the revert.'
 - id: ASES-GIT-06
   requirement: Squash merge only, one commit per plan task with the card ID
   section: '8.1'
@@ -405,13 +425,17 @@ requirements:
   section: '8.4'
   verified_by: 22.5, 22.11
   status: partial
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): guards.check_idle_worktrees runs every pass and reports
-    changes in worktrees no running card owns as WARNINGS (an idle_worktree_changed event), never a halt: the
-    first version has known false positives (a card re-dispatched into its worktree between two polls).
-    Earlier note: Built 2026-09-19: guards.check_primary_checkout runs at the start of every controller pass
-    and at swarm run start. The primary checkout must be on the integration branch, clean (modified, staged,
-    deleted and untracked files, except Hermes''s .worktrees/), and at the HEAD ASES itself last wrote
-    (adopted at run start, updated after every fast-forward it makes). A violation records an
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven for the primary-checkout half (22.11): a worker that
+    writes outside its own worktree trips check_primary_checkout end to end, records integrity_violation,
+    halts the run, and the integration branch never moves again. The other-worktree half
+    (check_idle_worktrees) stays partial with its documented false-positive gap unchanged this round. Earlier
+    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): guards.check_idle_worktrees runs every pass and
+    reports changes in worktrees no running card owns as WARNINGS (an idle_worktree_changed event), never a
+    halt: the first version has known false positives (a card re-dispatched into its worktree between two
+    polls). Earlier note: Built 2026-09-19: guards.check_primary_checkout runs at the start of every
+    controller pass and at swarm run start. The primary checkout must be on the integration branch, clean
+    (modified, staged, deleted and untracked files, except Hermes''s .worktrees/), and at the HEAD ASES itself
+    last wrote (adopted at run start, updated after every fast-forward it makes). A violation records an
     integrity_violation event and halts the run with exit code 3 before anything is dispatched or merged. Two
     deviations from the blueprint text, on purpose: the check is per pass, not around each spawn (Hermes, not
     ASES, spawns workers), and it halts the run instead of failing one card (the writer cannot be attributed
@@ -517,8 +541,16 @@ requirements:
   requirement: Cards proposed by agents land in triage and are validated before promotion
   section: '12.4'
   verified_by: '22.15'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'ROUND 6 (2026-09-22, zero quota): triage.py built: list_triage_cards, validate, promote_card,
+    archive_card, format_triage. Confirmed by reading the real Hermes source that a worker can already propose
+    a card in triage itself (kanban_create with triage=true; ASES needs no propose_card helper).
+    Acceptance-tested (22.15''s triage sub-scenario) once the module landed mid-round. KNOWN BUG found by that
+    same test: promote_card calls kanban_promote unconditionally, but Hermes can only promote from
+    todo/blocked, never triage, so promote_card on a genuinely triage-status card always raises. Needs a fix
+    before this is usable. The lineage charge (bump on infra_failures, a deliberate stopgap since fix_cards is
+    unreachable from this module) is documented as not semantically correct; a proposed_cards lineage column
+    is the real fix.'
 - id: ASES-REV-01
   requirement: Plan critique and diff review are done by the independent Reviewer profile
   section: '13'
@@ -535,18 +567,24 @@ requirements:
   section: '13.1'
   verified_by: '22.14'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): `swarm critique` runs the one-shot reviewer critique (at
-    most two change requests, optional --auto-replan) and `swarm approve` requires a PASS bound to the plan
-    hash or an explicit --skip-critic. It is a one-shot call, not the critique CARD that blueprint 13.1 words
-    it as. Earlier note: Blocked on ASES-REV-01 (also not_covered): the plan-critique mechanism itself (a
-    critique card for the Reviewer, a PASS/CHANGES_REQUIRED/BLOCKED verdict) does not exist yet -- review.py
-    only re-runs Gate 1 for diff review (ASES-REV-05), never touches plans. There is no call site to attach a
-    bounce counter to, and no data model to hold it (plan_tasks, the only per-task counter table, is only
-    created by create_cards_from_plan AFTER Gate P/approval succeeds, i.e. after this loop would already be
-    over -- and config/swarm.yaml''s budgets.replans_per_project, the field meant for this, has no DB column
-    anywhere, reserved or otherwise). Worth noting: "Gate P" as the blueprint defines it (section 13) is a
-    compound checkpoint -- critique, then privacy check, then budget check, then user approval, then publish
-    -- and cmd_approve today implements 4 of those 5 steps under that same name, printing "Gate P
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.14): a plan with a cycle, a missing
+    criterion or a missing touches entry fails Gate 0 with exact errors; a scripted critic returns
+    CHANGES_REQUIRED twice (next_step correctly needs a THIRD to cross the default max_rounds=2 bound, not
+    two, which is worth knowing precisely); the user''s rejection is modelled as simply never calling
+    create_cards_from_plan, and a bare fake board proves no implementation card ever existed. The approval
+    screen''s budget/calendar text (cli._estimate_lines) was called directly and confirmed non-empty. Earlier
+    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): `swarm critique` runs the one-shot reviewer critique
+    (at most two change requests, optional --auto-replan) and `swarm approve` requires a PASS bound to the
+    plan hash or an explicit --skip-critic. It is a one-shot call, not the critique CARD that blueprint 13.1
+    words it as. Earlier note: Blocked on ASES-REV-01 (also not_covered): the plan-critique mechanism itself
+    (a critique card for the Reviewer, a PASS/CHANGES_REQUIRED/BLOCKED verdict) does not exist yet --
+    review.py only re-runs Gate 1 for diff review (ASES-REV-05), never touches plans. There is no call site to
+    attach a bounce counter to, and no data model to hold it (plan_tasks, the only per-task counter table, is
+    only created by create_cards_from_plan AFTER Gate P/approval succeeds, i.e. after this loop would already
+    be over -- and config/swarm.yaml''s budgets.replans_per_project, the field meant for this, has no DB
+    column anywhere, reserved or otherwise). Worth noting: "Gate P" as the blueprint defines it (section 13)
+    is a compound checkpoint -- critique, then privacy check, then budget check, then user approval, then
+    publish -- and cmd_approve today implements 4 of those 5 steps under that same name, printing "Gate P
     REFUSED"/"Gate P: published" for the parts that exist. Once ASES-REV-01 lands, this bound is exactly as
     offline-testable as fix_cards_per_task is today (fake the verdict, assert on the counter and the
     escalation call) -- the blocker is the missing mechanism, not a need for a live LLM call.'
@@ -604,19 +642,30 @@ requirements:
   section: '14.2'
   verified_by: '22.12'
   status: covered
-  note: 'gates.run_gate is the only source of gate truth; the review lane sends a card back on a red re-check
-    regardless of the worker''s own claim, and since 2026-09-19 the merge queue believes only the
-    controller''s own gate_runs records for the exact head (a reviewer''s or coder''s claim that tests passed
-    is never read; the real review on 2026-09-19 listed the gate as verified although it had no way to run
-    anything). A profile with no commands is rejected at Gate 0 because it would be vacuously green.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.12): the merge queue and review lane believe
+    only the controller''s own gate records, never a worker''s or reviewer''s self-report, across five real
+    tampering attempts run through the real controller.run_pass. Earlier note: gates.run_gate is the only
+    source of gate truth; the review lane sends a card back on a red re-check regardless of the worker''s own
+    claim, and since 2026-09-19 the merge queue believes only the controller''s own gate_runs records for the
+    exact head (a reviewer''s or coder''s claim that tests passed is never read; the real review on 2026-09-19
+    listed the gate as verified although it had no way to run anything). A profile with no commands is
+    rejected at Gate 0 because it would be vacuously green.'
 - id: ASES-QG-02
   requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
   section: '14.3'
   verified_by: '22.12'
   status: partial
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The pin check of the gate profiles exists; the diff side
-    is the tamper module''s gate_config_changed finding, which cannot fire through the review wiring today
-    (see ASES-QG-03), so a change to gate configuration is stopped by the scope check alone. Earlier note:
+  note: 'ROUND 6 (2026-09-22, zero quota): Gate 0 now rejects a task whose touches is a WILDCARD glob broad enough
+    to cover gate/CI configuration, unless the task explicitly sets allow_gate_config_changes: true (a narrow,
+    literal touches entry needs no marker). This closes the hole two independent round 6 builders (TV building
+    it, AC-E reproducing it live) confirmed: because review.check_branch runs the scope check BEFORE the
+    tamper check, anything that reaches tamper.py is already inside touches and hence exempt, so
+    gate_config_changed and assertion_weakened findings can never fire through this wiring on their own. The
+    register''s existing partial note (hashing/pinning a fixed CI-file list) is a different, still-open half;
+    this round''s fix is plan-time touches-breadth, complementary, not a substitute. Earlier note: BUILT AND
+    WIRED, NOT RUN FOR REAL (2026-09-22): The pin check of the gate profiles exists; the diff side is the
+    tamper module''s gate_config_changed finding, which cannot fire through the review wiring today (see
+    ASES-QG-03), so a change to gate configuration is stopped by the scope check alone. Earlier note:
     gates.hash_gate_profiles() + controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a plan''s
     gate_profiles are content-hashed and pinned per-project at swarm approve time (only after every earlier
     REFUSED path -- data-policy, budget -- has passed, so a refused plan is never pinned), and swarm run
@@ -632,9 +681,18 @@ requirements:
   section: '14.3'
   verified_by: '22.12'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): tamper.check_range runs in the review lane and in the
-    merge-time check (deleted or skipped tests, unconditional passes, weakened assertions, gate configuration,
-    generated artifacts, secrets, large files). KNOWN GAP: through this wiring the gate-configuration and
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven for three of its five blueprint attempts (22.12:
+    deleted test, skip marker, || true all correctly fail Gate 1 with the right finding kind, through the real
+    review lane). The other two land through different, already-covered mechanisms and are documented
+    precisely rather than forced to match the blueprint''s literal prose: the out-of-scope attempt is caught
+    by the SCOPE check, not the tamper check (same ASES-QG-02 gap, now closed at plan time); the
+    untracked-file attempt is caught because Gate 1 genuinely reruns in a clean checkout and the underlying
+    test is still failing for real, not by any missing-file detection. Independently confirmed twice this
+    round (TV building the fix, AC-E reproducing the gap live) that gate_config_changed/assertion_weakened
+    cannot fire through the review wiring without ASES-QG-02''s new plan-time check. Earlier note: BUILT AND
+    WIRED, NOT RUN FOR REAL (2026-09-22): tamper.check_range runs in the review lane and in the merge-time
+    check (deleted or skipped tests, unconditional passes, weakened assertions, gate configuration, generated
+    artifacts, secrets, large files). KNOWN GAP: through this wiring the gate-configuration and
     assertion-weakening findings can never fire, because the scope check runs first and a path that reaches
     the tamper check is already inside the task''s touches (a wildcard touches glob silently allows config
     edits); plan-time validation of touches is needed.'
@@ -656,17 +714,27 @@ requirements:
   section: '14.4'
   verified_by: CI without network
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): src/ases/fakes/: FakeHermes (an in-memory Hermes 0.21.3
-    board with the real block, unblock, triage-loop and give-up rules, real git worktrees, a fake clock and
-    failure injection, with a test that its signatures match hermes.py), ScriptedWorker with personas, and a
-    fake OpenAI-compatible server (429 with Retry-After, 401, 500, timeouts, malformed JSON, tool calls, a
-    request log with assert_never_received). Nothing runs it against a real Hermes board yet.'
+  note: 'ROUND 6 (2026-09-22, zero quota): The fake rig gained six new scenario files this round (22.3, 22.5, 22.7,
+    22.9, 22.10, 22.11, 22.12, 22.13, 22.14, 22.15, 22.16 -- ten of the sixteen 22.x acceptance tests now
+    exist and pass at zero quota), on top of the two demonstrations from round 5. 22.8 (merge conflict)
+    remains to be written, now that ASES-GIT-05''s revert wiring exists to test it against. 22.4 likely
+    already covered by test_models.py, not confirmed this round. 22.1 and 22.17 correctly excluded: they need
+    a real provider. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): src/ases/fakes/: FakeHermes
+    (an in-memory Hermes 0.21.3 board with the real block, unblock, triage-loop and give-up rules, real git
+    worktrees, a fake clock and failure injection, with a test that its signatures match hermes.py),
+    ScriptedWorker with personas, and a fake OpenAI-compatible server (429 with Retry-After, 401, 500,
+    timeouts, malformed JSON, tool calls, a request log with assert_never_received). Nothing runs it against a
+    real Hermes board yet.'
 - id: ASES-TST-02
   requirement: Acceptance tests 22.1 to 22.16 are repeatable and cost no quota
   section: '22'
   verified_by: Inspection
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): tests/acceptance/ has the rig and two demonstration
+  note: 'ROUND 6 (2026-09-22, zero quota): Same evidence as TST-01: ten of sixteen 22.x scenarios now run at zero
+    quota under tests/acceptance/. 22.11 (prompt injection) is honestly split: three of its four clauses are
+    proven end to end through the real controller and guards, the fourth (a real sandboxed network block) is
+    documented as unit/policy-level only, since Docker never runs anywhere in this suite by design. Earlier
+    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): tests/acceptance/ has the rig and two demonstration
     scenarios (22.2 core with a worker question and a controller restart, 22.6 core); scenarios 22.3, 22.5,
     22.7 to 22.16 are not written yet.'
 - id: ASES-OBS-01
@@ -726,57 +794,81 @@ requirements:
   section: '19.2'
   verified_by: 22.3, 22.6
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): recovery.py is called from controller.process_recovery
-    every pass: a capability failure becomes a fresh attempt card (fresh worktree, failure bundle attached),
-    the second also pins the next model of the role class on the new card, an infrastructure failure resumes
-    after a backoff, auth, policy and context failures become a question, and a decision the controller could
-    not carry out is redriven from the event log. Not run for real; the provider name for `hermes kanban
-    set-model` on a custom endpoint is unverified.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.3): one card walked through all four
+    failure classifications via the real controller.process_recovery -- rate-limit (Hermes retries alone),
+    infrastructure (resumed after backoff), auth (marks the credential unhealthy as a question, answered), and
+    two rounds of capability failures (a fresh-attempt card, then a model-switch card pinned to a declared
+    candidate) which finally succeeds, ending with exactly the right number of cards, no loss or duplication.
+    A REAL GAP surfaced: a card that crashes ONCE with genuinely auth- or quota-shaped error text, short of
+    tripping the retry breaker, can get permanently stuck in ready, respawn-guarded by Hermes itself, and
+    NEVER reach recovery.py at all (which only examines blocked cards) -- worth checking against real Hermes
+    before relying on this failure class being handled. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL
+    (2026-09-22): recovery.py is called from controller.process_recovery every pass: a capability failure
+    becomes a fresh attempt card (fresh worktree, failure bundle attached), the second also pins the next
+    model of the role class on the new card, an infrastructure failure resumes after a backoff, auth, policy
+    and context failures become a question, and a decision the controller could not carry out is redriven from
+    the event log. Not run for real; the provider name for `hermes kanban set-model` on a custom endpoint is
+    unverified.'
 - id: ASES-REC-02
   requirement: Review rounds, fix cards and requests are budgeted per plan task lineage
   section: '19.3'
   verified_by: '22.6'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Lineage counters per plan task are wired: review rounds
-    escalate once per round count, fix cards escalate at the failure that would need a third one, re-plans are
-    counted per project. The re-plan itself is a question to the user (`swarm answer` retries with guidance);
-    the automatic Lead re-plan call is NOT built.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Lineage escalation acceptance-proven as part of 22.3''s multi-round
+    failure walk (capability failures accumulate and correctly trigger a fresh attempt then a model switch).
+    Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Lineage counters per plan task are wired:
+    review rounds escalate once per round count, fix cards escalate at the failure that would need a third
+    one, re-plans are counted per project. The re-plan itself is a question to the user (`swarm answer`
+    retries with guidance); the automatic Lead re-plan call is NOT built.'
 - id: ASES-REC-03
   requirement: Card creation is idempotent
   section: '19.4'
   verified_by: '22.15'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): intents.py records are written around card creation,
-    candidate build with Gate 3, fast-forward, merge-card completion and revert (not around a gate run) and
-    closed by reconcile. Card creation passes idempotency keys; it has not been repeated twice against a real
-    board or after deleting the database (test 22.15).'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.7, all three named crash points): a
+    crash during a running card, during a candidate build, and between the fast-forward and merge-card
+    completion are each faithfully simulated (with the exact mechanism justified in each test''s docstring)
+    and each recovers with no duplicate cards, no orphan workers, no half-merged state, every repair logged
+    once, and a second dry-run reconcile finding nothing new. A working bug in the acceptance rig itself was
+    found along the way (FakeHermes.fail_next cannot be armed after install(), hit independently by two
+    different round builders) and worked around, not yet fixed. Earlier note: BUILT AND WIRED, NOT RUN FOR
+    REAL (2026-09-22): intents.py records are written around card creation, candidate build with Gate 3,
+    fast-forward, merge-card completion and revert (not around a gate run) and closed by reconcile. Card
+    creation passes idempotency keys; it has not been repeated twice against a real board or after deleting
+    the database (test 22.15).'
 - id: ASES-REC-04
   requirement: Reconcile-on-start repairs what is safe and blocks the rest
   section: '19.4'
   verified_by: '22.7'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): reconcile.reconcile() runs at `swarm run` start (a blocked
-    finding stops the run with exit code 5, --ignore-reconcile overrides) and before `swarm resume`; repairs
-    done-without-record, record-without-done-card, unfinished candidates, open intents, dead workers, orphan
-    workers (found by card id, never killed otherwise) and reports orphan worktrees. Earlier note:
-    reconcile.py checks card IDs still resolve, a done merge has a matching merge_records row, and nothing
-    reads done-but-reverted; wired into swarm run''s startup. Unit-tested (6 cases) AND real-verified against
-    the live board after fixing kanban_show''s return shape (was crashing with KeyError on real data -- see
-    docs/architecture.md). Findings are reported, not yet auto-repaired. After the 2026-09-19 real run (a code
-    task merged, a review-only task recorded as a no-op) it reported no findings, so a no-op merge record is
-    accepted as a done merge.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Same 22.7 evidence as REC-03 (reconcile.reconcile is the mechanism
+    proven at all three crash points). The register''s prior note calling reconcile-on-start ''not built yet''
+    had drifted from the source; corrected here: reconcile.py is fully built and now proven both at the unit
+    level and end to end. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): reconcile.reconcile()
+    runs at `swarm run` start (a blocked finding stops the run with exit code 5, --ignore-reconcile overrides)
+    and before `swarm resume`; repairs done-without-record, record-without-done-card, unfinished candidates,
+    open intents, dead workers, orphan workers (found by card id, never killed otherwise) and reports orphan
+    worktrees. Earlier note: reconcile.py checks card IDs still resolve, a done merge has a matching
+    merge_records row, and nothing reads done-but-reverted; wired into swarm run''s startup. Unit-tested (6
+    cases) AND real-verified against the live board after fixing kanban_show''s return shape (was crashing
+    with KeyError on real data -- see docs/architecture.md). Findings are reported, not yet auto-repaired.
+    After the 2026-09-19 real run (a code task merged, a review-only task recorded as a no-op) it reported no
+    findings, so a no-op merge record is accepted as a done merge.'
 - id: ASES-REC-05
   requirement: Questions block cards and are answered through the CLI; they never time out into guesses
   section: '19.5'
   verified_by: '22.2'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): questions.py (open_question over four sources: a worker''s
-    block, the dispatcher''s give-up, Hermes''s unblock-loop triage lane and an ASES QUESTION comment;
-    ask_user for the controller; list_questions; answer_question) is used by `swarm questions`, `swarm
-    answer`, the merge queue (a merge card with an open question is not re-processed) and recovery. Real
-    Hermes limit: a second question on a card with the same block kind lands in triage, where swarm answer can
-    only comment. Unit and fake-board tested; the events Hermes writes on each give-up path are read from its
-    source, not probed live.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-covered indirectly (22.3''s auth-failure question is answered
+    via questions.answer_question inside a real controller pass); no dedicated 22.2-question-style acceptance
+    scenario was added this round beyond what the existing demo already covers. Earlier note: BUILT AND WIRED,
+    NOT RUN FOR REAL (2026-09-22): questions.py (open_question over four sources: a worker''s block, the
+    dispatcher''s give-up, Hermes''s unblock-loop triage lane and an ASES QUESTION comment; ask_user for the
+    controller; list_questions; answer_question) is used by `swarm questions`, `swarm answer`, the merge queue
+    (a merge card with an open question is not re-processed) and recovery. Real Hermes limit: a second
+    question on a card with the same block kind lands in triage, where swarm answer can only comment. Unit and
+    fake-board tested; the events Hermes writes on each give-up path are read from its source, not probed
+    live.'
 - id: ASES-REC-06
   requirement: swarm stop halts everything within 30 seconds
   section: '19.6'
@@ -792,9 +884,18 @@ requirements:
   section: '21.1'
   verified_by: '22.10'
   status: covered
-  note: gates.scan_for_secrets (reuses events.py's redaction patterns) runs inside mergeq.merge_task on
-    the full diff before Gate 3 -- a planted secret blocks the merge and never reaches the integration
-    branch. Unit-tested end to end (test_merge_blocks_on_a_planted_secret) and at the pattern level.
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.10): a planted secret-shaped value in a
+    committed file, and a second key in the controller''s own test-process environment, were both scanned for
+    across every event payload, gate_runs.detail, review_verdicts.metadata, every card body/comment/run, and
+    both report renderings after a full scenario run -- absent everywhere. A whole file named like a secret
+    (id_rsa) is caught too, as generated_artifact rather than secret_added (that distinction is now
+    documented: secret_added is a value on an added line, generated_artifact is a whole flagged file, and
+    gates.scan_for_secrets, which WOULD call a whole file secret_added, is only reached from Gate 3/mergeq,
+    never the review lane). The Docker/sandbox half of 22.10 (env inside a worker terminal, reading .env from
+    inside the sandbox) is still unverified: Docker never runs in this suite. Earlier note:
+    gates.scan_for_secrets (reuses events.py''s redaction patterns) runs inside mergeq.merge_task on the full
+    diff before Gate 3 -- a planted secret blocks the merge and never reaches the integration branch.
+    Unit-tested end to end (test_merge_blocks_on_a_planted_secret) and at the pattern level.'
 - id: ASES-SEC-02
   requirement: Sensitive paths are denied through the sandbox mount list
   section: '21.1'
@@ -820,9 +921,11 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Every role prompt ends with the data-not-instructions
-    sentence and the prompts are checked against Hermes''s own injection patterns in a test. No injection test
-    (22.11) has run.'
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed via 22.11''s negative case: injection text
+    planted in two seeded files and never acted on causes no violation and a normal merge, alongside the
+    positive case above proving a violation IS caught. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL
+    (2026-09-22): Every role prompt ends with the data-not-instructions sentence and the prompts are checked
+    against Hermes''s own injection patterns in a test. No injection test (22.11) has run.'
 - id: ASES-SEC-05
   requirement: Sandbox network access is disabled by default and only enabled through explicit task-scoped
     exceptions
@@ -845,26 +948,37 @@ requirements:
   section: '21.2'
   verified_by: '22.16'
   status: covered
-  note: policy.check_data_class is called for every task's resolved provider in cmd_approve, before Gate
-    P publication -- enforced before card creation, not after. Unit-tested (public/private/confidential
-    x safe/unsafe policies).
+  note: 'ROUND 6 (2026-09-22, zero quota): A REAL GAP confirmed empirically this round (22.16): the data-class
+    provider check (policy.check_data_class) is enforced ONLY once, at Gate P (cli._estimate_lines, called by
+    cmd_approve/cmd_critique). controller.process_budget_gate never calls it; the only per-pass call site is
+    inside recovery''s model-switch branch, reached only after a card''s second capability failure. So a
+    provider that becomes (or always was) unsafe for the project''s data class is never parked for that reason
+    once the plan is past approval -- confirmed by a test, not assumed. Status kept at covered because the
+    Gate P check itself is real and does what its own requirement text asks; the gap is recorded here for
+    whoever revisits per-pass enforcement. Earlier note: policy.check_data_class is called for every task''s
+    resolved provider in cmd_approve, before Gate P publication -- enforced before card creation, not after.
+    Unit-tested (public/private/confidential x safe/unsafe policies).'
 - id: ASES-PRV-02
   requirement: The default class is private; no run without a declared class
   section: '21.2'
   verified_by: '22.16'
   status: covered
-  note: config.py already requires project.data_class to be one of public/private/confidential; no default
-    beyond what swarm.yaml states explicitly (this project's own swarm.yaml documents WHY it's set to
-    public).
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.16): a ProjectConfig genuinely cannot be
+    built without a declared data class, and swarm run''s own pre-flight refuses before anything is dispatched
+    when none is declared. Earlier note: config.py already requires project.data_class to be one of
+    public/private/confidential; no default beyond what swarm.yaml states explicitly (this project''s own
+    swarm.yaml documents WHY it''s set to public).'
 - id: ASES-PRV-03
   requirement: The controller never relaxes the data class to keep work flowing
   section: '21.2'
   verified_by: '22.16'
   status: covered
-  note: check_data_class raises rather than returning a bool -- there is no code path that silently downgrades
-    the requirement to keep a plan moving. test_current_real_providers_are_not_yet_safe_for_private pins
-    today's actual state so a future loosening of _SAFE_FOR_PRIVATE without a real policy change would
-    be caught.
+  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.16): confidential with only remote providers,
+    and private with only a training-on-inputs provider, both refuse at Gate P before any card exists. See
+    ASES-PRV-01''s note for the per-pass gap this does not close. Earlier note: check_data_class raises rather
+    than returning a bool -- there is no code path that silently downgrades the requirement to keep a plan
+    moving. test_current_real_providers_are_not_yet_safe_for_private pins today''s actual state so a future
+    loosening of _SAFE_FOR_PRIVATE without a real policy change would be caught.'
 - id: ASES-ARC-09
   requirement: After Gate P approval, the controller publishes approved planning artifacts to the integration
     branch before implementation cards become ready
@@ -880,9 +994,14 @@ requirements:
   section: '18.2'
   verified_by: '22.2'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): finalgates.py: Gate 4 (built-in tracked-tree secret and
-    artifact scan plus the plan''s gate4 profile), Gate 5 (the plan''s gate5 profile, else every distinct task
-    command on the integration HEAD), the release report, and finalize(), called by
+  note: 'ROUND 6 (2026-09-22, zero quota): Gate 4 now has an allowlist (plan.gate4_allowlist, matched by
+    tamper.py''s glob semantics, findings demoted to advisory not dropped) so a repository with known sample
+    keys or generated artifacts is not permanently blocked. Run read-only against ASES''s own repository: 60
+    blocking findings, all in tests/ and docs/, all excused by allow_paths=["tests/**", "docs/**"], Gate 4
+    then passes. finalize() wires plan.gate4_allowlist through. Not yet run against a real project''s Gate
+    4/5. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): finalgates.py: Gate 4 (built-in
+    tracked-tree secret and artifact scan plus the plan''s gate4 profile), Gate 5 (the plan''s gate5 profile,
+    else every distinct task command on the integration HEAD), the release report, and finalize(), called by
     controller.process_finalize once every merge card is done. Unit tested with real git repositories; never
     run on a real project. Gate 4 fails on ASES''s own repository (sample keys in tests and docs) and has no
     allowlist.'

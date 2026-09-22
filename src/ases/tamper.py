@@ -703,6 +703,16 @@ _CONFIG_NAMES = frozenset({
 })
 _CONFIG_NAME_PATTERNS = ("jest.config.*", "vitest.config.*", "karma.conf.*")
 _CI_PATH_RE = re.compile(r"(?:^|/)(?:\.github/workflows|\.circleci)/")
+
+# ASES-QG-02 (section 14.3, plan.py's Gate 0): the same names and CI directories _config_reason treats as gate,
+# CI or test-runner configuration, exported as glob patterns so Gate 0's touches check shares this one list
+# instead of keeping a second copy that could drift from it. The two directory patterns mirror _CI_PATH_RE
+# above; the rest is _CONFIG_NAMES and _CONFIG_NAME_PATTERNS verbatim. package.json and Cargo.toml are left out
+# on purpose: _config_reason only counts them as gate configuration when a hunk touches their test-related keys
+# or sections, a diff-time judgement Gate 0 cannot make from a path glob alone, before any diff exists.
+GATE_CONFIG_PATTERNS: tuple[str, ...] = (
+    (".github/workflows/**", ".circleci/**") + tuple(sorted(_CONFIG_NAMES)) + _CONFIG_NAME_PATTERNS
+)
 _PACKAGE_KEY_RE = re.compile(r'"(?:scripts|jest|test|pretest|posttest|test:[^"]*)"')
 _CARGO_SECTION_RE = re.compile(r"^\s*\[(?:profile|lints)\b")
 

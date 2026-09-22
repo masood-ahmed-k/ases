@@ -31,10 +31,32 @@ the package file.
 | `r5_wp_fakes.md` | FK: fake Hermes board, scripted worker, fake provider, acceptance rig | built |
 | `r5_wp_hardening.md` | HD: migrations, worktree and branch cleanup, retention, runbook | built |
 
-Not yet written as work orders: the acceptance scenarios 22.3, 22.5, 22.7 to 22.16 on the rig (`tests/acceptance/` has the rig and
-two demonstrations), the project-scoping sweep (a working `project` value in `gate_runs`, `merge_records` and `events`, now that
-migration 7 has made room), plan-time validation of touches (Gate 0), a Gate 4 allowlist, wiring the post-merge revert, and the
-triage lane (ASES-LED-03).
+## Round 6 (2026-09-22, zero quota only per the user's "no need to test and burn the tokens from xkiro")
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r6_rules.md` | shared rules addendum: the hard zero-quota constraint, the fake rig summary | in use |
+| `r6_wp_core.md` | CORE: project-scoped gate_runs/merge_records, the post-merge revert trigger (ASES-GIT-05), the CHANGES_REQUIRED dead end | dispatched |
+| `r6_wp_tv.md` | TV: touches can no longer hide gate-config edits (ASES-QG-02), a Gate 4 allowlist | dispatched |
+| `r6_wp_led.md` | LED: agent-proposed cards land in triage and are validated (ASES-LED-03) | dispatched |
+| `r6_wp_fix.md` | FIX: one Bounds class, one stop_requested meaning, report.HEALTH_KINDS | dispatched |
+| `r6_wp_ac_a.md` | AC-A: acceptance 22.3 (failure/fallback), 22.9 (quota exhaustion) | dispatched |
+| `r6_wp_ac_b.md` | AC-B: acceptance 22.5 (parallel), 22.13 (kill switch) | dispatched |
+| `r6_wp_ac_c.md` | AC-C: acceptance 22.7 (crash recovery, all three points) | dispatched |
+| `r6_wp_ac_e.md` | AC-E: acceptance 22.10 (secret leak), 22.12 (gate tampering) | dispatched |
+| `r6_wp_ac_f.md` | AC-F: acceptance 22.11 (prompt injection; honest about the Docker gap) | dispatched |
+| `r6_wp_ac_g.md` | AC-G: acceptance 22.14 (plan rejection), 22.15 (idempotent re-run), 22.16 (data class) | done |
+
+All ten round 6 packages finished; see `builder-findings.md` for every report. CORE's own full-suite run was clean (5416 passed, 2
+skipped, 0 failed) before the other nine packages' changes were all merged together; a final merged-tree run confirms the whole set.
+
+Not yet written: acceptance 22.8 (merge conflict; CORE's revert wiring now exists, so this can be dispatched as package AC-D), 22.4
+(context test; likely already covered by `test_models.py`, worth confirming rather than rebuilding), the `merge_records` primary-key
+migration CORE wrote up (needs `db.py` plus five other readers updated together), the `events.project` sweep (deliberately deferred
+twice now), a fix for `triage.promote_card` (always fails on a genuinely triage-status card, found by AC-G), a fix for
+`FakeHermes.fail_next` (cannot be armed after `install()`, found independently by two builders), a Lead-prompt mention of the new
+`allow_gate_config_changes`/`gate4_allowlist` plan fields (TV's report asks for this), and `swarm triage` CLI commands plus a
+`process_triage` controller step (LED's report asks for this).
 
 Paths inside the older files that point at a session scratchpad (the blueprint text extract, for example) are stale: the extract
 lives at `C:\Users\masoo\ases-workspaces\tools\blueprint.txt`, next to the helper scripts used during the build (`nemo.py` to call

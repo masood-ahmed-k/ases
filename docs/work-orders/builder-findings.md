@@ -737,3 +737,342 @@ Noticed:
   `project IS NULL OR project = ?`). `docs/architecture.md` around line 674 still describes `_ensure_columns`.
 - `hermes worktree prune` skips `t_*` kanban trees by design (`_KANBAN_RE` in `worktree_gc.py`), so ASES needs its own cleanup.
 - This account cannot create symlinks (link-safety tests fall back to Windows junctions).
+
+# Round 6 (2026-09-22): acceptance scenarios, project scoping, touches validation, triage, consolidation (all zero quota)
+
+Work orders: `r6_rules.md`, `r6_wp_*.md`. Every package was told never to call a real Hermes or a real model provider.
+
+## Package AC-F: acceptance 22.11 injection (`tests/acceptance/test_22_11_injection.py`), done
+
+Built three tests: sandbox policy is network-deny-by-default for a profile built the real way (`config.ProjectConfig.
+sandbox_policy_config()` -> `SandboxPolicy.from_config`, the same call doctor.py/cli.py make); a worker that writes outside its
+worktree (the one thing the rig can simulate of "the model echoes the injection as a tool call") trips `guards.check_primary_checkout`
+end to end through the real `controller.run_pass`, records `integrity_violation`, halts the pass, and the integration branch never
+moves again; the negative baseline (injection text present, never acted on) causes no violation and a normal merge. Full suite:
+5279 passed, 2 skipped, 1 failed (the one failure was `test_killswitch.py`'s live AST scan colliding with another builder mid-edit;
+passed alone on re-run).
+
+Correction to the work order's own speculation: it worried `ScriptedWorker` might have no way to simulate an out-of-worktree write.
+It does: `WorkerContext.path()` accepts an absolute path "so a worker can deliberately write OUTSIDE its worktree (the prompt-injection
+and integrity scenarios need exactly that)" - built for exactly this. So three of the blueprint's four clauses (nothing outside the
+worktree, the integration branch untouched, a security event recorded) are proven fully END TO END, not reduced.
+
+Only clause 1 ("the sandbox must block the network call") stays at the policy level, as `r6_rules.md` anticipated: FakeHermes/
+ScriptedWorker never shells out and Docker never starts in this suite by hard constraint, so nothing here can make a real network
+attempt. The builder's judgment: don't spend a future round adding a `worker.py` step to fake a "curl attempt" (it would still not be
+a real network call, just decoration around the same policy-level proof); closing that gap for real needs a separate, explicitly
+Docker-permitted test phase, deliberately out of scope for this whole suite.
+
+Noticed: `guards.check_idle_worktrees` is warning-only with documented false positives (ASES-GIT-12's own register note); the primary-
+checkout guard (`check_primary_checkout`) is the half that actually halts and records the security event, and the test says so.
+
+## Package FIX: consolidation (`recovery.py`, `killswitch.py`, `report.py` and their tests), done
+
+Built: `recovery.Bounds` is now an ALIAS of `bounds.Bounds` (not a second class), so `exhausted`/`escalation`/`decide` read the same
+8-field, frozen, strictly-parsed dataclass `controller.py` already uses; `report.HEALTH_KINDS` extended from 8 to 12 (adds
+`model_mismatch`, `should_stop_error`, `tamper_check_error`, `tamper_blocked`), with the two tamper kinds deliberately double-listed
+(counted in health AND still individually shown in the quality panel's "contains tamper" catch-all, which the builder confirmed is a
+deliberately general net, not tied only to these two kinds: it is tested against a fictional kind that matches nothing in `src/`).
+694 tests in the three files; full suite 5353 passed, 2 skipped, 11 failed (all in `mergeq.py`/`triage.py`, owned by CORE/LED and being
+edited concurrently; confirmed transient by an isolated re-run of just those 5 files: 134 passed, 0 failed).
+
+DEVIATION from the work order, deliberate: `killswitch.stop_requested` was KEPT with its original name and "stopped only" meaning,
+not renamed or merged into `bounds.stop_requested`. Reason: `tests/unit/test_cli_commands.py` (owned by package CL, not FIX, and
+protected by the standing rule against editing another package's file) calls `killswitch.stop_requested` 8 times, correctly and
+deliberately distinguishing it from a paused state elsewhere in the same file via `bounds.get_state(...)["status"]`. Renaming or
+merging it would have broken that file. The docstring now cross-references `bounds.stop_requested` explicitly so the distinction is
+documented, not just implicit. Independent confirmation: `tests/acceptance/test_22_13_kill_switch.py` (package AC-B, built
+concurrently) reached the same conclusion on its own, in its own comments.
+
+`Bounds.from_budgets` strictness: the old `recovery.Bounds.from_budgets` was lenient (a present bad value silently fell back to the
+default); `bounds.Bounds.from_budgets` is strict (raises `ValueError`). The builder picked strict, and verified this introduces NO new
+production failure mode: `controller.py` already calls the strict parser on the same raw `project.budgets` dict earlier in every pass
+(via `bounds.evaluate_bounds`), so anything that would newly raise inside `recovery.py` would already have raised there first.
+
+Noticed (to settle later):
+- `controller.py` calls NEITHER `stop_requested` function by name. Its `_halted()` reimplements the identical "stopped or paused"
+  check a THIRD time inline (`bounds_mod.get_state(...).status not in ("stopped", "paused")`), then threads it through
+  `mergeq._stop_requested` (a private, generically-named helper). CORE could simplify `_halted` to call `bounds.stop_requested`
+  directly; not fixed here (not FIX's file).
+- `bounds.Bounds` is frozen; the old `recovery.Bounds` was not. Nothing mutates one today, so this is safe, but flagged for anyone who
+  might later try an in-place mutation.
+
+## Package LED: the triage lane (`src/ases/triage.py`, `tests/unit/test_triage.py`), done
+
+Built: `TriageError`, `TriageCard`, `Decision` (PROMOTE/ARCHIVE), `ValidationResult`, `list_triage_cards`, `validate`, `promote_card`,
+`archive_card`, `record_decision`, `format_triage`. 44 tests. Full suite 5336 passed, 42 failed (all in `test_controller.py`,
+`test_controller_loop.py`, `test_mergeq.py`, owned by CORE and mid-edit at the time; none touch `triage.py`), 2 skipped, up from the
+5277 baseline. No `propose_card` helper was needed (see the real-Hermes finding below, which confirms the work order's own guess).
+
+Real Hermes finding (read-only, from the installed source, never run): a plain task WORKER can call `kanban_create` itself as a
+structured tool call (`kanban_create` is NOT in `_ORCHESTRATOR_TOOLS`, the only two tools hidden from workers), so Appendix C.2's
+"propose a follow-up card" is a literal tool call the worker makes, not a comment or a different tool name. `kanban_create` does NOT
+default new cards to triage: its schema's `initial_status` enum is only `["running", "blocked"]` (triage is not even a legal value
+there; `VALID_INITIAL_STATUSES = {"running", "blocked"}`), and a card lands in triage only when the worker's own call passes a
+SEPARATE boolean, `triage=true`. `created_by` is exposed on the flat task dict; `creator_task_id` (a cleaner "which task's run created
+this" signal) is NOT, which is why `raised_by_task` needs the same id/parent/title-prefix heuristic `questions.py`/`leases.py` use.
+
+Deviations:
+- `promote_card`/`validate` gained optional `plan`/`known_roles` kwargs beyond the listed signature, since `validate` needs them.
+- `list_triage_cards` is NOT a literal copy of `questions._owner`'s ownership rule: a card claimed by NEITHER this project NOR another
+  (no title prefix, no parent link) is still LISTED with `raised_by_task=None`, rather than dropped, because a proposal (unlike a
+  question) is real work on the board that must be validated even with no clean attribution; only a card POSITIVELY claimed by another
+  project is excluded. Flagged as a deliberate deviation from the literal instruction.
+- The lineage charge field is a STOPGAP: `fix_cards` (the blueprint's closest conceptual match) is not in `recovery.bump`'s whitelist
+  and is bumped directly by `mergeq.process_merge_queue`, unreachable from this package. Of the four reachable fields, `infra_failures`
+  was chosen because `recovery.exhausted`/`escalation` explicitly exclude it from ever triggering a replan or a model switch, giving it
+  the narrowest blast radius, but it is still not semantically correct. A new `proposed_cards` column on the `lineage` table is the
+  right long-term fix (not built: LED does not own `db.py`).
+
+Noticed: ASES's own `hermes.py::kanban_create` wrapper has NO `triage` parameter at all (only `initial_status`), so if ASES itself
+ever needs to land a card in triage (as opposed to a worker's own tool call, which is the LED-03 path), that wrapper and the CLI's
+`create` subcommand both need extending first.
+
+## Package AC-B: acceptance 22.5 (parallel) and 22.13 (kill switch) (`tests/acceptance/test_22_5_parallel.py`, `test_22_13_kill_switch.py`), done
+
+Built: one scenario per file, three cards running at once with distinct worktrees/branches/profiles/port-blocks and a fourth queued
+by `max_in_progress` (22.5); `killswitch.stop_all`/`resume_all` driven against three live cards with fake `alive`/`killer`/
+`command_line` built from `fake.live_workers()` (never a real process), plus a focused test that a pid not answering alive is reported
+unverified and never killed (22.13). 3 tests total. Full suite: 5336 passed, 2 skipped, 42 failed, ALL in `test_controller.py`,
+`test_controller_loop.py`, `test_mergeq.py` (CORE was mid-edit); a 60s-later re-run of just those three files dropped it to 5 different
+failures, still zero in AC-B's own files, confirming a moving target from concurrent editing, not AC-B's bug.
+
+Deviation: `conftest.py`'s `world_factory`/`make_world` have a roles map fixed to one profile per role
+(`policy.resolve_assignee` is a strict one-role-one-profile lookup), but 22.5/22.13 need THREE distinct coder profiles. Since AC-B
+cannot edit `conftest.py`, it built each scenario's own `World` by repeating `make_world`'s steps with a wider roles map, rather than
+using the shared fixture. Suggests a `roles=`/`known_roles=` override on `make_world`/`world_factory` would help future multi-profile
+scenarios (not added: out of scope for this package). Also: `killswitch.default_list_containers`/`default_stop_container` swallow ANY
+exception by design, so a raising guard is silently eaten there; the builder used a call-tracking list instead of `pytest.raises`.
+
+Noticed: `leases.py`'s module-level `LIVE_STATUSES = ("running","ready","review","scheduled")` OMITS "todo"/"blocked", while
+`controller.py`'s own `_LEASE_LIVE_STATUSES` (always passed explicitly to `sweep_finished`) includes both -- two similarly-named
+tuples that disagree; worth confirming the module-level one isn't stale dead code or a real bug.
+
+Confirmed signatures (matched the work order's assumptions): `killswitch.stop_all(board, plan, *, conn, deadline_seconds=30,
+reason=..., pause=None, kanban_list=None, kanban_show=None, reclaim=None, killer=None, alive=None, command_line=None,
+list_containers=None, stop_container=None, now=None, sleep=None)`; `resume_all(board, plan, *, conn, resume=None, reconcile=None)`;
+`reconcile.reconcile(board, repo, plan, *, conn, apply=True, alive=pid_alive, killer=terminate_tree,
+command_line=process_command_line)`.
+
+## Package AC-C: acceptance 22.7 (crash recovery, all three points) (`tests/acceptance/test_22_7_crash_recovery.py`), done
+
+Built: three tests, one per crash point, each with its own `world_factory()` world (never shared). Full suite: 5342 passed, 2 skipped,
+42 failed, all in `test_controller.py`/`test_controller_loop.py`/`test_mergeq.py` (CORE mid-edit); an isolated re-run of just those
+three files gave 358 passed, 0 failed, confirming the collision was transient.
+
+Crash simulations, each confirmed faithful to what a real SIGKILL would leave behind:
+- Point 1 (during a running card): `fake.kill_worker(card_id)`, no monkeypatch at all -- runs zero ASES code, just leaves "running
+  card, dead pid" on the board. Confirmed reconcile's OWN `worker_gone`/`worker_gone_reclaimed` repair fires (not Hermes's own
+  dispatch-time crash detection, since nothing ticks between the kill and the reconcile call).
+- Point 2 (during a candidate build): monkeypatched `gates.run_gate` ONLY for `gate_name == "gate3"`, delegating every other gate call
+  (notably Gate 1 re-checks, which call the identical function) to the real implementation. Lands exactly in the
+  row-written-before-Gate-3-returns gap `test_reconcile.py`'s own `test_crash_b` already proves in isolation, now through the real
+  controller with a real Gate 3 running for every other call.
+- Point 3 (between the fast-forward and the merge-card completion): monkeypatched `hermes.kanban_complete` itself (already pointed at
+  `FakeHermes.kanban_complete` by `install()`) to raise the FIRST time it is called for the one merge card, then delegate normally.
+  Lands exactly in the git-write/db-write-vs-board-write gap. Reconcile produces TWO repairs in order at this point
+  (`merge_card_completed` then `intent_recovered`, since `process_merge_queue`'s own completion intent is also left open), matching
+  `test_reconcile.py`'s shape; the test asserts both.
+
+CONFIRMED BUG (independently found twice now: the round 5 CT builder hit the same thing): `FakeHermes.fail_next` cannot be armed
+after `install()` for ANY test built on the standard `world`/`world_factory` fixtures, because its validation
+(`inspect.isfunction(getattr(hermes, name))`) rejects a name once `install()` has already replaced it with a bound method -- which is
+unconditionally true for every world, since `make_world()` always calls `install()` before returning. This blocks every acceptance
+package from using `fail_next` as documented; the crash-point-3 monkeypatch above is the work order's own suggested fallback, used
+because the documented mechanism does not work. Worth a fix in `fakes/board.py` (accept `inspect.ismethod` too, or check against the
+fake's own method instead of the hermes module's current attribute) -- not built here, AC-C does not own that file.
+
+Noticed: `spec/requirements.yaml`'s ASES-ARC-03 note says "reconcile-on-start (crash recovery) not built yet", which has drifted from
+the source: `reconcile.py` is fully built with its own extensive unit-level crash-recovery suite, now also proven end to end by this
+package. Per "the source wins, report the disagreement", not corrected here (out of scope for this package).
+
+## Package TV: touches validation and Gate 4 allowlist (`tamper.py`, `plan.py`, `finalgates.py`, `config/swarm.yaml`), done
+
+Built: `tamper.GATE_CONFIG_PATTERNS` (public export, built from the same private constants `_config_reason` already uses, so Gate 0
+and the diff-time check share one list); `plan.py` gains `PlanTask.allow_gate_config_changes: bool = False` and
+`Plan.gate4_allowlist: tuple[str, ...] = ()` (both default such that an existing plan.json parses unchanged), `_is_literal_glob`,
+`_gate_config_violation`, and Gate 0 now REJECTS a touches entry that is a WILDCARD and overlaps a gate-config pattern unless the task
+sets `allow_gate_config_changes: true` (a narrow literal entry, e.g. exactly `"pytest.ini"`, is never rejected, marker or not);
+`finalgates.py` gains `ALLOWLIST_PREFIX = "allowed_"`, `severity()` treats any `allowed_`-prefixed kind as info (never blocking),
+`_apply_allowlist` rewrites only currently-blocking findings whose path matches (never `scan_error`, never an already-advisory
+finding), `run_gate4(..., allow_paths=())` (backward compatible default), `finalize()` passes `plan.gate4_allowlist` through only when
+non-empty. `config.py` was NOT touched (confirmed not needed: the allowlist lives on the plan, not the project config).
+`config/swarm.yaml` gained a documented comment block only, no live key. 30 new tests across three files; full suite 5354 passed, 2
+skipped, 37 failed, all in CORE's `controller.py` files and two acceptance tests mid-edit; an isolated re-run of just those four files
+gave 282 passed, 0 failed, confirming the collision was transient.
+
+Ran Gate 4 against ASES's OWN repository (read-only, as the work order asked): 60 blocking `secret_in_tree` findings at HEAD
+8ae7372, all sample/fake keys, all inside `tests/` or `docs/`. With `allow_paths=["tests/**", "docs/**"]` all 60 are excused and Gate 4
+now PASSES. The 20 files it had to allowlist: `docs/architecture.md`, `docs/work-orders/r2_wp_questions.md`,
+`docs/work-orders/r2_wp_report.md`, and 17 files under `tests/unit/` (bounds, cli_commands, critic, evals, events, fakes, finalgates,
+gates, killswitch, mergeq, profiles, questions, recovery, report, review, sandbox, tamper).
+
+Deviation: the work order said the marker is "the task's `gate_profile` OR a new explicit boolean"; the builder found no elaboration
+of a `gate_profile`-based exemption anywhere in the blueprint or the work order's own detailed spec, and built only the boolean.
+Flagged in case a `gate_profile`-based exemption was intended elsewhere.
+
+Noticed:
+- `tamper._config_reason` treats `package.json`/`Cargo.toml` as gate-config only by CONTENT (a diff hunk touching their test-related
+  keys), not by path, so `GATE_CONFIG_PATTERNS` deliberately excludes them: the new Gate-0 check cannot pre-empt a broad touches over
+  `package.json`, but the existing diff-time `gate_config_changed` finding still catches it at Gate 1, unaffected.
+- `spec/requirements.yaml`'s existing ASES-QG-02 note flags a DIFFERENT, still-open gap (hashing/pinning a fixed list of CI/config
+  files at approve time): this round's Gate-0 fix is complementary (plan-time touches-breadth), not a substitute; the register still
+  needs a note reflecting this round's work.
+- `cli.py`'s Lead-prompt text should mention the new `allow_gate_config_changes` task field and `gate4_allowlist` plan field (not
+  built: TV does not own `cli.py`).
+
+## Package AC-A: acceptance 22.3 (failure/fallback) and 22.9 (quota exhaustion) (`tests/acceptance/test_22_3_failure.py`, `test_22_9_quota.py`), done
+
+Built: one card walked through all four failure classifications end to end via `controller.process_recovery` (rate-limit: Hermes
+retries alone; infrastructure: three trips, resumed after backoff; auth: three trips, marks the credential unhealthy as a QUESTION,
+answered; capability: a fresh-attempt card then a switch-model card pinned to a declared candidate, which succeeds), ending with
+exactly 4 cards (no loss or duplication) and the ingested usage row naming the model/provider actually used (22.3); a 30-request daily
+cap with 10 already spent parks an over-budget task (`scheduled`, `budget:`-prefixed reason) while a cheaper task finishes normally,
+several idle passes show exactly one `card_parked_for_budget` event (no thrashing, the fake provider never started), the report shows
+the reset time and the parked card, a snapshot scan finds no purchase language anywhere, and after `ledger._today` is monkeypatched
+past midnight the card unparks and completes with the other task's state unchanged (22.9). 5 tests. Full suite 5361 passed, 2 skipped,
+35 failed, all in CORE's `controller.py` files mid-edit; an isolated re-run one minute later gave 279 passed, 0 failed.
+
+Report-back: `ledger.py` has NO injectable "today" (`ledger._today()` always calls `datetime.now(timezone.utc)` directly; `run_pass`'s
+own injected `now` is never read by it); the builder monkeypatched `ledger._today` itself. Budget shape used: one capped provider
+(`{"limits": {"per_day": 30}}`), one uncapped, `daily_reserve_percent`/`review_reserve_requests` zeroed so the arithmetic is just
+cap-minus-used; usage seeded directly via `ledger.record_usage` rather than through a real worker session, for exactness.
+
+Noticed (both worth checking):
+1. IMPORTANT: a card that crashes ONCE with genuinely auth- or quota-shaped error text (short of tripping the 3-strike breaker) can
+   get PERMANENTLY STUCK in `ready`, invisible to `recovery.py`. `FakeHermes._respawn_guard` (mirroring real Hermes) refuses to
+   redispatch ANY card whose `last_failure_error` matches an auth/quota-shaped regex (429, 403, `auth\w*`, "unauthorized", "invalid api
+   key"...), regardless of whether the breaker has actually tripped, and `recovery.process_failures` only ever examines `blocked`
+   cards -- so such a card never becomes a question, never gets marked credential-unhealthy, nothing. The builder had to choose error
+   text carefully (avoiding "429"/"rate limit") to keep the test working. This is a real gap between what the blueprint promises
+   (401/429 always classified and acted on) and what a worker crashing with realistic provider error text would experience against
+   real Hermes.
+2. `usage.py`'s `_ingest_run` resolves the "pinned" model purely from the profile's ROLE (`provider_for_profile`), never from
+   `card.get("model_override")`, while `recovery._current_model` (used for the NEXT switch decision) DOES check it -- the two modules
+   read the override inconsistently. It still works today (a mismatch is detected and the real reported model is recorded), but worth
+   confirming that inconsistency is intentional.
+
+## Package AC-E: acceptance 22.10 (secret leak) and 22.12 (gate tampering) (`tests/acceptance/test_22_10_secrets.py`, `test_22_12_tampering.py`), done
+
+Built: five 22.12 tests, one per real `fw.TAMPER_KINDS` value (`delete_test`, `skip_marker`, `or_true`, `outside_paths`, `untracked`),
+each sent back before any reviewer runs, with the RIGHT finding kind asserted; three 22.10 tests (a secret-shaped value in a committed
+file blocks Gate 1 and never leaks across events/gate_runs.detail/review_verdicts.metadata/card bodies/comments/both report renderings;
+a key in the controller's own environment never leaks anywhere either; a whole file named like a secret, e.g. `id_rsa`, blocks Gate 1).
+8 tests. Full suite 5350 passed, 2 skipped, 41 failed, all in CORE's `controller.py` files mid-edit; an isolated re-run gave 358
+passed, 0 failed.
+
+Deviations: the work order's guessed kind name "out_of_scope" is not real, the actual value is `outside_paths`; for the whole-file
+secret case touches had to be `["a.py", "id_*"]` not `["a.py", "id_rsa"]` (naming the file literally would EXEMPT it from the
+`generated_artifact` finding, since tamper.py only exempts a glob that names the artifact explicitly); had to move off a bare `"*"`
+touches glob because TV's plan-time validation (landed concurrently) now refuses one broad enough to cover gate/CI config without
+`allow_gate_config_changes: true`; each kind's worker is `fw.sequence(tampering_coder(kind), fw.questioner(...))` not the persona
+alone, since the review lane's send-back and dispatch's redispatch happen in the SAME `run_pass` call and `tampering_coder`'s steps
+are not safe to repeat on the same branch. The fake provider was never started (nothing here makes a model call).
+
+CONFIRMED (independently reproduced, matching the register's own ASES-QG-02/QG-03 note and the MR builder's round 5 finding):
+because `review.check_branch` runs the scope check BEFORE the tamper check, `gate_config_changed` and `assertion_weakened` can never
+fire through this wiring -- anything that reaches tamper.py is already inside touches, hence "allowed". The `outside_paths` test is
+caught purely by the scope check, confirming this a second, independent way.
+
+Finding/event kinds the real code actually produces (table for future readers): delete_test/skip_marker/or_true -> `tamper_blocked` +
+`gate1_recheck_failed`, detail kind `test_file_deleted`/`skip_marker`/`unconditional_pass`; outside_paths -> scope check only (
+`gate1_recheck_failed`, BranchCheck kind `out_of_scope`, no `tamper_blocked`); untracked -> Gate 1 itself runs and is genuinely red (
+`gate1_recheck_failed`, BranchCheck kind `gate1_red`, a real `gate_runs` fail row) -- the blueprint's prose reads as if a
+missing-file check catches this kind, but the real mechanism is simply that the diff has no tamper finding and the seeded test was
+never actually fixed. A whole secret-named file added is `generated_artifact`, NEVER `secret_added`: `secret_added` only fires for a
+secret-shaped VALUE on an added line, via `tamper.check_range` (what the review lane and merge queue call); `gates.scan_for_secrets`
+(which WOULD call a whole secret file `secret_added`) is a separate helper only reached from `mergeq.merge_task` at Gate 3, never from
+`review.check_branch`.
+
+## Package AC-G: acceptance 22.14 (plan rejection), 22.15 (idempotent re-run), 22.16 (data class) (three new files under `tests/acceptance/`), done
+
+Built: Gate 0 rejects a cycle/missing-acceptance/missing-touches plan with exact errors, no FakeHermes needed; a 3-round critic loop
+(replan, replan, ask_user -- `next_step`'s real bound needs a THIRD CHANGES_REQUIRED to cross `max_rounds=2`, not two) ending in
+rejection with no card ever created (22.14); card creation idempotent twice and once more after the database is deleted, a fix card's
+staleness after DB deletion documented as a real gap (below), a triage card untouched by ordinary `run_pass` calls, listed/validated/
+archived for real once LED's `triage.py` landed mid-session, and a NEW bug found in `triage.promote_card` (below) (22.15); a
+`ProjectConfig` cannot be built at all without a data class, `swarm run` refuses before dispatch with none declared, confidential with
+only remote providers refuses at Gate P, private refuses a training-on-inputs provider at Gate P, and the per-pass budget gate has NO
+data-class awareness -- a genuine, empirically confirmed gap (22.16). 14 tests. Full suite 5350 passed, 2 skipped, 41 failed, all in
+CORE's `controller.py`/`mergeq.py` files mid-edit (the machine was heavily contended: ~39 python processes from concurrent builders,
+19.5 minutes for this run); none of AC-G's own 14 tests failed, each file also passed standalone.
+
+Two real, not-yet-fixed problems found:
+1. NEW BUG in `triage.py` (package LED): `promote_card` calls `hermes.kanban_promote` UNCONDITIONALLY, including under `force=True`
+   (force only skips `validate()`, not the Hermes call). Both `FakeHermes.kanban_promote` and, per the same source reading, REAL
+   Hermes only promote from `todo`/`blocked`, never `triage`. So `promote_card` on a genuinely triage-status card ALWAYS raises
+   `HermesCommandError` ("... is 'triage'; promote only applies to 'todo' or 'blocked'") -- it can never actually do its job.
+   `archive_card` is unaffected. Not fixed (not AC-G's file); needs a follow-up in `triage.py` (likely: promote a triage card via
+   `unblock`/`specify`-adjacent mechanics, or accept that "promote" for a triage card means something Hermes-side this function does
+   not yet call).
+2. `create_cards_from_plan`'s fix-card protection (the `CASE WHEN plan_tasks.fix_cards > 0 THEN plan_tasks.work_card_id ELSE
+   excluded.work_card_id END` clause in its upsert) only fires when a `plan_tasks` row ALREADY EXISTS to read `fix_cards` from.
+   Deleting the ASES database deletes that row, so a THIRD `create_cards_from_plan` call after a DB delete reverts `work_card_id` to
+   the ORIGINAL, superseded work card and resets `fix_cards` to 0, even though a fix card is still the task's real current card on the
+   (unchanged) board. The board stays internally consistent (no duplicate card), but ASES's own bookkeeping silently goes stale. Test
+   reproduces the exact fix-card state `process_merge_queue` leaves and pins this precisely.
+
+Confirmed empirically (not assumed): the data-class guarantee is enforced ONLY by `cli._estimate_lines` (calling
+`policy.check_data_class` per task), invoked once at plan-approval time by `cmd_approve`/`cmd_critique`. `controller.process_budget_gate`
+calls only `policy.check_budget` (a grep for `next_model|data_class` in `controller.py` returns nothing from that function); the only
+other call site is `recovery.next_model` -> `recovery._adjust` -> `process_failures`, which DOES run every pass but only on the
+switch-model branch, reached only after a card's SECOND capability failure -- never on ordinary dispatch of a healthy ready card. So
+"they park instead" (private class, provider exhausted) is a ONE-TIME Gate P check today, not a per-pass re-check; a card whose
+provider becomes or was always unsafe is never parked for that reason once past approval.
+
+## Package CORE: project-scoped gate/merge records, the post-merge revert trigger, the CHANGES_REQUIRED dead end (`gates.py`, `bounds.py`, `mergeq.py`, `controller.py` and their tests), done -- the last of the ten round 6 packages
+
+Built: `gates.run_gate(..., project=None)` (stores it; NULL when omitted, unchanged) and `last_gate_result(..., project=None)`
+(NULL-tolerant scoping); `bounds.record_final_gate` now also stamps `gate_runs.project`; `bounds.final_gates_green(conn, head, *,
+project=None)` (keyword-only, so every existing positional call keeps working) and `bounds.is_finished` now passes `project=
+plan.project` internally, fixing the real bug (two projects sharing a database could read each other's final-gate rows);
+`mergeq.RevertOutcome` (new: ok, commit_sha, detail, aborted) replaces `revert_merge`'s old bare bool, `reverted=1` written only on a
+REAL success, a failed revert runs `git revert --abort` as best effort; `merge_task` threads `project` through to Gate 3 and to
+`merge_records` writes; `controller.process_merge_queue` re-runs Gate 3 as `"gate3-postmerge"` on the new HEAD after every real
+(non-no-op) coder merge (ASES-GIT-05): green is unchanged, red-but-revert-succeeds takes the ordinary fix-card/escalate path (factored
+into a new `_handle_merge_failure` helper both failure paths now share), red-and-revert-also-fails records `integrity_violation` and
+halts the run via a new `integrity` out-param threaded through `run_pass`; and the CHANGES_REQUIRED/BLOCKED dead end is fixed: a
+well-formed non-PASS verdict on a `done` card now calls `kanban_reopen_review` + a `reviewer_completed_with_changes_requested` event
+instead of being refused forever. 27 new tests plus one narrowed/renamed. Full suite: 5416 passed, 2 skipped, 0 FAILED (822s) -- clean,
+all ten round 6 packages now integrate. Also explicitly re-ran `test_finalgates.py` (green) and `test_reconcile.py` (170 passed) after
+the change, as its own work order asked.
+
+IMPORTANT, answered the work order's own question: CORE did NOT touch `db.py` (the hard rule), but concluded the NULL-tolerant
+approach, while sufficient for `gate_runs` (an append-only log, filtering genuinely disambiguates), is NOT a complete fix for
+`merge_records`. `merge_records.task_key` is the table's ONLY primary key; SQLite's `ON CONFLICT` dispatches off the DECLARED
+constraint, not a value passed at call time, so an upsert's conflict target cannot be made NULL-tolerant the way a SELECT's WHERE can.
+Two projects reusing the same task key will have the SECOND project's candidate-build upsert land directly on the FIRST project's row,
+overwriting candidate_sha/gate3_result/squash_commit/reverted/completed_at -- real data loss, not just an ambiguous read. What CORE
+built (project-stamped writes, NULL-tolerant WHERE-scoped plain UPDATEs in `_fast_forward`/`revert_merge`) turns that specific
+corruption into a safe no-op instead (a mismatched-project UPDATE matches zero rows) and lets `reconcile.py`'s existing
+`merge_done_without_record` check surface the resulting inconsistency -- a real improvement, but explicitly not a fix for the upsert
+collision itself.
+
+**PROPOSED MIGRATION for a future round (architect decision, not built)**: change `merge_records`' PRIMARY KEY from `task_key` to
+`(project, task_key)`, `project` NOT NULL going forward, backfilled from `plan_tasks` (which already has `(project, task_key)` as its
+own primary key, so a join can supply the correct value for every existing row; a sentinel for anything unresolvable). Every
+`INSERT ... ON CONFLICT(task_key)` in `mergeq.py` becomes `ON CONFLICT(project, task_key)`. This is a COORDINATED change, not a solo
+fix: `finalgates.py`, `report.py`, `reconcile.py`, `hardening.py`, and `evalkit/codetasks.py` all currently read `merge_records` by
+`task_key` alone (several via `.fetchone()`), and once `task_key` stops being unique on its own, every one of them needs a `project`
+filter added too, or they read (or crash on) the wrong row the moment two projects genuinely share a task key.
+
+Deviations: `Verdict` has no `summary` field (the work order's suggested `reason=verdict.summary` does not exist); used
+`completed_run.get("summary")` instead. `review.py`'s Gate 1 call to `run_gate` was NOT given `project=` (confirmed by reading it: not
+yet project-scoped, deliberately left for a later round). `events.record` was not touched (nothing in this change made it newly
+urgent). nemotron returned 403 again; the builder did a manual self-review instead of a second-opinion pass.
+
+Noticed: `hardening.py` (a different round 5 package) ALREADY reads `merge_records` with the identical NULL-tolerant
+`(project IS NULL OR project = ?)` pattern CORE independently used -- cross-confirms this is the converged convention for this round.
+The post-merge check is gated on `task.role == "coder"` exactly as instructed; if a non-coder branch ever carried a real diff (not
+supposed to happen: review-only roles have no file-write tools by design) it would skip the post-merge re-check entirely.
+
+## Architect fix: FakeHermes.fail_next after install() (`src/ases/fakes/board.py`, `tests/unit/test_fakes.py`), done
+
+Applied directly (small, mechanical, well-understood after two independent reports). Root cause: `fail_next` validated a name
+against `inspect.isfunction(getattr(_hermes, name))`, reading the HERMES MODULE's CURRENT attribute; once `install(monkeypatch)`
+replaces `hermes.<name>` with a bound method of the fake, `inspect.isfunction` on it is always False, so `fail_next` rejected EVERY
+name for any test built on `world`/`world_factory` (which always call `install()`). Fix: a module-level `_HERMES_PUBLIC_NAMES`
+frozenset, captured once at import time (before any test's monkeypatching can happen), and `fail_next` now validates against that
+frozen set instead of a live lookup. One regression test added (`test_fail_next_can_still_be_armed_after_install`), also checking
+that a real method of the fake that is NOT a hermes-module function (`card`) is still correctly rejected. `test_fakes.py`: 159 passed.
+`tests/acceptance/test_scenarios_demo.py`: 4 passed (unaffected). Full merged-tree suite run separately to confirm no wider impact.

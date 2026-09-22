@@ -925,6 +925,108 @@ def test_gate4_end_to_end_a_tracked_env_file_fails_before_any_command_runs(tmp_p
 
 
 # ============================================================================================================
+# Gate 4 allowlist (ASES-TSK-04, section 18.2): a finding an allow_paths glob covers is dropped from the
+# blocking set but stays in the outcome, renamed to its "allowed_" kind, so it is never silently invisible.
+# ============================================================================================================
+
+
+def test_gate4_allowlist_drops_a_matching_finding_from_blocking_and_passes(conn):
+    finding = _finding("secret_in_tree", path="tests/fixtures/fake_key.py", detail="secret-shaped value (nvapi-)")
+    outcome = _run4(
+        conn, _plan(profiles={"g": ["x"]}), "a" * 40,
+        scan=lambda repo, ref: [finding], allow_paths=["tests/**"],
+    )
+
+    assert outcome.passed is True
+    assert finalgates.blocking(outcome.findings) == []
+    assert [(f.kind, f.path) for f in outcome.findings] == [
+        ("allowed_secret_in_tree", "tests/fixtures/fake_key.py"),
+    ]
+    assert "allowlisted" in outcome.findings[0].detail and "nvapi-" in outcome.findings[0].detail
+    assert [row["result"] for row in _final_rows(conn, "gate4")] == ["pass"]
+
+
+def test_gate4_allowlist_still_fails_on_a_non_allowlisted_finding(conn):
+    allowed = _finding("secret_in_tree", path="tests/a.py")
+    other = _finding("secret_in_tree", path="src/leak.py")
+    outcome = _run4(
+        conn, _plan(profiles={"g": ["x"]}), "a" * 40,
+        scan=lambda repo, ref: [allowed, other], allow_paths=["tests/**"],
+    )
+
+    assert outcome.passed is False
+    kinds = {(f.kind, f.path) for f in outcome.findings}
+    assert ("allowed_secret_in_tree", "tests/a.py") in kinds
+    assert ("secret_in_tree", "src/leak.py") in kinds
+    assert [f.path for f in finalgates.blocking(outcome.findings)] == ["src/leak.py"]
+
+
+def test_gate4_allowlist_never_excuses_a_scan_error(conn):
+    """A scan that could not run is not a content decision a plan can excuse (and its path is often "" anyway,
+    which no glob can name)."""
+    error = _finding("scan_error", path="", line=None, detail="git diff failed")
+    outcome = _run4(
+        conn, _plan(profiles={"g": ["x"]}), "a" * 40, scan=lambda repo, ref: [error], allow_paths=["*"],
+    )
+
+    assert outcome.passed is False
+    assert [f.kind for f in outcome.findings] == ["scan_error"]
+
+
+def test_gate4_allowlist_default_is_a_no_op(conn):
+    finding = _finding("secret_in_tree", path="tests/a.py")
+    outcome = _run4(conn, _plan(profiles={"g": ["x"]}), "a" * 40, scan=lambda repo, ref: [finding])
+
+    assert outcome.passed is False
+    assert [f.kind for f in outcome.findings] == ["secret_in_tree"]
+
+
+def test_gate4_allowlist_matches_the_same_glob_semantics_as_elsewhere(conn):
+    """fnmatch, so * and ** both cross directories, matching tamper._glob_match and plan.py's touches check."""
+    finding = _finding("generated_artifact_tracked", path="docs/sample/secret.pem")
+    outcome = _run4(
+        conn, _plan(profiles={"g": ["x"]}), "a" * 40,
+        scan=lambda repo, ref: [finding], allow_paths=["docs/*/secret.pem"],
+    )
+
+    assert outcome.passed is True and outcome.findings[0].kind == "allowed_generated_artifact_tracked"
+
+
+def test_gate4_allowlist_end_to_end_with_the_real_scan(tmp_path, conn):
+    repo = _make_repo(tmp_path / "repo", {"tests/fixtures/fake_key.py": f'KEY = "{SECRET}"\n'})
+    plan = _plan(profiles={"g": ["echo ok"], "gate4": ["python -c \"print('audit ok')\""]})
+    outcome = finalgates.run_gate4(repo, plan, conn, _head(repo), allow_paths=["tests/**"])
+
+    assert outcome.passed is True
+    assert any(f.kind == "allowed_secret_in_tree" for f in outcome.findings)
+    assert SECRET not in outcome.detail and SECRET_TAIL not in outcome.detail
+
+
+def test_gate4_allowlist_leaves_an_advisory_finding_under_the_same_path_untouched(conn):
+    """injection_pattern is already advisory, never blocking: there is nothing on it for the allowlist to
+    excuse, so it keeps its own kind rather than being relabeled allowed_injection_pattern."""
+    advisory = _finding("injection_pattern", path="tests/a.py", detail="eval or exec of a non-literal (heuristic)")
+    outcome = _run4(
+        conn, _plan(profiles={"g": ["x"]}), "a" * 40, scan=lambda repo, ref: [advisory], allow_paths=["tests/**"],
+    )
+
+    assert outcome.passed is True
+    assert outcome.findings == (advisory,)
+
+
+def test_severity_of_an_allowlisted_kind_is_info():
+    finding = _finding("allowed_secret_in_tree", path="tests/a.py")
+
+    assert finalgates.severity(finding) == "info"
+    assert finalgates.blocking([finding]) == [] and finalgates.advisory([finding]) == []
+
+
+def test_severity_only_the_allowlist_prefix_is_special_cased():
+    """A kind that merely ends with the word "allowed" (not prefixed with it) still blocks: fail closed."""
+    assert finalgates.severity("secret_in_tree_allowed") == "blocking"
+
+
+# ============================================================================================================
 # run_gate5
 # ============================================================================================================
 
@@ -1489,8 +1591,11 @@ class FakeGate:
         self.raises, self.record, self.on_run = raises, record, on_run
         self.calls = []
 
-    def __call__(self, repo, plan, conn, head, *, runner=None, timeout_per_command=300):
-        self.calls.append({"repo": repo, "head": head, "runner": runner, "timeout": timeout_per_command})
+    def __call__(self, repo, plan, conn, head, *, runner=None, timeout_per_command=300, allow_paths=()):
+        self.calls.append({
+            "repo": repo, "head": head, "runner": runner, "timeout": timeout_per_command,
+            "allow_paths": allow_paths,
+        })
         if self.on_run is not None:
             self.on_run()
         if self.raises is not None:
@@ -1526,6 +1631,34 @@ def _finalize(world, *, run4=None, run5=None, build=None, now=NOW, **kwargs):
 
 def _report_dir(world):
     return world.tmp / "home" / "reports" / "ases" / STAMP
+
+
+# --- ASES-TSK-04: plan.gate4_allowlist flows through finalize() to run4 as allow_paths -------------------------
+
+
+def test_finalize_passes_the_plans_gate4_allowlist_to_run4(world, written_reports):
+    world.plan = dataclasses.replace(world.plan, gate4_allowlist=("tests/**", "docs/**"))
+    run4 = FakeGate("gate4")
+    _finalize(world, run4=run4)
+
+    assert run4.calls[0]["allow_paths"] == ("tests/**", "docs/**")
+
+
+def test_finalize_omits_allow_paths_when_the_plan_has_no_allowlist(world, written_reports):
+    """The plan's default gate4_allowlist is (): finalize() then calls run4 exactly as it did before this field
+    existed, so a run4 stand-in written before it (elsewhere in the suite) keeps working unchanged."""
+    run4 = FakeGate("gate4")
+    _finalize(world, run4=run4)
+
+    assert run4.calls[0]["allow_paths"] == ()
+
+
+def test_finalize_never_passes_allow_paths_to_run5(world, written_reports):
+    world.plan = dataclasses.replace(world.plan, gate4_allowlist=("tests/**",))
+    run5 = FakeGate("gate5")
+    _finalize(world, run5=run5)
+
+    assert run5.calls[0]["allow_paths"] == ()
 
 
 def test_finalize_is_not_ready_while_a_merge_card_is_not_done(world, fake_board, written_reports):

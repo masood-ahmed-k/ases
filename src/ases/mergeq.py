@@ -12,6 +12,20 @@ Two things wrap those steps (round 5). The kill switch (ASES-REC-06: "stop the m
 the middle of one. And when the caller names a project, the steps write intent records (ASES-REC-03/04: "Every
 multi-step action writes an intent record before acting and a completion record after ... build a candidate,
 fast-forward ... revert"), so a crash between the two leaves an open intent that reconcile-on-start can read.
+
+Round 6, project-scoping merge_records (found by the reconcile and evals builders: two projects sharing this
+database, or reusing a task key, share a merge_records row): schema v7 added a nullable `project` column here, the
+same as gate_runs. Every write in this module now stamps it, and revert_merge's own write is NULL-tolerant scoped
+by it (the same pattern gates.last_gate_result uses). That is deliberately the SMALLER, SAFER fix, not a full
+solution: merge_records.task_key is still the table's only primary key, so an INSERT ... ON CONFLICT(task_key)
+upsert (every write in _build_candidate and _record_candidate) cannot be made NULL-tolerant the way a SELECT or an
+UPDATE's WHERE clause can -- SQLite dispatches ON CONFLICT off the table's actual constraint, not a value passed at
+call time, so a second project's candidate for a reused task_key still lands on the SAME physical row as the
+first project's, overwriting it, not creating a row of its own. A true fix needs a schema migration (task_key
+alone is no longer enough for a primary key) touching db.py, which this package does not own and has not made:
+see the CORE package's final report for the exact migration proposed and why every other reader of merge_records
+(finalgates.py, report.py, reconcile.py, hardening.py, evalkit/codetasks.py -- none of them owned by this
+package either) would need updating in the same change, since they all read it by task_key alone today.
 """
 from __future__ import annotations
 
@@ -63,6 +77,28 @@ class MergeOutcome:
     # True ONLY when should_stop asked for a halt at a checkpoint (ASES-REC-06). The candidate was discarded and no
     # merge_records row was written or changed for it; candidate_sha, squash_commit and gate3_result are None.
     stopped: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.detail, str):
+            object.__setattr__(self, "detail", events_mod.redact_text(self.detail))
+
+
+@dataclasses.dataclass(frozen=True)
+class RevertOutcome:
+    """The result of one revert_merge call (round 6: the MR builder found that the old bool return let a failed
+    `git revert` still mark merge_records.reverted = 1, and never cleaned up a conflicted checkout).
+
+    `ok` is True only when `git revert` itself exited 0 and a new revert commit exists; that is the one bit the
+    old bare bool carried, kept under a name a caller checks explicitly (the same style as MergeOutcome.merged),
+    never by truthiness. `commit_sha` is that new commit, None when there is none. `aborted` is True only when
+    the revert failed AND `git revert --abort` was run and itself exited 0, so the primary checkout was left
+    clean at the pre-revert commit; a caller for which even that is not good enough (the checkout could still be
+    left mid-conflict) tells the two apart by `ok is False and aborted is False`. `detail` is git's own output or
+    error text, always redacted (ASES-SEC-01: git can echo an environment or a remote URL)."""
+    ok: bool
+    commit_sha: str | None
+    detail: str
+    aborted: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.detail, str):
@@ -208,7 +244,7 @@ def merge_task(
                      f"squash {work_branch} onto {integration_branch}"):
             candidate_sha, early = _build_candidate(
                 repo, integration_branch, work_branch, squash_ref, task_key, candidate, commit_message,
-                allow_empty, conn,
+                allow_empty, conn, project,
             )
             if early is not None:
                 return early
@@ -216,20 +252,20 @@ def merge_task(
             if _stop_requested(should_stop, conn, task_key, STEP_GATE3):
                 return _stopped(STEP_GATE3)
             gate_result = gates_mod.run_gate(
-                candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key,
+                candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key, project=project,
             )
             # The last checkpoint comes BEFORE the merge_records row is written, so a stop here leaves the row
             # exactly as it was. A red gate never reaches the fast-forward, so it has nothing left to stop.
             if gate_result.passed and _stop_requested(should_stop, conn, task_key, STEP_FAST_FORWARD):
                 return _stopped(STEP_FAST_FORWARD)
             if conn is not None:
-                _record_candidate(conn, task_key, candidate_sha, gate_result.passed)
+                _record_candidate(conn, task_key, candidate_sha, gate_result.passed, project)
             if not gate_result.passed:
                 return MergeOutcome(False, candidate_sha, None, "fail", gate_result.detail)
 
         with _intent(conn, project, intents_mod.KIND_FAST_FORWARD, task_key,
                      f"fast-forward {integration_branch} to {candidate_sha}"):
-            return _fast_forward(repo, integration_branch, candidate_sha, task_key, conn)
+            return _fast_forward(repo, integration_branch, candidate_sha, task_key, conn, project)
     finally:
         _git(["worktree", "remove", "--force", str(candidate)], repo)
         shutil.rmtree(tmp_root, ignore_errors=True)
@@ -237,7 +273,7 @@ def merge_task(
 
 def _build_candidate(
     repo: pathlib.Path, integration_branch: str, work_branch: str, squash_ref: str, task_key: str,
-    candidate: pathlib.Path, commit_message: str | None, allow_empty: bool, conn,
+    candidate: pathlib.Path, commit_message: str | None, allow_empty: bool, conn, project: str | None = None,
 ) -> tuple[str | None, MergeOutcome | None]:
     """Squash `squash_ref` onto the integration tip in the throwaway worktree `candidate`, commit it, and scan the
     diff for secrets. Returns (candidate_sha, None) when there is a candidate commit ready for Gate 3, or (None,
@@ -278,13 +314,20 @@ def _build_candidate(
             # card. candidate_sha is the integration tip the empty squash was built on. A retry rewrites every
             # column the no-op owns, so running it twice leaves one identical row. reverted is one of them: this
             # is a new candidate build too, so it starts the row over (see merge_task's ASES-REC-04 note).
+            #
+            # project (schema v7, round 6): stamped the same way, and reset the same way on a new candidate. This
+            # is the smaller, safer fix the MR builder chose over a primary-key migration (see revert_merge and
+            # the module docstring note below): merge_records.task_key is still the ONLY primary key, so a second
+            # project's candidate for a reused task_key still upserts onto this SAME row rather than a row of its
+            # own -- writing project here does not stop that collision, it only lets a reader (this row's later
+            # UPDATEs, and any caller that filters by project) tell whether the row it is looking at is its own.
             conn.execute(
                 "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
-                "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, ?) "
+                "reverted, completed_at, project) VALUES (?, ?, ?, NULL, 0, ?, ?) "
                 "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
                 "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, "
-                "completed_at=excluded.completed_at",
-                (task_key, base_sha, "skipped", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                "completed_at=excluded.completed_at, project=excluded.project",
+                (task_key, base_sha, "skipped", datetime.now(timezone.utc).isoformat(timespec="seconds"), project),
             )
         return None, MergeOutcome(True, None, None, "skipped", "no changes to merge (review-only task)")
 
@@ -306,22 +349,23 @@ def _build_candidate(
     return candidate_sha, None
 
 
-def _record_candidate(conn, task_key: str, candidate_sha: str, passed: bool) -> None:
+def _record_candidate(conn, task_key: str, candidate_sha: str, passed: bool, project: str | None = None) -> None:
     """Write the merge_records row for a candidate that has been through Gate 3. A NEW candidate starts the row
-    over: reverted, squash_commit and completed_at are reset, because they describe the previous merge of this task
-    (a revert, a fix card and a second merge is the case that used to leave reverted=1 behind). The fast-forward
-    fills squash_commit and completed_at in again once it lands."""
+    over: reverted, squash_commit, completed_at and project are reset, because they describe the previous merge of
+    this task (a revert, a fix card and a second merge is the case that used to leave reverted=1 behind). The
+    fast-forward fills squash_commit and completed_at in again once it lands."""
     conn.execute(
         "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
-        "reverted, completed_at) VALUES (?, ?, ?, NULL, 0, NULL) "
+        "reverted, completed_at, project) VALUES (?, ?, ?, NULL, 0, NULL, ?) "
         "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
-        "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, completed_at=NULL",
-        (task_key, candidate_sha, "pass" if passed else "fail"),
+        "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, completed_at=NULL, "
+        "project=excluded.project",
+        (task_key, candidate_sha, "pass" if passed else "fail", project),
     )
 
 
 def _fast_forward(
-    repo: pathlib.Path, integration_branch: str, candidate_sha: str, task_key: str, conn,
+    repo: pathlib.Path, integration_branch: str, candidate_sha: str, task_key: str, conn, project: str | None = None,
 ) -> MergeOutcome:
     """Advance the real integration branch to the gated candidate, or refuse without forcing anything, and
     complete the merge_records row when it lands."""
@@ -350,6 +394,11 @@ def _fast_forward(
         return MergeOutcome(False, candidate_sha, None, "pass", detail, integration_moved=moved)
 
     if conn is not None:
+        # project is deliberately NOT touched here (2026-09-19 upsert already stamped it, this is a plain
+        # UPDATE): a fast-forward with no project given (an old caller) must still land on whichever row
+        # _record_candidate/_build_candidate just wrote moments ago, in the SAME merge_task call, under the
+        # SAME task_key -- there is only one row per task_key (merge_records has no composite key, see
+        # revert_merge's docstring), so task_key alone always finds it.
         conn.execute(
             "UPDATE merge_records SET squash_commit = ?, completed_at = ? WHERE task_key = ?",
             (candidate_sha, datetime.now(timezone.utc).isoformat(timespec="seconds"), task_key),
@@ -359,17 +408,59 @@ def _fast_forward(
 
 def revert_merge(
     repo: pathlib.Path, squash_commit: str, *, conn=None, task_key: str = "", project: str | None = None,
-) -> bool:
+) -> RevertOutcome:
     """ASES-GIT-05: a post-merge failure reverts the squash commit rather than leaving the
-    integration branch red.
+    integration branch red. Returns a RevertOutcome; read RevertOutcome.ok, never the truthiness of the
+    object itself (round 6: this used to return a bare bool, which the caller trusted even when it was
+    wrong -- see the two fixes below).
 
     ASES-REC-03/04 (`project`): with a project name (and a connection) the revert runs inside an intent of kind
     revert keyed by `task_key`, the shape reconcile-on-start reads ("a revert was started for the task"). It is
     completed when this function returns and left open when it raises or the process dies, so a crash between
-    `git revert` and the merge_records update is found and settled from git."""
+    `git revert` and the merge_records update is found and settled from git. `git revert --abort` (below) is run
+    OUTSIDE that accounting on purpose: a best-effort cleanup attempt must never turn into a second half-written
+    intent of its own.
+
+    Round 6 (the MR builder's finding): this used to mark merge_records.reverted = 1 even when `git revert`
+    itself failed, and never ran `git revert --abort` on a conflict, so a failed revert could leave the primary
+    checkout mid-revert (conflict markers, an in-progress revert in .git) while the database quietly claimed the
+    commit was reverted. Both are fixed: `reverted = 1` is written only when `git revert` actually exited 0, and
+    any other exit runs `git revert --abort` as a best-effort cleanup (its own failure is swallowed, never
+    raised: a cleanup attempt that itself blows up must not be worse than not attempting one) so the checkout is
+    left clean at the pre-revert commit whenever git can manage it at all. `RevertOutcome.aborted` says whether
+    that cleanup succeeded; `ok` is False either way; a caller that must tell "cleanly refused" from "still
+    dirty" apart checks `aborted` too, matching the halt path controller.process_merge_queue wires this round.
+
+    The `reverted` write is NULL-tolerant by project (the same scoping run_gate and last_gate_result use, ASES
+    schema v7), the smaller, safer fix in place of a primary-key migration to merge_records (see the module-level
+    note in mergeq.py's docstring and the CORE package report): task_key is still merge_records' only primary
+    key, so this cannot stop two projects that reuse a task_key from upserting onto the SAME row (only a
+    composite key could); what it DOES stop is THIS write landing on a row a DIFFERENT project's more recent
+    candidate has since claimed, which would otherwise silently mark that other project's in-flight merge
+    reverted. With no project given (the old call shape), nothing is filtered, exactly as before."""
     with _intent(conn, project, intents_mod.KIND_REVERT, task_key, f"revert {squash_commit}"):
         result = _git(["revert", "--no-edit", squash_commit], repo)
         ok = result.returncode == 0
-        if conn is not None and task_key:
-            conn.execute("UPDATE merge_records SET reverted = 1 WHERE task_key = ?", (task_key,))
-    return ok
+        aborted = False
+        if ok:
+            commit_sha = _head_sha(repo)
+            detail = f"reverted {squash_commit}: {result.stdout}{result.stderr}".strip()
+        else:
+            commit_sha = None
+            detail = f"git revert of {squash_commit} failed: {result.stdout}{result.stderr}"
+            try:
+                abort = _git(["revert", "--abort"], repo)
+                aborted = abort.returncode == 0
+                if not aborted:
+                    detail += f" (git revert --abort also failed: {abort.stdout}{abort.stderr})"
+            except Exception as exc:  # noqa: BLE001 - best effort: a cleanup attempt must never itself raise
+                detail += f" (git revert --abort also raised: {type(exc).__name__}: {exc})"
+        if ok and conn is not None and task_key:
+            if project is None:
+                conn.execute("UPDATE merge_records SET reverted = 1 WHERE task_key = ?", (task_key,))
+            else:
+                conn.execute(
+                    "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND (project IS NULL OR project = ?)",
+                    (task_key, project),
+                )
+    return RevertOutcome(ok, commit_sha, detail, aborted=aborted)

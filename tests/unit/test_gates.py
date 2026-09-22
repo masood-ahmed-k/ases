@@ -65,6 +65,74 @@ def test_last_gate_result_none_when_absent(tmp_path):
     assert gates.last_gate_result(conn, "T1", "gate1", "deadbeef") is None
 
 
+# --- schema v7: gate_runs.project (round 6) ----------------------------------------------------------------------
+
+
+def test_run_gate_with_no_project_stores_a_null_project_column(repo, tmp_path):
+    """Keep the old behavior exactly when project is not given: a NULL project column, matching every row
+    written before this column existed."""
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+
+    gates.run_gate(repo, sha, "gate1", ["python ok.py"], conn=conn, task_key="T1")
+
+    row = conn.execute("SELECT project FROM gate_runs WHERE task_key = 'T1'").fetchone()
+    assert row["project"] is None
+
+
+def test_run_gate_stores_the_project_it_is_given(repo, tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+
+    gates.run_gate(repo, sha, "gate1", ["python ok.py"], conn=conn, task_key="T1", project="p1")
+
+    row = conn.execute("SELECT project FROM gate_runs WHERE task_key = 'T1'").fetchone()
+    assert row["project"] == "p1"
+
+
+def test_last_gate_result_with_no_project_ignores_the_column_entirely(repo, tmp_path):
+    """The old, still-default call shape: every row for this task_key/gate/commit_sha counts, whatever project
+    (or none) wrote it -- exactly the query this function ran before schema v7 added the column."""
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+    gates.run_gate(repo, sha, "gate1", ["python ok.py"], conn=conn, task_key="T1", project="someone-elses-project")
+
+    assert gates.last_gate_result(conn, "T1", "gate1", sha) == "pass"
+
+
+def test_last_gate_result_scoped_to_a_project_matches_its_own_rows_and_null_legacy_rows(repo, tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+    gates.run_gate(repo, sha, "gate1", ["python ok.py"], conn=conn, task_key="T1", project="p1")
+
+    assert gates.last_gate_result(conn, "T1", "gate1", sha, project="p1") == "pass"
+
+    conn.execute("DELETE FROM gate_runs")
+    gates.run_gate(repo, sha, "gate1", ["python ok.py"], conn=conn, task_key="T1")  # no project: a legacy row
+
+    assert gates.last_gate_result(conn, "T1", "gate1", sha, project="p1") == "pass"  # NULL still counts
+
+
+def test_last_gate_result_scoped_to_a_project_never_matches_a_different_projects_row(repo, tmp_path):
+    """The bug two projects sharing a database (or reusing a task key) used to hit: the same task_key and commit
+    under a DIFFERENT project must not be read as this project's own gate history."""
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+    gates.run_gate(repo, sha, "gate1", ["exit 1"], conn=conn, task_key="T1", project="p2")  # p2's row: fail
+
+    assert gates.last_gate_result(conn, "T1", "gate1", sha, project="p1") is None  # not p1's history
+    assert gates.last_gate_result(conn, "T1", "gate1", sha, project="p2") == "fail"  # but is p2's
+
+
+def test_last_gate_result_scoped_to_a_project_the_latest_row_still_wins(repo, tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    sha = _head_sha(repo)
+    gates.run_gate(repo, sha, "gate1", ["exit 1"], conn=conn, task_key="T1", project="p1")
+    gates.run_gate(repo, sha, "gate1", ["python ok.py"], conn=conn, task_key="T1", project="p1")
+
+    assert gates.last_gate_result(conn, "T1", "gate1", sha, project="p1") == "pass"
+
+
 def test_gate_worktree_cleaned_up(repo):
     gates.run_gate(repo, _head_sha(repo), "gate1", ["echo x"])
     result = subprocess.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True)

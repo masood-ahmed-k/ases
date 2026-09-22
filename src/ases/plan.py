@@ -16,6 +16,8 @@ import json
 import pathlib
 from collections.abc import Sequence
 
+from . import tamper
+
 
 @dataclasses.dataclass(frozen=True)
 class PlanTask:
@@ -27,6 +29,10 @@ class PlanTask:
     acceptance: tuple[str, ...]
     gate_profile: str
     estimated_requests: int
+    # ASES-QG-02 (section 14.3): true only when this task is deliberately allowed to touch gate, CI or
+    # test-runner configuration with a touches glob broad enough to cover it (see _gate_config_violation).
+    # Optional and False by default, so a plan written before this field existed parses unchanged.
+    allow_gate_config_changes: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,6 +52,10 @@ class Plan:
     tasks: tuple[PlanTask, ...]
     # Already applied to `tasks` as depends_on entries; kept so callers can report what Gate 0 added.
     serialization_links: tuple[SerializationLink, ...] = ()
+    # ASES-TSK-04 (section 18.2): path globs that finalgates.run_gate4 drops from its blocking set, a plan-author
+    # decision published and reviewed at Gate P (see config/swarm.yaml for where this belongs and why). Optional
+    # and empty by default, so a plan written before this field existed parses unchanged.
+    gate4_allowlist: tuple[str, ...] = ()
 
     def task(self, key: str) -> PlanTask:
         for t in self.tasks:
@@ -86,6 +96,12 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
                     or not all(isinstance(c, str) and c.strip() for c in commands)):
                 errors.append(f"plan.gate_profiles.{name} must be a non-empty list of non-empty command strings")
 
+    # ASES-TSK-04: optional, defaults to empty so a plan written before this field existed parses unchanged.
+    gate4_allowlist_raw = raw.get("gate4_allowlist", [])
+    if not isinstance(gate4_allowlist_raw, list) or not all(isinstance(g, str) for g in gate4_allowlist_raw):
+        errors.append("plan.gate4_allowlist must be an array of path glob strings")
+        gate4_allowlist_raw = []
+
     raw_tasks = raw["tasks"]
     if not isinstance(raw_tasks, list) or not raw_tasks:
         errors.append("plan.tasks must be a non-empty array")
@@ -114,6 +130,13 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
         if not isinstance(acceptance, list) or not acceptance:
             errors.append(f"{where} ({key}): acceptance must be a non-empty array (ASES-TSK-03)")
 
+        allow_gate_config = rt.get("allow_gate_config_changes", False)
+        if not isinstance(allow_gate_config, bool):
+            errors.append(
+                f"{where} ({key}): allow_gate_config_changes must be true or false, got {allow_gate_config!r}"
+            )
+            allow_gate_config = False
+
         touches = rt.get("touches")
         if not isinstance(touches, list):
             errors.append(f"{where} ({key}): touches must be an array, possibly empty (ASES-TSK-03)")
@@ -121,6 +144,19 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
             # Serialization below compares touches as globs, so a non-string would crash Gate 0 (card
             # creation would fail on it too, when it joins the touches into the card body).
             errors.append(f"{where} ({key}): touches entries must be path glob strings")
+        elif not allow_gate_config:
+            # ASES-QG-02: a task whose touches is broad enough to also cover gate, CI or test-runner
+            # configuration silently exempts it from tamper.analyze_diff's gate_config_changed finding too
+            # (that finding's allow_paths is the task's own touches). A narrow, explicit touches on exactly
+            # one gate-config path is fine without the marker (see _gate_config_violation).
+            for g in touches:
+                hit = _gate_config_violation(g)
+                if hit is not None:
+                    errors.append(
+                        f"{where} ({key}): touches {g!r} is broad enough to also cover gate/CI configuration "
+                        f"({hit!r}); add \"allow_gate_config_changes\": true if this task is meant to change "
+                        "it, or narrow the touches (ASES-QG-02)"
+                    )
 
         gate_profile = rt.get("gate_profile")
         if gate_profile is not None and gate_profile not in gate_profiles:
@@ -138,6 +174,7 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
                 touches=tuple(touches) if isinstance(touches, list) else (),
                 acceptance=tuple(acceptance) if isinstance(acceptance, list) else (),
                 gate_profile=gate_profile or "", estimated_requests=estimated_requests,
+                allow_gate_config_changes=bool(allow_gate_config),
             ))
 
     # Dangling dependencies and cycles, checked over whatever tasks parsed even if some rows had errors --
@@ -160,6 +197,7 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
     return Plan(
         project=raw["project"], integration_branch=raw["integration_branch"],
         gate_profiles=gate_profiles, tasks=serialized_tasks, serialization_links=serialization_links,
+        gate4_allowlist=tuple(gate4_allowlist_raw),
     )
 
 
@@ -236,6 +274,26 @@ def _globs_overlap(g1: str, g2: str) -> bool:
     p1, p2 = _literal_prefix(g1), _literal_prefix(g2)
     s1, s2 = _literal_suffix(g1), _literal_suffix(g2)
     return (p1.startswith(p2) or p2.startswith(p1)) and (s1.endswith(s2) or s2.endswith(s1))
+
+
+def _is_literal_glob(glob: str) -> bool:
+    """No wildcard character at all: a plain path, matching nothing else. Two literal globs can only overlap
+    (see _globs_overlap) by being equal, which is exactly the "narrow, explicit" exemption ASES-QG-02 wants: a
+    task allowed to touch exactly pytest.ini and nothing else should not need the marker."""
+    return not any(c in glob for c in _WILDCARDS)
+
+
+def _gate_config_violation(touches_glob: str) -> str | None:
+    """ASES-QG-02 (section 14.3): the gate-config pattern `touches_glob` is broad enough to also reach, or None.
+    A literal touches entry never violates (see _is_literal_glob); a wildcarded one does only when it actually
+    overlaps a pattern in tamper.GATE_CONFIG_PATTERNS, using the exact same conservative glob-overlap semantics
+    serialize_overlapping_tasks already uses, so this check and the merge-time scope check never disagree about
+    what a touches glob covers."""
+    normalized = _normalize_glob(touches_glob)
+    if _is_literal_glob(normalized):
+        return None
+    overlap = _first_overlap((touches_glob,), tamper.GATE_CONFIG_PATTERNS)
+    return overlap[1] if overlap is not None else None
 
 
 def _reaches(deps: dict[str, list[str]], start: str, target: str) -> bool:

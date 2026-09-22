@@ -442,9 +442,59 @@ def process_review_lane(
     return sent_back
 
 
+def _handle_merge_failure(
+    board: str, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn, key: str, row, work_card: dict,
+    task: plan_mod.PlanTask, reviewer_profile: str, models_config: dict | None, detail: str, fix_limit: int,
+    attempts: int,
+) -> None:
+    """The failure path a merge takes once its detail text is known (round 6: factored out so an ordinary Gate 3
+    or fast-forward failure and a post-merge revert, ASES-GIT-05, share one implementation instead of two). Past
+    `fix_limit` the merge card is blocked for the user (through questions.ask_user, never hermes.kanban_block --
+    every merge card is created blocked, and real Hermes refuses to block a card that already is); otherwise a
+    fix card is opened for the same role in a fresh worktree, linked as an EXTRA parent of the merge card, and
+    the task's CURRENT work card is repointed at it. The merge card itself is never completed here in either
+    case: it stays open, for the fix or for the human."""
+    if row["fix_cards"] >= fix_limit:
+        asked = _ask_about_merge_card(
+            board, row["merge_card_id"],
+            f"Fix-card budget ({fix_limit}) exhausted for {key}: the merge keeps failing and ASES will not open "
+            f"another fix card. Last failure: {detail[:500]}\nHow should this be resolved?",
+            conn=conn,
+        )
+        events.record(conn, "fix_card_budget_exhausted", {"task_key": key, "asked": asked})
+        return
+
+    assignee = policy.resolve_assignee(task.role, project.roles)
+    fix_branch = f"swarm/{key}-fix{row['fix_cards'] + 1}"
+    # project= is the real Hermes project id, read off the card being fixed (`work_card`), never `project.name`
+    # (2026-09-19 fix). parent= is likewise the card being replaced, so this must run BEFORE work_card_id is
+    # repointed below.
+    fix_card = hermes_mod.kanban_create(
+        board, f"{key}: fix (round {row['fix_cards'] + 1})", assignee=assignee,
+        workspace="worktree", branch=fix_branch, project=work_card.get("project_id"),
+        body=(f"Merge attempt for {key} failed. Fix in a fresh worktree.\n\n"
+              f"Failure detail:\n{detail[:1500]}\n\n"
+              + "\n".join([*_scope_lines(task), "", *_finish_instructions(task.role, reviewer_profile)])),
+        parent=[row["work_card_id"]],
+        idempotency_key=f"ases-fix-{plan.project}-{key}-{row['fix_cards'] + 1}",
+        max_retries=attempts, max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
+    )
+    hermes_mod.kanban_link(board, fix_card["id"], row["merge_card_id"])
+    # Count the outgoing card's finished runs NOW (see _ingest_outgoing_usage), before it is repointed.
+    _ingest_outgoing_usage(board, row["work_card_id"], project, models_config, plan, key, conn)
+    # Spend the fix budget and repoint work_card_id in ONE statement: the next pass then waits for
+    # the fix card to reach done, merges the fix card's branch, and the review lane can find it.
+    conn.execute(
+        "UPDATE plan_tasks SET fix_cards = fix_cards + 1, work_card_id = ? "
+        "WHERE project = ? AND task_key = ?",
+        (fix_card["id"], plan.project, key),
+    )
+    events.record(conn, "fix_card_created", {"task_key": key, "fix_card_id": fix_card["id"]})
+
+
 def process_merge_queue(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn,
-    unreviewed: list[str] | None = None, models_config: dict | None = None,
+    unreviewed: list[str] | None = None, models_config: dict | None = None, integrity: list[str] | None = None,
 ) -> list[str]:
     """One pass: for every DONE work card whose merge card is still blocked/ready, run the merge.
     Serialized -- one merge_task call at a time, in task order, matching ASES-GIT-04.
@@ -509,7 +559,28 @@ def process_merge_queue(
         card must not leave the integrity guard expecting the old one and calling the controller's own merge a
         violation).
       * ASES-QG-03: a pre-merge check of kind `tamper_check_error` (git could not answer) is never a failure: it is
-        recorded and the task is retried on the next pass. Kind `tamper` takes the ordinary failure path."""
+        recorded and the task is retried on the next pass. Kind `tamper` takes the ordinary failure path.
+
+    Round 6 adds the post-merge check (ASES-GIT-05, section 8.1: "The integration branch MUST stay runnable. If a
+    post-merge check fails, the queue reverts the squash commit, records it, blocks the merge card and opens a fix
+    card."). Gate 3 above is a PRE-merge check: it can be green a moment before another task's merge lands on a
+    shared file this task's own touches never named, making the candidate's promise stale by the time it actually
+    reaches the tip. So immediately after a real (non-no-op) merge, for a coder task, Gate 3's own commands run
+    ONE more time on the new integration HEAD, in a throwaway worktree, before the merge card is completed:
+
+      * green (the common case): unchanged from before this round -- the merge card completes, `merged` is
+        recorded, done.
+      * red, and the revert succeeds: a `post_merge_reverted` event, then the SAME failure path an ordinary Gate 3
+        or fast-forward failure takes (`_handle_merge_failure`: a `merge_failed` event, a fix card bounded by
+        `fix_cards_per_task`, or the budget escalation past it). The merge card is NOT completed: it stays open
+        for the fix. The branch is runnable again (the bad commit is gone), so the rest of the queue is not halted.
+      * red, and the revert ITSELF fails (git refuses and `git revert --abort` cannot recover a clean checkout
+        either): this is not safe to paper over with a fix card while the integration branch is in an unknown
+        state, so it halts the run the way the primary-checkout guard does (ASES-GIT-12): an `integrity_violation`
+        event, and, when the caller passes a list for `integrity` (run_pass does), the problem is appended to it
+        and the queue stops for this pass. Callers that do not pass `integrity` see this exactly as an ordinary
+        halt of the loop below (no further tasks processed this pass), which is why every existing caller of this
+        function keeps working unchanged: `integrity` is new and optional, the same shape as `unreviewed`."""
     merged = []
     fix_limit = project.budgets.get("fix_cards_per_task", 2)
     attempts = project.budgets.get("attempts_per_card", 3)
@@ -557,12 +628,31 @@ def process_merge_queue(
         if task.role == "coder":
             # ASES-REV-06: the verdict is validated against the schema, and it must be a PASS.
             verdict = review_mod.validate_verdict(completed_run.get("metadata"))
-            if not verdict.valid or verdict.outcome != "PASS":
+            if not verdict.valid:
                 _refuse_once(conn, "merge_refused_invalid_verdict", work_card, {
                     "task_key": key, "outcome": verdict.outcome, "problems": list(verdict.problems)[:10],
                 })
                 if unreviewed is not None:
                     unreviewed.append(key)
+                continue
+            if verdict.outcome != "PASS":
+                # Found by the FK builder: a reviewer that calls kanban_complete with a CHANGES_REQUIRED or
+                # BLOCKED verdict in its metadata, instead of using kanban_request_changes/kanban_block, used to
+                # fall into the branch above and be refused as an "invalid" verdict forever -- the card was
+                # `done`, refused every poll, and never went back to its implementer. The verdict is well formed
+                # here (validate_verdict already ruled out valid=False above): the reviewer answered, just not
+                # with a pass, so this is not the unreviewed-refusal path at all. Treat it as if the reviewer had
+                # called kanban_reopen_review instead of kanban_complete: back to the implementer, with the
+                # reviewer's own words as the reason when it gave any (a run's "summary", not part of the
+                # validated Verdict, which carries no free-text summary field of its own).
+                reason = _clean(
+                    completed_run.get("summary") or f"reviewer completed the card with a {verdict.outcome} verdict",
+                    300,
+                )
+                hermes_mod.kanban_reopen_review(board, work_card["id"], reason=reason)
+                events.record(conn, "reviewer_completed_with_changes_requested", {
+                    "task_key": key, "card_id": work_card["id"], "outcome": verdict.outcome,
+                })
                 continue
             # ASES-GIT-03, ASES-GIT-13, ASES-REV-05, ASES-QG-01: scope, then the controller's OWN green Gate 1
             # record for this exact head. A red or stale result takes the ordinary failure path (fix card).
@@ -632,6 +722,48 @@ def process_merge_queue(
             events.record(conn, "merged", {"task_key": key, "sha": None, "no_op": True})
             continue
         if outcome.merged:
+            # ASES-GIT-05 (section 8.1): re-check Gate 3 on the NEW integration HEAD before trusting the merge.
+            # Only a coder task has anything to re-check (a no-op merge, squash_commit None, was already handled
+            # above and never reaches here). Deliberately redundant with the pre-merge Gate 3 above: this catches
+            # a project-level regression another task's merge introduced on the shared tip between this
+            # candidate's build and this fast-forward, on a file this task's own touches never named.
+            postcheck = gates_mod.run_gate(
+                repo, outcome.squash_commit, "gate3-postmerge", gate_cmds, conn=conn, task_key=key,
+                project=plan.project,
+            ) if task.role == "coder" else None
+
+            if postcheck is not None and not postcheck.passed:
+                post_detail = _clean(postcheck.detail, 500)
+                events.record(conn, "post_merge_reverted", {
+                    "task_key": key, "commit": outcome.squash_commit, "detail": post_detail,
+                })
+                revert = mergeq.revert_merge(repo, outcome.squash_commit, conn=conn, task_key=key, project=plan.project)
+                if not revert.ok:
+                    # The integration branch is now in an unknown state (still broken, or mid-conflict if even
+                    # git revert --abort could not recover it): not safe to keep merging on top of, the same
+                    # reasoning run_pass's primary-checkout guard already acts on (ASES-GIT-12).
+                    problem = (
+                        f"post-merge Gate 3 failed for {key} on {outcome.squash_commit[:12]} and the automatic "
+                        f"revert could not repair the integration branch (aborted={revert.aborted}): "
+                        f"{_clean(revert.detail, 300)}"
+                    )
+                    events.record(conn, "integrity_violation", {
+                        "problems": [problem], "head": outcome.squash_commit, "branch": plan.integration_branch,
+                    })
+                    if integrity is not None:
+                        integrity.append(problem)
+                    break
+                # The revert landed a new commit on the primary checkout itself: that, not the reverted merge, is
+                # the HEAD the integrity guard must now expect (the same reasoning as the green case below).
+                guards_mod.set_expected_head(conn, plan.project, revert.commit_sha)
+                events.record(conn, "merge_failed", {"task_key": key, "detail": post_detail})
+                _handle_merge_failure(
+                    board, plan, project, conn=conn, key=key, row=row, work_card=work_card, task=task,
+                    reviewer_profile=reviewer_profile, models_config=models_config, detail=post_detail,
+                    fix_limit=fix_limit, attempts=attempts,
+                )
+                continue
+
             # The merge queue moved the primary checkout's HEAD itself, so that is the HEAD the integrity
             # guard must now expect (a move it did not make is the violation, ASES-GIT-12). Recorded BEFORE the
             # card is completed: the fast-forward has already happened, and a Hermes error below must not leave
@@ -663,42 +795,11 @@ def process_merge_queue(
         # half-visible at a truncation point (ASES-SEC-01).
         detail = events.redact_text(outcome.detail or "")
         events.record(conn, "merge_failed", {"task_key": key, "detail": detail[:500]})
-        if row["fix_cards"] >= fix_limit:
-            asked = _ask_about_merge_card(
-                board, row["merge_card_id"],
-                f"Fix-card budget ({fix_limit}) exhausted for {key}: the merge keeps failing and ASES will not open "
-                f"another fix card. Last failure: {detail[:500]}\nHow should this be resolved?",
-                conn=conn,
-            )
-            events.record(conn, "fix_card_budget_exhausted", {"task_key": key, "asked": asked})
-            continue
-
-        assignee = policy.resolve_assignee(task.role, project.roles)
-        fix_branch = f"swarm/{key}-fix{row['fix_cards'] + 1}"
-        # project= is the real Hermes project id, read off the card being fixed (`work_card`, fetched
-        # above and not yet repointed), never `project.name` (2026-09-19 fix). parent= is likewise the
-        # card being replaced, so this is created BEFORE work_card_id is repointed below.
-        fix_card = hermes_mod.kanban_create(
-            board, f"{key}: fix (round {row['fix_cards'] + 1})", assignee=assignee,
-            workspace="worktree", branch=fix_branch, project=work_card.get("project_id"),
-            body=(f"Merge attempt for {key} failed. Fix in a fresh worktree.\n\n"
-                  f"Failure detail:\n{detail[:1500]}\n\n"
-                  + "\n".join([*_scope_lines(task), "", *_finish_instructions(task.role, reviewer_profile)])),
-            parent=[row["work_card_id"]],
-            idempotency_key=f"ases-fix-{plan.project}-{key}-{row['fix_cards'] + 1}",
-            max_retries=attempts, max_runtime=f"{project.budgets.get('card_runtime_minutes', 45)}m",
+        _handle_merge_failure(
+            board, plan, project, conn=conn, key=key, row=row, work_card=work_card, task=task,
+            reviewer_profile=reviewer_profile, models_config=models_config, detail=detail,
+            fix_limit=fix_limit, attempts=attempts,
         )
-        hermes_mod.kanban_link(board, fix_card["id"], row["merge_card_id"])
-        # Count the outgoing card's finished runs NOW (see _ingest_outgoing_usage), before it is repointed.
-        _ingest_outgoing_usage(board, row["work_card_id"], project, models_config, plan, key, conn)
-        # Spend the fix budget and repoint work_card_id in ONE statement: the next pass then waits for
-        # the fix card to reach done, merges the fix card's branch, and the review lane can find it.
-        conn.execute(
-            "UPDATE plan_tasks SET fix_cards = fix_cards + 1, work_card_id = ? "
-            "WHERE project = ? AND task_key = ?",
-            (fix_card["id"], plan.project, key),
-        )
-        events.record(conn, "fix_card_created", {"task_key": key, "fix_card_id": fix_card["id"]})
     return merged
 
 
@@ -1588,7 +1689,9 @@ def run_pass(
       2. idle worktrees (warnings)                    3. usage ingest into the ledger (ASES-CAP-03)
       4. failure recovery and spent budgets           5. bounds: a project-stopping bound pauses and returns
       6. the budget gate, then unpark                 7. review-lane policing (Gate 1 re-check)
-      8. dispatch, then provisioning                  9. the merge queue (halt checks inside)
+      8. dispatch, then provisioning                  9. the merge queue (halt checks inside; ASES-GIT-05: a
+                                                           post-merge revert that cannot repair the branch also
+                                                           returns with `integrity` set)
      10. the final gates, once every merge card is done
 
     Steps 2 to 5, unpark, provisioning and the final gates are not safety-critical for the pass: an exception in one is
@@ -1670,7 +1773,13 @@ def run_pass(
     )
     summary["merged"] = process_merge_queue(
         board, repo, plan, project, conn=conn, unreviewed=summary["unreviewed"], models_config=models_config,
+        integrity=summary["integrity"],
     )
+    if summary["integrity"]:
+        # ASES-GIT-05: the merge queue's own post-merge check found the integration branch broken and could not
+        # repair it with a revert. The same rule as the primary-checkout guard above: nothing later in the pass
+        # (finalize, the finished check) is safe to run on top of a branch in that state.
+        return summary
     final = _isolated(
         conn, summary, "finalize",
         lambda: process_finalize(board, repo, plan, project, models_config, conn=conn, now=now), None,

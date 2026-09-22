@@ -57,12 +57,16 @@ def _run_commands(cwd: pathlib.Path, commands: list[str], timeout: int) -> tuple
 
 def run_gate(
     repo_path: pathlib.Path, commit_sha: str, gate_name: str, commands: list[str], *,
-    conn=None, task_key: str = "", timeout_per_command: int = 120,
+    conn=None, task_key: str = "", project: str | None = None, timeout_per_command: int = 120,
     runner: Callable[[pathlib.Path, list[str], int], tuple[bool, str]] | None = None,
 ) -> GateResult:
     """Checks out commit_sha into a throwaway worktree, runs commands there, tears it down.
 
-    If conn is given, records the result in gate_runs (task_key, gate, commit_sha, result, detail).
+    If conn is given, records the result in gate_runs (task_key, gate, commit_sha, result, detail, project).
+    `project` (schema v7) scopes the row to the project that ran it, so two projects sharing this database, or
+    reusing a task key, do not share gate history: see last_gate_result for how a reader tells them apart. Left
+    at the default None, the row's project column is NULL, exactly as every row written before this column
+    existed -- old behavior, unchanged.
 
     `runner` (ASES-QG-04, ASES-SEC-03) replaces the local command runner: a callable
     runner(worktree, commands, timeout_per_command) -> (passed, output). This is how the sandbox module runs
@@ -103,20 +107,35 @@ def run_gate(
 
     if conn is not None:
         conn.execute(
-            "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (task_key, gate_name, commit_sha, "pass" if result.passed else "fail", result.detail,
-             datetime.now(timezone.utc).isoformat(timespec="seconds")),
+             datetime.now(timezone.utc).isoformat(timespec="seconds"), project),
         )
     return result
 
 
-def last_gate_result(conn, task_key: str, gate: str, commit_sha: str) -> str | None:
-    row = conn.execute(
-        "SELECT result FROM gate_runs WHERE task_key = ? AND gate = ? AND commit_sha = ? "
-        "ORDER BY id DESC LIMIT 1",
-        (task_key, gate, commit_sha),
-    ).fetchone()
+def last_gate_result(conn, task_key: str, gate: str, commit_sha: str, *, project: str | None = None) -> str | None:
+    """The most recent gate_runs.result for this task_key, gate and commit_sha, or None with no row.
+
+    `project`, when given, scopes the match to rows this project wrote OR a row with no project at all (a NULL
+    column: written before schema v7 added it, or by a caller that did not pass one to run_gate). A NULL row
+    still counts so history from before this change, or from a caller that has not been updated yet, is never
+    orphaned; it is only a DIFFERENT project's row, stamped with a project that is neither this one nor NULL,
+    that is excluded. Left at the default None (the old call shape), nothing is filtered by project at all --
+    every caller's behavior is exactly what it was before this parameter existed."""
+    if project is None:
+        row = conn.execute(
+            "SELECT result FROM gate_runs WHERE task_key = ? AND gate = ? AND commit_sha = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_key, gate, commit_sha),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT result FROM gate_runs WHERE task_key = ? AND gate = ? AND commit_sha = ? "
+            "AND (project IS NULL OR project = ?) ORDER BY id DESC LIMIT 1",
+            (task_key, gate, commit_sha, project),
+        ).fetchone()
     return row["result"] if row else None
 
 

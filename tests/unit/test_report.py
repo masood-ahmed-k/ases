@@ -1249,7 +1249,8 @@ def test_health_counts_newest_time_and_message_per_kind(scenario_report):
     assert by_kind["pass_error"]["newest_message"] == "TimeoutExpired: hermes kanban list timed out"
     assert by_kind["integrity_violation"]["newest_message"] == "primary checkout is dirty: M a.py"
     assert by_kind["fix_card_created"]["newest_message"] == 'T2: {"fix_card_id":"wfix"}'
-    for unseen in ("usage_ingest_error", "merge_race_retrying", "fix_card_budget_exhausted"):
+    for unseen in ("usage_ingest_error", "merge_race_retrying", "fix_card_budget_exhausted", "model_mismatch",
+                   "should_stop_error", "tamper_check_error", "tamper_blocked"):
         assert by_kind[unseen] == {"kind": unseen, "count": 0, "newest_at": None, "newest_message": None}
     assert health["read"] == 6 and health["window"] == 200
     assert [(e["ts"], e["kind"]) for e in health["recent"]] == [
@@ -1261,7 +1262,8 @@ def test_health_counts_newest_time_and_message_per_kind(scenario_report):
 
 ALL_HEALTH_KINDS = [
     "pass_error", "usage_ingest_error", "merge_failed", "merge_race_retrying", "card_parked_for_budget",
-    "integrity_violation", "fix_card_created", "fix_card_budget_exhausted",
+    "integrity_violation", "fix_card_created", "fix_card_budget_exhausted", "model_mismatch", "should_stop_error",
+    "tamper_check_error", "tamper_blocked",
 ]
 
 
@@ -1274,9 +1276,49 @@ def test_every_health_kind_is_read_and_nothing_else(conn, tmp_path, monkeypatch)
                                    "swarm_stop", "pass_errors", "xpass_error", "question_read_failed"], start=20):
         _event(conn, f"2026-09-19T10:{number:02d}:00+00:00", kind, {"n": number})
     health = _build(conn, tmp_path)["health"]
-    assert health["read"] == 8
+    assert health["read"] == len(ALL_HEALTH_KINDS)
     assert [(k["kind"], k["count"]) for k in health["kinds"]] == [(kind, 1) for kind in ALL_HEALTH_KINDS]
-    assert [e["kind"] for e in health["recent"]] == list(reversed(ALL_HEALTH_KINDS))
+    # "recent" is capped at _HEALTH_RECENT, so with more kinds than that it no longer holds all of them.
+    assert [e["kind"] for e in health["recent"]] == list(reversed(ALL_HEALTH_KINDS))[:report._HEALTH_RECENT]
+
+
+def test_the_four_round_5_health_kinds_report_did_not_read_yet_are_now_counted(conn, tmp_path, monkeypatch):
+    """model_mismatch (usage.py, ASES-RTE-01), should_stop_error (mergeq._stop_requested), and tamper_check_error
+    / tamper_blocked (review.py, ASES-QG-03) existed before round 6 but were missing from HEALTH_KINDS. Payload
+    shapes match what each module actually records."""
+    _fake_hermes(monkeypatch, {})
+    _event(conn, "2026-09-19T10:00:00+00:00", "model_mismatch",
+           {"session_id": "s1", "profile": "coder-1", "expected": "qwen/pinned", "actual": "qwen/other"})
+    _event(conn, "2026-09-19T10:01:00+00:00", "should_stop_error",
+           {"task_key": "T1", "step": "gate3", "error": "RuntimeError: database is locked"})
+    _event(conn, "2026-09-19T10:02:00+00:00", "tamper_check_error",
+           {"task_key": "T1", "card_id": "w1", "head": "a" * 40,
+            "reason": "the tamper check could not run: git exited 128"})
+    _event(conn, "2026-09-19T10:03:00+00:00", "tamper_blocked",
+           {"task_key": "T1", "card_id": "w1", "head": "a" * 40, "detail": "test_x.py: assertion weakened"})
+
+    health = _build(conn, tmp_path)["health"]
+    by_kind = {k["kind"]: k for k in health["kinds"]}
+    assert by_kind["model_mismatch"]["count"] == 1
+    assert by_kind["should_stop_error"]["newest_message"] == "T1: RuntimeError: database is locked"
+    assert by_kind["tamper_check_error"]["count"] == 1
+    assert by_kind["tamper_blocked"]["newest_message"] == "T1: test_x.py: assertion weakened"
+
+
+def test_tamper_events_are_counted_in_health_and_also_listed_in_quality(conn, tmp_path, monkeypatch):
+    """Pins the round 6 decision (see the comments by HEALTH_KINDS and in _quality_panel): tamper_check_error and
+    tamper_blocked are counted by the Health panel (they are in HEALTH_KINDS) AND still listed individually by the
+    Quality panel's findings (its "contains tamper" catch-all is a deliberately general net, unchanged). A
+    health-panel count and a quality-panel per-event listing are different things and both are kept on purpose;
+    change this test on purpose if that decision is ever revisited."""
+    _fake_hermes(monkeypatch, {})
+    _event(conn, "2026-09-19T10:00:00+00:00", "tamper_blocked",
+           {"task_key": "T1", "card_id": "w1", "head": "a" * 40, "detail": "test_x.py: assertion weakened"})
+
+    rep = _build(conn, tmp_path)
+
+    assert {k["kind"]: k["count"] for k in rep["health"]["kinds"]}["tamper_blocked"] == 1
+    assert [f["kind"] for f in rep["quality"]["findings"]] == ["tamper_blocked"]
 
 
 def test_health_says_provider_health_from_real_traffic_is_not_collected(scenario_report):

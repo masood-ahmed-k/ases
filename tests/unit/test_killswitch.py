@@ -18,7 +18,7 @@ import types
 
 import pytest
 
-from ases import db, hermes, killswitch, plan as plan_mod
+from ases import bounds, db, hermes, killswitch, plan as plan_mod
 
 PROJECT = "p1"
 PLAN = plan_mod.Plan(project=PROJECT, integration_branch="integration", gate_profiles={}, tasks=())
@@ -340,6 +340,24 @@ def test_clear_stop_leaves_every_other_status_alone(conn, status):
 def test_clear_stop_without_a_row_changes_nothing(conn):
     assert killswitch.clear_stop(conn, PROJECT) is False
     assert state_row(conn) is None
+
+
+def test_stop_requested_is_deliberately_narrower_than_bounds_stop_requested(conn):
+    """Round 6 fix: killswitch.stop_requested and bounds.stop_requested were found to answer two different
+    questions under confusingly similar names. This one is kept, under its existing name, for "did the kill
+    switch specifically stop this project"; bounds.stop_requested is the general "should new work happen right
+    now" (true for stopped OR paused). A project a bound merely paused must read False here even though
+    bounds.stop_requested reads True for it: that is the distinction test_cli_commands.py already depends on."""
+    bounds.start_project(conn, PROJECT)
+    bounds.set_status(conn, PROJECT, "paused", "project wall clock reached")
+
+    assert killswitch.stop_requested(conn, PROJECT) is False
+    assert bounds.stop_requested(conn, PROJECT) is True
+
+    killswitch.request_stop(conn, PROJECT, "swarm stop")
+
+    assert killswitch.stop_requested(conn, PROJECT) is True
+    assert bounds.stop_requested(conn, PROJECT) is True  # both true once the kill switch itself has stopped it
 
 
 def test_request_stop_clear_stop_round_trip_can_repeat(conn):

@@ -1177,4 +1177,42 @@ def test_blocking_keeps_every_finding_except_one_marked_informational():
     assert tamper.blocking([skip, cov, info]) == [skip, cov]
     assert tamper.blocking([]) == []
     assert tamper.blocking(None) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# GATE_CONFIG_PATTERNS (ASES-QG-02): exported so plan.py's Gate 0 shares this one list instead of keeping a
+# second copy that could drift from what _config_reason actually treats as gate/CI configuration. No behavior
+# of analyze_diff changes: every test above still passes unmodified.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_gate_config_patterns_is_exported_as_a_tuple():
+    assert isinstance(tamper.GATE_CONFIG_PATTERNS, tuple)
+    assert all(isinstance(p, str) and p for p in tamper.GATE_CONFIG_PATTERNS)
+
+
+def test_gate_config_patterns_covers_the_names_config_reason_recognises_by_path_alone():
+    for name in ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "conftest.py", ".coveragerc",
+                 "noxfile.py", "makefile", ".pre-commit-config.yaml", ".gitlab-ci.yml", "azure-pipelines.yml",
+                 "jenkinsfile", "jest.config.*", "vitest.config.*", "karma.conf.*"):
+        assert name in tamper.GATE_CONFIG_PATTERNS
+    assert ".github/workflows/**" in tamper.GATE_CONFIG_PATTERNS
+    assert ".circleci/**" in tamper.GATE_CONFIG_PATTERNS
+
+
+def test_gate_config_patterns_leaves_out_the_content_gated_files():
+    """package.json and Cargo.toml only count as gate configuration when a hunk touches their test-related keys
+    or sections (see _config_reason): a diff-time judgement Gate 0 cannot make from a path glob alone, so they
+    are deliberately not in this path-only list."""
+    assert "package.json" not in tamper.GATE_CONFIG_PATTERNS
+    assert "cargo.toml" not in tamper.GATE_CONFIG_PATTERNS
+
+
+def test_gate_config_patterns_is_built_from_the_same_private_constants_config_reason_uses():
+    """Reused, not duplicated: every name in tamper.py's own _CONFIG_NAMES/_CONFIG_NAME_PATTERNS is in the
+    exported list verbatim, so the two can never silently drift apart."""
+    for name in tamper._CONFIG_NAMES:
+        assert name in tamper.GATE_CONFIG_PATTERNS
+    for pattern in tamper._CONFIG_NAME_PATTERNS:
+        assert pattern in tamper.GATE_CONFIG_PATTERNS
     assert len(tamper.KINDS) == 10 and len(set(tamper.KINDS)) == 10

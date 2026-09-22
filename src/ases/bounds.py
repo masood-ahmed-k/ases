@@ -531,10 +531,15 @@ def record_final_gate(
     """ASES-TSK-04, ASES-CTL-01: record the result of a final gate, "gate4" (security) or "gate5" (smoke), on an
     exact commit. Anything else raises ValueError, as does a blank commit or a result that is not pass or fail.
 
-    The row is the one gates.run_gate would insert (task_key, gate, commit_sha, result, detail, ran_at), under
-    the task_key "__final__". `detail` is passed through events.redact first: Gate 4 is a secrets scan, and its
-    findings quote the lines they found (ASES-SEC-01: secrets never reach logs or reports). gate_runs has no
-    project column, so the project is recorded in a `final_gate_recorded` event next to the row."""
+    The row is the one gates.run_gate would insert (task_key, gate, commit_sha, result, detail, ran_at, project),
+    under the task_key "__final__". `detail` is passed through events.redact first: Gate 4 is a secrets scan, and
+    its findings quote the lines they found (ASES-SEC-01: secrets never reach logs or reports).
+
+    Schema v7 added a project column to gate_runs (this function predates it, and used to record the project only
+    in the `final_gate_recorded` event below, next to a row that could not otherwise carry it). It is written here
+    too now, the same way gates.run_gate writes it, so a reader that scopes by project (final_gates_green,
+    gates.last_gate_result) has real data to filter on; the event is kept as well, since another reader may still
+    depend on it and it costs nothing to keep."""
     if gate not in FINAL_GATES:
         raise ValueError(f"a final gate is one of {', '.join(FINAL_GATES)}, got {ascii(gate)}")
     sha = (commit_sha or "").strip()
@@ -542,23 +547,36 @@ def record_final_gate(
         raise ValueError("a final gate result needs the commit SHA it ran on")
     outcome = _outcome(result)
     conn.execute(
-        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (FINAL_TASK_KEY, gate, sha, outcome, events.redact({"detail": detail or ""})["detail"],
-         _iso(_utc(now))),
+         _iso(_utc(now)), project),
     )
     events.record(conn, "final_gate_recorded", {"project": project, "gate": gate, "commit_sha": sha, "result": outcome})
 
 
-def final_gates_green(conn: sqlite3.Connection, integration_head: str | None) -> bool:
+def final_gates_green(
+    conn: sqlite3.Connection, integration_head: str | None, *, project: str | None = None,
+) -> bool:
     """ASES-CTL-01: True only when Gate 4 AND Gate 5 both passed on exactly `integration_head`. A pass on an older
     commit does not count (the integration branch has moved since, so that evidence is about different code), a
     fail does not count, and when a gate ran more than once on the commit the latest row wins (the same rule as
     gates.last_gate_result), so a red re-run cancels an earlier green. Only rows under the "__final__" task_key are
-    read: a task's own gate rows never stand in for a final gate. No head means nothing is green."""
+    read: a task's own gate rows never stand in for a final gate. No head means nothing is green.
+
+    `project` is a new, keyword-only, optional filter (schema v7): omitted (the old, still positional, two-argument
+    call shape every existing caller and test uses), it scans every project's "__final__" rows exactly as before --
+    two projects sharing this database is a real case (found by the bounds and MR builders) that this function used
+    to get wrong silently. Given, it is passed on to gates.last_gate_result, which matches that project's own rows
+    OR a legacy row with no project at all, never a different project's. is_finished/finish_project pass plan.project
+    here; finalgates.py (which this round does not own or edit) still calls this with just (conn, head) and keeps
+    working unchanged."""
     sha = (integration_head or "").strip()
     if not sha:
         return False
-    return all(gates_mod.last_gate_result(conn, FINAL_TASK_KEY, gate, sha) == "pass" for gate in FINAL_GATES)
+    return all(
+        gates_mod.last_gate_result(conn, FINAL_TASK_KEY, gate, sha, project=project) == "pass" for gate in FINAL_GATES
+    )
 
 
 def mark_release_report(conn: sqlite3.Connection, project: str, path) -> None:
@@ -609,7 +627,7 @@ def is_finished(board: str, plan: plan_mod.Plan, integration_head: str | None, *
     nothing). `integration_head` is the exact commit the final gates must have passed on."""
     if not plan.tasks:
         return False
-    if not final_gates_green(conn, integration_head):
+    if not final_gates_green(conn, integration_head, project=plan.project):
         return False
     if not release_report_written(conn, plan.project):
         return False

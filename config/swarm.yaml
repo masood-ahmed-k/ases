@@ -66,3 +66,14 @@ sandbox:
 retention:
   logs_days: 30
   reports_days: 90
+
+# Gate 4's built-in tree scan allowlist (ASES-TSK-04, section 18.2) is NOT a key of this file. It lives on the
+# approved PLAN as a top-level "gate4_allowlist" field (a list of path globs, docs/ases/plan.json), because it is
+# a plan-author decision published and reviewed at Gate P by the critic and the user, table 34's "gates the agent
+# cannot edit": a worker who can edit config/swarm.yaml (when its touches allow it) must not be able to quietly
+# excuse its own planted secret by adding itself to a config-file allowlist. Example, in plan.json next to
+# "gate_profiles" and "tasks":
+#   "gate4_allowlist": ["tests/**", "docs/**"]
+# A finding whose path an allowlist glob covers is dropped from Gate 4's blocking set but stays listed in the
+# outcome and the release report, renamed to its "allowed_" kind (finalgates.severity), so what was excused is
+# always auditable, never silently invisible.

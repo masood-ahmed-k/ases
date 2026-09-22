@@ -872,6 +872,88 @@ decisions that wait on the user (Hermes global configuration, Docker, reviewer c
 and then testing at zero quota only: on 2026-09-22 the user said not to burn xKiro tokens on tests, so there are no real runs
 unless they ask for one; the fake rig, seeded-bug checks and an independent review cover everything built since round 1.
 
+## Round 6: ten of sixteen acceptance scenarios on the fake rig, project-scoped records, the post-merge revert, the triage lane (2026-09-22)
+
+The user said "continue all work... you are free to deploy sonnets as many as u want", immediately after "no need to test and burn
+the tokens from xkiro" -- so this round is bigger (ten builders at once, matching the earlier rounds' scale) but every builder was
+told, in writing, never to call a real Hermes, a real model provider, or Docker. Everything here runs on the fake acceptance rig
+(`ases.fakes.board.FakeHermes`, real git worktrees, no network) or plain unit fakes. Work orders: `docs/work-orders/r6_rules.md` +
+`r6_wp_*.md`; every builder's report is in `docs/work-orders/builder-findings.md`. The final merged-tree suite: 5,416 passed, 2 skipped, 0 failed.
+
+Four packages fixed real gaps in the controller itself:
+- **CORE** (`gates.py`, `bounds.py`, `mergeq.py`, `controller.py`): `gate_runs` and `merge_records` are now project-scoped
+  (schema v7's `project` column, added in round 5, finally gets a writer); the post-merge revert trigger is wired (ASES-GIT-05:
+  after every real coder merge, Gate 3 re-runs on the new integration HEAD, and a red result reverts, records, and opens a fix
+  card, or halts the run if the revert itself fails); and a reviewer that calls `kanban_complete` with a CHANGES_REQUIRED or
+  BLOCKED verdict, instead of the proper Hermes verdict tools, no longer dead-ends the card forever -- it is reopened for its
+  implementer instead. CORE also found that the NULL-tolerant scoping it used is not a complete fix for `merge_records`: SQLite's
+  `ON CONFLICT` dispatches off the table's declared primary key, which is `task_key` alone, so two projects reusing a task key
+  would still have their upserts collide and overwrite each other's row. It wrote up the exact migration this needs
+  (`(project, task_key)` as the primary key) and which five other modules would need updating alongside it, for a future round.
+- **TV** (`tamper.py`, `plan.py`, `finalgates.py`): Gate 0 now rejects a task whose `touches` is a wildcard glob broad enough to
+  cover gate or CI configuration, unless the task explicitly sets `allow_gate_config_changes: true` -- closing the hole two
+  independent builders confirmed this round (the scope check runs before the tamper check, so a broad touches glob silently
+  exempted config edits from ever being caught). Gate 4 gained an allowlist (`plan.gate4_allowlist`), tested read-only against
+  ASES's own repository: 60 blocking findings, all sample keys in `tests/` and `docs/`, all excused once allowlisted, and Gate 4
+  now passes on ASES's own tree.
+- **LED** (new `triage.py`): the triage lane (ASES-LED-03). Reading the real Hermes source settled an open question: a worker can
+  already propose a card in triage itself (`kanban_create(triage=true)`), so ASES needs no card-proposal helper, only discovery,
+  validation and promote/archive. A round 6 acceptance test then found a real bug in the same module: `promote_card` calls
+  `kanban_promote` unconditionally, but Hermes can only promote a card from `todo` or `blocked`, never `triage`, so it currently
+  always fails on the one card shape it exists to handle. Not yet fixed.
+- **FIX** (`recovery.py`, `killswitch.py`, `report.py`): consolidated the two independently-defined `Bounds` classes into one
+  (`recovery.Bounds` is now an alias of `bounds.Bounds`), and, after reading every real caller, deliberately KEPT the two
+  differently-named `stop_requested` functions rather than merging them, because `tests/unit/test_cli_commands.py` (a file it does
+  not own) correctly relies on them meaning different things. `report.HEALTH_KINDS` gained the four event kinds round 5 introduced
+  but never added.
+
+Six packages wrote ten of the blueprint's sixteen 22.x acceptance scenarios, all zero-quota, all driving the real controller against
+`FakeHermes`:
+- 22.3 (failure and fallback) and 22.9 (quota exhaustion): one card walked through every failure classification end to end, and a
+  30-request daily cap correctly parks, shows its reset time, never thrashes, and resumes with state intact.
+- 22.5 (parallel) and 22.13 (kill switch): three cards running at once with distinct worktrees, branches, profiles and lease-assigned
+  ports, a fourth queued by `max_in_progress`; and `killswitch.stop_all`/`resume_all` driven against three live cards with safe fake
+  process handles.
+- 22.7 (crash recovery, all three named crash points): a running card, a candidate build, and the gap between the fast-forward and
+  the merge-card completion, each faithfully simulated and each recovering with no duplicate cards, no orphan workers, no
+  half-merged state.
+- 22.10 (secret leak) and 22.12 (gate tampering): a planted secret-shaped value never appears anywhere the controller writes, and
+  three of the five blueprint tampering attempts (deleted test, skip marker, `|| true`) each fail Gate 1 with the right finding
+  kind through the real review lane.
+- 22.11 (prompt injection): written honestly, since Docker never runs in this suite -- three of the blueprint's four clauses
+  (nothing outside the worktree, the integration branch untouched, a security event recorded) are proven fully end to end using a
+  worker step that writes outside its own worktree; the fourth (a real sandboxed network block) stays at the policy level on
+  purpose, documented as such rather than faked.
+- 22.14 (plan rejection), 22.15 (idempotent re-run), 22.16 (data class): a rejected plan never creates an implementation card;
+  card creation survives being run twice and once more after the database is deleted (though a real gap was found here too, next
+  paragraph); a data class must be declared, and an unsafe provider is refused at Gate P.
+
+Real problems the round 6 builders found, none fixed yet unless noted:
+- `create_cards_from_plan`'s fix-card protection only works while the `plan_tasks` row that names the current fix card still
+  exists. Delete the ASES database and re-run card creation a third time, and it silently reverts `work_card_id` to the ORIGINAL,
+  superseded work card -- the board stays consistent (no duplicate card), but ASES's own bookkeeping goes stale, pointing at a card
+  that is no longer the task's real current one.
+- The private-data-class guarantee ("cards never routed to a provider marked as training on inputs... they park instead") is
+  enforced only ONCE, at Gate P. Confirmed empirically: `process_budget_gate` never calls `check_data_class`, and the only
+  per-pass call site is inside the model-switch branch of recovery, reached only after a card's second capability failure. A
+  provider that becomes unsafe after approval is never parked for that reason.
+- A card that crashes once with genuinely auth- or quota-shaped error text, without tripping the retry breaker, can get stuck in
+  `ready` forever: Hermes's own respawn guard refuses to redispatch it, and `recovery.process_failures` only ever looks at
+  `blocked` cards, so it never becomes a question and is never marked credential-unhealthy.
+- `FakeHermes.fail_next` could not be armed after `install()` -- two different builders, in two different rounds, independently hit
+  the same bug in the acceptance rig itself and had to work around it. Fixed directly after this round landed (a module-level
+  frozenset of the real hermes module's public names, captured at import time, replaces the old live, monkeypatch-able check).
+- `triage.promote_card` (this round's own new code) always fails on a genuinely triage-status card, for the reason above.
+
+What is still open after this round: 22.8 (merge conflict) was deliberately deferred, since it needed CORE's revert wiring to
+exist first, which it now does -- its work order (`r6_wp_ac_d.md`) is written and ready to dispatch as a wave 2 package; 22.4 is
+likely already covered by `test_models.py` but was not confirmed; 22.1 and 22.17 correctly stay out of scope, since they need a
+real provider; the `merge_records` primary-key migration CORE wrote up; the `events.project` sweep, deliberately deferred again
+this round (CORE's own read: `events.record` is called from roughly a hundred places, a full sweep is its own change); and a fix
+for `triage.promote_card`, which needs a design decision first (does "promote" a triage card mean calling Hermes's own
+`specify`/`decompose` auxiliary-model path, which `r2_rules.md` currently says ASES never runs on its own, or something else)
+rather than a mechanical patch.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of

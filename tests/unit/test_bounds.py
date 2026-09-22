@@ -1332,6 +1332,46 @@ def test_final_gates_green_ignores_whitespace_around_the_head(conn):
     assert bounds.final_gates_green(conn, f"{HEAD}\n") is True
 
 
+# --- schema v7: final_gates_green(project=...) (round 6) -----------------------------------------------------
+
+def test_record_final_gate_now_also_stamps_the_gate_runs_project_column(conn):
+    """gate_runs gained a project column (schema v7) after this function was written; it used to record the
+    project only in the final_gate_recorded event because the column did not exist yet. It is written to the
+    row too now, the same way gates.run_gate writes it, so a project-scoped reader has real data to filter on."""
+    bounds.record_final_gate(conn, "p1", "gate4", HEAD, "pass", now=NOW)
+
+    row = conn.execute("SELECT project FROM gate_runs WHERE task_key = ?", (bounds.FINAL_TASK_KEY,)).fetchone()
+    assert row["project"] == "p1"
+
+
+def test_final_gates_green_with_no_project_keeps_the_old_two_argument_behavior(conn):
+    """The old, still-default, positional call shape every existing caller (finalgates.py, every test above)
+    uses: nothing is filtered by project, matching exactly what this function did before it existed."""
+    bounds.record_final_gate(conn, "someone-elses-project", "gate4", HEAD, "pass", now=NOW)
+    bounds.record_final_gate(conn, "someone-elses-project", "gate5", HEAD, "pass", now=NOW)
+
+    assert bounds.final_gates_green(conn, HEAD) is True
+
+
+def test_final_gates_green_scoped_to_a_project_matches_its_own_rows_and_null_legacy_rows(conn):
+    bounds.record_final_gate(conn, "p1", "gate4", HEAD, "pass", now=NOW)
+    bounds.record_final_gate(conn, "p1", "gate5", HEAD, "pass", now=NOW)
+    assert bounds.final_gates_green(conn, HEAD, project="p1") is True
+
+    conn.execute("UPDATE gate_runs SET project = NULL")  # a legacy row, written before schema v7
+    assert bounds.final_gates_green(conn, HEAD, project="p1") is True  # NULL still counts
+
+
+def test_final_gates_green_scoped_to_a_project_never_matches_a_different_projects_rows(conn):
+    """Two projects sharing this database, or reusing "__final__" gate rows on the same commit SHA (an
+    astronomically unlikely but not impossible collision), must not read each other's final-gate history."""
+    bounds.record_final_gate(conn, "p2", "gate4", HEAD, "pass", now=NOW)
+    bounds.record_final_gate(conn, "p2", "gate5", HEAD, "pass", now=NOW)
+
+    assert bounds.final_gates_green(conn, HEAD, project="p1") is False
+    assert bounds.final_gates_green(conn, HEAD, project="p2") is True
+
+
 def test_rows_the_gate_runner_itself_writes_for_the_final_task_key_count(conn, tmp_path):
     """gates.run_gate(..., task_key="__final__") is how the gate builder will run Gates 4 and 5, so its rows must
     be exactly what final_gates_green reads (real git, a real throwaway worktree, a command that only echoes)."""
@@ -1551,6 +1591,27 @@ def test_is_finished_reads_only_this_plans_project(conn, fake_board):
     fake_board.cards["om"] = {"id": "om", "status": "done"}
 
     assert bounds.is_finished("b", plan, HEAD, conn=conn) is False
+
+
+def test_is_finished_is_not_fooled_by_another_projects_final_gate_rows_on_the_same_head(conn, fake_board):
+    """The bug two projects sharing this database used to hit (found by the bounds and MR builders): gate_runs
+    had no project column at all until schema v7, and is_finished's own final_gates_green call did not filter by
+    it even once the column existed, until this round. A second project's final-gate rows on the exact same
+    integration HEAD (a real possibility: two projects can share a database) must not count as this project's."""
+    plan = _plan(count=1, project="p1")
+    _seed_tasks(conn, plan)
+    for task in plan.tasks:
+        fake_board.cards[f"m_{task.key}"] = {"id": f"m_{task.key}", "status": "done"}
+    bounds.mark_release_report(conn, plan.project, "docs/ases/release-report.md")
+    bounds.record_final_gate(conn, "p2", "gate4", HEAD, "pass")  # p2's gates, not p1's
+    bounds.record_final_gate(conn, "p2", "gate5", HEAD, "pass")
+
+    assert bounds.is_finished("b", plan, HEAD, conn=conn) is False
+
+    bounds.record_final_gate(conn, plan.project, "gate4", HEAD, "pass")
+    bounds.record_final_gate(conn, plan.project, "gate5", HEAD, "pass")
+
+    assert bounds.is_finished("b", plan, HEAD, conn=conn) is True
 
 
 def test_finish_project_sets_the_status_and_says_it_did(conn, fake_board):

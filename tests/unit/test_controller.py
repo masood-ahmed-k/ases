@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from ases import config, controller, db, events, hermes, mergeq, plan as plan_mod, review as review_mod
+from ases import gates as gates_mod
 from ases import guards as guards_mod
 from ases import questions as questions_mod
 from ases import usage as usage_mod
@@ -33,6 +34,35 @@ def _round5_steps_are_inert(monkeypatch):
     monkeypatch.setattr(controller, "process_finalize", lambda *a, **kw: None)
     monkeypatch.setattr(questions_mod, "open_question", lambda card: None, raising=False)
     monkeypatch.setattr(questions_mod, "ask_user", lambda *a, **kw: "commented", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _post_merge_check_passes(monkeypatch):
+    """Round 6 (ASES-GIT-05): process_merge_queue re-runs Gate 3 on the new integration HEAD right after a real
+    merge. Every test below that is not about it gets a stub that always passes, so a scripted MergeOutcome's
+    fake SHA (such as "cand1") never has to be a real commit gates.run_gate could check out. Tests about the
+    post-merge check itself replace this stub (see _stub_post_merge_gate)."""
+    def lenient(repo, commit_sha, gate_name, commands, *, conn=None, task_key="", project=None,
+                timeout_per_command=120, runner=None):
+        return gates_mod.GateResult(gate_name, commit_sha, True, "ok")
+
+    monkeypatch.setattr(gates_mod, "run_gate", lenient)
+
+
+def _stub_post_merge_gate(monkeypatch, *, passed, detail="gate3-postmerge output"):
+    """Replace gates_mod.run_gate (the post-merge check only reaches it, in this file: Gate 1 and the pre-merge
+    Gate 3 are stubbed at a higher level, review.check_branch_for_merge and mergeq.merge_task) with a recorder
+    that answers `passed`/`detail` and remembers every call, with its REAL keyword names."""
+    calls = []
+
+    def fake(repo, commit_sha, gate_name, commands, *, conn=None, task_key="", project=None,
+              timeout_per_command=120, runner=None):
+        calls.append({"commit_sha": commit_sha, "gate_name": gate_name, "commands": commands,
+                      "task_key": task_key, "project": project})
+        return gates_mod.GateResult(gate_name, commit_sha, passed, detail)
+
+    monkeypatch.setattr(gates_mod, "run_gate", fake)
+    return calls
 
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
@@ -712,12 +742,14 @@ def _board_state(monkeypatch, pair, *, project_id=REAL_HERMES_PROJECT_ID, branch
 
 
 def _record_card_actions(monkeypatch):
-    """Replace every hermes call process_merge_queue can make on the merge card with a recorder, so a
+    """Replace every hermes call process_merge_queue can make on a card with a recorder, so a
     test can assert none happened (and a bug can never fall through to a real `hermes` subprocess)."""
-    actions = {"link": [], "block": [], "complete": [], "ask": []}
+    actions = {"link": [], "block": [], "complete": [], "ask": [], "reopen_review": []}
     monkeypatch.setattr(hermes, "kanban_link", lambda board, parent, child: actions["link"].append((parent, child)))
     monkeypatch.setattr(hermes, "kanban_block", lambda board, cid, reason: actions["block"].append((cid, reason)))
     monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: actions["complete"].append((cid, kw)))
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda board, cid, reason: (
+        actions["reopen_review"].append((cid, reason))))
     # The controller puts every question to a person through questions.ask_user; "ask" is where those land.
     monkeypatch.setattr(questions_mod, "ask_user", lambda board, card, text, *, conn=None, author="ases": (
         actions["ask"].append((card["id"], text)) or "commented"), raising=False)
@@ -912,7 +944,7 @@ def test_benign_fast_forward_race_retries_next_poll_without_a_fix_card(tmp_path,
     assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == []
 
     assert _fix_cards(created) == []
-    assert actions == {"link": [], "block": [], "complete": [], "ask": []}  # the merge card is left exactly as it was
+    assert actions == {"link": [], "block": [], "complete": [], "ask": [], "reopen_review": []}  # the merge card is left exactly as it was
     row = _task_row(conn)
     assert row["fix_cards"] == 0
     assert row["work_card_id"] == pair.work_card_id  # nothing was repointed either
@@ -1196,7 +1228,7 @@ def test_review_only_task_with_an_empty_branch_completes_its_merge_card_as_a_no_
 
     assert merged == ["T1"]
     assert actions == {
-        "link": [], "block": [], "ask": [],
+        "link": [], "block": [], "ask": [], "reopen_review": [],
         "complete": [(pair.merge_card_id, {"result": NO_OP_RESULT,
                                            "metadata": {"squash_commit": None, "no_op": True}})],
     }
@@ -1503,7 +1535,7 @@ def test_a_card_its_own_implementer_completed_is_refused_not_merged(tmp_path, mo
     assert merged == []
     assert calls == []  # merge_task was never reached, on either poll
     assert unreviewed == ["T1"]
-    assert actions == {"link": [], "block": [], "complete": [], "ask": []}  # the merge card was left exactly as it was
+    assert actions == {"link": [], "block": [], "complete": [], "ask": [], "reopen_review": []}  # the merge card was left exactly as it was
     assert _fix_cards(created) == []  # a refusal is not a merge failure: no fix card,
     assert _task_row(conn)["fix_cards"] == 0  # and no fix budget spent
     # Recorded once for the card, not once per poll.
@@ -1564,7 +1596,7 @@ def test_run_pass_polices_the_review_lane_before_it_dispatches_and_reports_unrev
 
     passed = {}
 
-    def fake_merge_queue(board, repo, plan, project, *, conn, unreviewed=None, models_config=None):
+    def fake_merge_queue(board, repo, plan, project, *, conn, unreviewed=None, models_config=None, integrity=None):
         order.append("merge")
         passed["merge_models_config"] = models_config
         unreviewed.append("T1")
@@ -1830,6 +1862,38 @@ def test_run_pass_passes_the_stored_expected_head_and_the_plans_integration_bran
     assert summary["integrity"] == []
 
 
+def test_run_pass_halts_when_the_merge_queue_cannot_repair_the_branch_after_a_revert(tmp_path, monkeypatch):
+    """ASES-GIT-05, round 6: process_merge_queue's own integrity out-param, wired into run_pass the same way the
+    primary-checkout guard's problems already are (an integrity_violation event, run_pass returns with
+    `integrity` set) -- nothing later in the pass is safe to run on top of a branch that could not be repaired."""
+    import types
+
+    conn = db.connect(tmp_path / "ases.db")
+    seen = _guard_ok(monkeypatch)
+    order = []
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: order.append("usage") or [])
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: order.append("budget") or [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: order.append("review") or [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: order.append("dispatch") or {})
+    monkeypatch.setattr(controller, "process_finalize", lambda *a, **kw: order.append("finalize") or None)
+
+    def fake_merge_queue(*a, integrity=None, **kw):
+        order.append("merge")
+        if integrity is not None:
+            integrity.append("post-merge Gate 3 failed for T1 and the revert could not repair the branch")
+        return []
+
+    monkeypatch.setattr(controller, "process_merge_queue", fake_merge_queue)
+    plan = types.SimpleNamespace(project="p", integration_branch="trunk")
+
+    summary = controller.run_pass("b", tmp_path, plan, types.SimpleNamespace(budgets={}), {}, conn=conn)
+
+    assert seen  # the guard itself ran and was green: this halt comes from the merge queue, not the guard
+    assert order == ["usage", "budget", "review", "dispatch", "merge"]  # finalize never ran
+    assert summary["integrity"] == ["post-merge Gate 3 failed for T1 and the revert could not repair the branch"]
+    assert summary["final"] is None and summary["finished"] is False
+
+
 def test_a_real_merge_records_the_new_head_as_the_expected_one(tmp_path, monkeypatch):
     """The merge queue moves the primary checkout's HEAD itself, so the guard must expect the new tip or the
     controller's own fast-forward would be reported as a violation on the very next pass."""
@@ -1865,6 +1929,106 @@ def test_a_failed_merge_leaves_the_expected_head_alone(tmp_path, monkeypatch):
     controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
 
     assert guards_mod.expected_head(conn, plan.project) == "before"
+
+
+# ---------------------------------------------------------------------------------------------
+# The post-merge check and revert trigger (round 6, ASES-GIT-05, section 8.1: "The integration branch MUST stay
+# runnable. If a post-merge check fails, the queue reverts the squash commit, records it, blocks the merge card
+# and opens a fix card."). mergeq.merge_task itself is scripted (as above); only gates_mod.run_gate (the
+# post-merge check) and mergeq.revert_merge need their own stubs here.
+# ---------------------------------------------------------------------------------------------
+
+def test_post_merge_check_green_completes_normally_and_checks_the_right_commit(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    calls = _stub_post_merge_gate(monkeypatch, passed=True)
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert merged == ["T1"]
+    assert len(calls) == 1
+    assert calls[0] == {"commit_sha": "cand1", "gate_name": "gate3-postmerge", "commands": ["echo ok"],
+                        "task_key": "T1", "project": "t3"}
+    assert actions["complete"] == [(pair.merge_card_id, {"result": "merged cand1",
+                                                          "metadata": {"squash_commit": "cand1"}})]
+    assert guards_mod.expected_head(conn, plan.project) == "cand1"
+    assert _fix_cards(created) == []
+
+
+def test_post_merge_check_red_but_revert_succeeds_opens_a_fix_card_and_leaves_the_merge_card_open(
+    tmp_path, monkeypatch,
+):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    _stub_post_merge_gate(monkeypatch, passed=False, detail="another task's merge broke this")
+    revert_calls = []
+
+    def fake_revert(repo, squash_commit, *, conn=None, task_key="", project=None):
+        revert_calls.append({"squash_commit": squash_commit, "task_key": task_key, "project": project})
+        return mergeq.RevertOutcome(True, "revertsha1", "reverted cand1", aborted=False)
+
+    monkeypatch.setattr(mergeq, "revert_merge", fake_revert)
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert merged == []  # never merged: the branch it landed on turned out broken
+    assert revert_calls == [{"squash_commit": "cand1", "task_key": "T1", "project": "t3"}]
+    assert actions["complete"] == []  # the merge card is NEVER completed on this path
+    assert guards_mod.expected_head(conn, plan.project) == "revertsha1"  # the revert's own new HEAD
+    fix_cards = _fix_cards(created)
+    assert len(fix_cards) == 1 and _task_row(conn)["fix_cards"] == 1
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "post_merge_reverted" in kinds and "merge_failed" in kinds and "fix_card_created" in kinds
+    assert "integrity_violation" not in kinds
+    (reverted_event,) = _refusals(conn, "post_merge_reverted")
+    assert reverted_event == {"task_key": "T1", "commit": "cand1", "detail": "another task's merge broke this"}
+
+
+def test_post_merge_check_red_and_revert_also_fails_halts_via_the_integrity_out_param(tmp_path, monkeypatch):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    _stub_post_merge_gate(monkeypatch, passed=False, detail="broken")
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: mergeq.RevertOutcome(
+        False, None, "git revert failed and --abort also failed", aborted=False,
+    ))
+    integrity: list[str] = []
+
+    merged = controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, integrity=integrity,
+    )
+
+    assert merged == []
+    assert integrity and "T1" in integrity[0] and "cand1" in integrity[0]
+    assert actions["complete"] == []
+    assert _fix_cards(created) == [] and _task_row(conn)["fix_cards"] == 0  # not the ordinary failure path
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "integrity_violation" in kinds
+    assert "fix_card_created" not in kinds and "merge_failed" not in kinds
+    assert guards_mod.expected_head(conn, plan.project) is None  # never set: no known-good HEAD to vouch for
+
+
+def test_process_merge_queue_without_an_integrity_list_still_stops_the_loop_on_an_unrepaired_revert(
+    tmp_path, monkeypatch,
+):
+    """integrity is optional (the same shape as unreviewed): a caller that does not pass one still gets the loop
+    stopped, just with nowhere to read the problem back from except the event."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    _stub_post_merge_gate(monkeypatch, passed=False)
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: mergeq.RevertOutcome(False, None, "still broken"))
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)  # no integrity=
+
+    assert merged == []
+    assert [e["kind"] for e in events.recent(conn)].count("integrity_violation") == 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1931,23 +2095,73 @@ def test_a_reviewer_completion_with_no_verdict_metadata_is_refused(tmp_path, mon
 
 
 @pytest.mark.parametrize("metadata", [
-    {"review_outcome": "changes_needed"},
-    {"review_status": "CHANGES_REQUIRED", "required_changes": ["add a test"]},
-    {"review_status": "BLOCKED"},
+    {"review_outcome": "changes_needed"},  # not "approved": unusable, not a well-formed CHANGES_REQUIRED
     {"review_outcome": "approved", "review_status": "CHANGES_REQUIRED"},  # contradiction is never read as PASS
     {"review_outcome": "approved", "commit": "not-hex"},
     "not json at all",
 ])
-def test_a_verdict_that_is_not_a_well_formed_pass_is_refused(tmp_path, monkeypatch, metadata):
+def test_a_malformed_verdict_is_refused(tmp_path, monkeypatch, metadata):
+    """Kept under its round 5 name and shape: these four are genuinely malformed (validate_verdict.valid is
+    False), the ONLY case that still takes the merge_refused_invalid_verdict path. A well-formed CHANGES_REQUIRED
+    or BLOCKED verdict is a different, round 6 case: see test_a_valid_changes_required_or_blocked_verdict below."""
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
     _work_card_runs(monkeypatch, pair, [_reviewer_run(metadata)])
-    _record_card_actions(monkeypatch)
+    actions = _record_card_actions(monkeypatch)
     calls = _script_merge_task(monkeypatch, _MERGED)
 
     assert controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn) == []
 
-    assert calls == []
+    assert calls == [] and actions["reopen_review"] == []
     assert len(_refusals(conn, "merge_refused_invalid_verdict")) == 1
+
+
+@pytest.mark.parametrize("metadata,outcome", [
+    ({"review_status": "CHANGES_REQUIRED", "required_changes": ["add a test"]}, "CHANGES_REQUIRED"),
+    ({"review_status": "BLOCKED"}, "BLOCKED"),
+])
+def test_a_valid_changes_required_or_blocked_verdict_reopens_the_card_instead_of_refusing_it(
+    tmp_path, monkeypatch, metadata, outcome,
+):
+    """Found by the FK builder (round 6): a reviewer that calls kanban_complete with a CHANGES_REQUIRED or
+    BLOCKED verdict, instead of kanban_request_changes/kanban_block, used to be refused forever as an "invalid"
+    verdict -- the card was `done`, refused every poll, with no path back to its implementer. The verdict is well
+    formed (validate_verdict.valid is True here), so it is treated as if the reviewer had used
+    kanban_reopen_review: back to the implementer, never the unreviewed-refusal path."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(metadata)])
+    actions = _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    unreviewed = []
+
+    merged = controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, unreviewed=unreviewed,
+    )
+
+    assert merged == [] and calls == [] and unreviewed == []  # never merged, and not the unreviewed path either
+    # _reviewer_run sets no run "summary", so the reason falls back to the default text (see the next test for a
+    # run that DOES carry one).
+    assert actions["reopen_review"] == [(pair.work_card_id, f"reviewer completed the card with a {outcome} verdict")]
+    assert actions["complete"] == [] and actions["block"] == []  # never completed, never blocked directly
+    assert _refusals(conn, "merge_refused_invalid_verdict") == []  # NOT the malformed-verdict path
+    (event,) = _refusals(conn, "reviewer_completed_with_changes_requested")
+    assert event == {"task_key": "T1", "card_id": pair.work_card_id, "outcome": outcome}
+    assert _fix_cards(created) == [] and _task_row(conn)["fix_cards"] == 0  # not a merge failure either
+
+
+def test_a_changes_required_verdict_uses_the_runs_own_summary_as_the_reopen_reason(tmp_path, monkeypatch):
+    """Verdict has no summary field of its own (validate_verdict's schema check does not carry free text); the
+    reason comes from the run's own "summary" (r2_rules.md: kanban_show's _runs carry one), which the
+    Verdict-shaped metadata used in the parametrized test above happens not to set for BLOCKED."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    run = _reviewer_run({"review_status": "CHANGES_REQUIRED"})
+    run["summary"] = "FAIL: the retry loop has no backoff"
+    _work_card_runs(monkeypatch, pair, [run])
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert actions["reopen_review"] == [(pair.work_card_id, "FAIL: the retry loop has no backoff")]
 
 
 @pytest.mark.parametrize("metadata", [

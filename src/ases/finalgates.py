@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import fnmatch
 import pathlib
 import re
 import sqlite3
@@ -77,6 +78,12 @@ SEVERITY_ADVISORY = "advisory"
 SEVERITY_INFO = "info"
 _ADVISORY_KINDS = frozenset({KIND_INJECTION})
 _INFO_KINDS = frozenset({KIND_SKIPPED})
+
+# ASES-TSK-04 (section 18.2): a finding the plan's gate4_allowlist excused (see _apply_allowlist). Every
+# original blocking kind (secret_in_tree, secret_file_tracked, generated_artifact_tracked) gets this prefix
+# rather than one fixed new kind, so the release report still says WHAT was found, only that it was allowed.
+# scan_error is never rewritten this way (see _apply_allowlist), so no "allowed_scan_error" kind exists.
+ALLOWLIST_PREFIX = "allowed_"
 
 # "scan the text of every tracked text file up to 1 MB": a file of exactly this size is scanned, one byte more is not.
 MAX_SCAN_BYTES = 1_000_000
@@ -177,8 +184,12 @@ def severity(finding_or_kind) -> str:
     """"blocking", "advisory" or "info" for a finding (or a kind). Only secret_in_tree, secret_file_tracked,
     generated_artifact_tracked and scan_error are named blocking by the work order, but the rule is fail closed:
     an injection_pattern is advisory, a `skipped` note is information, and ANY other kind blocks, so a kind nobody
-    classified can never let a gate pass by being unknown."""
+    classified can never let a gate pass by being unknown. A kind carrying ALLOWLIST_PREFIX (ASES-TSK-04: a
+    finding the plan's gate4_allowlist excused) is information: a human already reviewed and excused it, so it
+    is listed for audit but never fails the gate."""
     kind = finding_or_kind if isinstance(finding_or_kind, str) else getattr(finding_or_kind, "kind", "")
+    if kind.startswith(ALLOWLIST_PREFIX):
+        return SEVERITY_INFO
     if kind in _ADVISORY_KINDS:
         return SEVERITY_ADVISORY
     if kind in _INFO_KINDS:
@@ -604,8 +615,39 @@ def _run_scan(scan: Callable, repo, head: str) -> list:
         return [TreeFinding(KIND_SCAN_ERROR, "", None, f"the tree scan raised {_err(exc)}")]
 
 
+def _path_matches_any(path: str, globs: tuple) -> bool:
+    """Same glob semantics as everywhere else in ASES (tamper._glob_match, plan.py's touches check): fnmatch on
+    forward-slash paths, plus an exact-string fast path, so * and ** both cross directories."""
+    return bool(path) and any(path == glob or fnmatch.fnmatch(path, glob) for glob in globs)
+
+
+def _apply_allowlist(findings: list, allow_paths) -> list:
+    """ASES-TSK-04 (section 18.2): `findings` with every currently BLOCKING one whose `path` an `allow_paths`
+    glob covers turned into its ALLOWLIST_PREFIX kind (see severity()): still in the list for a human to audit,
+    never blocking. Only a finding severity() already calls blocking is rewritten: an advisory injection_pattern
+    or an informational skipped note under the same path is left exactly as it is, because there was nothing on
+    it to excuse. scan_error is never allowlisted either way (a scan that could not run is not a content
+    decision a plan can excuse, and its path is often "" anyway, which no glob can name). Findings that do not
+    match are returned unchanged, in place, so callers keep one list either way."""
+    globs = tuple(g for g in (allow_paths or ()) if isinstance(g, str) and g)
+    if not globs:
+        return findings
+    rewritten = []
+    for finding in findings:
+        if (finding.kind != KIND_SCAN_ERROR and severity(finding) == SEVERITY_BLOCKING
+                and finding.path and _path_matches_any(finding.path, globs)):
+            rewritten.append(dataclasses.replace(
+                finding, kind=f"{ALLOWLIST_PREFIX}{finding.kind}",
+                detail=f"{finding.detail} (allowlisted by the plan's gate4_allowlist)",
+            ))
+        else:
+            rewritten.append(finding)
+    return rewritten
+
+
 def run_gate4(
     repo, plan, conn, head: str, *, runner=None, scan=None, run_gate=None, timeout_per_command: int = 300,
+    allow_paths=(),
 ) -> GateOutcome:
     """Gate 4, security, on the integration HEAD `head` (table 24; ASES-TSK-04, ASES-QG-01, ASES-QG-04, ASES-SEC-01).
 
@@ -620,10 +662,17 @@ def run_gate4(
     ONE combined row is recorded, always through bounds.record_final_gate (see _record): the result is the scan
     AND the commands. A `scan` that raises is a scan that did not run, so it is a blocking scan_error and the gate
     is red (fail closed). A `run_gate` that raises is NOT caught: an infrastructure failure (Docker down, git
-    failing) is not a red gate, so it propagates and no row is written (finalize turns it into status "error")."""
+    failing) is not a red gate, so it propagates and no row is written (finalize turns it into status "error").
+
+    `allow_paths` (ASES-TSK-04, section 18.2: normally `plan.gate4_allowlist`) are path globs whose findings are
+    dropped from the blocking set before it is decided: a known, reviewed exception such as a sample key in
+    tests/ or docs/. An allowlisted finding is never silently invisible, it is still in the returned outcome's
+    findings and in the detail, renamed to its ALLOWLIST_PREFIX kind (see _apply_allowlist and severity()), so
+    the release report shows exactly what was excused. Defaults to `()`: a caller that does not pass it sees
+    exactly today's behaviour."""
     scan = scan or scan_tree
     run_gate = run_gate or gates.run_gate
-    findings = _run_scan(scan, repo, head)
+    findings = _apply_allowlist(_run_scan(scan, repo, head), allow_paths)
     blockers = blocking(findings)
     notes: list[str] = []
     skipped = [f for f in findings if f.kind == KIND_SKIPPED]
@@ -1234,7 +1283,11 @@ def finalize(
     (intents.KIND_RUN_GATE, KIND_RELEASE_REPORT), so a crash half way is visible to reconcile.
 
     The collaborators are late-bound parameters (None means the real one) so a test injects failures and the sandbox
-    `runner` reaches the plan's commands. `now` (a datetime, naive read as UTC) sets the report's clock and folder."""
+    `runner` reaches the plan's commands. `now` (a datetime, naive read as UTC) sets the report's clock and folder.
+
+    `plan.gate4_allowlist` (ASES-TSK-04), when the plan sets one, is passed to `run4` as `allow_paths` so Gate 4
+    drops those findings from its blocking set (see run_gate4); a plan with none calls `run4` exactly as before
+    this field existed, so a `run4` stand-in that predates it keeps working unchanged."""
     run4 = run4 or run_gate4
     run5 = run5 or run_gate5
     build = build or report_mod.build_report
@@ -1276,9 +1329,16 @@ def finalize(
         stopped = _stopped_reason(conn, plan)
         if stopped is not None:
             return FinalizeResult(STATUS_NOT_READY, outcomes.get(GATE4), outcomes.get(GATE5), None, stopped)
+        gate_kwargs = {"runner": runner, "timeout_per_command": timeout_per_command}
+        if gate == GATE4:
+            # ASES-TSK-04: the plan-author decision (Gate P reviewed), passed only when it is not empty, so a
+            # run4 stand-in written before this field existed (elsewhere in the suite, or a caller's own) keeps
+            # working unchanged: only a plan that actually sets gate4_allowlist sees the new keyword at all.
+            allow_paths = getattr(plan, "gate4_allowlist", None) or ()
+            if allow_paths:
+                gate_kwargs["allow_paths"] = allow_paths
         outcome, error = _run_final_gate(
-            conn, plan, gate, head, run, (repo, plan, conn, head),
-            {"runner": runner, "timeout_per_command": timeout_per_command},
+            conn, plan, gate, head, run, (repo, plan, conn, head), gate_kwargs,
         )
         if outcome is None:
             return FinalizeResult(

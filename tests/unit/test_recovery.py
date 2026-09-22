@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from ases import config, db, events, hermes, plan as plan_mod, questions, recovery
+from ases import bounds, config, db, events, hermes, plan as plan_mod, questions, recovery
 from ases.recovery import Bounds, Decision, FailureKind, Lineage
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
@@ -678,6 +678,13 @@ def test_refresh_review_rounds_skips_a_task_with_no_card_and_survives_an_unreada
 # ---------------------------------------------------------------------------------------------
 
 
+def test_recovery_bounds_is_an_alias_of_bounds_bounds():
+    """Round 6 fix: there used to be two independently-defined Bounds classes (recovery's own 4-field one, lenient,
+    and bounds.py's 8-field one, strict) for the same section 9.3 concept. Now there is exactly one class."""
+    assert recovery.Bounds is bounds.Bounds
+    assert Bounds is bounds.Bounds
+
+
 def test_bounds_default_to_the_blueprint_section_9_3_values():
     assert Bounds() == Bounds(attempts_per_card=3, review_rounds_per_task=3, fix_cards_per_task=2,
                               replans_per_project=2)
@@ -691,10 +698,41 @@ def test_bounds_read_the_budget_keys_and_ignore_the_others():
     assert Bounds.from_budgets(budgets) == Bounds(5, 4, 1, 7)
 
 
-def test_bounds_take_the_default_for_a_missing_or_unusable_value():
+def test_bounds_now_also_carries_the_fields_only_bounds_py_used_to_have():
+    """Since recovery.Bounds is bounds.Bounds (not a 4-field lookalike any more), a budgets dict that sets one of
+    the other four section 9.3 fields is honoured too, not silently dropped."""
+    full = Bounds.from_budgets({"max_cards": 99, "card_runtime_minutes": 12, "daily_reserve_percent": 25,
+                                "project_wall_clock_minutes": 480})
+    assert (full.max_cards, full.card_runtime_minutes, full.daily_reserve_percent,
+            full.project_wall_clock_minutes) == (99, 12, 25, 480)
+    # exhausted() and decide() only ever read the 4 fields recovery.py always had, so this is safe either way.
+    assert recovery.exhausted(_lineage(capability_failures=3), full) == "attempts"
+
+
+def test_bounds_take_the_default_for_a_missing_key():
     assert Bounds.from_budgets({"attempts_per_card": 6}) == Bounds(attempts_per_card=6)
-    assert Bounds.from_budgets({"attempts_per_card": None, "fix_cards_per_task": "two", "replans_per_project": "4"}) \
-        == Bounds(replans_per_project=4)
+    assert Bounds.from_budgets({"replans_per_project": 4}) == Bounds(replans_per_project=4)
+
+
+def test_bounds_from_budgets_is_strict_now_a_present_bad_value_raises_instead_of_defaulting():
+    """Before round 6, recovery.Bounds.from_budgets had its OWN lenient parser: a present value that was not a
+    usable int silently fell back to the default (None, a non-numeric string, a numeric string it coerced with
+    int()). Now that recovery.Bounds is bounds.Bounds, the same inputs raise ValueError instead: bounds.Bounds's
+    own from_budgets treats a bad value as a config typo that must stop the project at load time, not a value to
+    quietly ignore (see bounds.py's _bound_int docstring). This is the one behaviour difference Problem 1 asked to
+    pin: the strict behaviour wins, because nothing in this file's own tests or in process_failures depended on
+    the old silent-default-on-bad-value behaviour for a real reason (only this test asserted it, and it asserted
+    it as coincidence of the old implementation, not as a requirement)."""
+    with pytest.raises(ValueError):
+        Bounds.from_budgets({"attempts_per_card": None})           # used to default to 3
+    with pytest.raises(ValueError):
+        Bounds.from_budgets({"fix_cards_per_task": "two"})          # used to default to 2
+    with pytest.raises(ValueError):
+        Bounds.from_budgets({"replans_per_project": "4"})           # used to be coerced by int() to 4
+    with pytest.raises(ValueError):
+        Bounds.from_budgets({"attempts_per_card": True})            # a bool is refused although bool is an int
+    with pytest.raises(ValueError):
+        Bounds.from_budgets({"attempts_per_card": -1})               # a negative value is refused too
 
 
 @pytest.mark.parametrize("counters, expected", [

@@ -423,3 +423,108 @@ def test_a_gate_profile_without_real_commands_fails_gate_0(bad):
         plan_mod.parse_and_validate(raw, known_roles={"coder"}, max_cards=40)
 
     assert any("gate_profiles.tests" in e for e in info.value.errors)
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-QG-02 (section 14.3): a touches glob broad enough to also cover gate/CI configuration is rejected at
+# Gate 0 unless the task marks allow_gate_config_changes. Found by the MR and FG builders in round 5: a task
+# whose touches was a wildcard glob silently exempted gate-config paths too from tamper.gate_config_changed.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_bare_star_touches_covering_gate_config_is_rejected():
+    raw = _raw_plan(_raw_task("T1", ["*"]))
+    with pytest.raises(plan_mod.PlanError) as info:
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert any("gate/CI configuration" in e and "T1" in e and "'*'" in e for e in info.value.errors)
+
+
+def test_bare_double_star_touches_covering_gate_config_is_rejected():
+    raw = _raw_plan(_raw_task("T1", ["**"]))
+    with pytest.raises(plan_mod.PlanError, match="gate/CI configuration"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_bare_star_touches_is_accepted_with_allow_gate_config_changes():
+    raw = _raw_plan({**_raw_task("T1", ["*"]), "allow_gate_config_changes": True})
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.task("T1").allow_gate_config_changes is True
+    assert p.task("T1").touches == ("*",)
+
+
+def test_narrow_explicit_touches_on_a_gate_config_file_needs_no_marker():
+    raw = _raw_plan(_raw_task("T1", ["pytest.ini"]))
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.task("T1").touches == ("pytest.ini",)
+    assert p.task("T1").allow_gate_config_changes is False
+
+
+def test_wildcard_touches_that_does_not_reach_gate_config_is_unaffected():
+    raw = _raw_plan(_raw_task("T1", ["docs/*.md"]))
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.task("T1").touches == ("docs/*.md",)
+
+
+def test_src_star_star_touches_does_not_reach_a_root_level_pytest_ini():
+    """pytest.ini lives at the repo root in this project, not under src/, so src/** cannot match it: only an
+    ACTUAL overlap is rejected, not every broad-looking glob (ASES-QG-02's own boundary example)."""
+    raw = _raw_plan(_raw_task("T1", ["src/**"]))
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.task("T1").touches == ("src/**",)
+
+
+def test_only_the_offending_touches_entry_is_named_in_the_error():
+    raw = _raw_plan(_raw_task("T1", ["pytest.ini", "docs/*.md", "*"]))
+    with pytest.raises(plan_mod.PlanError) as info:
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    hits = [e for e in info.value.errors if "gate/CI configuration" in e]
+    assert len(hits) == 1
+    assert "'*'" in hits[0] and "'pytest.ini'" not in hits[0] and "'docs/*.md'" not in hits[0]
+
+
+def test_allow_gate_config_changes_must_be_a_bool():
+    raw = _raw_plan({**_raw_task("T1", ["*"]), "allow_gate_config_changes": "yes"})
+    with pytest.raises(plan_mod.PlanError, match="allow_gate_config_changes must be true or false"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_allow_gate_config_changes_defaults_to_false():
+    p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
+    assert all(t.allow_gate_config_changes is False for t in p.tasks)
+
+
+def test_existing_plan_with_no_allow_gate_config_changes_field_parses_unchanged():
+    """VALID has no allow_gate_config_changes and no gate4_allowlist anywhere: the shape of a plan.json written
+    before either field existed. It must still parse exactly as it did before this change."""
+    p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
+    assert len(p.tasks) == 2
+    assert p.task("T2").depends_on == ("T1",)
+    assert p.gate4_allowlist == ()
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-TSK-04 (section 18.2): the optional plan-level gate4_allowlist field.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_gate4_allowlist_defaults_to_an_empty_tuple():
+    p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
+    assert p.gate4_allowlist == () and isinstance(p.gate4_allowlist, tuple)
+
+
+def test_gate4_allowlist_round_trips():
+    raw = {**VALID, "gate4_allowlist": ["tests/**", "docs/**"]}
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.gate4_allowlist == ("tests/**", "docs/**")
+
+
+def test_gate4_allowlist_must_be_an_array_of_strings():
+    raw = {**VALID, "gate4_allowlist": ["tests/**", 5]}
+    with pytest.raises(plan_mod.PlanError, match="gate4_allowlist must be an array"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_gate4_allowlist_wrong_type_is_rejected():
+    raw = {**VALID, "gate4_allowlist": "tests/**"}
+    with pytest.raises(plan_mod.PlanError, match="gate4_allowlist must be an array"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)

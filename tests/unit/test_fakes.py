@@ -1573,6 +1573,27 @@ def test_install_replaces_every_public_hermes_function_and_forbids_running_a_rea
         hermes.kanban_show("default", card["id"])
 
 
+def test_fail_next_can_still_be_armed_after_install(monkeypatch):
+    """Round 6 regression: install() replaces hermes.kanban_show with a bound method of the fake, so the old check
+    (inspect.isfunction on hermes.<name>'s CURRENT value) rejected every name once installed. fail_next must validate
+    against the real hermes module's public names captured at import time, not a live, monkeypatch-able lookup."""
+    fake = new_fake().install(monkeypatch)
+    card = hermes.kanban_create(BOARD, "T1: work")
+
+    fake.fail_next("kanban_show")  # used to raise ValueError("... is not a public function ...") here
+
+    with pytest.raises(HermesCommandError, match="injected failure"):
+        hermes.kanban_show(BOARD, card["id"])
+    assert hermes.kanban_show(BOARD, card["id"])["id"] == card["id"]  # armed once, not forever
+
+    with pytest.raises(ValueError, match="not a public function"):
+        fake.fail_next("not_a_hermes_function")
+    with pytest.raises(ValueError, match="not a public function"):
+        fake.fail_next("_run")
+    with pytest.raises(ValueError, match="not a public function"):
+        fake.fail_next("card")  # a real method of the fake, but not a hermes-module function: must still be rejected
+
+
 def test_install_fails_loudly_for_a_hermes_wrapper_the_fake_does_not_have(monkeypatch):
     def kanban_future(board):
         """A wrapper added to hermes.py later."""

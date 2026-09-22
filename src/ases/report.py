@@ -40,11 +40,19 @@ HERMES_DASHBOARD_URL = "http://127.0.0.1:9119"
 # pseudo task key (bounds.record_final_gate). The Quality panel lists them next to the per-task gate runs.
 FINAL_GATE_KEY = "__final__"
 
-# The event kinds the Health panel reads: what the controller records when the run itself is in trouble or
-# has had to spend a bounded resource (controller.run_pass, process_budget_gate, process_merge_queue).
+# The event kinds the Health panel reads: what the controller records when the run itself is in trouble or has
+# had to spend a bounded resource (controller.run_pass, process_budget_gate, process_merge_queue), plus four kinds
+# round 5 added that the panel had not picked up yet (round 6 fix): model_mismatch (usage.py, ASES-RTE-01, a
+# session that ran on a different model than its profile is pinned to), should_stop_error (mergeq._stop_requested,
+# the caller's own kill-switch check raised), and tamper_check_error / tamper_blocked (review.py, ASES-QG-03, the
+# tamper check could not run, or found something that blocks a merge). The Quality panel's findings query also
+# lists the two tamper kinds individually (its "contains tamper" catch-all is a deliberately general net, kept
+# that way on purpose: see _quality_panel below); a health-panel COUNT and a quality-panel per-event LISTING are
+# different things and both are kept.
 HEALTH_KINDS = (
     "pass_error", "usage_ingest_error", "merge_failed", "merge_race_retrying", "card_parked_for_budget",
-    "integrity_violation", "fix_card_created", "fix_card_budget_exhausted",
+    "integrity_violation", "fix_card_created", "fix_card_budget_exhausted", "model_mismatch", "should_stop_error",
+    "tamper_check_error", "tamper_blocked",
 )
 
 _HEALTH_WINDOW = 200     # at most this many health events are read; counts are over the events read
@@ -521,6 +529,11 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
          "reverted": bool(records[key]["reverted"]), "completed_at": records[key]["completed_at"]}
         for key in scope if key in records
     ]
+    # Round 6 fix: tamper_check_error and tamper_blocked (review.py, ASES-QG-03) are now also counted in
+    # HEALTH_KINDS above. They are deliberately still matched here too by the "contains tamper" catch-all: this
+    # net is meant to be general (it also nets any future or ad hoc tamper-shaped kind, not only these two named
+    # ones), and a quality finding is a per-event, audited listing while the health count is an aggregate for
+    # operational monitoring. The two panels are allowed to show the same event for different readers.
     findings = [
         {"ts": event["ts"], "kind": event["kind"],
          "task_key": event["payload"]["task_key"] if isinstance(event["payload"].get("task_key"), str) else None,

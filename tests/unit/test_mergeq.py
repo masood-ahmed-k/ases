@@ -138,11 +138,12 @@ def test_revert_merge_creates_a_new_commit(repo):
     outcome = mergeq.merge_task(repo, "integration", "swarm/t6", "T6", ["echo ok"])
     before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
 
-    ok = mergeq.revert_merge(repo, outcome.squash_commit)
+    result = mergeq.revert_merge(repo, outcome.squash_commit)
 
-    assert ok is True
+    assert result.ok is True and result.aborted is False
     after = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
     assert after != before
+    assert result.commit_sha == after  # the new revert commit is the tip now
     assert not (repo / "new.txt").exists()  # revert undid the file addition
 
 
@@ -1035,9 +1036,9 @@ def test_revert_merge_writes_a_revert_intent_around_git_revert_and_completes_it(
 
     monkeypatch.setattr(mergeq, "_git", spy_git)
 
-    ok = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="V1", project="p1")
+    result = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="V1", project="p1")
 
-    assert ok is True and seen["open"] == ["revert"]
+    assert result.ok is True and seen["open"] == ["revert"]
     rows = _intent_rows(conn)
     assert [(r["project"], r["kind"], r["key"]) for r in rows] == [("p1", "revert", "V1")]
     assert rows[0]["completed_at"] and merged.squash_commit in rows[0]["detail"]
@@ -1073,11 +1074,120 @@ def test_revert_merge_writes_no_intent_without_a_project_or_a_connection(repo, t
     first = mergeq.merge_task(repo, "integration", "swarm/V3", "V3", ["echo ok"], conn=conn)
     second = mergeq.merge_task(repo, "integration", "swarm/V4", "V4", ["echo ok"], conn=conn)
 
-    assert mergeq.revert_merge(repo, second.squash_commit, conn=conn, task_key="V4") is True   # a connection only
-    assert mergeq.revert_merge(repo, first.squash_commit, project="p1") is True                # a project only
+    assert mergeq.revert_merge(repo, second.squash_commit, conn=conn, task_key="V4").ok is True   # a connection only
+    assert mergeq.revert_merge(repo, first.squash_commit, project="p1").ok is True                # a project only
 
     assert _intent_rows(conn) == []
     assert _merge_row(conn, "V4")["reverted"] == 1 and _merge_row(conn, "V3")["reverted"] == 0
+
+
+# --- round 6: revert_merge's fixed return value, and project-scoping (schema v7) ---------------------------------
+
+
+def test_revert_merge_marks_reverted_only_when_git_revert_actually_succeeds(repo, tmp_path):
+    """The MR builder's finding: the old bool return let a failed git revert still mark reverted=1. Reverting the
+    commit that ADDED new.txt, after a later commit has modified that same file, is a real conflict (modify/delete):
+    git revert cannot apply it, and neither should the database record a revert that never happened."""
+    _make_work_branch(repo, "swarm/G1", "new.txt", "v1\n")
+    conn = db.connect(tmp_path / "ases.db")
+    first = mergeq.merge_task(repo, "integration", "swarm/G1", "G1", ["echo ok"], conn=conn)
+    (repo / "new.txt").write_text("v2, a later unrelated change\n", encoding="utf-8")
+    _git_ok("commit", "-aqm", "a later change to the same file", cwd=repo)
+    before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    result = mergeq.revert_merge(repo, first.squash_commit, conn=conn, task_key="G1")
+
+    assert result.ok is False and result.commit_sha is None
+    assert result.aborted is True  # git revert --abort recovered the checkout
+    after = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    assert after == before  # the abort left HEAD exactly where it was, not mid-revert
+    assert _git_ok("status", "--porcelain", cwd=repo).stdout == ""  # clean, no conflict markers left behind
+    assert _merge_row(conn, "G1")["reverted"] == 0  # the fix: never set on a failed revert
+
+
+def test_revert_merge_with_a_mismatched_project_does_not_touch_another_projects_row(repo, tmp_path):
+    """The NULL-tolerant scoping (schema v7, the smaller, safer fix mergeq.py's module docstring explains in
+    place of a merge_records primary-key migration): a revert call under the WRONG project must not silently
+    flip reverted=1 on a row a different project's more recent candidate build has since stamped."""
+    _make_work_branch(repo, "swarm/S1", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+    merged = mergeq.merge_task(repo, "integration", "swarm/S1", "S1", ["echo ok"], conn=conn, project="p1")
+
+    result = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="S1", project="p2")
+
+    assert result.ok is True  # git itself reverted the commit...
+    row = _merge_row(conn, "S1")
+    assert row["reverted"] == 0 and row["project"] == "p1"  # ...but p1's row was never touched
+
+
+def test_revert_merge_still_matches_a_legacy_null_project_row(repo, tmp_path):
+    """A row with no project (written before schema v7, or by a caller that has not been updated to pass one)
+    still counts: never orphan history."""
+    _make_work_branch(repo, "swarm/S2", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+    merged = mergeq.merge_task(repo, "integration", "swarm/S2", "S2", ["echo ok"], conn=conn)  # no project
+
+    result = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="S2", project="p1")
+
+    assert result.ok is True and _merge_row(conn, "S2")["reverted"] == 1
+
+
+def test_merge_task_stamps_the_project_column_on_merge_records_and_gate_runs(repo, tmp_path):
+    _make_work_branch(repo, "swarm/S3", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    mergeq.merge_task(repo, "integration", "swarm/S3", "S3", ["echo ok"], conn=conn, project="p9")
+
+    assert _merge_row(conn, "S3")["project"] == "p9"
+    gate_row = conn.execute(
+        "SELECT project FROM gate_runs WHERE task_key = 'S3' AND gate = 'gate3'"
+    ).fetchone()
+    assert gate_row["project"] == "p9"
+
+
+def test_merge_task_with_no_project_leaves_the_project_column_null_as_before(repo, tmp_path):
+    _make_work_branch(repo, "swarm/S5", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    mergeq.merge_task(repo, "integration", "swarm/S5", "S5", ["echo ok"], conn=conn)
+
+    assert _merge_row(conn, "S5")["project"] is None
+
+
+def test_post_merge_check_mechanism_end_to_end_on_a_real_repo(repo, tmp_path):
+    """The mechanism controller.process_merge_queue's post-merge check and revert are built from (ASES-GIT-05,
+    section 8.1: "the queue reverts the squash commit, records it"), exercised directly with real git and no
+    controller involved: a task's merge (A2) lands, a second, unrelated commit (standing in for a second task's
+    merge) breaks a shared invariant A2's own gate also checks, the post-merge re-check (a fresh gates.run_gate
+    call on the new tip) goes red, and revert_merge repairs the branch cleanly because the two changes touch
+    different files and so do not conflict (see the conflicting case above for --abort)."""
+    (repo / "config.txt").write_text("enabled\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "project config", cwd=repo)
+    gate_cmd = ["grep -q safe guarded.txt", "grep -q enabled config.txt"]
+    conn = db.connect(tmp_path / "ases.db")
+
+    _make_work_branch(repo, "swarm/A2", "guarded.txt", "safe\n")
+    task_a = mergeq.merge_task(repo, "integration", "swarm/A2", "A2", gate_cmd, conn=conn, project="p1")
+    assert task_a.merged is True and task_a.gate3_result == "pass"
+
+    # A second, unrelated task's merge lands directly (standing in for process_merge_queue merging a DIFFERENT
+    # task next): it never touches guarded.txt, A2's own file, but breaks the shared invariant A2's gate also
+    # checks -- exactly "a project-level regression another task's merge introduced ... on a file THIS task's
+    # touches never named".
+    (repo / "config.txt").write_text("disabled\n", encoding="utf-8")
+    _git_ok("commit", "-aqm", "task B: disable config (unrelated to A2's own file)", cwd=repo)
+    new_head = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    postcheck = gates.run_gate(repo, new_head, "gate3-postmerge", gate_cmd, conn=conn, task_key="A2", project="p1")
+    assert postcheck.passed is False  # what A2's own Gate 3 would have caught, now broken underneath it
+
+    result = mergeq.revert_merge(repo, task_a.squash_commit, conn=conn, task_key="A2", project="p1")
+
+    assert result.ok is True and result.aborted is False  # different files: a clean, non-conflicting revert
+    assert _merge_row(conn, "A2")["reverted"] == 1
+    assert not (repo / "guarded.txt").exists()             # A2's own contribution is gone
+    assert (repo / "config.txt").read_text(encoding="utf-8") == "disabled\n"  # task B's change is left alone
 
 
 # --- a new candidate starts the merge_records row over (ASES-REC-04) --------------------------------------------
@@ -1088,7 +1198,7 @@ def test_a_new_candidate_after_a_revert_resets_reverted_squash_commit_and_comple
     conn = db.connect(tmp_path / "ases.db")
     first = mergeq.merge_task(repo, "integration", "swarm/F1", "F1", ["echo ok"], conn=conn)
     assert first.merged is True
-    assert mergeq.revert_merge(repo, first.squash_commit, conn=conn, task_key="F1") is True
+    assert mergeq.revert_merge(repo, first.squash_commit, conn=conn, task_key="F1").ok is True
     reverted = _merge_row(conn, "F1")
     assert (reverted["reverted"], reverted["squash_commit"]) == (1, first.squash_commit) and reverted["completed_at"]
 

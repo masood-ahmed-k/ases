@@ -129,10 +129,21 @@ def request_stop(conn: sqlite3.Connection, project: str, reason: str | None = No
 
 
 def stop_requested(conn: sqlite3.Connection, project: str) -> bool:
-    """True while the kill switch holds the project stopped. The polling loop and the merge queue call this
-    between steps (section 19.6: "stop the merge queue between steps"). Only status 'stopped' counts: a project
-    that bounds.py merely paused is not a kill-switch stop, and one that has finished is not stopped either. A
-    database error is not swallowed: the caller decides what an unreadable flag means."""
+    """True only while the KILL SWITCH holds the project stopped (status 'stopped'). Only that one status counts:
+    a project bounds.py merely paused is not a kill-switch stop, and one that has finished is not stopped either.
+    A database error is not swallowed: the caller decides what an unreadable flag means.
+
+    Round 6 fix (found alongside recovery.Bounds's duplicate): this is deliberately NARROWER than
+    bounds.stop_requested(conn, project), which is True for 'stopped' OR 'paused' and answers a different
+    question, "should new work happen right now" (ASES-REC-06, ASES-CTL-01) - that is what the polling loop and
+    `swarm run`'s between-pass check actually call. This function is kept, under its existing name, for the kill
+    switch's OWN narrower question, "did the kill switch specifically stop this project": stop_all uses it right
+    here to confirm request_stop's own write landed (see _stop_steps, step a), and code outside this module
+    (test_cli_commands.py, which this package does not own) already and correctly depends on exactly this
+    distinction to assert what `swarm stop` and `swarm resume` did, as opposed to what a separately reached bound
+    did. Renaming or deleting it would break that external, deliberate usage for no behavioural gain, so round 6
+    keeps both functions and both names: use bounds.stop_requested for "should the loop do new work", use this
+    one for "did the kill switch specifically stop it"."""
     row = conn.execute("SELECT status FROM project_state WHERE project = ?", (project,)).fetchone()
     return row is not None and row[0] == STOPPED
 
