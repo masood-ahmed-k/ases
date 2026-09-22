@@ -153,6 +153,70 @@ neither hypothetical, both only visible once real requests actually went out:
    the user rather than silently worked around, since GLM's reliability was explicitly called out as
    important earlier in this project.
 
+## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
+
+Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of
+hours produced real forward motion, not just repeats of the same failure -- and two more previously
+undocumented UnoRouter limits, found the same way as everything else tonight: by actually running it.
+
+- **coder-1 did real, correct work.** One attempt wrote `hello.py` with `print("Hello, world!")` --
+  correct against the task's acceptance criteria -- into the real worktree. A later attempt (14 real
+  tool calls in one session: `kanban_show`, `read_file` on `plan.json`, `git show --stat`, more)
+  reasoned *correctly* about ASES's own task graph on its own: "the child task t_980fcbd3 (merge)... is
+  blocked waiting on this task... I should call kanban_complete (not request_review -- because a
+  pre-created merge child task depends on my task)". That is the exact ASES-TSK-02 dependency structure,
+  inferred correctly by the model from the card body text alone, not hinted at in the prompt.
+- **A previously-undocumented Output-Tokens-Per-Minute (OTPM) cap.** A real 429 named it exactly:
+  `Request too large for model qwen/qwen3.8-27b ... on output tokens per minute (OTPM): Limit 1000,
+  Requested 2048`. Unlike the RPM/TPD limits, this one isn't timing-dependent -- Hermes's default
+  max_tokens for this model (2048) permanently exceeds the 1000 ceiling, so it fails on *every* request
+  that actually needs the full budget, not just under load. Checked Hermes's own source
+  (`agent_init.py`'s per-model `custom provider` config handling, alongside how it already reads
+  `context_length` the same way) and confirmed `providers.<name>.models."<model>".max_tokens` is a
+  schema-recognized per-model override (`hermes config set` warns on an unrecognized key and did NOT
+  warn on this path, unlike a first guess at `agent.max_tokens` which it correctly rejected). Set to 900
+  in `coder-1`'s `config.yaml` (comfortably under 1000). Caveat: this was confirmed against the CLI's own
+  schema validator, not by reading the exact runtime call site that applies it, given the size of
+  Hermes's source tree -- re-verify against the next real dispatch's actual `Requested N` figure if this
+  error recurs.
+- **Hermes's terminal tool blocks the test plan's own gate command.** `python -c "print('gate ok')"`
+  (this test plan's throwaway `trivial` gate profile) was refused by coder-1's terminal tool as
+  "flagged as dangerous (script...)" -- a real, working coder blocked from running its own assigned
+  gate check by Hermes's own safety heuristic on inline `python -c`. Not an ASES bug (ASES's own
+  `gates.py` runs these commands directly via subprocess, never through an agent's terminal tool, so
+  Gate 1/3 are unaffected) but a real gotcha for any plan that hands a gate command to a *worker* to
+  self-check before completing. Changed the test plan's `trivial` profile to `echo gate ok`.
+- **The TPD figure looks pooled and fluctuating, not a private monotonic counter.** Three separate 429s
+  named different `Used` values at different times that don't line up with a single account steadily
+  climbing to one fixed reset (195327, then -- after supposedly resetting -- 191667, then 195446):
+  consistent with `qwen/qwen3.8-27b`'s free-tier TPD bucket being shared across UnoRouter's free users of
+  this exact model in something closer to real time, not reserved per-key. Worth knowing before reading
+  too much into any single "retry in Nh" figure as a private, predictable schedule.
+
+Net effect: three genuine fixes applied (max_tokens, gate command, plus the earlier toolset/timeout/
+max_runtime fixes), and the real dispatch retried again with all of them in place. See this file's
+next dated entry (added once that run's outcome is known) for whether T1 actually reached `done`.
+
+## A real finding, not a hypothetical
+
+`policy.check_data_class` enforces section 21.2 for real: **neither UnoRouter nor OpenRouter's
+currently declared data policy qualifies as safe for `data_class: private`** (both say upstream
+providers or some endpoints may train on inputs). Gate P will correctly *refuse* to approve any plan
+under `private` until a provider with a confirmed no-training/local policy is added. This project's own
+`config/swarm.yaml` is set to `public` for exactly this reason -- it's throwaway test scaffold content,
+not real code, so that's an honest, deliberate choice, not a workaround. A real future project MUST set
+its own data class deliberately and will hit this same refusal under `private` until that gap is closed
+(most likely by adding a provider with `data_collection: deny` + `zdr: true` verified, or a local model).
+
+**Update, 2026-09-19**: that gap is now closed *for one role*. `openai` (added for `lead`, see the dated
+section below) declares `data_policy: no_training`, sourced from OpenAI's own current docs -- it does
+qualify. `config/swarm.yaml`'s `data_class` is still `public`, deliberately: this project's other two
+roles (coder-1 on UnoRouter, reviewer on OpenRouter) still don't qualify, and `data_class` is a single
+project-wide setting, not per-role, so flipping it now would just make Gate P refuse those two roles'
+cards. A real future project that's actually private AND wants every role on a qualifying provider would
+need all three roles on something like OpenAI (or another verified no-training/local provider), not just
+one -- per-role data classes aren't a thing this architecture supports today.
+
 ## Lead moved off GLM, then to OpenAI via xKiro (2026-09-19)
 
 The user's call after the finding above: "if the GLM is not working then lets use GPT API." Changes:
@@ -1046,70 +1110,6 @@ or stale test the fix might have left behind. It found none. Final suite: 5,505 
 
 Every "not_covered" row on the register the user asked to build in round 7 is now `in_progress`. This closes out
 the "build all" instruction that opened round 7: nothing on the register is still `not_covered`.
-
-## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
-
-Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of
-hours produced real forward motion, not just repeats of the same failure -- and two more previously
-undocumented UnoRouter limits, found the same way as everything else tonight: by actually running it.
-
-- **coder-1 did real, correct work.** One attempt wrote `hello.py` with `print("Hello, world!")` --
-  correct against the task's acceptance criteria -- into the real worktree. A later attempt (14 real
-  tool calls in one session: `kanban_show`, `read_file` on `plan.json`, `git show --stat`, more)
-  reasoned *correctly* about ASES's own task graph on its own: "the child task t_980fcbd3 (merge)... is
-  blocked waiting on this task... I should call kanban_complete (not request_review -- because a
-  pre-created merge child task depends on my task)". That is the exact ASES-TSK-02 dependency structure,
-  inferred correctly by the model from the card body text alone, not hinted at in the prompt.
-- **A previously-undocumented Output-Tokens-Per-Minute (OTPM) cap.** A real 429 named it exactly:
-  `Request too large for model qwen/qwen3.8-27b ... on output tokens per minute (OTPM): Limit 1000,
-  Requested 2048`. Unlike the RPM/TPD limits, this one isn't timing-dependent -- Hermes's default
-  max_tokens for this model (2048) permanently exceeds the 1000 ceiling, so it fails on *every* request
-  that actually needs the full budget, not just under load. Checked Hermes's own source
-  (`agent_init.py`'s per-model `custom provider` config handling, alongside how it already reads
-  `context_length` the same way) and confirmed `providers.<name>.models."<model>".max_tokens` is a
-  schema-recognized per-model override (`hermes config set` warns on an unrecognized key and did NOT
-  warn on this path, unlike a first guess at `agent.max_tokens` which it correctly rejected). Set to 900
-  in `coder-1`'s `config.yaml` (comfortably under 1000). Caveat: this was confirmed against the CLI's own
-  schema validator, not by reading the exact runtime call site that applies it, given the size of
-  Hermes's source tree -- re-verify against the next real dispatch's actual `Requested N` figure if this
-  error recurs.
-- **Hermes's terminal tool blocks the test plan's own gate command.** `python -c "print('gate ok')"`
-  (this test plan's throwaway `trivial` gate profile) was refused by coder-1's terminal tool as
-  "flagged as dangerous (script...)" -- a real, working coder blocked from running its own assigned
-  gate check by Hermes's own safety heuristic on inline `python -c`. Not an ASES bug (ASES's own
-  `gates.py` runs these commands directly via subprocess, never through an agent's terminal tool, so
-  Gate 1/3 are unaffected) but a real gotcha for any plan that hands a gate command to a *worker* to
-  self-check before completing. Changed the test plan's `trivial` profile to `echo gate ok`.
-- **The TPD figure looks pooled and fluctuating, not a private monotonic counter.** Three separate 429s
-  named different `Used` values at different times that don't line up with a single account steadily
-  climbing to one fixed reset (195327, then -- after supposedly resetting -- 191667, then 195446):
-  consistent with `qwen/qwen3.8-27b`'s free-tier TPD bucket being shared across UnoRouter's free users of
-  this exact model in something closer to real time, not reserved per-key. Worth knowing before reading
-  too much into any single "retry in Nh" figure as a private, predictable schedule.
-
-Net effect: three genuine fixes applied (max_tokens, gate command, plus the earlier toolset/timeout/
-max_runtime fixes), and the real dispatch retried again with all of them in place. See this file's
-next dated entry (added once that run's outcome is known) for whether T1 actually reached `done`.
-
-## A real finding, not a hypothetical
-
-`policy.check_data_class` enforces section 21.2 for real: **neither UnoRouter nor OpenRouter's
-currently declared data policy qualifies as safe for `data_class: private`** (both say upstream
-providers or some endpoints may train on inputs). Gate P will correctly *refuse* to approve any plan
-under `private` until a provider with a confirmed no-training/local policy is added. This project's own
-`config/swarm.yaml` is set to `public` for exactly this reason -- it's throwaway test scaffold content,
-not real code, so that's an honest, deliberate choice, not a workaround. A real future project MUST set
-its own data class deliberately and will hit this same refusal under `private` until that gap is closed
-(most likely by adding a provider with `data_collection: deny` + `zdr: true` verified, or a local model).
-
-**Update, 2026-09-19**: that gap is now closed *for one role*. `openai` (added for `lead`, see the dated
-section below) declares `data_policy: no_training`, sourced from OpenAI's own current docs -- it does
-qualify. `config/swarm.yaml`'s `data_class` is still `public`, deliberately: this project's other two
-roles (coder-1 on UnoRouter, reviewer on OpenRouter) still don't qualify, and `data_class` is a single
-project-wide setting, not per-role, so flipping it now would just make Gate P refuse those two roles'
-cards. A real future project that's actually private AND wants every role on a qualifying provider would
-need all three roles on something like OpenAI (or another verified no-training/local provider), not just
-one -- per-role data classes aren't a thing this architecture supports today.
 
 ## Known gaps (tracked, not hidden)
 
