@@ -1253,3 +1253,72 @@ data_policy_verified_at` into its `check_data_class` call, mirroring the existin
 above it. Updated `test_next_model_never_leaves_the_data_class_when_it_is_given_one`'s fixture to add a
 `data_policy_verified_at` field where the test expects a switch to succeed, and added one new assertion proving the reverse: a
 policy-compatible but UNVERIFIED candidate is correctly treated as unsafe, not silently allowed. `test_recovery.py`: 297 passed.
+
+## Package ROLES2 (round 7 wave 2): greenfield bootstrap and the Tester role's hardcoded-role bug
+
+Read the REAL current `controller.py` (1939 lines) and `cli.py` (1619 lines) fresh off HEAD `a98b95e` rather than trusting the
+work order's snapshot, per its own warning, and confirmed the working tree was clean before starting.
+
+Built `controller.ensure_repo_bootstrapped(repo, integration_branch, *, conn=None) -> bool` (ASES-GIT-10): detects a truly empty
+repository (no `.git`, or `.git` with zero commits), creates the integration branch and one commit carrying whatever is already
+on disk plus a `.gitignore`/README if missing, with a per-invocation `-c user.name=... -c user.email=...` identity, never a
+persistent git config. Returns `True` only when it created something; never touches a repository with real history, whatever
+branch it is on. Records `repo_bootstrapped`/`repo_bootstrap_error` events when given a `conn`. Wired into `cli.cmd_plan`,
+immediately after `_open_conn`, before the Lead is ever invoked: the earliest real touch-point, and the only one that avoids
+double-wiring, since `cmd_approve`'s `publish_plan` already refuses a repository not on the integration branch and so needs the
+bootstrap to have already happened.
+
+Found and fixed the bug the investigation surfaced (ASES-QG-05, ASES-ROL-09): `controller.py` hardcoded `role == "coder"` (or its
+negation) in what was thought to be six places to mean "the only role that produces a real commit", silently mistreating a
+Tester role's card the moment a project enabled one. Added `_COMMITTING_ROLES = frozenset({"coder", "tester"})` and rewrote the
+five real sites (`_finish_instructions`, the review-reserve budget check, `process_merge_queue`'s verdict-validation gate,
+`mergeq.merge_task`'s `allow_empty=`, the post-merge Gate 3 recheck) to check membership instead of equality. Empirically proved
+the old bug was worse than "a tester's card fails to merge": `mergeq.merge_task` runs Gate 3 unconditionally on any real diff
+regardless of role, so under the old code a tester's real commit would still have merged, just with the reviewer-verdict check,
+the Gate 1 recheck and the post-merge Gate 3 recheck all silently skipped -- unreviewed, unchecked work merging silently, not
+work failing to merge. Reverted the five sites, confirmed 7 tester-focused tests fail against the old code and pass against the
+fix, then restored and reconfirmed byte-identical.
+
+Confirmed `plan.py` needs NO change: Gate 0 already accepts a `tester` role automatically via `known_roles=set(project.roles)`;
+added a confirming test instead of touching the module. Extended `cmd_plan`'s prompt to offer `role: "tester"` (gated on
+`"tester" in project.roles`) and to instruct the Lead explicitly and forcefully to write a `depends_on` pointing parallel work at
+a scaffold task, after proving with a new test that Gate 0's touches-overlap serialization does NOT by itself guarantee this
+(ASES-GIT-11): a scaffold task's touches essentially never literally overlaps an ordinary task's touches, so the "parallel work
+starts only after the scaffold is merged" guarantee rests entirely on the Lead's own `depends_on`.
+
++17 tests in `test_controller.py` (plus a fix to `_setup_one_task`'s `known_roles=set(ROLES)`, which silently ignored its own
+`roles=` parameter), +4 in `test_cli_commands.py`, +4 in `test_plan.py`. Baseline (HEAD, before any edit): 5478 passed, 2 skipped.
+Final full suite at report time: 5501 passed, 2 skipped, 0 failed (18m32s).
+
+Found, not fixed (not this package's file, flagged for the architect): `src/ases/reconcile.py:651` has the same-species bug,
+`elif row["role"] != "coder":`, in `_done_without_record` used during reconcile-on-start.
+
+## Architect follow-up: two agents dispatched in parallel on ROLES2's own findings
+
+Rather than fix and verify ROLES2's own diff solo, two agents ran concurrently: one fixed the `reconcile.py` bug ROLES2 flagged
+as out of scope, one independently re-verified ROLES2's diff and swept the rest of the repository for anything missed.
+
+**Reconcile fix** (`src/ases/reconcile.py`, `tests/unit/test_reconcile.py`): confirmed no circular import risk (`controller.py`
+imports bounds/config/db/events/gates/guards/hermes/intents/leases/mergeq/plan/policy/questions/recovery/report/review/usage,
+none of which import `reconcile`; `reconcile.py` itself only imports events/hermes/intents), so `reconcile.py` now does
+`from . import controller as controller_mod` and reuses `controller_mod._COMMITTING_ROLES` directly rather than duplicating the
+frozenset. Line 651's `elif row["role"] != "coder":` became `elif row["role"] not in controller_mod._COMMITTING_ROLES:`, keeping
+the escalate branch as the correct complement. Confirmed by grep this was the file's only occurrence of the bug pattern. New test
+`test_b_a_tester_merge_card_that_says_done_with_no_commit_is_blocked_and_nothing_is_written`, proven with the same before/after
+technique: reverted, the new test failed (`report.blocked == []` instead of `['merge_done_without_record']`, the tester card
+silently no-op'd); restored, it and the two pre-existing coder/reviewer tests all passed. Full suite: 5505 passed, 2 skipped,
+0 failed (21m55s).
+
+**Independent verification**: re-derived (not just re-read) `ensure_repo_bootstrapped`'s safety properties directly from the
+code -- confirmed it checks for an existing commit via `git rev-parse -q --verify HEAD` and returns before any write when one
+exists, and that its only identity-bearing git call is scoped with `-c user.name=... -c user.email=...` rather than a global
+config, with a new test asserting `"[user]" not in (repo/".git"/"config").read_text()`. Corrected ROLES2's own site count: only
+five hardcoded-role comparisons exist in `controller.py`, not six -- one of the six originally listed was inside a docstring, not
+code. Swept `mergeq.py`, `review.py`, `evals.py`/`evalkit/`, `recovery.py`, `plan.py`, `gates.py`, `finalgates.py`, `tamper.py`,
+`config.py`, `critic.py`, `doctor.py`, `hardening.py`, `profiles.py`, `usage.py` for the same pattern: none found (the only other
+`"coder"` occurrences are `evals.py`'s unrelated `ROLE_TASKS` eval-class mapping and `profiles.py`'s coder-1/2/3 profile naming).
+Checked every acceptance and unit test touching `cmd_plan`, `tester`, or empty-repo bootstrapping for staleness against the new
+behavior: found none needing a fix. Independent full suite run: 5505 passed, 2 skipped, 0 failed (21m45s), matching the reconcile
+agent's own count.
+
+Architect's own final clean run (no concurrent editors) before committing: see the commit message for the exact number.

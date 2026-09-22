@@ -339,8 +339,20 @@ def cmd_plan(args: argparse.Namespace) -> int:
     exact absolute repo path and tells the model not to rely on any inherited working directory.
     """
     project = _load_project()
+    conn = _open_conn(project)
     repo = pathlib.Path(args.repo).resolve()
     request = args.request
+
+    # ASES-GIT-10 (section 8.3): a brand new project's repository may have no commits at all yet -- `git
+    # worktree add` needs at least one before any card can get its own workspace, and this is the earliest
+    # real touch-point on the repository: before the Lead ever inspects it, long before swarm run's own
+    # primary-checkout guard (ASES-GIT-12) would otherwise refuse an empty repo outright. A repository that
+    # already has history is left completely untouched (see ensure_repo_bootstrapped's own docstring).
+    if controller_mod.ensure_repo_bootstrapped(repo, project.integration_branch, conn=conn):
+        _out(f"bootstrapped an empty repository at {repo} on branch {project.integration_branch!r} (ASES-GIT-10)")
+
+    role_choices = "'coder', 'reviewer' or 'tester'" if "tester" in project.roles else "'coder' or 'reviewer'"
+    role_shape = '"coder"|"reviewer"|"tester"' if "tester" in project.roles else '"coder"|"reviewer"'
     prompt = (
         f"Repository (use this exact absolute path in every tool call, do not rely on any "
         f"current/working directory): {repo}\n\n"
@@ -349,14 +361,26 @@ def cmd_plan(args: argparse.Namespace) -> int:
         f"{repo / 'docs' / 'ases' / 'plan.json'}) with this exact top-level shape: "
         f'{{"project": "<slug>", "integration_branch": "{project.integration_branch}", '
         f'"gate_profiles": {{"<name>": ["<shell command>", ...]}}, "tasks": [{{"key": "T1", '
-        f'"title": "...", "role": "coder"|"reviewer", "depends_on": ["<task key>", ...], '
+        f'"title": "...", "role": {role_shape}, "depends_on": ["<task key>", ...], '
         f'"touches": ["<path glob>", ...], "acceptance": ["<criterion>", ...], '
         f'"gate_profile": "<name>", "estimated_requests": <int>}}]}}. '
-        f"Keep it small: 2 to 4 tasks. Every task's role must be exactly 'coder' or 'reviewer'. "
+        f"Keep it small: 2 to 4 tasks (more when a scaffold task is needed, see below). Every task's role must "
+        f"be exactly {role_choices}. "
         f"touches entries are glob patterns relative to the repository root: use exact file names, or dir/** "
         f"for everything under a directory (a bare directory name matches nothing). Tasks whose touches "
         f"overlap and that have no dependency between them will be run one after the other by Gate 0. "
         f"Use a trivial, fast gate_profile command since this is a throwaway test repo. "
+        f"If the repository is empty or has no meaningful existing files (ASES may have already bootstrapped it "
+        f"with nothing but a bare .gitignore and README.md, ASES-GIT-10 -- that alone still counts as empty): "
+        f"inspect it yourself and decide (blueprint 18.1, 'If it is empty, plan a scaffold task first'). When it "
+        f"is empty, the FIRST task in the plan must be a scaffold task whose touches covers the root config and "
+        f"tooling files it creates (for example pyproject.toml, package.json, docker-compose.yml, README.md, "
+        f"AGENTS.md, .gitattributes -- ASES-GIT-11, section 8.3), and EVERY OTHER task must then name that "
+        f"scaffold task's key in its own depends_on, explicitly. Do not rely on touches overlap alone to order "
+        f"them after it: Gate 0 only serializes two tasks whose touches globs can actually match a common path, "
+        f"and a task that does not literally touch one of the scaffold's own files (most will not) is otherwise "
+        f"free to run in parallel with it, which is exactly what 'parallel work starts only after the scaffold "
+        f"is merged' forbids. "
         f"Also write these before you finish (ASES-GIT-15, section 8.5: profiles do not share memory, and a "
         f"worktree shows what the code is, not why, so contracts and decisions live in the repository and are "
         f"merged before dependents start): "

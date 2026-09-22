@@ -423,14 +423,32 @@ requirements:
   requirement: An empty repository gets an initial commit and the integration branch
   section: '8.3'
   verified_by: '22.2'
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'ROUND 7 wave 2 (2026-09-23, zero quota): controller.ensure_repo_bootstrapped(repo, integration_branch, *,
+    conn=None) detects a truly empty repository (no .git, or .git with zero commits) and creates an initial
+    commit and the integration branch, using a per-invocation git identity (-c user.name=... -c
+    user.email=...) and never a persistent git config; verified by an independent review agent to never touch
+    a repo with real history, on any branch, and never write to .git/config. One deliberate deviation from the
+    blueprint''s literal wording, worth recording rather than silently following: section 8.3 says ''swarm run
+    MUST create an initial commit ... when the repository is empty'', but this is wired into cli.cmd_plan, not
+    cmd_run. This is necessary, not an oversight: cmd_approve''s publish_plan already refuses to operate on a
+    repository that is not on the integration branch, so the bootstrap has to happen no later than plan time
+    or approve would fail first on every greenfield project. Unit-tested (10 cases); not yet exercised against
+    a real Lead or a real swarm run.'
 - id: ASES-GIT-11
   requirement: Greenfield projects start with one serialized scaffold task
   section: '8.3'
   verified_by: Plan inspection, 22.17
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'ROUND 7 wave 2 (2026-09-23, zero quota): cli.cmd_plan''s prompt to the Lead now explicitly instructs it to
+    plan a scaffold task first in an empty repository and to give parallel work an explicit depends_on
+    pointing at that scaffold task. A real limit was found and proven with a test rather than assumed away:
+    Gate 0''s touches-overlap serialization does NOT by itself guarantee parallel work starts only after the
+    scaffold is merged, since a scaffold task''s touches (pyproject.toml, package.json, AGENTS.md,
+    .gitattributes) essentially never literally overlaps an ordinary task''s touches. The ''parallel work
+    starts only after the scaffold is merged'' guarantee therefore rests entirely on the Lead itself writing
+    the depends_on, a prompt-level instruction, not a code-enforced one. Matches this row''s own verified_by
+    (''Plan inspection, 22.17''): stays in_progress until exercised against a real Lead''s plan.'
 - id: ASES-GIT-12
   requirement: Integrity snapshots around every worker run; changes outside the worktree fail the card
   section: '8.4'
@@ -740,8 +758,17 @@ requirements:
   requirement: Acceptance tests come from the contract and should precede the implementation
   section: '14.3'
   verified_by: Plan inspection, 22.17
-  status: not_covered
-  note: ''
+  status: in_progress
+  note: 'ROUND 7 wave 2 (2026-09-23, zero quota): The tester role is now functionally trustworthy (see
+    ASES-ROL-09), which is the precondition for this requirement to mean anything in practice: before this
+    round a tester task''s card was either silently treated as a review-only no-op or (the worse case an
+    independent review agent found empirically by reverting the fix) merged with every review and gate check
+    skipped, so a contract test written by a tester never actually gated anything. The Lead prompt now offers
+    a tester role and scaffold-first/depends_on guidance (ASES-GIT-11), making ''acceptance tests come from
+    the contract and precede the implementation'' achievable, but whether a real Lead actually sequences a
+    tester task before the coder task it should gate is a planning decision, not mechanically enforced beyond
+    the depends_on machinery. verified_by is ''Plan inspection, 22.17'', same as GIT-11: stays in_progress
+    until exercised.'
 - id: ASES-TST-01
   requirement: The controller test suite runs on fakes and never touches a real provider
   section: '14.4'
@@ -884,23 +911,32 @@ requirements:
   section: '19.4'
   verified_by: '22.7'
   status: in_progress
-  note: 'ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): No
-    change this round beyond what ASES-CAP-03''s fix touches indirectly (create_cards_from_plan is not the
-    reconcile module, but the same ''the database can be deleted and state must still be recoverable from the
-    board'' principle now holds in one more place). Earlier note: ROUND 6 (2026-09-22, zero quota): Same 22.7
-    evidence as REC-03 (reconcile.reconcile is the mechanism proven at all three crash points). The
-    register''s prior note calling reconcile-on-start ''not built yet'' had drifted from the source; corrected
-    here: reconcile.py is fully built and now proven both at the unit level and end to end. Earlier note:
-    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): reconcile.reconcile() runs at `swarm run` start (a blocked
-    finding stops the run with exit code 5, --ignore-reconcile overrides) and before `swarm resume`; repairs
-    done-without-record, record-without-done-card, unfinished candidates, open intents, dead workers, orphan
-    workers (found by card id, never killed otherwise) and reports orphan worktrees. Earlier note:
-    reconcile.py checks card IDs still resolve, a done merge has a matching merge_records row, and nothing
-    reads done-but-reverted; wired into swarm run''s startup. Unit-tested (6 cases) AND real-verified against
-    the live board after fixing kanban_show''s return shape (was crashing with KeyError on real data -- see
-    docs/architecture.md). Findings are reported, not yet auto-repaired. After the 2026-09-19 real run (a code
-    task merged, a review-only task recorded as a no-op) it reported no findings, so a no-op merge record is
-    accepted as a done merge.'
+  note: 'ROUND 7 wave 2 (2026-09-23, zero quota): A real instance of this row''s own bug fixed today, in the exact
+    function its docstring cites (_merge / _done_without_record, ASES-REC-04): reconcile.py hardcoded role !=
+    "coder" to mean ''this role''s merge card legitimately has no git commit'', the same hardcoding just fixed
+    in controller.py. A tester''s merge card marked done with no landed commit (crash, force-push, board/git
+    desync) was silently written as a no-op merge record instead of being escalated for a person to look at on
+    swarm resume. Fixed by reusing controller._COMMITTING_ROLES directly (confirmed no circular import:
+    controller.py does not import reconcile.py). Proven with a before/after test: reverted, the new
+    tester-merge-card-with-no-commit test failed (zero blocked findings, the card silently swallowed);
+    restored, it and the two pre-existing coder/reviewer-role tests all passed. Earlier note: ROUND 7 wave 1
+    (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): No change this round
+    beyond what ASES-CAP-03''s fix touches indirectly (create_cards_from_plan is not the reconcile module, but
+    the same ''the database can be deleted and state must still be recoverable from the board'' principle now
+    holds in one more place). Earlier note: ROUND 6 (2026-09-22, zero quota): Same 22.7 evidence as REC-03
+    (reconcile.reconcile is the mechanism proven at all three crash points). The register''s prior note
+    calling reconcile-on-start ''not built yet'' had drifted from the source; corrected here: reconcile.py is
+    fully built and now proven both at the unit level and end to end. Earlier note: BUILT AND WIRED, NOT RUN
+    FOR REAL (2026-09-22): reconcile.reconcile() runs at `swarm run` start (a blocked finding stops the run
+    with exit code 5, --ignore-reconcile overrides) and before `swarm resume`; repairs done-without-record,
+    record-without-done-card, unfinished candidates, open intents, dead workers, orphan workers (found by card
+    id, never killed otherwise) and reports orphan worktrees. Earlier note: reconcile.py checks card IDs still
+    resolve, a done merge has a matching merge_records row, and nothing reads done-but-reverted; wired into
+    swarm run''s startup. Unit-tested (6 cases) AND real-verified against the live board after fixing
+    kanban_show''s return shape (was crashing with KeyError on real data -- see docs/architecture.md).
+    Findings are reported, not yet auto-repaired. After the 2026-09-19 real run (a code task merged, a
+    review-only task recorded as a no-op) it reported no findings, so a no-op merge record is accepted as a
+    done merge.'
 - id: ASES-REC-05
   requirement: Questions block cards and are answered through the CLI; they never time out into guesses
   section: '19.5'
@@ -1058,9 +1094,17 @@ requirements:
   section: 4.1, 16
   verified_by: '22.17'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The tester profile and prompt exist (inactive) in
-    profiles.py and prompts/tester.md. The controller''s finish instructions treat every non-coder role as a
-    review-only card, so a tester task needs its own branch there before it is enabled.'
+  note: 'ROUND 7 wave 2 (2026-09-23, zero quota): The real gap this row''s own earlier note named is fixed:
+    controller.py no longer treats every non-coder role as a review-only card. It hardcoded role == "coder"
+    (or its negation) in five places (one of the six originally estimated was a docstring, not code, corrected
+    by an independent review agent); all five now check membership in _COMMITTING_ROLES = frozenset({"coder",
+    "tester"}), the new single source of truth for which roles produce a real git commit. The matching bug in
+    reconcile.py (ASES-REC-04''s module) was found and fixed the same day. Discriminating-power proven: the
+    five sites were temporarily reverted and seven tester-focused tests were shown to fail against the old
+    code and pass against the fix. Unit-tested; not yet exercised against a real tester profile running for
+    real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The tester profile and prompt exist
+    (inactive) in profiles.py and prompts/tester.md. The controller''s finish instructions treat every
+    non-coder role as a review-only card, so a tester task needs its own branch there before it is enabled.'
 - id: ASES-ROL-10
   requirement: Worker profiles are fresh by default; clone operations are opt-in and cloned credentials/memory
     are reviewed or cleared

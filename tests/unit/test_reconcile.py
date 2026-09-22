@@ -750,6 +750,20 @@ def test_b_a_coder_merge_card_that_says_done_with_no_commit_is_blocked_and_nothi
     assert _merge_row(env.conn) is None and report.repairs == [] and _repair_events(env.conn) == []
 
 
+def test_b_a_tester_merge_card_that_says_done_with_no_commit_is_blocked_and_nothing_is_written(env):
+    """Regression for the controller.py _COMMITTING_ROLES bug class: a tester commits real work just like a
+    coder does, so a tester's merge card that says done with no git commit must be escalated for a person to
+    look at, never silently recorded as a legitimate no-op (that treatment is for review-only roles only)."""
+    env.task(role="tester")
+    env.board(_card("t_work", "done"), _card("t_merge", "done"))
+
+    report = env.go()
+
+    assert _kinds(report.blocked) == ["merge_done_without_record"] and report.blocked[0] in report.findings
+    assert "Merge card: t_merge" in report.blocked[0].detail
+    assert _merge_row(env.conn) is None and report.repairs == [] and _repair_events(env.conn) == []
+
+
 def test_b_a_commit_for_a_card_whose_id_only_starts_with_ours_is_not_ours(env):
     env.task()
     _land(env.repo, "T9", merge="t_merge2", work="t_work2")  # t_merge is a PREFIX of t_merge2

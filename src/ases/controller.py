@@ -54,6 +54,134 @@ class CardPair:
     merge_card_id: str
 
 
+_BOOTSTRAP_GITIGNORE = "__pycache__/\n*.pyc\n.venv/\nnode_modules/\n"
+
+
+def _bootstrap_git(repo: pathlib.Path, args: list[str]) -> subprocess.CompletedProcess:
+    """One git command against `repo`, for ensure_repo_bootstrapped only: output captured as text and never
+    raising, even when git itself cannot be started (a synthetic CompletedProcess with returncode 1 comes back
+    instead, the same shape a real failure has, so the caller reads .returncode uniformly either way). Every
+    other git call in this module (publish_plan, _branch_diff) is a single invocation and stays inline; this one
+    chains several in a row with the same error handling, which is what earns it a helper."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(args, 1, "", f"git could not be run: {exc}")
+
+
+def _bootstrap_event(conn, kind: str, repo: pathlib.Path, integration_branch: str, **extra) -> None:
+    """Record one of ensure_repo_bootstrapped's own events, only when the caller gave a database connection: a
+    plain unit test of the git mechanics alone need not open one (the same optional-conn idiom
+    _ingest_outgoing_usage uses for models_config)."""
+    if conn is None:
+        return
+    events.record(conn, kind, {"repo": str(repo), "integration_branch": integration_branch, **extra})
+
+
+def ensure_repo_bootstrapped(repo: pathlib.Path, integration_branch: str, *, conn=None) -> bool:
+    """ASES-GIT-10 (section 8.3): "git worktree add needs at least one commit. swarm run MUST create an initial
+    commit and the integration branch when the repository is empty." Called once, from cmd_plan: the earliest
+    real touch-point on a brand new project's repository (before the Lead ever inspects it, long before `swarm
+    run`'s own primary-checkout guard, ASES-GIT-12, would refuse an empty repo outright). Returns True when it
+    had to create the branch or the commit, False when the repository already had at least one commit (left
+    completely untouched) or when a step failed (see below): either way there was nothing new to build on.
+
+    "Empty" is asked of git itself, the same question check_primary_checkout effectively answers later: no
+    `.git` at all, or a `.git` whose HEAD names no commit yet (`git rev-parse --verify HEAD` fails, the ordinary
+    state right after a bare `git init`). A repository that already has history is NEVER touched here, even if
+    it is on the wrong branch: that stays publish_plan's own refusal, unchanged, exactly what ASES-GIT-10 asks
+    for ("when the repository is empty"), not "when it happens to be on the wrong branch".
+
+    Two different git calls put the repository on `integration_branch`, because they are not interchangeable on
+    a genuinely fresh `.git`: `git init -b <name>` only sets the initial branch while `.git` does not exist yet
+    (a re-init on an existing `.git` silently ignores --initial-branch, confirmed empirically: `git init -q -b
+    x` on an existing unborn repo prints "warning: re-init: ignored --initial-branch=x" and leaves the branch
+    alone); `git checkout -B <name>` is what moves an already-unborn HEAD onto that branch name instead (there
+    is no commit yet to check out FROM, but checkout -B only ever touches the symbolic ref in that case, is
+    idempotent whether or not the branch already exists or is already checked out, confirmed empirically, and
+    is safe to repeat if an earlier bootstrap attempt got this far and failed on a later step).
+
+    The commit carries whatever is already on disk (`git add -A`, not just the files below): a repository is
+    "empty" here purely by git history, and any file already sitting in the working tree before this ran would
+    otherwise show up as an untracked change the moment the primary-checkout guard (ASES-GIT-12) next looks at
+    it. This function writes at minimum a .gitignore and a one-line README.md of its own, but never a
+    pyproject.toml or similar (that is the plan's own scaffold task's job, ASES-GIT-11, part B) -- and only
+    when a file of that name is not already there, so a repository that already had one before bootstrapping
+    keeps it.
+
+    Never writes git config (the standing hard rule): the commit's author and committer are given with a
+    `-c user.name=... -c user.email=...` pair scoped to that one git invocation, the same throwaway-identity
+    pattern already used elsewhere in this codebase for a repository with no identity of its own
+    (evalkit/codetasks.py's E8 fixture, fakes/worker.py's _IDENTITY).
+
+    Never raises for an ordinary git failure: a step that fails records a repo_bootstrap_error event (only when
+    `conn` is given) naming which step and git's own text, and returns False, leaving the repository exactly as
+    git left it for a person to look at. A repo_bootstrapped event, with the branch and the new commit SHA, is
+    recorded only on the success path, once something was actually created, so the release report / operations
+    log has a trace of it."""
+    has_dot_git = (repo / ".git").exists()
+    if has_dot_git:
+        verify = _bootstrap_git(repo, ["rev-parse", "-q", "--verify", "HEAD"])
+        if verify.returncode == 0:
+            return False  # real history: never touched here, whatever branch it is on (publish_plan's refusal)
+    else:
+        try:
+            repo.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                              step="mkdir", detail=_clean(str(exc), 300))
+            return False
+
+    try:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        readme = repo / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                f"This repository was bootstrapped by ASES on {stamp} for this project (ASES-GIT-10, section "
+                f"8.3): git needs at least one commit before `git worktree add` can give a card its own "
+                f"workspace.\n",
+                encoding="utf-8",
+            )
+        gitignore = repo / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(_BOOTSTRAP_GITIGNORE, encoding="utf-8")
+    except OSError as exc:
+        _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                          step="write_files", detail=_clean(str(exc), 300))
+        return False
+
+    if not has_dot_git:
+        result, step = _bootstrap_git(repo, ["init", "-q", "-b", integration_branch]), "init"
+    else:
+        result, step = _bootstrap_git(repo, ["checkout", "-q", "-B", integration_branch]), "checkout"
+    if result.returncode != 0:
+        _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                          step=step, detail=_clean(f"{result.stdout}{result.stderr}", 300))
+        return False
+
+    add = _bootstrap_git(repo, ["add", "-A"])
+    if add.returncode != 0:
+        _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                          step="add", detail=_clean(f"{add.stdout}{add.stderr}", 300))
+        return False
+
+    commit = _bootstrap_git(repo, [
+        "-c", "user.name=ASES bootstrap", "-c", "user.email=ases-bootstrap@example.invalid",
+        "commit", "-q", "-m", "ASES: bootstrap an empty repository (ASES-GIT-10)",
+    ])
+    if commit.returncode != 0:
+        _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                          step="commit", detail=_clean(f"{commit.stdout}{commit.stderr}", 300))
+        return False
+
+    sha = _bootstrap_git(repo, ["rev-parse", "HEAD"]).stdout.strip()
+    _bootstrap_event(conn, "repo_bootstrapped", repo, integration_branch, commit=sha)
+    return True
+
+
 def publish_plan(repo: pathlib.Path, integration_branch: str) -> str:
     """ASES-ARC-09 (v1.2): commit docs/ases/ to the integration branch and return that commit's SHA,
     BEFORE any implementation card is created. A worktree cut after this point sees the approved plan;
@@ -360,13 +488,28 @@ def _refuse_unreviewed(
     })
 
 
+# ASES-QG-05 (round 7, part C): every role whose card produces a real commit that must go through review and
+# merge exactly like any other diff, not a no-op verdict-only card. Round 7 found six places in this module that
+# hardcoded `role == "coder"` (or its negation) to mean "the only role that commits", which is correct for
+# "reviewer" but was silently wrong for "tester": ASES-QG-05 says "The Tester writes acceptance tests from
+# docs/ases/contracts/ ... and the implementation card SHOULD depend on them", and a test file that never
+# actually lands on the integration branch is not much of a contract. profiles.py and plan.py already treat
+# "tester" as an ordinary role (RoleDef, known_roles); this is the one place that decides which roles commit,
+# and there was no other such place to extend (checked config.py and plan.py first).
+_COMMITTING_ROLES = frozenset({"coder", "tester"})
+
+
 def _finish_instructions(role: str, reviewer_profile: str = "reviewer") -> list[str]:
     """How a worker hands its card off (ASES-REV-04: a review request carries handoff evidence). Appended to
-    every work card body and every fix card body. A coder commits and asks for review, and must NOT complete
-    its own card: that would let the merge queue run before anyone independent had looked at the diff. Any
-    other role (a reviewer) has no commit to hand off: it completes with its verdict, and the merge card
-    for its task completes as a recorded no-op."""
-    if role == "coder":
+    every work card body and every fix card body. A coder or a tester (any role in `_COMMITTING_ROLES`) commits
+    and asks for review, and must NOT complete its own card: that would let the merge queue run before anyone
+    independent had looked at the diff. A tester's instructions are deliberately identical to a coder's (the
+    hand-off steps -- worktree, gate profile, commit, request review -- are the same regardless of what kind of
+    file was changed); ASES-QG-05's own guidance about writing tests from docs/ases/contracts/ belongs in the
+    acceptance criteria the Lead writes on the card, not repeated here. Any role not in `_COMMITTING_ROLES`
+    (reviewer today) has no commit to hand off: it completes with its verdict, and the merge card for its task
+    completes as a recorded no-op."""
+    if role in _COMMITTING_ROLES:
         return [
             "How to finish (ASES):",
             "1. Make the change only inside your worktree and only on the paths listed under Touches.",
@@ -496,10 +639,13 @@ def _affordable_now(
     Three questions, in this order: when `project` is given, is the task's resolved provider still safe for the
     project's declared data_class (ASES-PRV-01, round 7 bug 2, checked first, mirroring Gate P's own order,
     "enforced before any other routing rule"); can the task's own provider afford its estimated requests (after
-    the daily reserve); and, for a coder task when `review_afford` is given, can the REVIEWER's provider afford
-    the review pass its finished work will need (usage.review_budget). A role with no pinned provider has
-    nothing to check and is affordable. The reasons start with `budget:`, `review budget` or `data class:`, the
-    first two of which are what _PARK_PREFIXES matches (see the comment above it for why the third is not).
+    the daily reserve); and, for a task whose role is in `_COMMITTING_ROLES` (a coder or a tester) when
+    `review_afford` is given, can the REVIEWER's provider afford the review pass its finished work will need
+    (usage.review_budget) -- round 7 part C: a tester's card needs review exactly like a coder's, and the old
+    `task.role == "coder"` check here would have let a tester card start even when nobody could afford to
+    review it. A role with no pinned provider has nothing to check and is affordable. The reasons start with
+    `budget:`, `review budget` or `data class:`, the first two of which are what _PARK_PREFIXES matches (see the
+    comment above it for why the third is not).
 
     Round 7 (ASES-PRV-01, bug 2): cli.cmd_approve's Gate P check (_estimate_lines) only ever runs once, at
     plan-approval time, so a provider that becomes (or, on a mis-approved plan, always was) unsafe for the
@@ -534,7 +680,7 @@ def _affordable_now(
     )
     if not afford.can_afford:
         return False, f"budget: {afford.reason}"
-    if review_afford is not None and not review_afford.can_afford and task.role == "coder":
+    if review_afford is not None and not review_afford.can_afford and task.role in _COMMITTING_ROLES:
         reviewer_pp = policy.profile_provider("reviewer", models_config)
         provider = reviewer_pp.provider if reviewer_pp else "the reviewer provider"
         return False, f"review budget on {provider}: {review_afford.reason}"
@@ -666,12 +812,13 @@ def process_merge_queue(
     fix_cards_per_task, then a block for a human. Keying the free retry on gate3_result == "pass" alone
     would have retried those silently on every poll.
 
-    A review-only task (any role other than "coder") has no commit to merge: its branch adds nothing to the
-    integration tip. Those are merged with allow_empty, which makes mergeq.merge_task record a no-op instead
-    of failing (merged=True, squash_commit None). The merge card is completed with result "no changes to
-    merge (review-only task)" and metadata no_op=True, the "merged" event carries no_op=True, and it is never
-    a failure: no fix card, no fix budget. A coder's empty branch is still the failure it always was.
-    Every squash commit carries the work card and merge card ids in its message (ASES-GIT-06).
+    A review-only task (any role not in `_COMMITTING_ROLES`, reviewer today) has no commit to merge: its branch
+    adds nothing to the integration tip. Those are merged with allow_empty, which makes mergeq.merge_task record
+    a no-op instead of failing (merged=True, squash_commit None). The merge card is completed with result "no
+    changes to merge (review-only task)" and metadata no_op=True, the "merged" event carries no_op=True, and it
+    is never a failure: no fix card, no fix budget. A coder's or a tester's empty branch (any role IN
+    `_COMMITTING_ROLES`, round 7 part C) is still the failure it always was. Every squash commit carries the
+    work card and merge card ids in its message (ASES-GIT-06).
 
     Loop version 2 (round 5) adds these rules:
       * ASES-REC-06 ("stop the merge queue between steps"): the halt flag (_halted: a stopped or paused project) is
@@ -757,7 +904,7 @@ def process_merge_queue(
         # diff, a Gate 1 record and a schema-checked verdict; a reviewer-role task's card has no commit to check.
         pre_merge_outcome = None
         expected_head = None
-        if task.role == "coder":
+        if task.role in _COMMITTING_ROLES:
             # ASES-REV-06: the verdict is validated against the schema, and it must be a PASS.
             verdict = review_mod.validate_verdict(completed_run.get("metadata"))
             if not verdict.valid:
@@ -825,12 +972,13 @@ def process_merge_queue(
             f"{key}: {task.title}\n\nWork card: {work_card['id']}\nMerge card: {row['merge_card_id']}\n"
             f"Branch: {branch}\nControlled by ASES (one squash commit per plan task)."
         )
-        # Only a coder is expected to commit. Any other role (a reviewer) legitimately leaves an empty diff,
-        # which merge_task then records as a no-op rather than failing on "nothing to commit".
+        # Only a role in _COMMITTING_ROLES (coder, tester) is expected to commit. Any other role (a reviewer)
+        # legitimately leaves an empty diff, which merge_task then records as a no-op rather than failing on
+        # "nothing to commit".
         outcome = pre_merge_outcome or mergeq.merge_task(
             repo, plan.integration_branch, branch, key, gate_cmds, conn=conn,
-            commit_message=commit_message, allow_empty=(task.role != "coder"), expected_head=expected_head,
-            project=plan.project, should_stop=should_stop,
+            commit_message=commit_message, allow_empty=(task.role not in _COMMITTING_ROLES),
+            expected_head=expected_head, project=plan.project, should_stop=should_stop,
         )
 
         if getattr(outcome, "stopped", False):
@@ -855,14 +1003,15 @@ def process_merge_queue(
             continue
         if outcome.merged:
             # ASES-GIT-05 (section 8.1): re-check Gate 3 on the NEW integration HEAD before trusting the merge.
-            # Only a coder task has anything to re-check (a no-op merge, squash_commit None, was already handled
-            # above and never reaches here). Deliberately redundant with the pre-merge Gate 3 above: this catches
-            # a project-level regression another task's merge introduced on the shared tip between this
-            # candidate's build and this fast-forward, on a file this task's own touches never named.
+            # Only a task whose role is in _COMMITTING_ROLES has anything to re-check (a no-op merge,
+            # squash_commit None, was already handled above and never reaches here). Deliberately redundant
+            # with the pre-merge Gate 3 above: this catches a project-level regression another task's merge
+            # introduced on the shared tip between this candidate's build and this fast-forward, on a file this
+            # task's own touches never named.
             postcheck = gates_mod.run_gate(
                 repo, outcome.squash_commit, "gate3-postmerge", gate_cmds, conn=conn, task_key=key,
                 project=plan.project,
-            ) if task.role == "coder" else None
+            ) if task.role in _COMMITTING_ROLES else None
 
             if postcheck is not None and not postcheck.passed:
                 post_detail = _clean(postcheck.detail, 500)

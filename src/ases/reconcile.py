@@ -27,6 +27,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from . import controller as controller_mod
 from . import events
 from . import hermes as hermes_mod
 from . import intents as intents_mod
@@ -648,14 +649,15 @@ class _Pass:
                 self.do(key, "merge_record_recovered",
                         f"finish the merge record for {key} from git: squash commit {sha}",
                         functools.partial(self._finish_record, key, sha))
-        elif row["role"] != "coder":
+        elif row["role"] not in controller_mod._COMMITTING_ROLES:
             self.do(key, "merge_record_noop",
                     f"record the no-op merge of review-only task {key} (merge card {merge_id} is done, git has "
                     f"no commit for it)", functools.partial(self._write_noop, key))
         else:
             self.escalate(finding, f"git has no commit carrying 'Merge card: {merge_id}' on '{self.branch}', so the "
-                                   f"card says merged but nothing landed; a person must decide whether to re-merge "
-                                   f"or reopen the card")
+                                   f"card says merged but nothing landed (its role is in _COMMITTING_ROLES, so a "
+                                   f"no-op is not legitimate); a person must decide whether to re-merge or reopen "
+                                   f"the card")
 
     def _record_without_done_card(self, row, merge: dict, mr) -> None:
         """The crash between the fast-forward and the merge-card completion, record side: merge_records says the

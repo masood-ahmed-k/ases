@@ -772,7 +772,11 @@ def _one_task_plan_raw(role):
 
 
 def _setup_one_task(tmp_path, monkeypatch, fix_cards_per_task=2, plan_raw=ONE_TASK_PLAN, roles=ROLES):
-    plan = plan_mod.parse_and_validate(plan_raw, known_roles=set(ROLES), max_cards=40)
+    # known_roles from the same `roles` the project itself gets (round 7 part C fix: this used to read the
+    # module-level ROLES unconditionally, so a caller's own `roles=` override was silently ignored by Gate 0
+    # while still taking effect on the ProjectConfig below -- never noticed before because no caller passed a
+    # role Gate 0 did not already know about).
+    plan = plan_mod.parse_and_validate(plan_raw, known_roles=set(roles), max_cards=40)
     conn = db.connect(tmp_path / "ases.db")
     project = config.ProjectConfig(
         name="t3", environment="native", data_class="public",
@@ -1488,9 +1492,16 @@ def test_normal_coder_merge_still_completes_with_the_squash_sha(tmp_path, monkey
     assert _fix_cards(created) == []
 
 
-@pytest.mark.parametrize("role, expected", [("coder", False), ("reviewer", True), ("lead", True)])
-def test_allow_empty_is_passed_for_every_role_but_coder(tmp_path, monkeypatch, role, expected):
-    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch, plan_raw=_one_task_plan_raw(role))
+@pytest.mark.parametrize("role, expected", [
+    ("coder", False),
+    ("tester", False),  # round 7 part C: a tester commits too, so it is not allow_empty either (ASES-QG-05)
+    ("reviewer", True), ("lead", True),
+])
+def test_allow_empty_is_passed_only_for_roles_outside_committing_roles(tmp_path, monkeypatch, role, expected):
+    roles = dict(ROLES, tester="tester-1") if role == "tester" else ROLES
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, plan_raw=_one_task_plan_raw(role), roles=roles,
+    )
     _board_state(monkeypatch, pair, branch=f"swarm/T1-{role}")
     _record_card_actions(monkeypatch)
     calls = _script_merge_task(monkeypatch, _MERGED)
@@ -1498,6 +1509,61 @@ def test_allow_empty_is_passed_for_every_role_but_coder(tmp_path, monkeypatch, r
     controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
 
     assert [c["allow_empty"] for c in calls] == [expected]
+
+
+def test_tester_task_with_a_real_commit_merges_exactly_like_a_coders_would(tmp_path, monkeypatch):
+    """ASES-QG-05 (round 7, part C): the Tester writes acceptance tests and its card produces a real commit
+    that must go through review and merge exactly like a coder's, not the review-only no-op path. Real git,
+    real mergeq.merge_task, real Gate 3 (the plan's own trivial gate command). Before the fix, the six
+    `role == "coder"` sites would have used allow_empty=True here (mergeq.merge_task never even looks for a
+    commit) and completed this as a no-op with squash_commit=None, silently losing the tester's actual work."""
+    repo = _plain_repo(tmp_path)
+    _git_ok("checkout", "-q", "-b", "swarm/T1-tester", cwd=repo)
+    (repo / "test_new.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "add acceptance test", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("tester"), roles=dict(ROLES, tester="tester-1"),
+    )
+    _board_state(monkeypatch, pair, branch="swarm/T1-tester")
+    actions = _record_card_actions(monkeypatch)
+
+    assert controller.process_merge_queue("b", repo, plan, project, conn=conn) == ["T1"]
+
+    sha = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    assert actions["complete"] == [(pair.merge_card_id, {"result": f"merged {sha}",
+                                                         "metadata": {"squash_commit": sha}})]
+    assert _merged_events(conn) == [{"task_key": "T1", "sha": sha}]
+    record = _merge_record(conn)
+    assert (record["gate3_result"], record["squash_commit"]) == ("pass", sha)  # real Gate 3 ran, not skipped
+    assert _fix_cards(created) == []
+
+
+def test_tester_task_with_an_empty_branch_is_also_a_merge_failure_not_a_no_op(tmp_path, monkeypatch):
+    """The pre-fix `role == "coder"` checks treated a tester exactly like a reviewer: review-only, no commit
+    required. A tester is a _COMMITTING_ROLES role now (ASES-QG-05), so an empty branch fails the merge and
+    opens a fix card, exactly the way test_coder_task_with_an_empty_branch_is_still_a_merge_failure does for a
+    coder -- and exactly UNLIKE test_review_only_task_with_an_empty_branch_completes_its_merge_card_as_a_no_op,
+    which is still correct for reviewer/lead."""
+    repo = _repo_with_branch_at_tip(tmp_path, "swarm/T1-tester")
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("tester"), roles=dict(ROLES, tester="tester-1"),
+    )
+    _board_state(monkeypatch, pair, branch="swarm/T1-tester")
+    actions = _record_card_actions(monkeypatch)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    assert actions["complete"] == []
+    (fix_card,) = _fix_cards(created)
+    assert _task_row(conn)["fix_cards"] == 1
+    failed = next(e for e in events.recent(conn) if e["kind"] == "merge_failed")
+    assert "nothing to commit" in failed["payload"]
+    assert _merged_events(conn) == []
+    assert _merge_record(conn) is None
 
 
 def test_a_no_op_merge_is_never_routed_through_the_failure_path(tmp_path, monkeypatch):
@@ -1593,7 +1659,10 @@ def test_finish_instructions_wording_is_pinned():
         "this card. The reviewer completes it after approving, and only then does the merge queue run.",
     ]
     assert controller._finish_instructions("reviewer") == reviewer_block
-    assert controller._finish_instructions("lead") == reviewer_block  # any role but coder
+    assert controller._finish_instructions("lead") == reviewer_block  # any role not in _COMMITTING_ROLES
+    # ASES-QG-05 (round 7 part C): a tester commits and hands off exactly like a coder, not like a reviewer.
+    assert controller._finish_instructions("tester") == controller._finish_instructions("coder")
+    assert controller._finish_instructions("tester") != reviewer_block
 
 
 @pytest.mark.parametrize("role, present, absent", [
@@ -1944,6 +2013,85 @@ def test_budget_gate_without_a_project_never_applies_the_review_reserve(tmp_path
     assert "T1" not in parked
 
 
+TESTER_PLAN_RAW = {
+    "project": "t3",
+    "integration_branch": "integration",
+    "gate_profiles": {"trivial": ["echo ok"]},
+    "tasks": [
+        {"key": "T1", "title": "write acceptance tests", "role": "tester", "depends_on": [], "touches": ["a.py"],
+         "acceptance": ["exists"], "gate_profile": "trivial", "estimated_requests": 10},
+        {"key": "T2", "title": "review the tests", "role": "reviewer", "depends_on": ["T1"],
+         "touches": [], "acceptance": ["reviewed"], "gate_profile": "trivial", "estimated_requests": 5},
+    ],
+}
+TESTER_ROLES = dict(ROLES, tester="tester-1")
+# Mirrors REVIEW_MODELS_CONFIG, but the committing role pinned is "tester", not "coder".
+TESTER_REVIEW_MODELS_CONFIG = {
+    "providers": {
+        "xkiro": {"limits": {}},  # no known daily cap: the tester's own provider never runs dry
+        "openrouter": {"limits": {"per_day_default": 50, "per_day_after_credits": 1000}, "credits_purchased": False},
+    },
+    "models": [
+        {"provider": "xkiro", "model": "tester-m", "role_class": "tester", "pinned": True},
+        {"provider": "openrouter", "model": "rev-m", "role_class": "reviewer", "pinned": True},
+    ],
+}
+
+
+def _tester_ready_cards_gate(tmp_path, monkeypatch, *, used_on_reviewer_provider, project_budgets):
+    plan = plan_mod.parse_and_validate(TESTER_PLAN_RAW, known_roles=set(TESTER_ROLES), max_cards=40)
+    conn = db.connect(tmp_path / "ases.db")
+    counter = _FakeCounter()
+    monkeypatch.setattr(hermes, "kanban_create", lambda board, title, **kw: {"id": counter.next_id("t"), **kw})
+    project = dataclasses.replace(_project(tmp_path), roles=TESTER_ROLES, budgets=project_budgets)
+    pairs = controller.create_cards_from_plan("b", "proj1", tmp_path / "repo", plan, project, conn=conn)
+    from ases import ledger
+    if used_on_reviewer_provider:
+        ledger.record_usage(conn, "openrouter", "rev-m", n=used_on_reviewer_provider)
+    ready = [pairs[0].work_card_id, pairs[1].work_card_id]  # T1 (tester) and T2 (reviewer role)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": cid, "status": "ready"} for cid in ready] if status == "ready" else []
+    ))
+    scheduled = []
+    monkeypatch.setattr(hermes, "kanban_schedule", lambda b, cid, reason: scheduled.append((cid, reason)))
+    return plan, conn, project, pairs, scheduled
+
+
+def test_budget_gate_parks_tester_cards_too_when_the_reviewer_provider_cannot_afford_the_review_reserve(
+    tmp_path, monkeypatch,
+):
+    """ASES-QG-05 (round 7, part C): a tester's card needs a review pass exactly like a coder's now
+    (_COMMITTING_ROLES), so the review-reserve half of ASES-CAP-03 (_affordable_now) must apply to it too. The
+    pre-fix `task.role == "coder"` check would have skipped this entirely for a tester task, letting it
+    dispatch even though nobody could afford to review the work it would produce."""
+    plan, conn, project, pairs, scheduled = _tester_ready_cards_gate(
+        tmp_path, monkeypatch, used_on_reviewer_provider=35,  # 15 of 50 left, minus the 10% reserve = 10 usable
+        project_budgets={"review_reserve_requests": 20, "daily_reserve_percent": 10},
+    )
+
+    parked = controller.process_budget_gate(
+        "b", plan, TESTER_REVIEW_MODELS_CONFIG, conn=conn, budgets={}, project=project,
+    )
+
+    assert parked == ["T1"]
+    assert [cid for cid, _ in scheduled] == [pairs[0].work_card_id]
+    assert "review budget on openrouter" in scheduled[0][1]
+    assert any(e["kind"] == "card_parked_for_budget" for e in events.recent(conn))
+
+
+def test_budget_gate_starts_tester_cards_when_the_review_reserve_is_affordable(tmp_path, monkeypatch):
+    plan, conn, project, pairs, scheduled = _tester_ready_cards_gate(
+        tmp_path, monkeypatch, used_on_reviewer_provider=10,  # 40 left: plenty for a 20 request reserve
+        project_budgets={"review_reserve_requests": 20, "daily_reserve_percent": 10},
+    )
+
+    parked = controller.process_budget_gate(
+        "b", plan, TESTER_REVIEW_MODELS_CONFIG, conn=conn, budgets={}, project=project,
+    )
+
+    assert parked == [] and scheduled == []
+
+
 def test_fix_card_creation_ingests_the_outgoing_cards_usage_before_the_repoint(tmp_path, monkeypatch):
     """Found by the usage builder: process_merge_queue repoints plan_tasks.work_card_id at a fix card, after
     which the per-pass ingest never reads the outgoing card again, so a reviewer run that ended since the last
@@ -1999,6 +2147,146 @@ def test_a_failing_outgoing_card_ingest_does_not_stop_the_fix_card(tmp_path, mon
     assert len(_fix_cards(created)) == 1
     assert _task_row(conn)["work_card_id"] != pair.work_card_id
     assert any(e["kind"] == "usage_ingest_error" for e in events.recent(conn))
+
+
+# ---------------------------------------------------------------------------------------------
+# ensure_repo_bootstrapped (ASES-GIT-10, round 7 part A): git worktree add needs at least one commit, so an
+# empty repository gets a branch and one commit before swarm run's primary-checkout guard would otherwise
+# refuse it outright.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_ensure_repo_bootstrapped_creates_branch_and_one_commit_when_there_is_no_git_at_all(tmp_path):
+    repo = tmp_path / "brand_new"  # does not exist on disk yet either
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration")
+
+    assert created is True
+    assert (repo / ".git").is_dir()
+    assert _git_ok("symbolic-ref", "--short", "HEAD", cwd=repo).stdout.strip() == "integration"
+    log = _git_ok("log", "--oneline", cwd=repo).stdout.strip().splitlines()
+    assert len(log) == 1  # exactly one commit
+    assert (repo / "README.md").exists() and (repo / ".gitignore").exists()
+    assert _git_ok("status", "--porcelain", cwd=repo).stdout == ""  # everything on disk was committed
+
+
+def test_ensure_repo_bootstrapped_creates_branch_and_commit_when_git_exists_with_zero_commits(tmp_path):
+    """`.git init -b <name>` only sets the initial branch while `.git` does not exist yet; a re-init on an
+    existing unborn `.git` silently ignores --initial-branch, so this case needs `git checkout -B` instead."""
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    _git_ok("init", "-q", cwd=repo)  # no -b: default branch name, zero commits
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration")
+
+    assert created is True
+    assert _git_ok("symbolic-ref", "--short", "HEAD", cwd=repo).stdout.strip() == "integration"
+    assert len(_git_ok("log", "--oneline", cwd=repo).stdout.strip().splitlines()) == 1
+
+
+def test_ensure_repo_bootstrapped_never_touches_a_repo_with_real_history_even_on_the_wrong_branch(tmp_path):
+    """ASES-GIT-10 says 'when the repository is empty', not 'when it happens to be on the wrong branch': that
+    stays publish_plan's own refusal, unchanged."""
+    repo = _plain_repo(tmp_path, name="existing")  # already has one commit, on "integration"
+    _git_ok("checkout", "-q", "-b", "some-other-branch", cwd=repo)
+    tip = _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration")
+
+    assert created is False
+    assert _git_ok("symbolic-ref", "--short", "HEAD", cwd=repo).stdout.strip() == "some-other-branch"
+    assert _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip() == tip
+    assert (repo / "README.md").read_text(encoding="utf-8") == "hi\n"  # _plain_repo's own file, not rewritten
+
+
+def test_ensure_repo_bootstrapped_is_a_no_op_on_an_already_correct_repo(tmp_path):
+    repo = _plain_repo(tmp_path, name="already_fine")  # already on "integration" with a commit
+    tip = _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration")
+
+    assert created is False
+    assert _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip() == tip
+
+
+def test_ensure_repo_bootstrapped_never_writes_git_config(tmp_path):
+    repo = tmp_path / "no_identity"
+
+    assert controller.ensure_repo_bootstrapped(repo, "integration") is True
+
+    local_config = (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert "[user]" not in local_config  # the commit's identity was scoped to that one git call, never persisted
+
+
+def test_ensure_repo_bootstrapped_keeps_a_pre_existing_readme_and_gitignore(tmp_path):
+    """A file already on disk before ASES ever looked at this repository (someone started adding source before
+    running git init) is kept, not clobbered by the bootstrap's own README/.gitignore -- but is still swept
+    into the one commit (git add -A), so it is not left as an untracked change for the next guard to trip on."""
+    repo = tmp_path / "pre_seeded"
+    repo.mkdir()
+    (repo / "README.md").write_text("the real readme\n", encoding="utf-8")
+    (repo / "app.py").write_text("print('hi')\n", encoding="utf-8")
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration")
+
+    assert created is True
+    assert (repo / "README.md").read_text(encoding="utf-8") == "the real readme\n"
+    assert _git_ok("status", "--porcelain", cwd=repo).stdout == ""
+    tracked = _git_ok("ls-files", cwd=repo).stdout.split()
+    assert "app.py" in tracked and "README.md" in tracked
+
+
+def test_ensure_repo_bootstrapped_records_an_event_only_on_success(tmp_path):
+    repo = tmp_path / "brand_new"
+    conn = db.connect(tmp_path / "ases.db")
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration", conn=conn)
+
+    assert created is True
+    rows = [json.loads(e["payload"]) for e in events.recent(conn) if e["kind"] == "repo_bootstrapped"]
+    assert len(rows) == 1
+    assert rows[0]["integration_branch"] == "integration" and rows[0]["repo"] == str(repo)
+    assert rows[0]["commit"] == _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+
+def test_ensure_repo_bootstrapped_records_no_event_when_nothing_was_done(tmp_path):
+    repo = _plain_repo(tmp_path)
+    conn = db.connect(tmp_path / "ases.db")
+
+    assert controller.ensure_repo_bootstrapped(repo, "integration", conn=conn) is False
+
+    assert [e for e in events.recent(conn) if e["kind"].startswith("repo_bootstrap")] == []
+
+
+def test_ensure_repo_bootstrapped_without_a_connection_still_bootstraps_but_records_nothing(tmp_path):
+    """A plain unit test of the git mechanics needs no database at all (conn defaults to None)."""
+    repo = tmp_path / "brand_new"
+
+    assert controller.ensure_repo_bootstrapped(repo, "integration") is True
+    assert (repo / ".git").is_dir()
+
+
+def test_ensure_repo_bootstrapped_records_an_error_event_and_returns_false_on_a_git_failure(tmp_path, monkeypatch):
+    """Never raises for an ordinary git failure (the standing rule): a step that fails is reported through the
+    event, not an exception, and the caller gets False back (nothing was durably created)."""
+    repo = tmp_path / "brand_new"
+    conn = db.connect(tmp_path / "ases.db")
+    real = controller._bootstrap_git
+
+    def fail_on_commit(repo_arg, args):
+        if args and args[0] == "-c":
+            return subprocess.CompletedProcess(args, 1, "", "commit failed: no identity available")
+        return real(repo_arg, args)
+
+    monkeypatch.setattr(controller, "_bootstrap_git", fail_on_commit)
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration", conn=conn)
+
+    assert created is False
+    errors = [json.loads(e["payload"]) for e in events.recent(conn) if e["kind"] == "repo_bootstrap_error"]
+    assert len(errors) == 1 and errors[0]["step"] == "commit"
+    assert "commit failed" in errors[0]["detail"]
+    assert [e for e in events.recent(conn) if e["kind"] == "repo_bootstrapped"] == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2216,6 +2504,53 @@ def test_post_merge_check_red_and_revert_also_fails_halts_via_the_integrity_out_
     assert guards_mod.expected_head(conn, plan.project) is None  # never set: no known-good HEAD to vouch for
 
 
+def test_tester_task_gets_the_post_merge_gate3_recheck_like_a_coders_would(tmp_path, monkeypatch):
+    """Round 7 part C, site 6: the post-merge Gate 3 recheck (ASES-GIT-05) used to run only `if task.role ==
+    "coder"`. A tester's real commit needs the same protection: a project-level regression another task's merge
+    introduced on the shared tip must not go unchecked just because the task that exposed it is a tester."""
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("tester"), roles=dict(ROLES, tester="tester-1"),
+    )
+    _board_state(monkeypatch, pair, branch="swarm/T1-tester")
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    calls = _stub_post_merge_gate(monkeypatch, passed=True)
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert merged == ["T1"]
+    assert len(calls) == 1  # the postcheck actually ran; the old role=="coder" gate would have left it None
+    assert calls[0]["task_key"] == "T1"
+    assert actions["complete"] == [(pair.merge_card_id, {"result": "merged cand1",
+                                                          "metadata": {"squash_commit": "cand1"}})]
+
+
+def test_tester_task_with_a_red_post_merge_gate_is_reverted_not_silently_kept(tmp_path, monkeypatch):
+    """The red half of the same site: without the fix, a regression the tester's merge exposed would have
+    landed on the integration branch for good, because the postcheck was None and never even asked -- proved
+    empirically by reverting the six sites and re-running this file: this test then fails (merged == ["T1"]
+    instead of [], no fix card, no post_merge_reverted event)."""
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("tester"), roles=dict(ROLES, tester="tester-1"),
+    )
+    _board_state(monkeypatch, pair, branch="swarm/T1-tester")
+    actions = _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    _stub_post_merge_gate(monkeypatch, passed=False, detail="a regression the tester's merge exposed")
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: mergeq.RevertOutcome(
+        True, "revertsha1", "reverted cand1", aborted=False,
+    ))
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert merged == []  # never merged: the branch it landed on turned out broken
+    assert actions["complete"] == []  # the merge card is never completed on this path
+    fix_cards = _fix_cards(created)
+    assert len(fix_cards) == 1 and _task_row(conn)["fix_cards"] == 1
+    kinds = [e["kind"] for e in events.recent(conn)]
+    assert "post_merge_reverted" in kinds and "merge_failed" in kinds and "fix_card_created" in kinds
+
+
 def test_process_merge_queue_without_an_integrity_list_still_stops_the_loop_on_an_unrepaired_revert(
     tmp_path, monkeypatch,
 ):
@@ -2295,6 +2630,27 @@ def test_a_reviewer_completion_with_no_verdict_metadata_is_refused(tmp_path, mon
     (event,) = _refusals(conn, "merge_refused_invalid_verdict")  # once, not once per poll
     assert event["card_id"] == pair.work_card_id and event["task_key"] == "T1" and event["problems"]
     assert _fix_cards(created) == [] and _task_row(conn)["fix_cards"] == 0  # a refusal is not a merge failure
+
+
+def test_tester_task_with_no_verdict_metadata_is_refused_not_merged_blindly(tmp_path, monkeypatch):
+    """Round 7 part C, site 4: the verdict-validation gate (ASES-REV-06) used to run only `if task.role ==
+    "coder"`. Without the fix, a tester's card with no verdict metadata at all would skip straight past this
+    check (pre_merge_outcome stays None) and merge_task would be called anyway, regardless of whether anyone
+    ever actually reviewed the work -- proved empirically: reverting the six sites makes `calls` non-empty and
+    this test fail."""
+    plan, conn, project, pair, created = _setup_one_task(
+        tmp_path, monkeypatch, plan_raw=_one_task_plan_raw("tester"), roles=dict(ROLES, tester="tester-1"),
+    )
+    _work_card_runs(monkeypatch, pair, [_reviewer_run(None)], branch="swarm/T1-tester")
+    _record_card_actions(monkeypatch)
+    calls = _script_merge_task(monkeypatch, _MERGED)
+    unreviewed = []
+
+    merged = controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn, unreviewed=unreviewed)
+
+    assert merged == [] and calls == [] and unreviewed == ["T1"]  # merge_task was never even called
+    (event,) = _refusals(conn, "merge_refused_invalid_verdict")
+    assert event["card_id"] == pair.work_card_id and event["task_key"] == "T1"
 
 
 @pytest.mark.parametrize("metadata", [

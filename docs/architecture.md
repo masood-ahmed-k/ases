@@ -994,6 +994,59 @@ wave already had in flight. Wave 2 (`r7_wp_wave2_roles.md`, already written) als
 six places in `controller.py` hardcode `role == "coder"`, which would silently mistreat a Tester role's card (no review, no merge,
 treated as a review-only no-op) the moment a project actually enables one.
 
+## Round 7, wave 2: greenfield bootstrapping and the Tester role's hardcoded-role bug (2026-09-23)
+
+Wave 1 left two things for wave 2, both from the same investigation: the two greenfield-bootstrapping rows
+(ASES-GIT-10/11), and a bug the investigation surfaced along the way, that controller.py hardcoded
+`role == "coder"` (or its negation) in several places to mean "the only role that produces a real git commit",
+which would silently mistreat a Tester role's card the moment a project actually enabled one. Package ROLES2
+built both; two more agents then independently verified the work before it was committed, a heavier check than
+usual because this touches the merge and gate machinery directly.
+
+- **`controller.ensure_repo_bootstrapped(repo, integration_branch, *, conn=None)`** (ASES-GIT-10): detects a
+  truly empty repository (no `.git`, or `.git` with zero commits), creates the integration branch and an initial
+  commit carrying whatever is already on disk plus a `.gitignore`/README if missing, with a per-invocation git
+  identity, never a persistent git config. Never touches a repository with real history, on any branch. Wired
+  into `cli.cmd_plan`, before the Lead is ever invoked. Worth recording plainly: the blueprint's literal wording
+  in section 8.3 assigns this to `swarm run` ("git worktree add needs at least one commit. swarm run MUST create
+  an initial commit..."), but the actual implementation does it at plan time instead. This is a necessary
+  adaptation, not a missed requirement: `cmd_approve`'s `publish_plan` already refuses to operate on a repository
+  that is not on the integration branch, so for a genuinely empty repository the bootstrap has to happen no later
+  than plan time, or approve would fail first on every greenfield project, before a single worktree is ever
+  created. The requirement's own reasoning (worktree creation needs a commit) is satisfied either way.
+- **`cli.cmd_plan`'s prompt** (ASES-GIT-11) now explicitly tells the Lead to plan a scaffold task first in an
+  empty repository and to give parallel work an explicit `depends_on` pointing at it. A real limit was found and
+  proven with a test, not assumed away: Gate 0's touches-overlap serialization does NOT by itself order parallel
+  work after a scaffold task, since a scaffold task's touches (`pyproject.toml`, `package.json`, `AGENTS.md`)
+  essentially never literally overlaps an ordinary task's touches. The "parallel work starts only after the
+  scaffold is merged" guarantee rests entirely on the Lead itself writing the `depends_on`; this is a prompt-level
+  instruction, not a code-enforced one, and the row stays `in_progress` for exactly that reason.
+- **`_COMMITTING_ROLES = frozenset({"coder", "tester"})`** (ASES-QG-05, ASES-ROL-09): the new single source of
+  truth for which roles produce a real commit, replacing five hardcoded `role == "coder"` comparisons in
+  controller.py (`_finish_instructions`, the review-reserve budget check, the merge queue's verdict-validation
+  gate, `allow_empty` for `mergeq.merge_task`, the post-merge Gate 3 recheck). One independent review agent
+  corrected the original estimate of six sites to five: the sixth was a docstring, not code. Reverting the five
+  sites and re-running the tester-focused tests showed the old bug was worse than "a tester's card fails to
+  merge": Gate 3 runs unconditionally on any real diff regardless of role, so a tester's real commit would still
+  have merged under the old code, just with the reviewer-verdict check, the Gate 1 recheck, and the post-merge
+  Gate 3 recheck all silently skipped. Unreviewed, unchecked work merging silently, not work failing to merge.
+- **The same bug, found and fixed independently in `reconcile.py`** (ASES-REC-04): `_done_without_record`
+  hardcoded `role != "coder"` to mean "this role's merge card legitimately has no git commit", the same
+  hardcoding just fixed in controller.py. A tester's merge card marked done with no landed commit behind it
+  (crash, force-push, board/git desync) would be silently written as a no-op merge record on `swarm resume`
+  instead of escalating for a person to look at. Fixed by reusing `controller._COMMITTING_ROLES` directly
+  (confirmed no circular import between the two modules) rather than duplicating the frozenset.
+
+Every one of the five fixes above, plus the reconcile.py fix, was proven with a before/after test: reverted,
+shown to fail against the old code, restored, shown to pass. A second, independent agent then re-read the diff
+line by line, re-derived the safety properties of `ensure_repo_bootstrapped` from the code itself rather than
+trusting the builder's report, and swept the rest of the repository (`mergeq.py`, `review.py`, `evals.py`,
+`recovery.py`, `plan.py`, `gates.py`, `finalgates.py`, `tamper.py`, and more) for any other hardcoded-role site
+or stale test the fix might have left behind. It found none. Final suite: 5,505 passed, 2 skipped, 0 failed.
+
+Every "not_covered" row on the register the user asked to build in round 7 is now `in_progress`. This closes out
+the "build all" instruction that opened round 7: nothing on the register is still `not_covered`.
+
 ## Coder-1's first real progress, and two more real limits (2026-09-18 into 2026-09-19)
 
 Once coder-1's TPD wall (above) cleared, retrying T1's dispatch several times over the next couple of

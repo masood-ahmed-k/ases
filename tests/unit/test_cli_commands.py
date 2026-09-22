@@ -711,6 +711,116 @@ def test_plan_says_when_the_lead_could_not_run_at_all(world, monkeypatch, capsys
 
 
 # ---------------------------------------------------------------------------------------------
+# plan: ensure_repo_bootstrapped wiring (ASES-GIT-10, round 7 part A) and the scaffold-task prompt
+# guidance (ASES-GIT-11, round 7 part B).
+# ---------------------------------------------------------------------------------------------
+
+
+def test_plan_bootstraps_an_empty_repository_before_ever_asking_the_lead(world, monkeypatch, capsys):
+    """world.repo (a plain directory, no .git) is exactly the "brand new project" case ASES-GIT-10 is about:
+    cmd_plan is the earliest real touch-point, so the branch and the one commit must exist before the Lead is
+    ever asked to inspect the repository."""
+    assert not (world.repo / ".git").exists()
+
+    def lead(repo, prompt):
+        assert (repo / ".git").is_dir()  # bootstrapped BEFORE the Lead ever runs
+        world.plan_file.write_text("{}", encoding="utf-8")
+        return cli._LeadResult(True, 0, "done")
+
+    monkeypatch.setattr(cli, "_run_lead", lead)
+
+    assert cli.main(["plan", "--repo", str(world.repo), "--request", "x"]) == 0
+
+    assert (world.repo / ".git").is_dir()
+    branch = subprocess.run(
+        ["git", "-C", str(world.repo), "symbolic-ref", "--short", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+    assert branch == "integration"
+    log = subprocess.run(
+        ["git", "-C", str(world.repo), "log", "--oneline"], capture_output=True, text=True,
+    ).stdout.strip().splitlines()
+    assert len(log) == 1
+    out, _ = _console(capsys)
+    assert "bootstrapped an empty repository" in out and "ASES-GIT-10" in out
+    rows = _events(world.conn, "repo_bootstrapped")
+    assert len(rows) == 1 and rows[0]["repo"] == str(world.repo.resolve())
+
+
+def test_plan_never_touches_a_repository_that_already_has_real_history(world, monkeypatch, capsys):
+    subprocess.run(["git", "-C", str(world.repo), "init", "-q", "-b", "integration"], check=True)
+    (world.repo / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(world.repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(world.repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+        check=True,
+    )
+    tip = subprocess.run(
+        ["git", "-C", str(world.repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+
+    def lead(repo, prompt):
+        world.plan_file.write_text("{}", encoding="utf-8")
+        return cli._LeadResult(True, 0, "done")
+
+    monkeypatch.setattr(cli, "_run_lead", lead)
+
+    assert cli.main(["plan", "--repo", str(world.repo), "--request", "x"]) == 0
+
+    after = subprocess.run(
+        ["git", "-C", str(world.repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+    assert after == tip  # untouched
+    out, _ = _console(capsys)
+    assert "bootstrapped" not in out
+    assert _events(world.conn, "repo_bootstrapped") == []
+
+
+def test_plan_prompt_tells_the_lead_to_plan_a_scaffold_task_first_when_the_repo_is_empty(world, monkeypatch):
+    """ASES-GIT-11 (section 8.3): 'Greenfield projects start with one serialized scaffold task ... Parallel work
+    starts only after the scaffold is merged.' The prompt must say this explicitly and tell the Lead to wire
+    every other task's depends_on to the scaffold task by name -- Gate 0's touches-overlap serialization alone
+    does not guarantee that (see test_plan.py's Gate 0 test)."""
+    prompts = []
+
+    def lead(repo, prompt):
+        prompts.append(prompt)
+        world.plan_file.write_text("{}", encoding="utf-8")
+        return cli._LeadResult(True, 0, "done")
+
+    monkeypatch.setattr(cli, "_run_lead", lead)
+
+    cli.main(["plan", "--repo", str(world.repo), "--request", "Build a todo app"])
+
+    (prompt,) = prompts
+    assert "ASES-GIT-11" in prompt and "scaffold task" in prompt
+    assert "depends_on" in prompt and "Gate 0" in prompt
+    assert "pyproject.toml" in prompt and "package.json" in prompt
+
+
+def test_plan_prompt_offers_the_tester_role_only_when_the_project_maps_one(tmp_path, monkeypatch, world):
+    prompts = []
+
+    def lead(repo, prompt):
+        prompts.append(prompt)
+        world.plan_file.write_text("{}", encoding="utf-8")
+        return cli._LeadResult(True, 0, "done")
+
+    monkeypatch.setattr(cli, "_run_lead", lead)
+
+    cli.main(["plan", "--repo", str(world.repo), "--request", "x"])
+    (no_tester_prompt,) = prompts
+    assert "'tester'" not in no_tester_prompt and '"tester"' not in no_tester_prompt
+
+    prompts.clear()
+    project_with_tester = _project(tmp_path, roles=dict(ROLES, tester="tester-1"))
+    monkeypatch.setattr(cli, "_load_project", lambda: project_with_tester)
+
+    cli.main(["plan", "--repo", str(world.repo), "--request", "x"])
+    (with_tester_prompt,) = prompts
+    assert "'tester'" in with_tester_prompt and '"coder"|"reviewer"|"tester"' in with_tester_prompt
+
+
+# ---------------------------------------------------------------------------------------------
 # critique (Gate P: ASES-REV-01, ASES-REV-02)
 # ---------------------------------------------------------------------------------------------
 

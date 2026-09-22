@@ -58,6 +58,27 @@ twice now), a fix for `triage.promote_card` (always fails on a genuinely triage-
 `allow_gate_config_changes`/`gate4_allowlist` plan fields (TV's report asks for this), and `swarm triage` CLI commands plus a
 `process_triage` controller step (LED's report asks for this).
 
+## Round 7 (2026-09-22 to 2026-09-23, zero quota, one narrowly authorized real Hermes call)
+
+The user was told what was left to build (the items in the paragraph above, plus the never-built register rows) and answered in
+one message: "option A" (ASES may call Hermes's own `specify`, only from `triage.promote_card`), "fix all the bugs", "build all".
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r7_rules.md` | shared rules addendum: the one authorized real Hermes call, and why it does not weaken the zero-quota rule | in use |
+| `r7_wp_specify.md` | SPECIFY: `hermes.kanban_specify`, `triage.promote_card` now works (ASES-LED-03) | done |
+| `r7_wp_fixes.md` | FIXES: stale fix/retry-card pointer, budget gate data-class check, a card stuck ready after an auth/quota failure (ASES-CAP-03, PRV-04, REC-01/03) | done |
+| `r7_wp_policy.md` | POLICY: docs/ases scaffolding, data-policy verification, key-pool doctor checks (ASES-GIT-15, PRV-04, CFG-02/03) | done |
+| (no separate work order; AC-D dispatched directly) | AC-D: acceptance 22.8, the sixteenth and last blueprint scenario | done |
+| `r7_wp_wave2_roles.md` | ROLES2: greenfield repo bootstrapping, the Tester-role hardcoded-role bug (ASES-GIT-10/11, QG-05, ROL-09) | done, independently verified |
+| (no separate work order; dispatched directly alongside ROLES2's verification) | the matching hardcoded-role bug in `reconcile.py` (ASES-REC-04) | done |
+
+Wave 1 (four packages) landed as commit `a98b95e`; wave 2 (ROLES2 plus the two verification/fix agents dispatched alongside it)
+closes out every remaining "not_covered" row from the user's "build all" instruction. See `builder-findings.md` for every report,
+including two architect fixes in wave 1 (`FakeHermes.kanban_specify`, a `recovery.next_model` regression) and the independent
+review this round that corrected wave 2's own site count (five hardcoded-role sites in controller.py, not six as first estimated)
+and found no stale tests anywhere else in the repository.
+
 Paths inside the older files that point at a session scratchpad (the blueprint text extract, for example) are stale: the extract
 lives at `C:\Users\masoo\ases-workspaces\tools\blueprint.txt`, next to the helper scripts used during the build (`nemo.py` to call
 nemotron, `regtool.py` to rewrite register rows, the seeded-bug scripts `mutate4.py` and `mutate5.py`).

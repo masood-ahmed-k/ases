@@ -528,3 +528,68 @@ def test_gate4_allowlist_wrong_type_is_rejected():
     raw = {**VALID, "gate4_allowlist": "tests/**"}
     with pytest.raises(plan_mod.PlanError, match="gate4_allowlist must be an array"):
         plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-QG-05 (round 7, part C): the Tester is an ordinary plan role, exactly like coder and reviewer, once a
+# project maps a tester: profile in config/swarm.yaml. Gate 0 needs no special-casing for it -- cli.py already
+# builds known_roles=set(project.roles) from that config, so this is a confirming test, not new production
+# code (plan.py's role validation was not touched).
+# ---------------------------------------------------------------------------------------------
+
+
+def test_role_tester_validates_cleanly_when_the_project_maps_one():
+    raw = _raw_plan({**_raw_task("T1", ["tests/**"]), "role": "tester"})
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES | {"tester"}, max_cards=40)
+    assert p.task("T1").role == "tester"
+
+
+def test_role_tester_is_rejected_like_any_other_unmapped_role():
+    raw = _raw_plan({**_raw_task("T1", ["tests/**"]), "role": "tester"})
+    with pytest.raises(plan_mod.PlanError, match="unknown role 'tester'"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)  # ROLES has no "tester"
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-GIT-11 (section 8.3, round 7 part B): a greenfield scaffold task, and whether Gate 0's own
+# touches-overlap serialization (ASES-GIT-08) alone guarantees "parallel work starts only after the scaffold
+# is merged".
+# ---------------------------------------------------------------------------------------------
+
+
+def test_touches_overlap_serialization_alone_does_not_order_a_task_after_the_scaffold():
+    """The real gap this round found: a scaffold task's touches names root config/tooling files (pyproject.toml,
+    package.json, .gitattributes, AGENTS.md), and an ordinary implementation task's touches names source files
+    under src/ -- these do not literally overlap (ASES-GIT-08's own conservative glob comparison, see
+    test_touches_overlap_table), so serialize_overlapping_tasks adds NO dependency between them. Without an
+    explicit depends_on from the Lead, the scaffold task and the later task are free to run in parallel, which
+    is exactly what ASES-GIT-11 ("parallel work starts only after the scaffold is merged") forbids. The
+    guarantee rests entirely on the Lead writing an explicit depends_on to the scaffold task's key (see cli.py's
+    cmd_plan prompt guidance), never on Gate 0's touches-overlap mechanism alone."""
+    scaffold = _task("scaffold", ["pyproject.toml", "package.json", ".gitattributes", "AGENTS.md"])
+    feature = _task("T1", ["src/feature_x.py"])  # no depends_on written by the Lead, and no touches overlap
+
+    tasks, links = plan_mod.serialize_overlapping_tasks([scaffold, feature])
+
+    assert _deps(tasks) == {"scaffold": (), "T1": ()}  # NOT ordered: this is the gap
+    assert links == ()
+
+
+def test_explicit_depends_on_the_scaffold_task_is_what_actually_orders_parallel_work_after_it():
+    """The mechanism that DOES provide the ASES-GIT-11 guarantee: an explicit depends_on from every other task
+    to the scaffold task's key, exactly like any other plan dependency, survives Gate 0 unchanged and puts the
+    scaffold strictly before every dependent task in topological_order -- with no help needed from touches
+    overlap (serialization_links stays empty)."""
+    raw = _raw_plan(
+        _raw_task("scaffold", ["pyproject.toml", "package.json", ".gitattributes", "AGENTS.md"]),
+        _raw_task("T1", ["src/feature_x.py"], depends_on=["scaffold"]),
+        _raw_task("T2", ["src/feature_y.py"], depends_on=["scaffold"]),
+    )
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+    assert p.task("T1").depends_on == ("scaffold",)
+    assert p.task("T2").depends_on == ("scaffold",)
+    order = plan_mod.topological_order(p)
+    assert order.index("scaffold") < order.index("T1")
+    assert order.index("scaffold") < order.index("T2")
+    assert p.serialization_links == ()  # from the explicit depends_on, not from a touches overlap
