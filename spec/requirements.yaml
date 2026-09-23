@@ -1184,32 +1184,66 @@ requirements:
   section: 10, 17.4
   verified_by: '22.10'
   status: partial
-  note: 'ROUND 7 wave 2 audit (2026-09-23, zero quota): The UnoRouter-credential half is moot (UnoRouter dropped as
-    a provider entirely, confirmed against config/models.yaml). For the still-live ''do not export provider
-    keys into worker shells'' half, an inspection agent confirmed the existing note''s claim precisely: ASES
-    never spawns a worker process itself (hermes.py''s _run only ever calls kanban/doctor/pause/resume/gateway
-    status, never a worker/agent spawn; dispatch is Hermes''s own gateway, entirely outside ASES''s process
-    tree), and ASES never reads a key''s VALUE, only its key_env NAME, everywhere
-    config.py/doctor.py/profiles.py touch it. The Docker sandbox path has real, tested guards (sandbox.py''s
-    docker_run_argv and check_terminal_block, unit-tested), but the sandbox is off by default and no real
-    profile uses it today, so those guards do not apply to the local backend ASES actually runs. The audit
-    additionally found one concrete, narrow, previously-unlisted gap: hermes.py''s _run and evals.py''s
-    _run_process (the one function that makes a real, live one-shot hermes call for an evaluation task) both
-    launch the real hermes CLI while inheriting the full ambient process environment, completely unfiltered,
-    unlike evalkit/codeeval.py''s existing scrubbed_env pattern used for a related but different purpose. A
-    fix (scrub credential-shaped environment variable names before either subprocess call, mirroring the
-    existing pattern) was dispatched as a separate build-and-independently-verify task; see the next register
-    update once that lands. Until then this row stays partial: satisfied by design for everything ASES''s own
-    config/profile code touches, tested for the Docker sandbox path only, genuinely unverified for the local
-    backend ASES actually uses by default today. Earlier note: PARTIAL CORRECTION (2026-09-22): the
-    UnoRouter-specific half of this row is obsolete -- UnoRouter was dropped from every role on 2026-09-19
-    ([[feedback_no-unorouter]] in the operator''s own notes; lead and coder-1 now run on xKiro, an unrelated
-    custom-endpoint provider, the reviewer on OpenRouter). The row is NOT marked not_applicable, because its
-    second half (''do not export provider keys into worker shells'') is a live, general guarantee that still
-    matters for xKiro or any future custom endpoint, and is partially covered by sandbox.py''s ASES-CFG-04
-    work (no credential-shaped variable is ever forwarded into a container argv) -- that coverage is for the
-    DOCKER sandbox path only, not the local terminal backend ASES still runs on by default, so this row stays
-    not_covered until the local-backend half is checked or the sandbox is actually enabled.'
+  note: 'ROUND 7 wave 2, CFG-05 close-out (2026-09-23, zero quota): The still-live ''do not export provider keys
+    into worker shells'' half now has a real fix, not just an inspection finding. New module
+    src/ases/procenv.py (stdlib-only, no ASES imports) defines the project''s one credential-name pattern and
+    scrubbed_environ(); every real subprocess launch of the hermes CLI that ASES''s own code controls now uses
+    it: hermes.py''s _run (every kanban/doctor/pause/resume call), evals.py''s _run_process (the one live
+    one-shot model call the evaluation harness makes), cli.py''s _run_lead (the swarm plan Lead call),
+    critic.py''s default_invoke (the swarm critique reviewer call), and profiles.py''s real hermes profile
+    create call via a new _hermes_runner wrapper. A real design constraint surfaced and was respected rather
+    than shortcut: the scrub could not be a public function of hermes.py itself, because
+    ases.fakes.board.FakeHermes.install requires a fake for every public function defined there, and an env
+    scrub is not a Hermes call; procenv.py exists as its own module for exactly that reason. profiles.py''s
+    fix deliberately did NOT make sandbox.default_runner scrub for every command it runs, because that runner
+    also drives the Docker sandbox''s own key-leak probes (key_visibility_test, exfiltration_probe), which
+    need to see a real, unscrubbed environment to actually detect a regression; scrubbing there would have
+    blinded the probes that exist to catch this exact class of bug. Every fix proven with a before/after test
+    (git stash revert, confirm the credential leaks through, restore, confirm it does not). Two independent
+    adversarial tests (one per build) additionally confirmed no leak survives. Full suite: 5512 passed, 2
+    skipped, 0 failed. Two things remain honestly out of reach or out of scope, not hidden: (1) a real,
+    Hermes-gateway-dispatched worker (the actual coder-1/lead/reviewer agent process during a live swarm run)
+    is spawned entirely by Hermes''s own gateway, a process ASES never touches (confirmed by the ASES-ARC-01
+    audit), so no ASES-side env= fix can reach that path; if a key leaks there, it is because the human
+    operator exported it into the shell that starts the Hermes gateway itself, which the blueprint already
+    tells them never to do, and nothing in ASES''s own code could control that even in principle; (2) a
+    separate, genuine, deferred gap two independent agents found and correctly declined to patch under this
+    fix''s scope: gates.py''s _run_commands runs the project''s own gate commands with shell=True and the
+    operator''s full, unscrubbed environment, so a model-authored test committed to the repo could read a key
+    from the controller''s own shell during a gate run -- same family as ASES-SEC-01/03, a real design
+    decision (COMSPEC/PATH must survive; sandbox runners bypass this path already) for a future session, not a
+    two-line fix. Also worth a human decision, not a bug: the shared credential pattern also strips
+    SSH_AUTH_SOCK/XAUTHORITY on POSIX and SESSIONNAME on Windows from every scrubbed launch (informational
+    names, but would affect an ssh-agent-backed git push from a Lead''s terminal tool). Stays partial: the
+    UnoRouter half is moot, the worker-shell half is now substantially and verifiably fixed for everything
+    ASES''s own code launches, but the row''s full scope (every worker shell, including gateway-dispatched
+    ones) has a structural gap ASES cannot close from its own side. Earlier note: ROUND 7 wave 2 audit
+    (2026-09-23, zero quota): The UnoRouter-credential half is moot (UnoRouter dropped as a provider entirely,
+    confirmed against config/models.yaml). For the still-live ''do not export provider keys into worker
+    shells'' half, an inspection agent confirmed the existing note''s claim precisely: ASES never spawns a
+    worker process itself (hermes.py''s _run only ever calls kanban/doctor/pause/resume/gateway status, never
+    a worker/agent spawn; dispatch is Hermes''s own gateway, entirely outside ASES''s process tree), and ASES
+    never reads a key''s VALUE, only its key_env NAME, everywhere config.py/doctor.py/profiles.py touch it.
+    The Docker sandbox path has real, tested guards (sandbox.py''s docker_run_argv and check_terminal_block,
+    unit-tested), but the sandbox is off by default and no real profile uses it today, so those guards do not
+    apply to the local backend ASES actually runs. The audit additionally found one concrete, narrow,
+    previously-unlisted gap: hermes.py''s _run and evals.py''s _run_process (the one function that makes a
+    real, live one-shot hermes call for an evaluation task) both launch the real hermes CLI while inheriting
+    the full ambient process environment, completely unfiltered, unlike evalkit/codeeval.py''s existing
+    scrubbed_env pattern used for a related but different purpose. A fix (scrub credential-shaped environment
+    variable names before either subprocess call, mirroring the existing pattern) was dispatched as a separate
+    build-and-independently-verify task; see the next register update once that lands. Until then this row
+    stays partial: satisfied by design for everything ASES''s own config/profile code touches, tested for the
+    Docker sandbox path only, genuinely unverified for the local backend ASES actually uses by default today.
+    Earlier note: PARTIAL CORRECTION (2026-09-22): the UnoRouter-specific half of this row is obsolete --
+    UnoRouter was dropped from every role on 2026-09-19 ([[feedback_no-unorouter]] in the operator''s own
+    notes; lead and coder-1 now run on xKiro, an unrelated custom-endpoint provider, the reviewer on
+    OpenRouter). The row is NOT marked not_applicable, because its second half (''do not export provider keys
+    into worker shells'') is a live, general guarantee that still matters for xKiro or any future custom
+    endpoint, and is partially covered by sandbox.py''s ASES-CFG-04 work (no credential-shaped variable is
+    ever forwarded into a container argv) -- that coverage is for the DOCKER sandbox path only, not the local
+    terminal backend ASES still runs on by default, so this row stays not_covered until the local-backend half
+    is checked or the sandbox is actually enabled.'
 - id: ASES-SEC-07
   requirement: Docker worker network is disabled by default; network exceptions are explicit and task-scoped
   section: '21.3'

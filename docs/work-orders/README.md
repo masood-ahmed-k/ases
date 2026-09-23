@@ -72,12 +72,16 @@ one message: "option A" (ASES may call Hermes's own `specify`, only from `triage
 | (no separate work order; AC-D dispatched directly) | AC-D: acceptance 22.8, the sixteenth and last blueprint scenario | done |
 | `r7_wp_wave2_roles.md` | ROLES2: greenfield repo bootstrapping, the Tester-role hardcoded-role bug (ASES-GIT-10/11, QG-05, ROL-09) | done, independently verified |
 | (no separate work order; dispatched directly alongside ROLES2's verification) | the matching hardcoded-role bug in `reconcile.py` (ASES-REC-04) | done |
+| (no separate work order; a direct architect audit) | audit of the 3 rows wave 2 left not_covered: ASES-ARC-01, ASES-DOC-03, ASES-CFG-05 | done |
+| (no separate work order; two build-and-verify pairs dispatched from the audit's CFG-05 finding) | credential-scrubbed environment for every real hermes launch (ASES-CFG-05) | done, independently verified twice |
 
 Wave 1 (four packages) landed as commit `a98b95e`; wave 2 (ROLES2 plus the two verification/fix agents dispatched alongside it)
-closes out every remaining "not_covered" row from the user's "build all" instruction. See `builder-findings.md` for every report,
-including two architect fixes in wave 1 (`FakeHermes.kanban_specify`, a `recovery.next_model` regression) and the independent
-review this round that corrected wave 2's own site count (five hardcoded-role sites in controller.py, not six as first estimated)
-and found no stale tests anywhere else in the repository.
+landed as `2fc4bfa` and left three rows not_covered (ASES-ARC-01, ASES-DOC-03, ASES-CFG-05); an audit closed ARC-01 by design,
+found DOC-03 honestly partial, and found a concrete CFG-05 gap that two more build-and-verify pairs then fixed (`2cfc825` and the
+CFG-05 commit that follows it). See `builder-findings.md` for every report, including two architect fixes in wave 1
+(`FakeHermes.kanban_specify`, a `recovery.next_model` regression), the independent review in wave 2 that corrected its own site
+count (five hardcoded-role sites in controller.py, not six as first estimated), and the CFG-05 pairs' shared finding of a
+separate, deferred gap in `gates.py` (same family as ASES-SEC-01/03, not fixed under this scope).
 
 Paths inside the older files that point at a session scratchpad (the blueprint text extract, for example) are stale: the extract
 lives at `C:\Users\masoo\ases-workspaces\tools\blueprint.txt`, next to the helper scripts used during the build (`nemo.py` to call

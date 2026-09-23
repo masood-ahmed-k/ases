@@ -1261,6 +1261,38 @@ def test_apply_init_a_runner_that_says_ok_but_creates_nothing_did_not_stick(tmp_
     assert "did not stick" in result.failed[0].why
 
 
+def test_apply_init_default_runner_starts_hermes_with_a_credential_scrubbed_environment(tmp_path, monkeypatch):
+    """ASES-CFG-05 (blueprint 10.2): with no runner injected, `hermes profile create` goes through the real default
+    (sandbox.default_runner, whose subprocess.run is faked here: nothing real starts), and a provider key exported
+    into the shell that runs `swarm init` must not reach it, while PATH (and SYSTEMROOT on Windows) still must.
+    The default runner's other guarantees (the timeout, closed stdin) are unchanged."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-adversarial-12345")
+    monkeypatch.setenv("ASES_HARMLESS_SETTING", "kept")
+    home = _home(tmp_path)
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=list(argv), kwargs=kwargs)
+        (home / "profiles" / argv[3]).mkdir(parents=True)  # what a real create leaves behind, so the change sticks
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+
+    result = profiles.apply_init(_plan(_project(tmp_path), home)[:1], home, PROMPTS_DIR, confirmed=True)
+
+    assert [c.kind for c in result.applied] == ["create_profile"] and not result.failed
+    assert seen["argv"][:3] == ["hermes-test", "profile", "create"]
+    env = seen["kwargs"].get("env")
+    assert env is not None, "the default runner passed no env=, so hermes inherits the whole parent environment"
+    assert "OPENROUTER_API_KEY" not in {name.upper() for name in env}
+    assert "sk-test-adversarial-12345" not in env.values()
+    assert env["ASES_HARMLESS_SETTING"] == "kept" and env["PATH"] == os.environ["PATH"]
+    if os.name == "nt":
+        assert env["SYSTEMROOT"] == os.environ["SYSTEMROOT"]
+    assert seen["kwargs"]["timeout"] == profiles.CREATE_TIMEOUT_SECONDS
+    assert seen["kwargs"]["stdin"] == subprocess.DEVNULL and seen["kwargs"]["capture_output"] is True
+
+
 def test_apply_init_creating_a_profile_that_now_exists_is_a_no_op(tmp_path):
     project = _project(tmp_path)
     home = _home(tmp_path)

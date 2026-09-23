@@ -389,6 +389,7 @@ def default_invoke(profile: str, prompt: str, timeout: int) -> tuple[int, str, s
     try:
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+            env=hermes_mod.scrubbed_environ(),  # ASES-CFG-05: a provider key in the launching shell stops here
         )
     except subprocess.TimeoutExpired:
         return -1, "", f"the reviewer did not answer within {timeout}s"

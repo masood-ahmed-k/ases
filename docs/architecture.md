@@ -1111,6 +1111,36 @@ or stale test the fix might have left behind. It found none. Final suite: 5,505 
 Every "not_covered" row on the register the user asked to build in round 7 is now `in_progress`. This closes out
 the "build all" instruction that opened round 7: nothing on the register is still `not_covered`.
 
+## Round 7, closing the audit: ASES-CFG-05, and a doc-ordering defect (2026-09-23)
+
+The round 7 wave 2 audit above left three rows not_covered. ASES-ARC-01 turned out to be satisfied by design
+(closed same day, by inspection, no code needed) and ASES-DOC-03 stays honestly partial (build order was
+compressed across rounds and no exit test has run for real yet, by disclosed policy). The audit also found a
+physical defect in this very file: a 2026-09-18/19 section had been sitting after three much later round
+sections, because new sections were repeatedly inserted before a fixed anchor without ever checking that
+anchor's own place in time. Fixed the same day: the misplaced block now sits where it actually continues from,
+confirmed by a line-count-preserving diff.
+
+ASES-CFG-05's live half ("do not export provider keys into worker shells") got a real fix. Two build-and-
+independently-verify pairs ran back to back: the first added `src/ases/procenv.py` (a new, ASES-import-free
+module; `scrubbed_environ()` could not be a public function of `hermes.py` itself, since `FakeHermes.install`
+requires a fake for every public name defined there, and an environment scrub is not a Hermes call) and wired
+it into `hermes.py`'s `_run` and `evals.py`'s `_run_process`. The second, working from a spawned follow-up
+suggestion that named three more real launch sites, wired the same helper into `cli.py`'s Lead call and
+`critic.py`'s reviewer call, and gave `profiles.py`'s real `hermes profile create` call a new `_hermes_runner`
+wrapper rather than changing `sandbox.default_runner` itself: that runner also drives the Docker sandbox's own
+key-leak probes, which need to see a real, unscrubbed environment to actually detect a regression, so scrubbing
+it globally would have blinded the very probes meant to catch this class of bug. Every one of the five real
+hermes-launch sites in `src/ases` is now covered; both verify passes independently confirmed no sixth site was
+missed.
+
+Two things stay open, honestly, not silently closed: a real Hermes-gateway-dispatched worker is spawned
+entirely by Hermes's own gateway, a process ASES never touches, so no ASES-side fix can reach that path (this
+matches ASES-ARC-01's own finding that ASES never spawns a worker itself); and `gates.py`'s own gate-command
+runner still executes with the operator's full, unscrubbed environment, a separate, deferred design decision
+(same family as ASES-SEC-01/03) two independent agents found and correctly declined to patch under this fix's
+scope. Suite: 5,512 passed, 2 skipped, 0 failed.
+
 ## Known gaps (tracked, not hidden)
 
 - `glm-5.3-thinking:free`'s context length is **not declared** in `config/models.yaml` -- native

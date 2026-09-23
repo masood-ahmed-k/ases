@@ -3,6 +3,7 @@ reviewer call is a fake `invoke`, the database is a temp SQLite file."""
 import dataclasses
 import hashlib
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -728,6 +729,27 @@ def test_default_invoke_runs_hermes_with_the_profile_and_prompt_and_no_toolsets(
     kwargs = hermes_run["kwargs"]
     assert kwargs["timeout"] == 42 and kwargs["encoding"] == "utf-8" and kwargs["errors"] == "replace"
     assert kwargs["capture_output"] is True and kwargs["text"] is True
+
+
+def test_default_invoke_starts_hermes_with_a_credential_scrubbed_environment(hermes_run, monkeypatch):
+    """ASES-CFG-05 (blueprint 10.2): a provider key exported into the shell that runs `swarm critique` must not
+    reach the reviewer's hermes process, while PATH (and SYSTEMROOT on Windows) still must. Nothing else about the
+    call changes."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-adversarial-12345")
+    monkeypatch.setenv("ASES_HARMLESS_SETTING", "kept")
+
+    assert critic.default_invoke("reviewer", "p", 5) == (0, "OUT", "ERR")
+
+    env = hermes_run["kwargs"].get("env")
+    assert env is not None, "default_invoke passed no env=, so the reviewer inherits the whole parent environment"
+    assert "OPENROUTER_API_KEY" not in {name.upper() for name in env}
+    assert "sk-test-adversarial-12345" not in env.values()
+    assert env["ASES_HARMLESS_SETTING"] == "kept" and env["PATH"] == os.environ["PATH"]
+    if os.name == "nt":
+        assert env["SYSTEMROOT"] == os.environ["SYSTEMROOT"]
+    assert {k: v for k, v in hermes_run["kwargs"].items() if k != "env"} == {
+        "capture_output": True, "text": True, "timeout": 5, "encoding": "utf-8", "errors": "replace",
+    }
 
 
 def test_default_invoke_turns_none_output_into_empty_strings(hermes_run):

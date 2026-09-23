@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import os
 import pathlib
 import re
 import shutil
@@ -22,17 +21,16 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 
+from .. import procenv
 from .text import CodeBlock, extract_code_blocks
-
-_CREDENTIAL_ENV = re.compile(r"(key|token|secret|passw|credential|auth|cookie|session)", re.IGNORECASE)
 
 
 def scrubbed_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment a model-written test or program runs in: the current one without any variable whose name
     looks like a credential (ASES-SEC-01: a generated test must not be able to read an API key from the
-    environment), without PYTHONPATH and pytest's option variables, with pytest plugin autoload off, no bytecode
-    files, and UTF-8 output."""
-    env = {name: value for name, value in os.environ.items() if not _CREDENTIAL_ENV.search(name)}
+    environment; procenv.scrubbed_environ is the one definition of which names count), without PYTHONPATH and
+    pytest's option variables, with pytest plugin autoload off, no bytecode files, and UTF-8 output."""
+    env = procenv.scrubbed_environ()
     for name in ("PYTHONPATH", "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONSTARTUP"):
         env.pop(name, None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"

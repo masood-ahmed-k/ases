@@ -6,6 +6,7 @@ and E8 run real pytest and real git in temp directories, because what those scor
 repository (they are kept small so the file stays fast).
 """
 import json
+import os
 import pathlib
 import subprocess
 import types
@@ -1689,6 +1690,38 @@ def test_run_process_reports_a_command_that_cannot_start_and_a_normal_run(tmp_pa
 
     done = evals._run_process(["hermes"], tmp_path, 9, popen=lambda *a, **k: Done())
     assert (done.returncode, done.stdout, done.stderr, done.started) == (0, "out", "", True)
+
+
+def test_run_process_starts_hermes_with_a_credential_scrubbed_environment(monkeypatch, tmp_path):
+    """ASES-CFG-05 (blueprint 10.2): a provider key exported into the shell that runs `swarm eval` must not reach the
+    hermes process; everything else, and the UTF-8 settings this function adds, must. No other argument changes."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "value-one")
+    monkeypatch.setenv("MY_TOKEN", "value-two")
+    monkeypatch.setenv("HARMLESS_SETTING", "kept")
+    seen = {}
+
+    class Done:
+        pid = 1
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("out", "")
+
+    def popen(argv, **kwargs):
+        seen.update(argv=list(argv), kwargs=kwargs)
+        return Done()
+
+    result = evals._run_process(["hermes", "-z", "p"], tmp_path, 9, popen=popen)
+    assert result.returncode == 0 and seen["argv"] == ["hermes", "-z", "p"]
+    env = seen["kwargs"]["env"]
+    assert not {"OPENROUTER_API_KEY", "MY_TOKEN"} & set(env)
+    assert "value-one" not in env.values() and "value-two" not in env.values()
+    assert env["HARMLESS_SETTING"] == "kept" and env["PATH"] == os.environ["PATH"]
+    assert env["PYTHONIOENCODING"] == "utf-8" and env["PYTHONUTF8"] == "1"
+    assert {k: v for k, v in seen["kwargs"].items() if k != "env"} == {
+        "cwd": str(tmp_path), "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+        "text": True, "encoding": "utf-8", "errors": "replace",
+    }
 
 
 def test_the_process_killer_uses_taskkill_on_windows_and_never_os_kill(monkeypatch):

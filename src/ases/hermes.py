@@ -14,6 +14,14 @@ import re
 import shutil
 import subprocess
 
+# The environment every hermes subprocess starts with (ASES-CFG-05). Re-exported for the modules that start hermes
+# themselves with `hermes_mod` already in hand (cli, critic, profiles). It is DEFINED in procenv, not here, on purpose:
+# ases.fakes.board.FakeHermes.install replaces every public function defined in this module, and test_fakes requires
+# each one to have a fake with the same signature, because this module's public names are the Hermes call surface.
+# Both checks go by `__module__`, so a re-export is invisible to them, while a definition here broke every test that
+# installs the fake. An environment scrub is not a Hermes call and must never be faked.
+from .procenv import scrubbed_environ
+
 _VERSION_RE = re.compile(r"Hermes Agent v(\d+\.\d+\.\d+)")
 
 
@@ -39,6 +47,9 @@ def hermes_path() -> str:
 
 
 def _run(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    """Every hermes subcommand goes through here. The environment is a credential-scrubbed copy of the current one
+    (ASES-CFG-05, procenv.scrubbed_environ), never the parent's own, so a provider key exported into the launching
+    shell stops here."""
     return subprocess.run(
         [hermes_path(), *args],
         capture_output=True,
@@ -46,6 +57,7 @@ def _run(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
         timeout=timeout,
         encoding="utf-8",
         errors="replace",
+        env=scrubbed_environ(),
     )
 
 

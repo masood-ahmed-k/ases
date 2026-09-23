@@ -316,6 +316,7 @@ def _run_lead(repo: pathlib.Path, prompt: str) -> _LeadResult:
     try:
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=_LEAD_TIMEOUT_SECONDS, encoding="utf-8", errors="replace",
+            env=hermes_mod.scrubbed_environ(),  # ASES-CFG-05: a provider key in the launching shell stops here
         )
     except subprocess.TimeoutExpired as exc:
         # The partial output of a timed-out run can be bytes even with text=True, so each half is decoded alone.

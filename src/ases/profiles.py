@@ -18,8 +18,9 @@ This module reads and, on request, changes the user's REAL Hermes profiles, so i
 - Only keys ASES manages are changed: a value is merged into the loaded YAML and every other key survives, in order.
   Comments do not survive yaml.safe_dump (the backup keeps the original bytes). A config the loader cannot round-trip
   (a custom tag, more than one document, a value that dumps to something different) is refused, not rewritten.
-- Nothing here runs `hermes` itself except through the injectable `runner` (default: sandbox.default_runner, which
-  runs the command with a timeout and never raises).
+- Nothing here runs `hermes` itself except through the injectable `runner` (default: _hermes_runner, which is
+  sandbox.default_runner with a credential-scrubbed environment: it runs the command with a timeout and never
+  raises, and a provider key exported into the shell that runs `swarm init` never reaches hermes, ASES-CFG-05).
 
 What Hermes 0.21.3 really does, read from its source on 2026-09-22 (toolsets.py, model_tools.py,
 tools/kanban_tools.py, hermes_cli/tools_config.py, profiles.py, profile_cmd.py, config_defaults.py,
@@ -1209,6 +1210,14 @@ def _env_definition(data: bytes, name: str) -> bytes | None:
     return found
 
 
+def _hermes_runner(argv: Sequence[str], timeout: float):
+    """The default `runner(argv, timeout)` of apply_init: sandbox.default_runner (a timeout, closed stdin, never
+    raises) started with hermes.scrubbed_environ() instead of the parent's whole environment (ASES-CFG-05, blueprint
+    10.2: a provider key exported into the shell that runs `swarm init` must not reach `hermes profile create`).
+    The runner contract stays (argv, timeout), so an injected runner sees no difference."""
+    return sandbox_mod.default_runner(argv, timeout, env=hermes_mod.scrubbed_environ())
+
+
 class _Applier:
     """State of one apply_init call: the home, the backup stamp, the runner, and the files already backed up."""
 
@@ -1347,7 +1356,8 @@ def apply_init(
     """Make the changes of a plan. It changes the user's REAL Hermes profiles, so it raises ProfileError unless the
     caller passes confirmed=True (after the user has approved the plan).
 
-    Missing profiles are created through `runner(argv, timeout)` (default: sandbox.default_runner, which never raises)
+    Missing profiles are created through `runner(argv, timeout)` (default: _hermes_runner, sandbox.default_runner
+    with a credential-scrubbed environment, which never raises)
     with argv [hermes, "profile", "create", name, "--description", description]; never --clone-all, and no cloning at
     all: a clone copies memory files and static API keys (ASES-ROL-02). Then each change is applied on its own: a
     failure is recorded with its reason and the rest continue. Files are written next to a backup
@@ -1369,7 +1379,7 @@ def apply_init(
         raise ProfileError("apply_init takes the Change objects that plan_init returned")
     del prompts_dir  # see the docstring
     applier = _Applier(
-        pathlib.Path(hermes_home), _stamp(now), runner if runner is not None else sandbox_mod.default_runner,
+        pathlib.Path(hermes_home), _stamp(now), runner if runner is not None else _hermes_runner,
         reuse_credentials_from,
     )
     applied: list[Change] = []

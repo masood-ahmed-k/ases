@@ -1629,6 +1629,22 @@ def test_default_runner_closes_stdin_and_passes_the_timeout(monkeypatch):
     assert "shell" not in seen or seen["shell"] is False
 
 
+def test_default_runner_inherits_the_environment_unless_one_is_given(monkeypatch):
+    """The plain (argv, timeout) call every probe makes inherits the parent's environment, credentials included:
+    the key visibility test must be able to see a credential that a mis-built docker run would forward. A caller
+    that starts hermes passes its own scrubbed copy (profiles.apply_init, ASES-CFG-05)."""
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(kwargs.get("env"))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
+    sandbox.default_runner(["docker", "info"], 7)
+    sandbox.default_runner(["hermes", "profile", "create", "x"], 7, env={"PATH": "p", "ASES_ONLY": "1"})
+    assert seen == [None, {"PATH": "p", "ASES_ONLY": "1"}]
+
+
 def test_every_probe_carries_its_own_timeout():
     """20 seconds to ask docker a question, 120 to run a container."""
     seen = {}

@@ -67,7 +67,7 @@ import pathlib
 import posixpath
 import re
 import subprocess
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, NamedTuple
 
 import yaml
@@ -1021,16 +1021,23 @@ def remove_container_command(name: str) -> list[str]:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def default_runner(argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess:
+def default_runner(
+    argv: Sequence[str], timeout: float, *, env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """Run argv with a timeout and never raise: a command that is missing, cannot start or does not finish comes
     back as a CompletedProcess with RC_NOT_FOUND, RC_ERROR or RC_TIMEOUT and the reason in stderr. stdin is closed,
     so nothing can wait for input. Killing a timed-out docker CLI does not stop its container (see
-    remove_container_command)."""
+    remove_container_command).
+
+    `env` is the environment the command starts with; None (the default, and what every `runner(argv, timeout)`
+    call gets) inherits the parent's whole environment, as before. The docker probes here rely on that: the key
+    visibility test must see a credential that a mis-built `docker run` would forward, so this helper never
+    scrubs on its own. A caller that starts hermes passes hermes.scrubbed_environ() (ASES-CFG-05)."""
     argv = list(argv)
     try:
         return subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, env=env,
         )
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(argv, RC_TIMEOUT, _text(exc.stdout), f"timed out after {timeout}s")

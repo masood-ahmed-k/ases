@@ -1322,3 +1322,57 @@ behavior: found none needing a fix. Independent full suite run: 5505 passed, 2 s
 agent's own count.
 
 Architect's own final clean run (no concurrent editors) before committing: see the commit message for the exact number.
+
+## ASES-CFG-05 close-out: an audit sweep, a doc-ordering fix, and two build-and-verify pairs on real hermes launches
+
+An inspection audit of the three remaining not_covered rows (ASES-ARC-01, ASES-DOC-03, ASES-CFG-05) found ARC-01 satisfied by
+design (closed same day, no code, see the register note for the row-by-row citations against blueprint table 2), DOC-03 honestly
+partial (build order compressed across rounds, no exit test run for real yet, by disclosed policy), and one mechanical defect in
+this very file's sibling, `docs/architecture.md`: a 2026-09-18/19 section had drifted to sit after three much later round
+sections, because new sections were repeatedly inserted before a fixed anchor without checking that anchor's own place in time.
+Fixed directly the same day: the misplaced 64-line block now sits right after the section it actually continues from, confirmed
+by a line-count-preserving diff (64 inserted, 64 deleted, same total).
+
+For CFG-05's live half, the audit also surfaced a concrete, previously-unlisted gap: `hermes.py`'s `_run` and `evals.py`'s
+`_run_process` (the one function that makes a real, live one-shot hermes call for an evaluation) both launched the real hermes
+CLI with the parent's full, unfiltered environment. Two build-and-independently-verify pairs closed this, run back to back:
+
+**Pair 1** (`hermes.py`, `evals.py`, `evalkit/codeeval.py`): the builder's first attempt defined the scrub as a new public
+function of `hermes.py` itself and broke 50 tests, because `ases.fakes.board.FakeHermes.install` replaces every public function
+DEFINED in that module and `test_fakes.py` requires a fake with the same signature for each one; an environment scrub is not a
+Hermes call and must never be faked. Corrected to a new module, `src/ases/procenv.py` (stdlib-only, zero ASES imports, so the
+lowest module that starts a process can use it), re-exported from `hermes.py` (a re-export keeps `__module__ == "ases.procenv"`,
+invisible to the fake-completeness check). `evals.py` and `evalkit/codeeval.py` (which used to carry its own, near-identical
+credential regex) both now build on the same one definition. Discriminating proof: reverted, both new tests fail with the
+credential leaking through; restored, both pass. Independent verifier ran its own adversarial test (three credential-shaped
+names, both real and timeout code paths) and confirmed no leak, no missed site, and a clean independent full suite:
+5515 passed, 2 skipped, 0 failed.
+
+**Pair 2** (`cli.py`, `critic.py`, `profiles.py`, `sandbox.py`): closed the three remaining real hermes-launch sites the first
+pair's builder had spotted and flagged but left out of scope (a spawned follow-up suggestion the user started): the `swarm plan`
+Lead call, the `swarm critique` reviewer call, and the real `hermes profile create` call. The first two got the same one-keyword
+`env=hermes_mod.scrubbed_environ()` addition. `profiles.py`'s case needed a real design decision: `sandbox.default_runner` (the
+injectable runner `profiles.py` calls through) is also the instrument of the Docker sandbox's own key-leak probes
+(`key_visibility_test`, `exfiltration_probe`), which need to see a REAL, unscrubbed environment to detect a regression in
+`docker_run_argv`'s own credential filtering -- scrubbing `default_runner` globally would have blinded the very probes that exist
+to catch this class of bug. Fixed instead with a new `_hermes_runner` wrapper that composes a scrubbed call on top of
+`default_runner`'s new optional `env=` parameter (default `None`, meaning "inherit, exactly as before," so every other caller of
+`default_runner` is untouched), made the default for `profiles.py`'s real init path. A hard constraint that ruled out a third
+option (growing the runner `Callable` contract to accept `env`): `test_profiles.py` asserts the module never contains the string
+`subprocess`, and every injected fake runner in both test files takes exactly `(argv, timeout)`. Discriminating proof for all
+three sites via `git stash push -- <file>` / `git stash pop`, each showing the exact old failure and the fix restoring a pass.
+Independent verifier ran its own adversarial test through `critic.run_critique` from the top of its real call path (not just
+`default_invoke` directly), covering the reviewer's repair-call branch too, and confirmed no fourth unscrubbed site exists: all
+five `hermes_path()` call sites in `src/ases` (hermes.py, evals.py, cli.py, critic.py, profiles.py) are now covered.
+
+Both independent verifiers, working from different agents on different days' worth of investigation, converged on the exact same
+out-of-scope finding: `gates.py`'s `_run_commands` still runs the project's own gate commands with `shell=True` and the
+operator's full, unscrubbed environment, so a model-authored test committed to the repo could read a key from the controller's
+own shell during a gate run. Same family as ASES-SEC-01/03. Neither patched it (a real design decision -- COMSPEC/PATH must
+survive, and sandbox runners already bypass this path -- not a two-line fix), correctly reporting rather than patching under
+time pressure, per instruction. Also flagged, not a bug: the shared credential pattern also strips `SSH_AUTH_SOCK`/`XAUTHORITY`
+on POSIX and `SESSIONNAME` on Windows from every scrubbed launch, which would affect an ssh-agent-backed git push from a Lead's
+terminal tool; a human decision for later, not touched.
+
+Architect's own final clean run on the fully combined tree (no concurrent editors) before committing: 5512 passed, 2 skipped,
+0 failed.

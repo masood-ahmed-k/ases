@@ -33,7 +33,7 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
-from . import events, hermes, ledger, policy
+from . import events, hermes, ledger, policy, procenv
 from .evalkit import codetasks
 from .evalkit import tasks as tasks_mod
 from .evalkit.model import (  # re-exported: these are the public spellings
@@ -337,10 +337,12 @@ def _run_process(
     argv: list[str], cwd: pathlib.Path, timeout: int, *, popen: Callable = subprocess.Popen,
     kill_tree: Callable[[int], None] = _kill_process_tree,
 ) -> _Process:
-    """Run `argv` with UTF-8 output and no stdin, and never raise. A timeout stops the whole process tree (a Hermes
+    """Run `argv` with UTF-8 output, no stdin and a credential-scrubbed environment (ASES-CFG-05: a provider key
+    exported into the shell that runs `swarm eval` must not reach the hermes process; procenv.scrubbed_environ is
+    the one definition of which names count), and never raise. A timeout stops the whole process tree (a Hermes
     launcher starts a Python child, and killing only the launcher would leave the model call running and spending
     quota) and comes back as returncode -1 with timed_out True."""
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    env = dict(procenv.scrubbed_environ(), PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     try:
         proc = popen(
             argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

@@ -586,6 +586,35 @@ def test_run_lead_calls_hermes_with_the_lead_profile_and_the_file_and_terminal_t
     assert result == cli._LeadResult(True, 0, "done")
 
 
+def test_run_lead_starts_hermes_with_a_credential_scrubbed_environment(monkeypatch):
+    """ASES-CFG-05 (blueprint 10.2): a provider key exported into the shell that runs `swarm plan` must not reach
+    the Lead's hermes process, while PATH (and SYSTEMROOT on Windows) still must. Nothing else about the call
+    changes."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-adversarial-12345")
+    monkeypatch.setenv("ASES_HARMLESS_SETTING", "kept")
+    monkeypatch.setattr(cli.hermes_mod, "hermes_path", lambda: "hermes")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, kwargs=kwargs)
+        return _Completed(0, "done\n", "")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli._run_lead(pathlib.Path("r"), "p") == cli._LeadResult(True, 0, "done")
+
+    env = seen["kwargs"].get("env")
+    assert env is not None, "_run_lead passed no env=, so the Lead inherits the whole parent environment"
+    assert "OPENROUTER_API_KEY" not in {name.upper() for name in env}
+    assert "sk-test-adversarial-12345" not in env.values()
+    assert env["ASES_HARMLESS_SETTING"] == "kept" and env["PATH"] == os.environ["PATH"]
+    if os.name == "nt":
+        assert env["SYSTEMROOT"] == os.environ["SYSTEMROOT"]
+    assert {k: v for k, v in seen["kwargs"].items() if k != "env"} == {
+        "capture_output": True, "text": True, "timeout": 1800, "encoding": "utf-8", "errors": "replace",
+    }
+
+
 def test_run_lead_falls_back_to_stderr_when_stdout_is_empty(monkeypatch):
     monkeypatch.setattr(cli.hermes_mod, "hermes_path", lambda: "hermes")
     monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: _Completed(1, "", "boom\n"))
