@@ -593,21 +593,34 @@ def test_ordinary_files_are_not_gate_configuration(path):
     assert only(tamper.analyze_diff(file_diff(path, CHANGE)), "gate_config_changed") == []
 
 
-def test_a_config_path_the_task_allows_is_not_flagged():
+def test_touches_alone_no_longer_exempts_a_config_path():
+    """ASES-QG-02, round 9 (CIPIN). BEFORE this fix, naming a gate-config path in the task's own touches
+    (`allow_paths`) -- literal or
+    wildcarded, narrow or broad -- was read as "a plan task allows it" and suppressed gate_config_changed. That
+    made the finding unreachable from review.check_branch's real wiring: _check_scope already refuses any diff
+    with a path outside touches before the tamper check ever runs, so every path this function sees from that
+    caller is already covered by touches. AFTER: touches plays no part in this decision any more; only the
+    plan task's own allow_gate_config_changes marker does (see test_gate_config_allowed_exempts_the_whole_task
+    below for the positive case)."""
     diff = file_diff("pyproject.toml", CHANGE)
 
-    assert only(tamper.analyze_diff(diff, allow_paths=["pyproject.toml"]), "gate_config_changed") == []
-    assert only(tamper.analyze_diff(diff, allow_paths=["*.toml"]), "gate_config_changed") == []
+    assert len(only(tamper.analyze_diff(diff, allow_paths=["pyproject.toml"]), "gate_config_changed")) == 1
+    assert len(only(tamper.analyze_diff(diff, allow_paths=["*.toml"]), "gate_config_changed")) == 1
     assert len(only(tamper.analyze_diff(diff, allow_paths=["src/**"]), "gate_config_changed")) == 1
     assert len(only(tamper.analyze_diff(diff, allow_paths=[]), "gate_config_changed")) == 1
 
 
-def test_allowing_one_config_file_does_not_allow_another():
+def test_gate_config_allowed_exempts_the_whole_task_not_one_named_path():
+    """allow_gate_config_changes is the plan task's own marker (ASES-QG-02): a whole-task switch, unlike the
+    old touches-based exemption it replaces, it does not need the changed path to be named anywhere -- setting
+    it exempts every gate-config path the task's diff touches, not just one the plan happens to list."""
     diff = file_diff("pyproject.toml", CHANGE) + file_diff("tox.ini", CHANGE)
 
+    assert only(tamper.analyze_diff(diff, allow_gate_config_changes=True), "gate_config_changed") == []
+    # Without the marker both paths are flagged, regardless of what allow_paths (touches) names -- naming only
+    # one of them in touches used to be enough to exempt it; it no longer is.
     hits = only(tamper.analyze_diff(diff, allow_paths=["tox.ini"]), "gate_config_changed")
-
-    assert [h.path for h in hits] == ["pyproject.toml"]
+    assert {h.path for h in hits} == {"pyproject.toml", "tox.ini"}
 
 
 def test_package_json_counts_only_when_a_test_related_key_is_touched():
@@ -639,32 +652,49 @@ def test_paths_named_by_the_gate_profile_commands_count_as_gate_configuration():
     assert len(only(tamper.analyze_diff(diff, gate_config_paths=["scripts/check.sh"]), "gate_config_changed")) == 1
     assert len(only(tamper.analyze_diff(diff, gate_config_paths=["scripts/*.sh"]), "gate_config_changed")) == 1
     assert only(tamper.analyze_diff(diff, gate_config_paths=["scripts/other.sh"]), "gate_config_changed") == []
-    assert only(tamper.analyze_diff(diff, gate_config_paths=["scripts/check.sh"], allow_paths=["scripts/check.sh"]),
-                "gate_config_changed") == []
+    # ASES-QG-02: touches (allow_paths) no longer exempts it on its own; only allow_gate_config_changes does.
+    assert len(only(tamper.analyze_diff(diff, gate_config_paths=["scripts/check.sh"], allow_paths=["scripts/check.sh"]),
+                     "gate_config_changed")) == 1
+    assert only(tamper.analyze_diff(
+        diff, gate_config_paths=["scripts/check.sh"], allow_paths=["scripts/check.sh"],
+        allow_gate_config_changes=True,
+    ), "gate_config_changed") == []
 
 
-def test_allow_globs_match_exactly_like_the_touches_check():
-    from ases import integrity
-
+def test_touches_globs_no_longer_change_the_gate_config_changed_verdict():
+    """ASES-QG-02, round 9 (CIPIN): this test used to be named test_allow_globs_match_exactly_like_the_touches_
+    check and asserted that gate_config_changed's exemption tracked integrity.paths_outside_touches's own
+    touches-overlap test exactly -- which was precisely the bug (see
+    test_touches_alone_no_longer_exempts_a_config_path): review.check_branch's scope check already guarantees
+    every path reaching the tamper check is in scope, so an exemption keyed on touches could never actually
+    withhold the finding in real use. It is now keyed on allow_gate_config_changes alone, regardless of touches."""
     paths = ["pyproject.toml", "packages/api/pyproject.toml", "tests/unit/conftest.py", ".github/workflows/ci.yml"]
     globs = ["*", "**", "*.toml", "packages/*", "packages/**", "tests/*", "tests/**", ".github/*", ".github/**/*.yml",
              "pyproject.toml", "conftest.py", "src/*"]
     for path in paths:
         for glob in globs:
             hits = only(tamper.analyze_diff(file_diff(path, CHANGE), allow_paths=[glob]), "gate_config_changed")
-            in_scope = integrity.paths_outside_touches([path], [glob]) == []
-            assert (hits == []) == in_scope, (path, glob)
+            assert len(hits) == 1, (path, glob)  # touches never exempts on its own any more
+            hits = only(
+                tamper.analyze_diff(file_diff(path, CHANGE), allow_paths=[glob], allow_gate_config_changes=True),
+                "gate_config_changed",
+            )
+            assert hits == [], (path, glob)  # the marker exempts no matter which glob (if any) covers the path
 
 
 def test_allow_paths_accepts_a_bare_string_none_and_windows_style_globs():
-    diff = file_diff("pyproject.toml", CHANGE)
+    """_globs() (shared by every finding that reads allow_paths) accepts a bare string, None, a mix of junk, or
+    an iterator, normalising each into a tuple of path globs. Exercised through generated_artifact rather than
+    gate_config_changed, since ASES-QG-02 (round 9, CIPIN) moved gate_config_changed's exemption off allow_paths
+    entirely, onto the plan task's own allow_gate_config_changes marker."""
+    diff = file_diff("dist/bundle.js", ["+x"], status="A")
 
-    assert only(tamper.analyze_diff(diff, allow_paths="pyproject.toml"), "gate_config_changed") == []
-    assert only(tamper.analyze_diff(diff, allow_paths="./pyproject.toml"), "gate_config_changed") == []
-    assert only(tamper.analyze_diff(diff, allow_paths=iter([".\\pyproject.toml"])), "gate_config_changed") == []
-    assert len(only(tamper.analyze_diff(diff, allow_paths=None), "gate_config_changed")) == 1
-    assert len(only(tamper.analyze_diff(diff, allow_paths=[None, 3, ""]), "gate_config_changed")) == 1
-    assert len(only(tamper.analyze_diff(diff, allow_paths=7), "gate_config_changed")) == 1
+    assert only(tamper.analyze_diff(diff, allow_paths="dist/bundle.js"), "generated_artifact") == []
+    assert only(tamper.analyze_diff(diff, allow_paths="./dist/bundle.js"), "generated_artifact") == []
+    assert only(tamper.analyze_diff(diff, allow_paths=iter([".\\dist\\bundle.js"])), "generated_artifact") == []
+    assert len(only(tamper.analyze_diff(diff, allow_paths=None), "generated_artifact")) == 1
+    assert len(only(tamper.analyze_diff(diff, allow_paths=[None, 3, ""]), "generated_artifact")) == 1
+    assert len(only(tamper.analyze_diff(diff, allow_paths=7), "generated_artifact")) == 1
 
 
 # --- generated_artifact --------------------------------------------------------------------------------------
@@ -943,7 +973,9 @@ def test_a_task_allowed_to_change_its_config_only_gets_the_other_findings(repo):
     append_or_true(repo)
     commit(repo)
 
-    findings = tamper.check_range(repo, "integration", "swarm/T1", allow_paths=["pytest.ini"])
+    findings = tamper.check_range(
+        repo, "integration", "swarm/T1", allow_paths=["pytest.ini"], allow_gate_config_changes=True,
+    )
 
     assert kinds(findings) == ["unconditional_pass"]
 

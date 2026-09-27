@@ -712,7 +712,7 @@ def process_review_lane(
         branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
         ok = review_mod.gate_before_review(
             board, card["id"], repo, branch, plan.integration_branch, gate_cmds, list(task.touches),
-            conn=conn, task_key=task_key,
+            conn=conn, task_key=task_key, allow_gate_config_changes=task.allow_gate_config_changes,
         )
         if not ok:
             sent_back.append(task_key)
@@ -938,6 +938,7 @@ def process_merge_queue(
             check = review_mod.check_branch_for_merge(
                 repo, branch, plan.integration_branch, gate_cmds, list(task.touches), conn=conn, task_key=key,
                 require_binding=True, reviewed_commit=verdict.commit or _handoff_commit(work_card),
+                allow_gate_config_changes=task.allow_gate_config_changes,
             )
             if not check.ok and check.kind == "tamper_check_error":
                 # git could not answer the tamper question, so nothing is known about the diff: not a failure of the

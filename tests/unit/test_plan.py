@@ -452,11 +452,25 @@ def test_bare_star_touches_is_accepted_with_allow_gate_config_changes():
     assert p.task("T1").touches == ("*",)
 
 
-def test_narrow_explicit_touches_on_a_gate_config_file_needs_no_marker():
+def test_narrow_explicit_touches_on_a_gate_config_file_needs_the_marker_too():
+    """Round 9 (CIPIN): this used to be the one exemption ASES-QG-02 granted without the marker (a literal
+    touches naming exactly one gate-config path). tamper.analyze_diff no longer reads being named in touches,
+    literal or wildcarded, as "a plan task allows it" for gate_config_changed -- only allow_gate_config_changes
+    does -- so Gate 0 must ask for the marker here too, or it would approve a plan Gate 1 can never let
+    through (a worker editing exactly the pytest.ini it declared would be sent back forever)."""
     raw = _raw_plan(_raw_task("T1", ["pytest.ini"]))
+    with pytest.raises(plan_mod.PlanError) as info:
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert any(
+        "gate/CI configuration" in e and "T1" in e and "'pytest.ini'" in e for e in info.value.errors
+    )
+
+
+def test_narrow_explicit_touches_on_a_gate_config_file_is_allowed_with_the_marker():
+    raw = _raw_plan({**_raw_task("T1", ["pytest.ini"]), "allow_gate_config_changes": True})
     p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
     assert p.task("T1").touches == ("pytest.ini",)
-    assert p.task("T1").allow_gate_config_changes is False
+    assert p.task("T1").allow_gate_config_changes is True
 
 
 def test_wildcard_touches_that_does_not_reach_gate_config_is_unaffected():
@@ -474,12 +488,14 @@ def test_src_star_star_touches_does_not_reach_a_root_level_pytest_ini():
 
 
 def test_only_the_offending_touches_entry_is_named_in_the_error():
-    raw = _raw_plan(_raw_task("T1", ["pytest.ini", "docs/*.md", "*"]))
+    # src/a.py is a literal touches entry too, like pytest.ini, but it is not a gate-config path, so it must
+    # stay unnamed just like the non-offending wildcard docs/*.md; only "*" actually reaches gate config.
+    raw = _raw_plan(_raw_task("T1", ["src/a.py", "docs/*.md", "*"]))
     with pytest.raises(plan_mod.PlanError) as info:
         plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
     hits = [e for e in info.value.errors if "gate/CI configuration" in e]
     assert len(hits) == 1
-    assert "'*'" in hits[0] and "'pytest.ini'" not in hits[0] and "'docs/*.md'" not in hits[0]
+    assert "'*'" in hits[0] and "'src/a.py'" not in hits[0] and "'docs/*.md'" not in hits[0]
 
 
 def test_allow_gate_config_changes_must_be_a_bool():
@@ -581,7 +597,10 @@ def test_explicit_depends_on_the_scaffold_task_is_what_actually_orders_parallel_
     scaffold strictly before every dependent task in topological_order -- with no help needed from touches
     overlap (serialization_links stays empty)."""
     raw = _raw_plan(
-        _raw_task("scaffold", ["pyproject.toml", "package.json", ".gitattributes", "AGENTS.md"]),
+        # pyproject.toml is a literal gate-config path (round 9, CIPIN): scaffold's touches genuinely covers
+        # it, unrelated to what this test proves, so it needs the marker like any other such task.
+        {**_raw_task("scaffold", ["pyproject.toml", "package.json", ".gitattributes", "AGENTS.md"]),
+         "allow_gate_config_changes": True},
         _raw_task("T1", ["src/feature_x.py"], depends_on=["scaffold"]),
         _raw_task("T2", ["src/feature_y.py"], depends_on=["scaffold"]),
     )
