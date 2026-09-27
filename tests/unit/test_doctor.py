@@ -370,6 +370,24 @@ def test_the_profile_rows_cite_the_requirements_they_check(tmp_path, monkeypatch
     assert {"ASES-ROL-02", "ASES-ROL-07", "ASES-ARC-08"} <= set(by_name["profile_state[1]"].requirement_ids)
 
 
+def test_worktree_sync_drift_is_a_profile_state_warn_row_citing_ases_git_16(tmp_path, monkeypatch, world):
+    """ASES-GIT-16: profiles.verify_state reports a profile whose worktree_sync is not pinned to false as one
+    more profile_state problem, and that row must cite ASES-GIT-16 like every other requirement_ids row does
+    (test_the_profile_rows_cite_the_requirements_they_check checks the other three IDs on the same family of
+    rows)."""
+    world.verify_problems = [
+        "profile coder-1 has worktree_sync on (Hermes default): worktrees would branch from a fetched remote "
+        "tip (ASES-GIT-16)",
+    ]
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    assert report.ok is True  # a WARN row, never a FAIL
+    assert by_name["profile_state[1]"].status == "warn"
+    assert "worktree_sync" in by_name["profile_state[1]"].detail
+    assert "ASES-GIT-16" in by_name["profile_state[1]"].requirement_ids
+
+
 def test_verify_state_is_asked_about_the_hermes_home_the_prompts_and_the_sandbox_switch(tmp_path, monkeypatch, world):
     project, _, _ = _run_healthy(tmp_path, monkeypatch)
 

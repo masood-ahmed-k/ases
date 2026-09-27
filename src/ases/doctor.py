@@ -22,6 +22,7 @@ import dataclasses
 import importlib
 import inspect
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -189,6 +190,12 @@ def _takes(func, name: str) -> bool:
     return name in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
 
 
+def _extract_requirement_ids(problem: str) -> tuple[str, ...]:
+    """Add any requirement IDs from the problem message to the base profile IDs."""
+    ids = tuple(dict.fromkeys(re.findall(r'ASES-[A-Z]+-\d+', problem))) + _PROFILE_IDS
+    return tuple(dict.fromkeys(ids))
+
+
 def _load_profiles_module() -> tuple[object | None, DoctorCheck | None]:
     """(the ases.profiles module, None), or (None, the row to show instead). The module belongs to another
     package and a machine may not have it yet, so a missing one is PENDING (a true statement about the build) and
@@ -240,7 +247,9 @@ def _check_profile_state(project: ases_config.ProjectConfig, models_config: dict
             _PROFILE_IDS,
         )]
     return [
-        DoctorCheck(f"profile_state[{number}]", "warn", f"{problem} (`swarm init` shows the fix)", _PROFILE_IDS)
+        DoctorCheck(
+            f"profile_state[{number}]", "warn", f"{problem} (`swarm init` shows the fix)", _extract_requirement_ids(problem),
+        )
         for number, problem in enumerate(problems, start=1)
     ]
 
