@@ -1,7 +1,11 @@
 # Round 9 package EVENTSPROJ: events carry their project (read `r9_rules.md`)
 
-Runs LAST, alone, after every other round 9 branch is merged, because it touches nearly every module. Worktree:
-`C:\Users\masoo\ases-wt\eventsproj`, branch `r9/eventsproj`, cut from the merged master. Tier 1 item 5.
+Touches nearly every module, so it starts after wave A is merged (T2B, CAPDOC, DOCTOR, PAUSEREASON, IDLEWT, MERGEPK, CIPIN are
+all on master). Wave B (GITHARDEN: the git subprocess call lines; GATESANDBOX: the gate call sites) is still being built on its
+own branches and merges after you; keep every hunk to the `events.record(` line or the `FROM events` query itself, never reflow
+the surrounding code, so those merges stay mechanical. Worktree: `C:\Users\masoo\ases-wt\eventsproj`, branch `r9/eventsproj`,
+cut from master after wave A. MERGEPK made `merge_records` project-scoped with schema v8: if you need a migration it is v9 (and
+GATESANDBOX may also add one; the architect renumbers at merge). Tier 1 item 5.
 
 ## Requirements (quoted from blueprint.txt)
 - ASES-ARC-03 (p101): "Every ASES record is keyed by the Hermes card ID and, where code is involved, by the commit SHA. On startup
