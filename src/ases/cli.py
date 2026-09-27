@@ -942,16 +942,42 @@ def _print_reconcile(report) -> None:
 
 
 def _refuse_unless_startable(conn, plan) -> int | None:
-    """ASES-CTL-01, ASES-REC-06: start the project's wall clock, or return exit code 4 after saying why it cannot
-    start. A stopped or finished project is refused by bounds.start_project itself (StateError). A paused project
-    is refused HERE: start_project would quietly make it running, but a pause (a reached bound, a failed final
-    gate) is a decision for the operator, who lifts it with `swarm resume`."""
+    """ASES-REC-06: return exit code 4 after saying why the project cannot even be considered for a run, reading
+    ONLY the project's currently recorded status (no side effect): paused (a reached bound, a failed final gate)
+    is a decision for the operator, who lifts it with `swarm resume`; stopped is the kill switch; finished has
+    nothing left to run. None otherwise.
+
+    Round 12 (RUNSTART, finding 8, ASES-REC-04/ASES-CTL-01): this used to also call bounds.start_project itself,
+    which stamps started_at and starts the project's wall clock -- BEFORE _reconcile_on_start got a chance to
+    refuse the run. An operator fixing a blocked reconcile could then burn real wall-clock budget on an attempt
+    that dispatched nothing at all, and project_state showed 'running' the whole time it was blocked. The actual
+    wall-clock start now happens in _start_project_or_refuse, called only once _reconcile_on_start has not
+    refused: reconcile.reconcile does not read or require project_state at all (it compares the board, git and
+    the ASES database), so running it before the project is marked running is safe."""
     state = bounds_mod.get_state(conn, plan.project)
-    if state is not None and state["status"] == "paused":
+    status = state.get("status") if state else None
+    if status == "paused":
         why = state.get("stop_reason") or "a bound was reached or a final gate failed"
         _err(f"swarm run REFUSED: project {plan.project} is paused ({why}). "
              f"swarm status shows why; swarm resume [--extend-minutes N] lifts the pause.")
         return 4
+    if status == "finished":
+        _err(f"swarm run REFUSED: project {plan.project} is finished; there is nothing left to run.")
+        return 4
+    if status == "stopped":
+        why = state.get("stop_reason") or "no reason was recorded"
+        _err(f"swarm run REFUSED: project {plan.project} is stopped ({why}). swarm resume lifts a stop "
+             f"(ASES-REC-06).")
+        return 4
+    return None
+
+
+def _start_project_or_refuse(conn, plan) -> int | None:
+    """ASES-CTL-01: start the project's wall clock, now that _refuse_unless_startable and _reconcile_on_start
+    (ASES-REC-04) have both had their say and neither refused. bounds.start_project's own StateError is still
+    caught here as a backstop for the narrow race _refuse_unless_startable's read cannot close on its own (a stop
+    landing between that read and this write): "the refusal is part of the write statement, so a stop that lands
+    between our read and our write still wins" (bounds.start_project's own docstring)."""
     try:
         bounds_mod.start_project(conn, plan.project)
     except bounds_mod.StateError:
@@ -1094,20 +1120,38 @@ def _run_loop(args: argparse.Namespace) -> int:
         _err(f"swarm run REFUSED (ASES-QG-02): {exc}")
         return 1
 
-    # ASES-GIT-12: refuse to start on a primary checkout ASES cannot trust (wrong branch, uncommitted changes),
+    # ASES-GIT-12: refuse to start on a primary checkout ASES cannot trust (wrong branch, uncommitted changes, or,
+    # on a restart, a HEAD moved by something other than ASES since the last run -- round 12, RUNSTART, finding 2),
     # then adopt its HEAD as the one the per-pass guard expects.
-    guard = guards_mod.check_primary_checkout(repo, plan.integration_branch)
+    allow_head_move = bool(getattr(args, "allow_head_move", False))
+    last_adopted = guards_mod.expected_head(conn, plan.project)
+    guard = guards_mod.check_primary_checkout(
+        repo, plan.integration_branch, None if allow_head_move else last_adopted,
+    )
     if not guard.ok:
         _err("swarm run REFUSED (ASES-GIT-12): the primary checkout is not in a state ASES can trust:")
         for problem in guard.problems[:20]:
             _err(f"  - {problem}")
+        if any("HEAD moved" in problem for problem in guard.problems):
+            _err("swarm run REFUSED: the primary checkout HEAD moved since the last run's own adopted head, "
+                 "the exact drift ASES-GIT-12 exists to catch (a stray write into the primary checkout between "
+                 "two runs). If this move is expected and safe, re-run with --allow-head-move to adopt it.")
         return 3
+    if allow_head_move and last_adopted is not None and guard.head and guard.head != last_adopted:
+        _err(f"WARNING: --allow-head-move given: adopting a primary checkout HEAD that moved since the last run "
+             f"(expected {last_adopted[:12]}, found {guard.head[:12]}) into the base-check allow-list.")
     guards_mod.adopt_current_head(conn, plan.project, repo)
 
+    # ASES-REC-04, ASES-CTL-01 (round 12, RUNSTART, finding 8): reconcile-on-start gets its say BEFORE the
+    # project's wall clock starts, so a run reconcile refuses never marks the project running or stamps a
+    # started_at it never earned.
     refused = _refuse_unless_startable(conn, plan)
     if refused is not None:
         return refused
     refused = _reconcile_on_start(project, repo, plan, conn, bool(getattr(args, "ignore_reconcile", False)))
+    if refused is not None:
+        return refused
+    refused = _start_project_or_refuse(conn, plan)
     if refused is not None:
         return refused
 
@@ -1755,6 +1799,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--ignore-reconcile", dest="ignore_reconcile", action="store_true",
                        help="Continue although reconcile-on-start left items it could not repair (exit code 5 "
                             "otherwise); whatever they describe stays unfixed")
+    p_run.add_argument("--allow-head-move", dest="allow_head_move", action="store_true",
+                       help="ASES-GIT-12: adopt the primary checkout's current HEAD as the new baseline even "
+                            "though it moved since the last run (exit code 3 otherwise). Only pass this when you "
+                            "know why HEAD moved and it is safe; the move is still logged loudly.")
     p_run.set_defaults(func=cmd_run)
 
     p_questions = sub.add_parser("questions", help="List the open questions with their cards (ASES-REC-05)")

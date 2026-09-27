@@ -677,6 +677,25 @@ def test_check_card_base_fails_closed_when_the_branch_does_not_exist(repo):
     assert result.base == ""
 
 
+# --- branch_exists (round 12, RUNSTART, finding 3; ASES-GIT-01, ASES-GIT-16) -----------------------------------
+
+
+def test_branch_exists_is_false_for_a_branch_never_created(repo):
+    assert guards.branch_exists(repo, "swarm/never-created") is False
+
+
+def test_branch_exists_is_true_once_the_branch_is_created(repo):
+    branch = _branch(repo, "swarm/t1")
+
+    assert guards.branch_exists(repo, branch) is True
+
+
+def test_branch_exists_is_false_when_a_git_call_fails(repo, monkeypatch):
+    monkeypatch.setattr(guards.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(OSError("no git")))
+
+    assert guards.branch_exists(repo, "swarm/t1") is False
+
+
 def test_check_card_base_still_passes_after_the_branch_is_reused_for_a_retry(repo):
     """A retried card keeps its original worktree/branch (Hermes: `git worktree add <path> <branch>`, no `-b`),
     which writes no new reflog entry, so the branch's original creation commit -- and the check's answer -- is

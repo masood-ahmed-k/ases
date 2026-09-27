@@ -987,6 +987,25 @@ def test_log_all_ref_updates_is_pending_without_a_repository_path():
     assert check.requirement_ids == ("ASES-GIT-01", "ASES-GIT-16")
 
 
+def test_log_all_ref_updates_pending_detail_does_not_claim_cmd_doctor_has_no_repo_flag():
+    """Finding 9 (round 12, RUNSTART): cmd_doctor has accepted --repo since round 10 (cli.py wires args.repo
+    through to doctor.run's own `repo` keyword, which is exactly what this check consumes), so the "pending"
+    detail must not tell the operator otherwise."""
+    check = doctor._check_log_all_ref_updates(None)
+
+    assert "cmd_doctor has no --repo" not in check.detail
+    assert "not yet given the project repository" not in check.detail
+
+
+def test_log_all_ref_updates_docstring_does_not_claim_cmd_doctor_has_no_repo_flag():
+    """Same finding, the other stale text: a maintainer reading this check's own docstring must not be told
+    cmd_doctor has no --repo flag (it has had one since round 10) or that no round 10 package added it."""
+    doc = doctor._check_log_all_ref_updates.__doc__ or ""
+
+    assert "cmd_doctor has no" not in doc
+    assert "no round 10 package adds it" not in doc
+
+
 def test_log_all_ref_updates_passes_when_explicitly_true(tmp_path):
     repo = _git_repo(tmp_path, log_all_ref_updates=True)
 

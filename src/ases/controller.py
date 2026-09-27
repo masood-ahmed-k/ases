@@ -2101,6 +2101,17 @@ def process_card_base_checks(board: str, repo: pathlib.Path, plan: plan_mod.Plan
     forgot everything") is skipped entirely, the same reading check_primary_checkout already gives an
     expected_head of None: there is nothing yet to compare a base against, so nothing here can call one wrong.
 
+    Round 12 (RUNSTART, finding 3): Hermes's own claim_task commits a card's status='running' in its own database
+    transaction and returns BEFORE the later `git worktree add -b <branch> ...` subprocess that actually creates
+    the branch and its reflog, so `hermes_mod.kanban_list(..., status="running")` can report a card whose branch
+    does not exist in the repository AT ALL yet. check_card_base fails a missing base closed exactly like a wrong
+    one (by design), which would otherwise yank a perfectly legitimate, brand-new card into `blocked` over nothing
+    but bad timing, with no retry. guards.branch_exists is checked first so THAT specific case -- no ref at all --
+    is skipped this pass, unrecorded, so the very next pass rechecks it once Hermes's worktree-add subprocess has
+    caught up; a branch that DOES exist but whose reflog is unusable or names a bad base still fails closed
+    immediately, exactly as before. mergeq.merge_task's own `_check_base` is the enforcement backstop either way,
+    so a card this misses this pass can still never have its branch land.
+
     Only this plan's own work cards (the plan_tasks rows of plan.project) are looked at: a merge card is never
     `running` (the merge queue is the only writer to the integration branch, never a worker), and another
     project's card on the same board is left to its own controller pass, exactly like process_budget_gate scopes
@@ -2127,6 +2138,8 @@ def process_card_base_checks(board: str, repo: pathlib.Path, plan: plan_mod.Plan
         branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
         if _card_base_verified(conn, card_id, branch):
             continue
+        if not guards_mod.branch_exists(repo, branch):
+            continue  # Hermes claimed the card but has not yet run `git worktree add -b`: recheck next pass
         result = guards_mod.check_card_base(repo, branch, allowed)
         if result.ok:
             _record_once(conn, "card_base_verified", {

@@ -123,15 +123,15 @@ def _check_log_all_ref_updates(repo: pathlib.Path | None) -> DoctorCheck:
     closed (blocks it) whenever the signal is missing, so a real remote-tip sync would go undetected right along
     with every legitimate card.
 
-    `repo` is None when the caller has not been given the project repository's path: `swarm doctor` is not yet
-    wired to accept one (cmd_doctor has no `--repo`, unlike `swarm run`/`swarm approve`; no round 10 package adds
-    it), so this stays "pending" rather than silently checking the wrong repository or claiming a pass it cannot
-    back up."""
+    `repo` is None when the caller has not been given the project repository's path: `cmd_doctor`'s `--repo` is
+    optional (added round 10; cli.py threads `args.repo` through to this function's own `repo` keyword), so an
+    invocation without it still runs every other check, but this one stays "pending" rather than silently
+    checking the wrong repository or claiming a pass it cannot back up."""
     if repo is None:
         return DoctorCheck(
             "log_all_ref_updates", "pending",
-            "not checked: swarm doctor is not yet given the project repository's path (cmd_doctor has no --repo "
-            "flag). The base-commit check (guards.check_card_base) depends on core.logAllRefUpdates being on "
+            "not checked: swarm doctor was not given the project repository's path this time (pass --repo). "
+            "The base-commit check (guards.check_card_base) depends on core.logAllRefUpdates being on "
             "there, not in this ASES checkout.",
             ("ASES-GIT-01", "ASES-GIT-16"),
         )
@@ -660,7 +660,7 @@ def _check_no_secrets_in_output(report_text_so_far: str) -> DoctorCheck:
 
 def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: pathlib.Path | None = None) -> DoctorReport:
     """`repo` (round 10, package BASECHECK): the project repository's path, for _check_log_all_ref_updates. Keyword
-    -only and optional so every existing caller (cmd_doctor has no --repo flag yet; see that check's own
+    -only and optional so a caller that does not pass one (cmd_doctor without --repo; see that check's own
     docstring) keeps working unchanged, getting a "pending" row for it instead of a forced signature change."""
     profiles_mod, profiles_unavailable = _load_profiles_module()
     checks: list[DoctorCheck] = [

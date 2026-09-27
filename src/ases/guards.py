@@ -620,6 +620,23 @@ class CardBaseResult:
     reason: str
 
 
+def branch_exists(repo: pathlib.Path, branch: str) -> bool:
+    """True when refs/heads/`branch` resolves to a commit in `repo`, False when it does not (or git could not say
+    at all, which fails closed to "does not exist" rather than guessing).
+
+    Round 12 (RUNSTART, finding 3, ASES-GIT-01/ASES-GIT-16): Hermes's claim_task commits a card's status='running'
+    in its own database transaction and returns BEFORE its later `git worktree add -b <branch> ...` subprocess has
+    actually created the branch. A controller pass that lands in that window must tell "the branch has no ref at
+    all yet" (this function: not yet checkable, safe to skip and recheck the next pass) from "the branch exists
+    but its reflog cannot be read or does not look like a creation" (check_card_base's own domain, which still
+    fails closed immediately: the branch demonstrably exists there and its provenance is unrecoverable or wrong).
+
+    `-q` on `rev-parse --verify` means a branch that does not resolve returns exit 1 with no stderr, not an
+    exception; read-only (--no-optional-locks, through _git), never raises."""
+    code, out, _ = _git(repo, ["rev-parse", "--verify", "-q", f"refs/heads/{branch}"])
+    return code == 0 and bool(out.strip())
+
+
 def _branch_created_from(repo: pathlib.Path, branch: str) -> tuple[str, str]:
     """(the commit `branch` was created at, "") or ("", why it could not be found).
 
