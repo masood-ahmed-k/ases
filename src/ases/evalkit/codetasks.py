@@ -512,11 +512,20 @@ def score_swarm_project(
     if not keys:
         return Score(False, findings={"tasks_total": 0}, notes=f"no plan tasks are recorded for project {text.ascii_safe(project)}")
     marks = ",".join("?" for _ in keys)
+    # round 12, finding 6: a legacy project=NULL row and this project's own row can coexist for one task_key
+    # (db.py's v8 migration leaves an ambiguous task_key NULL on purpose), so the raw row list can hold two
+    # entries for the same task_key. Summing over `merges` directly (the old code) double-counted that task_key,
+    # which could make `merged` exceed `len(keys)` and turn a genuinely fully-merged project into a false "not
+    # all tasks merged" failure. Folded into a dict keyed by task_key instead (the pattern report._quality_panel
+    # and finalgates._task_summaries already use): ORDER BY (project IS NULL) DESC visits the legacy NULL row
+    # first for a given task_key, so this project's own row -- visited second -- is the one left in the dict.
     merges = conn.execute(
         f"SELECT task_key, completed_at, reverted FROM merge_records "
-        f"WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?)", (*keys, project)).fetchall()
-    merged = sum(1 for m in merges if m["completed_at"] and not m["reverted"])
-    reverted = sum(1 for m in merges if m["reverted"])
+        f"WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?) "
+        f"ORDER BY (project IS NULL) DESC", (*keys, project)).fetchall()
+    records = {m["task_key"]: m for m in merges}
+    merged = sum(1 for m in records.values() if m["completed_at"] and not m["reverted"])
+    reverted = sum(1 for m in records.values() if m["reverted"])
     lineage = conn.execute(
         "SELECT COUNT(*) AS n, COALESCE(SUM(review_rounds), 0) AS rounds FROM lineage WHERE project = ?", (project,)).fetchone()
     if lineage["n"]:

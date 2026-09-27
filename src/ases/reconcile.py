@@ -88,7 +88,12 @@ def _check_cards(row, cards: dict, conn, project: str | None = None) -> list[Inc
     `project` (schema v8: merge_records' primary key is (project, task_key), so two projects can share a task_key
     as two separate rows) scopes the read the same NULL-tolerant way gates.last_gate_result does: this project's
     own row or a legacy row with no project recorded, never a different project's row for the same task_key. Left
-    at the default None (the old call shape), nothing is filtered, exactly as before."""
+    at the default None (the old call shape), nothing is filtered, exactly as before.
+
+    A legacy `project IS NULL` row and this project's own row can coexist for the same task_key (db.py's v8
+    migration leaves an ambiguous task_key NULL on purpose), so the ORDER BY below (round 12, same shape as
+    finding 7) prefers this project's own row over the legacy one: `.fetchone()` on the bare OR predicate has no
+    guarantee which row it returns, and picking the wrong one could read a stale/unrelated `reverted` flag."""
     findings: list[Inconsistency] = []
     key = row["task_key"]
     for label, card_id in (("work", row["work_card_id"]), ("merge", row["merge_card_id"])):
@@ -107,7 +112,7 @@ def _check_cards(row, cards: dict, conn, project: str | None = None) -> list[Inc
             else:
                 mr = conn.execute(
                     "SELECT completed_at, reverted FROM merge_records WHERE task_key = ? "
-                    "AND (project IS NULL OR project = ?)", (key, project),
+                    "AND (project IS NULL OR project = ?) ORDER BY (project IS NULL) ASC LIMIT 1", (key, project),
                 ).fetchone()
             if mr is None or not mr["completed_at"]:
                 findings.append(Inconsistency(
@@ -545,15 +550,20 @@ class _Pass:
             (self.project, key, sha, sha, _now()),
         )
 
-    def _finish_record(self, key: str, sha: str) -> None:
-        # Scoped the same NULL-tolerant way _merge_record reads it (this project's own row or a legacy row with
-        # no project recorded), and project is stamped at the same time: finishing a legacy row from git, inside
-        # THIS project's reconcile pass, is exactly the unambiguous attribution db.py's migration 8 backfill
-        # looks for, just discovered at runtime instead of at migration time.
+    def _finish_record(self, key: str, sha: str, record_project) -> None:
+        # round 12, finding 5: scoped by the EXACT project value of the row _merge_record actually found
+        # (record_project, which may itself be None for a legacy row), never the old NULL-tolerant
+        # `(project IS NULL OR project = ?)` predicate. That predicate could match TWO rows at once when a legacy
+        # project=NULL row and this project's own row both exist for `key` with completed_at IS NULL, and the
+        # UPDATE then tried to give both the same (project, task_key) primary key -- sqlite3.IntegrityError. `IS`
+        # matches NULL correctly (unlike `=`), so this is exactly one row, whichever one _merge_record found.
+        # project is stamped at the same time: finishing a legacy row from git, inside THIS project's reconcile
+        # pass, is exactly the unambiguous attribution db.py's migration 8 backfill looks for, just discovered at
+        # runtime instead of at migration time.
         self.conn.execute(
             "UPDATE merge_records SET squash_commit = ?, completed_at = ?, project = ? WHERE task_key = ? "
-            "AND completed_at IS NULL AND (project IS NULL OR project = ?)",
-            (sha, _now(), self.project, key, self.project),
+            "AND completed_at IS NULL AND project IS ?",
+            (sha, _now(), self.project, key, record_project),
         )
 
     def _write_noop(self, key: str) -> None:
@@ -567,12 +577,15 @@ class _Pass:
             (self.project, key, _now()),
         )
 
-    def _mark_reverted(self, key: str) -> None:
-        # Scoped by project (schema v8), the same NULL-tolerant way _merge_record reads it: never flips
-        # reverted=1 on a DIFFERENT project's row that happens to share this task_key.
+    def _mark_reverted(self, key: str, record_project) -> None:
+        # round 12, finding 4 (reconcile side): scoped by the EXACT project value of the row _merge_record
+        # actually found (record_project, possibly None), never the old NULL-tolerant
+        # `(project IS NULL OR project = ?)` predicate -- that matched a legacy project=NULL row too whenever one
+        # coexisted for this task_key, silently flipping reverted=1 on a merge this reconcile pass never touched.
+        # `IS` matches NULL correctly (unlike `=`), so this is exactly one row.
         self.conn.execute(
-            "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND (project IS NULL OR project = ?)",
-            (key, self.project),
+            "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND project IS ?",
+            (key, record_project),
         )
 
     def _complete_card(self, merge_id: str, sha: str | None) -> None:
@@ -623,9 +636,17 @@ class _Pass:
         # Scoped by project (schema v8) the same NULL-tolerant way gates.last_gate_result reads gate_runs: this
         # project's own row or a legacy row with no project recorded, never a different project's row for the
         # same task_key.
+        #
+        # round 12, finding 7 (same shape): a legacy project=NULL row and this project's own row can coexist for
+        # `key` (db.py's v8 migration leaves an ambiguous task_key NULL on purpose). ORDER BY (project IS NULL)
+        # ASC prefers this project's own (non-NULL) row when both match -- `.fetchone()` on the bare OR predicate
+        # has no such guarantee. `project` is selected too so a caller that goes on to WRITE using this row
+        # (_finish_record, _mark_reverted) can scope its own statement to this EXACT row (finding 4/5) instead of
+        # re-deriving the same ambiguous OR predicate.
         return self.conn.execute(
-            "SELECT candidate_sha, gate3_result, squash_commit, reverted, completed_at "
-            "FROM merge_records WHERE task_key = ? AND (project IS NULL OR project = ?)", (key, self.project),
+            "SELECT project, candidate_sha, gate3_result, squash_commit, reverted, completed_at "
+            "FROM merge_records WHERE task_key = ? AND (project IS NULL OR project = ?) "
+            "ORDER BY (project IS NULL) ASC LIMIT 1", (key, self.project),
         ).fetchone()
 
     def _landed(self, merge_id: str, mr) -> str | None:
@@ -682,7 +703,7 @@ class _Pass:
             else:
                 self.do(key, "merge_record_recovered",
                         f"finish the merge record for {key} from git: squash commit {sha}",
-                        functools.partial(self._finish_record, key, sha))
+                        functools.partial(self._finish_record, key, sha, mr["project"]))
         elif row["role"] not in controller_mod._COMMITTING_ROLES:
             self.do(key, "merge_record_noop",
                     f"record the no-op merge of review-only task {key} (merge card {merge_id} is done, git has "
@@ -758,7 +779,7 @@ class _Pass:
                     functools.partial(self._insert_recovered, key, sha))
         else:
             self.do(key, "merge_record_recovered", f"finish the merge record for {key}: squash commit {sha}",
-                    functools.partial(self._finish_record, key, sha))
+                    functools.partial(self._finish_record, key, sha, mr["project"]))
         self.do(key, "merge_card_completed", f"complete merge card {merge_id} as merged {sha} (recovered)",
                 functools.partial(self._complete_card, merge_id, sha))
 
@@ -786,7 +807,7 @@ class _Pass:
         self.note(key, "revert_unrecorded", f"git has revert {revert[:12]} of {sha[:12]} but "
                                             f"merge_records.reverted is 0")
         self.do(key, "revert_recorded", f"mark {key} reverted: git has revert {revert[:12]} of {sha[:12]}",
-                functools.partial(self._mark_reverted, key))
+                functools.partial(self._mark_reverted, key, mr["project"]))
         self.reverted_keys.add(key)
 
     def _workers(self, row, cards: dict) -> None:

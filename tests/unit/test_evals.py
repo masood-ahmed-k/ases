@@ -983,6 +983,25 @@ def test_e8_scores_a_finished_project_from_its_merge_records_review_counts_and_a
     _assert_findings_survive_redaction(score)
 
 
+def test_e8_a_coexisting_legacy_row_for_a_reused_task_key_is_not_double_counted(tmp_path):
+    """Round 12 audit finding 6 (medium): schema v8's PRIMARY KEY (project, task_key) lets a legacy project=NULL
+    row (here, the base fixture's own row) and p1's own real row coexist for the same task_key. The old
+    `score_swarm_project` summed EVERY matching row instead of deduplicating by task_key, so a genuinely
+    single-task project could read as having merged more tasks than it has (`merged > len(keys)`), making
+    `all_merged` false and `Score.success` a false negative."""
+    _fixture, repo, conn = _finished_swarm(tmp_path)  # T1, T2 rows already exist with project=NULL (legacy)
+    conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES ('p1', 'T1', 'abc', 'pass', 'abc', 0, datetime('now'))"
+    )
+
+    score = evals.score_swarm_project(conn, "p1", repo)
+
+    assert score.findings["tasks_total"] == 2
+    assert score.findings["tasks_merged"] == 2   # T1 counts once even though two rows match its task_key
+    assert score.success
+
+
 def test_e8_an_unmerged_or_reverted_task_or_an_unknown_project_is_not_success(tmp_path):
     _fixture, repo, conn = _finished_swarm(tmp_path)
     conn.execute("UPDATE merge_records SET completed_at = NULL WHERE task_key = 'T2'")

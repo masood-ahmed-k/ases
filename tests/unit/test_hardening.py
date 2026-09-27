@@ -75,14 +75,15 @@ class World:
             self.commit(f"work on {name}")
             self.git("checkout", "-q", "integration")
 
-    def squash_merge(self, branch, key, *, record=True, message=None):
+    def squash_merge(self, branch, key, *, record=True, message=None, project=None):
         """What mergeq does to the integration branch: a squash commit, and (record=True) the completed merge record."""
         self.git("merge", "--squash", branch)
         sha = self.commit(message or f"{key}: merge {branch}")
         if record:
             self.conn.execute(
-                "INSERT OR REPLACE INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, "
-                "completed_at) VALUES (?, ?, 'pass', ?, 0, '2026-09-21T10:00:00')", (key, sha, sha))
+                "INSERT OR REPLACE INTO merge_records (project, task_key, candidate_sha, gate3_result, "
+                "squash_commit, reverted, completed_at) VALUES (?, ?, ?, 'pass', ?, 0, '2026-09-21T10:00:00')",
+                (project, key, sha, sha))
         return sha
 
     def worktree(self, path, branch=None, *, detach=False):
@@ -263,6 +264,28 @@ def test_the_squash_proof_holds_for_a_rename_and_a_deletion_that_were_merged(wor
 
     assert _names(report.removed) == {"swarm/T1-coder"} and "swarm/T1-coder" not in world.branches()
     assert not (world.repo / "doomed.txt").exists() and (world.repo / "new_name.txt").exists()
+
+
+def test_the_squash_proof_prefers_this_plans_own_row_over_a_coexisting_legacy_one(world):
+    """Round 12 audit finding 7 (low): a legacy project=NULL row and this plan's own row can coexist for the same
+    task_key (schema v8's ambiguous-task-key backfill). `_squash_proof`'s old, unordered
+    `(project IS NULL OR project = ?)` fetchone() has no guarantee of returning THIS plan's row over an unrelated
+    legacy one that names a stale/unrelated squash commit -- and the audit found SQLite's real query planner
+    deterministically prefers the legacy row here, which would wrongly refuse to prove a branch that genuinely
+    was squash-merged by this plan."""
+    world.task("T1")
+    world.branch("swarm/T1-coder", {"T1.txt": "T1\n"})
+    world.conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES (NULL, 'T1', 'stale', 'pass', 'stale-squash-not-a-real-commit', 0, "
+        "'2020-01-01T00:00:00+00:00')"
+    )
+    world.squash_merge("swarm/T1-coder", "T1", project=PROJECT)
+
+    report = world.clean(apply=True)
+
+    assert report.errors == []
+    assert _names(report.removed) == {"swarm/T1-coder"} and "swarm/T1-coder" not in world.branches()
 
 
 def test_a_deletion_the_squash_commit_does_not_have_keeps_the_branch(world):
