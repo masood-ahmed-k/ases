@@ -55,26 +55,70 @@ requirements:
   requirement: The controller never claims cards, spawns workers or keeps its own copy of task status
   section: '3.2'
   verified_by: 22.2, 22.7
-  status: in_progress
-  note: Phase 3 code (controller.py) never claims/spawns cards -- true by construction. Full end-to-end
-    proof (acceptance test 22.2) still pending real dispatch (credentials not yet in the lead/coder-1/reviewer
-    profiles).
+  status: covered
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): Stale claim corrected -- credentials were added to the
+    lead/coder-1/reviewer profiles and a real end-to-end dispatch already happened on 2026-09-19
+    (docs/architecture.md, ''The first real end-to-end run: lead, coder, reviewer, merge''; project greet-e2e,
+    board ases-phase3): swarm approve created four real cards, coder-1 (xKiro qwen/qwen3-coder-plus:free)
+    claimed and completed G1, the reviewer (OpenRouter cohere/north-mini-code:free) completed both G1 and G2,
+    and the merge queue squash-merged G1 for real. Throughout, the controller itself never claimed a card or
+    spawned a worker: Hermes''s own gateway dispatcher did the dispatching, and ASES-QG-01''s note
+    independently confirms the merge queue believed only its own gate_runs records during this same run.
+    Combined with controller.py''s construction (kanban dispatch/gateway calls only, no claim/spawn call
+    anywhere in the module) and the acceptance-level proof at zero quota (22.2 core and 22.7 in
+    tests/acceptance/), this requirement is now covered both by a real dispatch and by repeatable tests.
+    Earlier note: Phase 3 code (controller.py) never claims/spawns cards -- true by construction. Full
+    end-to-end proof (acceptance test 22.2) still pending real dispatch (credentials not yet in the
+    lead/coder-1/reviewer profiles).'
 - id: ASES-ARC-03
   requirement: ASES records are keyed by card ID and commit SHA; the controller reconciles on start
   section: '3.2'
   verified_by: 22.7, 22.15
-  status: in_progress
-  note: gate_runs/merge_records keyed by task_key+commit_sha exist; reconcile-on-start (crash recovery)
-    not built yet.
+  status: covered
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): Stale claim corrected -- reconcile-on-start is built,
+    wired in and proven, not ''not built yet''. src/ases/reconcile.py implements reconcile() (section 19.4),
+    called at the start of every `swarm run` (cli.py''s _reconcile_on_start, exit code 5 on an unrepaired
+    blocked finding) and before `swarm resume`; it is unit-tested and acceptance-proven at all three named
+    crash points (22.7; see ASES-REC-03/REC-04) and was real-verified against the live board after the
+    2026-09-19 run (reconcile.check found no findings). ASES-REC-04''s own row already corrected this exact
+    drift back in ROUND 6 (''The register''s prior note calling reconcile-on-start not built yet had drifted
+    from the source; corrected here'') but that fix was never propagated to this row. Note that ASES-REC-04
+    itself stays in_progress because a real bug in its role-hardcoding was found and fixed as recently as
+    round 7 wave 2 (2026-09-23); check that row for the current fine-grained state of the repair logic. The
+    keyed-by-card-and-commit-SHA half of this requirement was already correctly reported as done. Earlier
+    note: gate_runs/merge_records keyed by task_key+commit_sha exist; reconcile-on-start (crash recovery) not
+    built yet.'
 - id: ASES-ARC-04
   requirement: One Hermes wrapper module, JSON or REST over text parsing, pinned Hermes version, no updates
     during a project
   section: '3.2'
   verified_by: '22.1'
-  status: in_progress
-  note: hermes.py is the sole module that shells out to hermes; version pinning and doctor-gating are
-    done. hermes doctor itself has no --json flag (checked via --help), so its output is parsed as text
-    by design -- true JSON preference applies once Phase 3 needs kanban/board calls, which do have --json
+  status: covered
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota; corrected 2026-09-27 after review): hermes.py
+    line 119 states in its own header comment: `Every one of these prefers --json (ASES-ARC-04)`. The
+    condition this row was waiting on is met, but a prior draft of this note overstated which wrappers do
+    that, asserting as a directly-confirmed fact that `_kanban_json` and its callers -- create, show,
+    block, unblock, specify, and the rest -- all pass --json. Reading hermes.py directly does not support
+    that for block, unblock or specify. The actual split: `kanban_create`, `kanban_show`, `kanban_list` and
+    `kanban_dispatch` call `_kanban_json` and parse JSON. `kanban_specify` (lines 328-384) passes `--json`
+    itself but is not a `_kanban_json` caller: its own docstring says it "Deliberately does NOT reuse
+    `_kanban`/`_kanban_json`". `kanban_block` (lines 239-255) calls `_kanban(board, [*args, card_id, "--",
+    reason])` and `kanban_unblock` (lines 262-268) calls `_kanban(board, args)`, neither one adding --json
+    anywhere in the function; they sit with the many plain text/exit-code wrappers -- `kanban_init`,
+    `kanban_link`, `kanban_complete`, `kanban_schedule`, `kanban_comment`, `kanban_promote`,
+    `kanban_archive`, `kanban_set_model`, `kanban_reclaim`, `kanban_request_changes` and
+    `kanban_reopen_review` -- none of which call `_kanban_json` or pass --json. `hermes doctor` remains the
+    one deliberate text-parsing exception outside kanban, justified in the same file: it has no --json flag
+    (checked via --help). hermes.py is confirmed the sole module that shells out to Hermes (also
+    independently confirmed by the ASES-ARC-01 division-of-labor audit). Version pinning and doctor-gating
+    were already correctly reported as done. Read narrowly -- one wrapper module, JSON preferred over text
+    where the code actually uses it, and a pinned version with no mid-project updates -- the requirement is
+    still met even though most kanban status-change wrappers parse plain exit-code and comment/event text
+    by design rather than JSON; whether those specific commands could also emit --json was not re-checked
+    against real Hermes here (outside this fix''s scope; flagged separately in the builder report). Earlier
+    note: hermes.py is the sole module that shells out to hermes; version pinning and doctor-gating are
+    done. hermes doctor itself has no --json flag (checked via --help), so its output is parsed as text by
+    design -- true JSON preference applies once Phase 3 needs kanban/board calls, which do have --json'
 - id: ASES-ARC-05
   requirement: Only the gateway dispatcher runs; the deprecated standalone daemon never runs next to it
   section: '6.2'
@@ -192,9 +236,24 @@ requirements:
   section: '5.1'
   verified_by: '22.4'
   status: in_progress
-  note: 'the check mechanism is built and doctor correctly WARNs today: glm-5.3-thinking:free has no declared
-    context_length in config/models.yaml yet, so it is not yet fit to pin (see config/models.yaml''s note
-    on this)'
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The specific evidence this note cites is stale --
+    glm-5.3-thinking:free is no longer in config/models.yaml at all. It was hosted on UnoRouter, which ''was
+    removed entirely 2026-09-19, per an explicit user decision ("dont use unorouter at all - its complete
+    waste")'' (config/models.yaml''s own provider-block comment); the lead role it used to fill moved to
+    xKiro''s qwen/qwen3.8-max:free (context_length 1050000, pinned: true). Checked every model currently
+    declared in config/models.yaml: none has context_length: null, and every custom-endpoint (xkiro, type
+    openai_compatible) model in use or candidate today declares context_length far above the 64K floor
+    (qwen3.8-max:free and qwen3-coder-plus:free at 1,050,000; minimax-m3:free at 1,000,000; minimax-m2.5:free
+    at 204,000) -- so doctor''s WARN-on-null-context path does not currently fire for anything live. That
+    said, the row''s actual requirement (the controller MUST reject an under-declared model before any card
+    starts, per blueprint 22.4''s wording) is still not built: grepping controller.py, policy.py and gates.py
+    for MINIMUM_CONTEXT_LENGTH / context_declared_and_sufficient finds no caller -- only doctor.py (a
+    report-time WARN) and recovery.py (a reactive, post-hoc failure classification after a card has already
+    run) use the check. Status stays in_progress: the specific stale example is corrected and the field is
+    honestly clean today, but pre-dispatch enforcement is the part of this requirement that does not exist
+    yet, not a warning about one now-removed model. Earlier note: the check mechanism is built and doctor
+    correctly WARNs today: glm-5.3-thinking:free has no declared context_length in config/models.yaml yet, so
+    it is not yet fit to pin (see config/models.yaml''s note on this)'
 - id: ASES-MOD-03
   requirement: Lead, Reviewer and Debugger use pinned model IDs; routers are for workers only
   section: '5.2'
@@ -324,9 +383,25 @@ requirements:
   requirement: One worktree per work card, branched from the exact integration HEAD
   section: '8'
   verified_by: 22.2, 22.5
-  status: in_progress
-  note: mergeq/gates verified against a real git repo in unit tests; the *real* Hermes-created worktree
-    (--workspace worktree) hasn't been exercised yet pending credentials.
+  status: partial
+  note: 'ROUND 9 architect correction (2026-09-27, zero quota): status set back from covered to partial. The
+    register hygiene pass above is right that the real Hermes-created worktree was exercised on 2026-09-19,
+    but blueprint p169 tags this row together with ASES-GIT-16 on the sentence ''Phase 3 MUST verify the
+    actual base commit before a worker starts'', and round 9''s T2B package confirmed no such verification
+    exists in src/ases: the base was observed once, never checked by the controller. Partial until a
+    base-commit check exists (listed as a new, separate work item). Earlier note: ROUND 9 register hygiene
+    (2026-09-27, zero quota): Stale claim corrected -- the real Hermes-created worktree HAS been exercised.
+    ASES-GIT-16''s own note records it precisely: ''Observed on the real 2026-09-19 run: the work-card
+    worktree Hermes created on dispatch was cut at the exact integration tip both times (232e12e for G1,
+    676628f for G2 after G1 merged)'', matching docs/architecture.md''s run log (''Its worktree was cut at
+    232e12e, exactly the integration tip''). That is real proof of this row''s own requirement (one worktree
+    per work card, branched from the exact integration HEAD) for two real cards, on top of the existing
+    mergeq/gates unit tests against a real git repo and the 22.5 parallel acceptance test (three simultaneous
+    cards, three distinct worktrees: tests/acceptance/test_22_5_parallel.py). GIT-16 itself stays partial for
+    a narrower, different reason (the test repo has no remote, so Hermes''s remote-sync default specifically
+    was never exercised) -- that gap does not affect this row''s own, simpler claim. Earlier note:
+    mergeq/gates verified against a real git repo in unit tests; the *real* Hermes-created worktree
+    (--workspace worktree) hasn''t been exercised yet pending credentials.'
 - id: ASES-GIT-02
   requirement: Only the merge queue writes to the integration branch
   section: '8.1'
@@ -397,10 +472,21 @@ requirements:
   requirement: No generated artifacts or secrets in commits; secret scan in Gates 1 and 3
   section: '8.1'
   verified_by: '22.10'
-  status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The secret scan now also runs in Gate 1 (through the
-    tamper check) as well as Gate 3, and Gate 4 scans the whole tracked tree. Known gap: Gate 4 fails on any
-    repository that tracks sample keys in tests or docs, with no allowlist.'
+  status: covered
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): Two problems with this note, both resolved. First, the
+    ''Known gap'' it names (Gate 4 blocked by tracked sample keys, no allowlist) belongs to a different gate
+    and a different row: Gate 4 is the final-gates tracked-tree scan (section 18.2, ASES-TSK-04/ASES-CTL-01),
+    not Gates 1 and 3, which are this row''s actual scope. Second, even that Gate 4 gap is now closed anyway:
+    ASES-TSK-04''s own note (ROUND 6, 2026-09-22) records plan.gate4_allowlist landing, and a read-only run
+    against ASES''s own repository shows Gate 4 passing with the allowlist applied. For this row''s real
+    scope, tests/acceptance/test_22_10_secrets.py now proves the requirement end to end through the real
+    controller at zero quota: a secret-shaped value committed to an ordinary file blocks Gate 1 (tamper.py''s
+    secret_added finding) and never appears in any event, card body, gate output, review verdict or report,
+    and a secret-named file (id_rsa) blocks Gate 1 too via the generated_artifact finding; Gate 3 also runs
+    the scan (gates.scan_for_secrets, merge-time). Status moved to covered. Earlier note: BUILT AND WIRED, NOT
+    RUN FOR REAL (2026-09-22): The secret scan now also runs in Gate 1 (through the tamper check) as well as
+    Gate 3, and Gate 4 scans the whole tracked tree. Known gap: Gate 4 fails on any repository that tracks
+    sample keys in tests or docs, with no allowlist.'
 - id: ASES-GIT-08
   requirement: Tasks with overlapping touches and no dependency path are serialized by Gate 0
   section: '8.2'
@@ -529,20 +615,40 @@ requirements:
   requirement: Finished is defined, and the global bounds in section 9.3 are enforced
   section: '9.3'
   verified_by: 22.6, 22.9, 22.14
-  status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): bounds.py is evaluated every pass: a breached project
-    bound pauses the project with a report; finished now means every merge card done, Gates 4 and 5 green on
-    the integration HEAD and the release report written (finalgates.finalize, called by
-    controller.process_finalize). Known gap: `bounds.set_status(paused)` drops the reason (kept in a
-    project_paused event), and Gate 4 fails on any repository with sample keys in tests or docs (no
-    allowlist).'
+  status: partial
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): One of the two ''Known gap'' items this note lists is
+    fixed. Gate 4''s no-allowlist gap is closed: ASES-TSK-04''s own note (ROUND 6, 2026-09-22) records
+    plan.gate4_allowlist landing (matched by tamper.py''s glob semantics, findings demoted to advisory), and a
+    read-only run against ASES''s own repository shows Gate 4 passing (60 findings, all excused by
+    allow_paths). The other known gap (`bounds.set_status(paused)` drops the reason, kept only in a
+    project_paused event) has no fix on record anywhere in the register or the code checked this round; it
+    remains open. ''Finished means every merge card done plus Gates 4/5 green'' is otherwise still ''not run
+    for real'' exactly as this note originally said: no real project has reached the finalize path since it
+    was built. Status moved from in_progress to partial: the mechanism is built, wired, unit-tested, and one
+    of its two documented gaps is closed; the other documented gap and the lack of a real end-to-end run keep
+    this short of covered. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): bounds.py is
+    evaluated every pass: a breached project bound pauses the project with a report; finished now means every
+    merge card done, Gates 4 and 5 green on the integration HEAD and the release report written
+    (finalgates.finalize, called by controller.process_finalize). Known gap: `bounds.set_status(paused)` drops
+    the reason (kept in a project_paused event), and Gate 4 fails on any repository with sample keys in tests
+    or docs (no allowlist).'
 - id: ASES-CFG-01
   requirement: Secrets never enter source control, card bodies, logs or reports
   section: '10'
   verified_by: '22.10'
-  status: in_progress
-  note: events.py redacts credential-shaped keys and known token patterns before any write; full discipline
-    (no secrets in card bodies/plan files) applies once those exist in Phase 3
+  status: covered
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): This note dates from before Phase 3 existed and was
+    conditioned on Phase 3 constructs (card bodies, plan files) existing at all -- they now do, extensively,
+    and the requirement is proven against them. tests/acceptance/test_22_10_secrets.py drives the real
+    controller with real plan tasks and card bodies and proves both halves end to end at zero quota: a
+    secret-shaped value committed to an ordinary file is redacted everywhere and ''never appears in any event,
+    card comment/body, gate output, review verdict or report,'' and a second secret-shaped value that lives
+    only in the test process''s own environment (never written to the repository) also never appears anywhere,
+    proving ASES never reads or forwards its own process environment into a card, event or report.
+    events.py''s redaction (credential-shaped keys, known token patterns) runs before every write, exactly as
+    this note already said. Status moved to covered. Earlier note: events.py redacts credential-shaped keys
+    and known token patterns before any write; full discipline (no secrets in card bodies/plan files) applies
+    once those exist in Phase 3'
 - id: ASES-CFG-02
   requirement: Prefer one key per provider plus several legitimate providers; same-account key pools do
     not create extra quota on the configured free paths
@@ -624,12 +730,27 @@ requirements:
   section: '13'
   verified_by: '22.1'
   status: partial
-  note: 'Diff review by the independent Reviewer profile happened for real on 2026-09-19: the reviewer (OpenRouter
-    cohere/north-mini-code:free, a different provider and family from the Lead on xKiro) read the coder''s
-    two files and approved via kanban_complete with review_outcome metadata, and the merge queue only merged
-    once the reviewer profile had completed the card. Plan critique (the critic role in Gate P) is not built.
-    The reviewer verified less than it claimed: it listed the gate as verified after its own attempt to run
-    the tests failed (it has no command tools), relying on the coder''s hand-off.'
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The ''Plan critique (the critic role in Gate P) is not
+    built'' sentence in this note is stale. src/ases/critic.py exists and implements exactly that (module
+    docstring: ''Gate P plan critique: the independent Reviewer reads the plan before the user is asked to
+    approve it (section 13.1; ASES-REV-01, ASES-REV-02, ASES-REV-03, ASES-LED-01)''), is unit-tested (123
+    cases in tests/unit/test_critic.py) and is acceptance-proven end to end per ASES-REV-02''s own note
+    (22.14: a plan with a cycle, a missing criterion or a missing touches entry fails Gate 0, a scripted
+    critic returns CHANGES_REQUIRED twice, next_step crosses the bound correctly, and the user''s rejection
+    leaves no implementation card ever created). That closes the half of the requirement the old note said was
+    missing. The diff-review half stays exactly as this note already, correctly, described: proven for real on
+    2026-09-19 (the independent Reviewer, OpenRouter cohere/north-mini-code:free, approved via kanban_complete
+    with review_outcome metadata; the merge queue only merged once the reviewer profile completed the card),
+    but the reviewer verified less than it claimed (it listed the gate as verified after its own attempt to
+    run the tests failed, since it has no command tools, relying on the coder''s hand-off) -- a genuine,
+    disclosed reliability gap, not a coverage gap, and the reason this row stays partial rather than covered
+    even though both critique and diff review now exist and are exercised. Earlier note: Diff review by the
+    independent Reviewer profile happened for real on 2026-09-19: the reviewer (OpenRouter
+    cohere/north-mini-code:free, a different provider and family from the Lead on xKiro) read the coder''s two
+    files and approved via kanban_complete with review_outcome metadata, and the merge queue only merged once
+    the reviewer profile had completed the card. Plan critique (the critic role in Gate P) is not built. The
+    reviewer verified less than it claimed: it listed the gate as verified after its own attempt to run the
+    tests failed (it has no command tools), relying on the coder''s hand-off.'
 - id: ASES-REV-02
   requirement: A plan goes back to the Lead at most twice
   section: '13.1'
@@ -661,11 +782,20 @@ requirements:
   section: '13.1'
   verified_by: '22.14'
   status: in_progress
-  note: 'cmd_approve now prints budget + calendar time (ASES-CAP-04) and then blocks on an interactive
-    input() confirmation before publish_plan/create_cards_from_plan run; --yes skips it for scripted use.
-    Argparse wiring smoke-tested for real (swarm approve --help); the interactive prompt itself has not
-    yet been exercised against a real approve run -- deliberately deferred to avoid touching the live
-    ases-phase3 board/test-repo-phase3 while the real T1/T2 dispatch (22.2) is in flight. Promote to
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The ''while the real T1/T2 dispatch (22.2) is in
+    flight'' framing is stale -- that dispatch is not in flight, it completed on 2026-09-19
+    (docs/architecture.md, ''The first real end-to-end run'': swarm approve at 16:51:56 through swarm run''s
+    exit 0 at 16:59:05, project greet-e2e). The underlying gap this row actually cares about still stands,
+    though: that same run used `swarm approve --yes` (docs/architecture.md''s own run log says so explicitly),
+    which skips the interactive input() confirmation entirely (cli.py: `if not getattr(args, ''yes'', False):
+    ... input(''Proceed? [y/N] '')`), so the real interactive y/N prompt itself has genuinely still never
+    fired in a real approve run -- only argparse wiring (`swarm approve --help`) has been smoke-tested for
+    real. Status stays in_progress; promote to covered once a real `swarm approve` run without --yes actually
+    confirms the prompt. Earlier note: cmd_approve now prints budget + calendar time (ASES-CAP-04) and then
+    blocks on an interactive input() confirmation before publish_plan/create_cards_from_plan run; --yes skips
+    it for scripted use. Argparse wiring smoke-tested for real (swarm approve --help); the interactive prompt
+    itself has not yet been exercised against a real approve run -- deliberately deferred to avoid touching
+    the live ases-phase3 board/test-repo-phase3 while the real T1/T2 dispatch (22.2) is in flight. Promote to
     covered after the next real `swarm approve` run confirms the prompt.'
 - id: ASES-REV-04
   requirement: Review requests carry handoff evidence
@@ -790,24 +920,64 @@ requirements:
   requirement: The controller test suite runs on fakes and never touches a real provider
   section: '14.4'
   verified_by: CI without network
-  status: in_progress
-  note: 'ROUND 6 (2026-09-22, zero quota): The fake rig gained six new scenario files this round (22.3, 22.5, 22.7,
-    22.9, 22.10, 22.11, 22.12, 22.13, 22.14, 22.15, 22.16 -- ten of the sixteen 22.x acceptance tests now
-    exist and pass at zero quota), on top of the two demonstrations from round 5. 22.8 (merge conflict)
-    remains to be written, now that ASES-GIT-05''s revert wiring exists to test it against. 22.4 likely
-    already covered by test_models.py, not confirmed this round. 22.1 and 22.17 correctly excluded: they need
-    a real provider. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): src/ases/fakes/: FakeHermes
-    (an in-memory Hermes 0.21.3 board with the real block, unblock, triage-loop and give-up rules, real git
-    worktrees, a fake clock and failure injection, with a test that its signatures match hermes.py),
-    ScriptedWorker with personas, and a fake OpenAI-compatible server (429 with Retry-After, 401, 500,
-    timeouts, malformed JSON, tool calls, a request log with assert_never_received). Nothing runs it against a
-    real Hermes board yet.'
+  status: covered
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The controller test suite (tests/unit, tests/acceptance
+    and tests/integration) never touches a real model provider. The one integration test that touches anything
+    real, tests/integration/test_doctor_real_hermes.py, calls only the local hermes.exe binary (version
+    string, `hermes doctor`, gateway status) -- its own docstring states exactly why this does not violate
+    this requirement: ''Runs against the REAL local hermes.exe (not a provider, so this doesn''t violate
+    ASES-TST-01 -- it''s a local tool-presence check, not a network call to a model)'' -- and it skips cleanly
+    (pytest.mark.skipif) when hermes is not on PATH. This project''s own house rule this round (never call a
+    real Hermes at all, zero quota) is why the full-suite command in r8_rules.md/r9_rules.md still passes
+    `--ignore=tests/integration/test_doctor_real_hermes.py`; that is a separate, stricter project policy, not
+    something this requirement''s own wording (never touches a real PROVIDER) requires excluding.
+    tests/acceptance/ now covers thirteen of the sixteen 22.x scenarios genuinely at zero quota (22.2, 22.3,
+    22.5, 22.6, 22.7, 22.8, 22.9, 22.10, 22.12, 22.13, 22.14, 22.15, 22.16 -- 22.8 in particular is new since
+    ROUND 6, when this row''s note still called it ''remains to be written''); 22.1 and 22.17 are correctly
+    excluded (blueprint p398: real providers are used only in 22.1, the Phase 2 evaluation and 22.17); 22.4
+    has no acceptance-level file (see ASES-MOD-02: the controller does not yet enforce the context-length
+    rejection 22.4 describes, only the classification primitive is unit-tested in test_models.py). None of
+    that 22.4/22.11 nuance bears on this row''s own claim, which is purely about the suite never touching a
+    real provider -- that claim is covered. See ASES-TST-02 for the separate, narrower judgment about the 22.x
+    scenarios themselves. Earlier note: ROUND 6 (2026-09-22, zero quota): The fake rig gained six new scenario
+    files this round (22.3, 22.5, 22.7, 22.9, 22.10, 22.11, 22.12, 22.13, 22.14, 22.15, 22.16 -- ten of the
+    sixteen 22.x acceptance tests now exist and pass at zero quota), on top of the two demonstrations from
+    round 5. 22.8 (merge conflict) remains to be written, now that ASES-GIT-05''s revert wiring exists to test
+    it against. 22.4 likely already covered by test_models.py, not confirmed this round. 22.1 and 22.17
+    correctly excluded: they need a real provider. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL
+    (2026-09-22): src/ases/fakes/: FakeHermes (an in-memory Hermes 0.21.3 board with the real block, unblock,
+    triage-loop and give-up rules, real git worktrees, a fake clock and failure injection, with a test that
+    its signatures match hermes.py), ScriptedWorker with personas, and a fake OpenAI-compatible server (429
+    with Retry-After, 401, 500, timeouts, malformed JSON, tool calls, a request log with
+    assert_never_received). Nothing runs it against a real Hermes board yet.'
 - id: ASES-TST-02
   requirement: Acceptance tests 22.1 to 22.16 are repeatable and cost no quota
   section: '22'
   verified_by: Inspection
-  status: in_progress
-  note: 'ROUND 6 (2026-09-22, zero quota): Same evidence as TST-01: ten of sixteen 22.x scenarios now run at zero
+  status: partial
+  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): Re-checked all sixteen scenarios against
+    tests/acceptance/ and the blueprint''s own text (blueprint.txt p396 to p431). 22.1 is correctly excluded:
+    p398 states real providers are used only in 22.1, the Phase 2 evaluation and 22.17, so 22.1 is the
+    ''unless stated otherwise'' exception p396 itself names, not a gap. Thirteen scenarios exist as genuine
+    acceptance-level tests and run at zero quota, repeatably: 22.3, 22.5, 22.7, 22.8 (new since ROUND 6:
+    tests/acceptance/test_22_8_merge_conflict.py, closing the gap the prior note flagged as ''remains to be
+    written''), 22.9, 22.10, 22.12, 22.13, 22.14, 22.15, 22.16, plus 22.2 and 22.6 which exist in
+    tests/acceptance/test_scenarios_demo.py but only as reduced ''cores only'' scenarios, by that file''s own
+    docstring (''Two demonstration scenarios that prove the acceptance rig (blueprint 22.2 and 22.6, cores
+    only)''). Two are honestly incomplete, not just unconfirmed: 22.4 (context test) has no acceptance-level
+    scenario at all -- test_models.py''s test_context_sufficiency only unit-tests the
+    context_declared_and_sufficient classification, never a controller actually rejecting a card before it
+    starts, because that enforcement is not built (see ASES-MOD-02); Appendix F pairs every requirement with a
+    verifying test, and a test cannot yet verify enforcement that does not exist. 22.11 (prompt injection) is
+    honestly split, exactly as the prior note said: three of its four blueprint clauses are proven end to end
+    through the real controller and guards, the fourth (an actual sandboxed network block) is
+    unit/policy-level only since Docker never runs in this suite by design (a disclosed, Phase-5-scoped
+    boundary, not an oversight) -- this does not block coverage for the clauses that ARE tested, but it does
+    mean 22.11 does not fully verify its own blueprint text yet either. Given 13 of 16 scenarios are genuinely
+    done, 22.1 is a correctly-excluded non-gap, and the remaining two (22.4, 22.11) are precisely and narrowly
+    documented rather than silently missing, status moves from in_progress to partial: closer to true than the
+    ROUND 6 count of ten of sixteen, but not yet the full sixteen the row''s own words claim. Earlier note:
+    ROUND 6 (2026-09-22, zero quota): Same evidence as TST-01: ten of sixteen 22.x scenarios now run at zero
     quota under tests/acceptance/. 22.11 (prompt injection) is honestly split: three of its four clauses are
     proven end to end through the real controller and guards, the fourth (a real sandboxed network block) is
     documented as unit/policy-level only, since Docker never runs anywhere in this suite by design. Earlier
@@ -1173,65 +1343,86 @@ requirements:
   section: '8'
   verified_by: 22.2, 22.5
   status: partial
-  note: 'Observed on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at the
-    exact integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and merge
-    worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote, so
-    Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
-    guards against) was never exercised, and whether worktree_sync must be turned off explicitly is unverified.'
+  note: 'ROUND 9 T2B (2026-09-27, zero quota): Read against the installed Hermes 0.21.3 source (read only).
+    worktree_sync is already pinned: profiles._config_rows sets worktree_sync: false on every ASES-managed
+    profile (built in round 5, citing this row), and profiles._check_profile reports a live profile that has
+    it on; T2B made swarm doctor tag that drift row with ASES-GIT-16 itself (doctor._extract_requirement_ids),
+    so a drifted value names this requirement. Still partial for two reasons, both honest: the remote-tip case
+    this row guards against has never been exercised (the real test repo has no remote), and the second half
+    of p169, ''Phase 3 MUST verify the actual base commit before a worker starts'', is not built anywhere
+    (listed as a new, separate work item; ASES-GIT-01 is set back to partial for the same reason). Earlier
+    note: Observed on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at
+    the exact integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and
+    merge worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote,
+    so Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
+    guards against) was never exercised, and whether worktree_sync must be turned off explicitly is
+    unverified.'
 - id: ASES-CFG-05
   requirement: UnoRouter custom-endpoint credentials use Hermes custom-endpoint secret handling; do not
     export provider keys into worker shells
   section: 10, 17.4
   verified_by: '22.10'
   status: partial
-  note: 'ROUND 7 wave 2, CFG-05 close-out (2026-09-23, zero quota): The still-live ''do not export provider keys
-    into worker shells'' half now has a real fix, not just an inspection finding. New module
-    src/ases/procenv.py (stdlib-only, no ASES imports) defines the project''s one credential-name pattern and
-    scrubbed_environ(); every real subprocess launch of the hermes CLI that ASES''s own code controls now uses
-    it: hermes.py''s _run (every kanban/doctor/pause/resume call), evals.py''s _run_process (the one live
-    one-shot model call the evaluation harness makes), cli.py''s _run_lead (the swarm plan Lead call),
-    critic.py''s default_invoke (the swarm critique reviewer call), and profiles.py''s real hermes profile
-    create call via a new _hermes_runner wrapper. A real design constraint surfaced and was respected rather
-    than shortcut: the scrub could not be a public function of hermes.py itself, because
-    ases.fakes.board.FakeHermes.install requires a fake for every public function defined there, and an env
-    scrub is not a Hermes call; procenv.py exists as its own module for exactly that reason. profiles.py''s
-    fix deliberately did NOT make sandbox.default_runner scrub for every command it runs, because that runner
-    also drives the Docker sandbox''s own key-leak probes (key_visibility_test, exfiltration_probe), which
-    need to see a real, unscrubbed environment to actually detect a regression; scrubbing there would have
-    blinded the probes that exist to catch this exact class of bug. Every fix proven with a before/after test
-    (git stash revert, confirm the credential leaks through, restore, confirm it does not). Two independent
-    adversarial tests (one per build) additionally confirmed no leak survives. Full suite: 5512 passed, 2
-    skipped, 0 failed. Two things remain honestly out of reach or out of scope, not hidden: (1) a real,
-    Hermes-gateway-dispatched worker (the actual coder-1/lead/reviewer agent process during a live swarm run)
-    is spawned entirely by Hermes''s own gateway, a process ASES never touches (confirmed by the ASES-ARC-01
-    audit), so no ASES-side env= fix can reach that path; if a key leaks there, it is because the human
-    operator exported it into the shell that starts the Hermes gateway itself, which the blueprint already
-    tells them never to do, and nothing in ASES''s own code could control that even in principle; (2) a
-    separate, genuine, deferred gap two independent agents found and correctly declined to patch under this
-    fix''s scope: gates.py''s _run_commands runs the project''s own gate commands with shell=True and the
-    operator''s full, unscrubbed environment, so a model-authored test committed to the repo could read a key
-    from the controller''s own shell during a gate run -- same family as ASES-SEC-01/03, a real design
-    decision (COMSPEC/PATH must survive; sandbox runners bypass this path already) for a future session, not a
-    two-line fix. Also worth a human decision, not a bug: the shared credential pattern also strips
-    SSH_AUTH_SOCK/XAUTHORITY on POSIX and SESSIONNAME on Windows from every scrubbed launch (informational
-    names, but would affect an ssh-agent-backed git push from a Lead''s terminal tool). Stays partial: the
-    UnoRouter half is moot, the worker-shell half is now substantially and verifiably fixed for everything
-    ASES''s own code launches, but the row''s full scope (every worker shell, including gateway-dispatched
-    ones) has a structural gap ASES cannot close from its own side. Earlier note: ROUND 7 wave 2 audit
-    (2026-09-23, zero quota): The UnoRouter-credential half is moot (UnoRouter dropped as a provider entirely,
-    confirmed against config/models.yaml). For the still-live ''do not export provider keys into worker
-    shells'' half, an inspection agent confirmed the existing note''s claim precisely: ASES never spawns a
-    worker process itself (hermes.py''s _run only ever calls kanban/doctor/pause/resume/gateway status, never
-    a worker/agent spawn; dispatch is Hermes''s own gateway, entirely outside ASES''s process tree), and ASES
-    never reads a key''s VALUE, only its key_env NAME, everywhere config.py/doctor.py/profiles.py touch it.
-    The Docker sandbox path has real, tested guards (sandbox.py''s docker_run_argv and check_terminal_block,
-    unit-tested), but the sandbox is off by default and no real profile uses it today, so those guards do not
-    apply to the local backend ASES actually runs. The audit additionally found one concrete, narrow,
-    previously-unlisted gap: hermes.py''s _run and evals.py''s _run_process (the one function that makes a
-    real, live one-shot hermes call for an evaluation task) both launch the real hermes CLI while inheriting
-    the full ambient process environment, completely unfiltered, unlike evalkit/codeeval.py''s existing
-    scrubbed_env pattern used for a related but different purpose. A fix (scrub credential-shaped environment
-    variable names before either subprocess call, mirroring the existing pattern) was dispatched as a separate
+  note: 'ROUND 8 (2026-09-27, zero quota): The deferred gates.py gap is closed. gates._run_commands (the host gate
+    runner) and run_gate''s own git worktree add/remove now start every subprocess with
+    procenv.scrubbed_environ(), so model-authored code under Gate 1/3/4/5 and a post-checkout hook planted in
+    the shared .git/hooks cannot read a provider key from the controller''s shell; proven before/after (the
+    old code printed KEYSEEN and the hook recorded the key), plus a new acceptance test
+    tests/acceptance/test_22_10_gate_env.py through a real controller pass. procenv exempts
+    GIT_AUTHOR_NAME/EMAIL/DATE by exact name (they match the pattern only on ''auth''); SSH_AUTH_SOCK and
+    XAUTHORITY stay stripped (capability-bearing). No pass-through allowlist (a gate that needs a credential
+    fails visibly). A read-only sweep then proved the same exposure in the controller''s OTHER git calls
+    (hooks, core.fsmonitor, textconv in a repository a local-backend worker can write); round 9''s GITHARDEN
+    package addresses that. Stays partial: a Hermes-gateway-dispatched worker is spawned by Hermes itself,
+    which no ASES-side scrub can reach (see below). Earlier note: ROUND 7 wave 2, CFG-05 close-out
+    (2026-09-23, zero quota): The still-live ''do not export provider keys into worker shells'' half now has a
+    real fix, not just an inspection finding. New module src/ases/procenv.py (stdlib-only, no ASES imports)
+    defines the project''s one credential-name pattern and scrubbed_environ(); every real subprocess launch of
+    the hermes CLI that ASES''s own code controls now uses it: hermes.py''s _run (every
+    kanban/doctor/pause/resume call), evals.py''s _run_process (the one live one-shot model call the
+    evaluation harness makes), cli.py''s _run_lead (the swarm plan Lead call), critic.py''s default_invoke
+    (the swarm critique reviewer call), and profiles.py''s real hermes profile create call via a new
+    _hermes_runner wrapper. A real design constraint surfaced and was respected rather than shortcut: the
+    scrub could not be a public function of hermes.py itself, because ases.fakes.board.FakeHermes.install
+    requires a fake for every public function defined there, and an env scrub is not a Hermes call; procenv.py
+    exists as its own module for exactly that reason. profiles.py''s fix deliberately did NOT make
+    sandbox.default_runner scrub for every command it runs, because that runner also drives the Docker
+    sandbox''s own key-leak probes (key_visibility_test, exfiltration_probe), which need to see a real,
+    unscrubbed environment to actually detect a regression; scrubbing there would have blinded the probes that
+    exist to catch this exact class of bug. Every fix proven with a before/after test (git stash revert,
+    confirm the credential leaks through, restore, confirm it does not). Two independent adversarial tests
+    (one per build) additionally confirmed no leak survives. Full suite: 5512 passed, 2 skipped, 0 failed. Two
+    things remain honestly out of reach or out of scope, not hidden: (1) a real, Hermes-gateway-dispatched
+    worker (the actual coder-1/lead/reviewer agent process during a live swarm run) is spawned entirely by
+    Hermes''s own gateway, a process ASES never touches (confirmed by the ASES-ARC-01 audit), so no ASES-side
+    env= fix can reach that path; if a key leaks there, it is because the human operator exported it into the
+    shell that starts the Hermes gateway itself, which the blueprint already tells them never to do, and
+    nothing in ASES''s own code could control that even in principle; (2) a separate, genuine, deferred gap
+    two independent agents found and correctly declined to patch under this fix''s scope: gates.py''s
+    _run_commands runs the project''s own gate commands with shell=True and the operator''s full, unscrubbed
+    environment, so a model-authored test committed to the repo could read a key from the controller''s own
+    shell during a gate run -- same family as ASES-SEC-01/03, a real design decision (COMSPEC/PATH must
+    survive; sandbox runners bypass this path already) for a future session, not a two-line fix. Also worth a
+    human decision, not a bug: the shared credential pattern also strips SSH_AUTH_SOCK/XAUTHORITY on POSIX and
+    SESSIONNAME on Windows from every scrubbed launch (informational names, but would affect an
+    ssh-agent-backed git push from a Lead''s terminal tool). Stays partial: the UnoRouter half is moot, the
+    worker-shell half is now substantially and verifiably fixed for everything ASES''s own code launches, but
+    the row''s full scope (every worker shell, including gateway-dispatched ones) has a structural gap ASES
+    cannot close from its own side. Earlier note: ROUND 7 wave 2 audit (2026-09-23, zero quota): The
+    UnoRouter-credential half is moot (UnoRouter dropped as a provider entirely, confirmed against
+    config/models.yaml). For the still-live ''do not export provider keys into worker shells'' half, an
+    inspection agent confirmed the existing note''s claim precisely: ASES never spawns a worker process itself
+    (hermes.py''s _run only ever calls kanban/doctor/pause/resume/gateway status, never a worker/agent spawn;
+    dispatch is Hermes''s own gateway, entirely outside ASES''s process tree), and ASES never reads a key''s
+    VALUE, only its key_env NAME, everywhere config.py/doctor.py/profiles.py touch it. The Docker sandbox path
+    has real, tested guards (sandbox.py''s docker_run_argv and check_terminal_block, unit-tested), but the
+    sandbox is off by default and no real profile uses it today, so those guards do not apply to the local
+    backend ASES actually runs. The audit additionally found one concrete, narrow, previously-unlisted gap:
+    hermes.py''s _run and evals.py''s _run_process (the one function that makes a real, live one-shot hermes
+    call for an evaluation task) both launch the real hermes CLI while inheriting the full ambient process
+    environment, completely unfiltered, unlike evalkit/codeeval.py''s existing scrubbed_env pattern used for a
+    related but different purpose. A fix (scrub credential-shaped environment variable names before either
+    subprocess call, mirroring the existing pattern) was dispatched as a separate
     build-and-independently-verify task; see the next register update once that lands. Until then this row
     stays partial: satisfied by design for everything ASES''s own config/profile code touches, tested for the
     Docker sandbox path only, genuinely unverified for the local backend ASES actually uses by default today.
