@@ -667,7 +667,10 @@ def unhealthy_credentials(conn: sqlite3.Connection) -> set[tuple[str, str]]:
     """The providers whose credential ASES has marked unhealthy, as {(provider, "*")}, ready to hand to
     next_model(unhealthy=...). Read from the event log: a `credential_unhealthy` event marks the provider, and a
     later `credential_restored` event for the same provider clears it (record one, with the provider in its
-    payload, once the user has fixed the key). Without a way out, one 401 would exclude a provider for ever."""
+    payload, once the user has fixed the key). Without a way out, one 401 would exclude a provider for ever.
+
+    Deliberately global, not scoped by project: a credential is unhealthy for the whole install, per provider, not
+    per project, even though the write itself (below) does carry the project that first noticed it."""
     rows = conn.execute(
         "SELECT kind, payload FROM events WHERE kind IN ('credential_unhealthy', 'credential_restored') ORDER BY id"
     ).fetchall()
@@ -818,7 +821,7 @@ def _already_decided(conn: sqlite3.Connection, project: str, task_key: str, card
     failure count once, however many passes see the same blocked card."""
     return conn.execute(
         "SELECT 1 FROM events WHERE kind = 'recovery_decision' "
-        "AND json_extract(payload, '$.project') = ? AND json_extract(payload, '$.task_key') = ? "
+        "AND (COALESCE(project, json_extract(payload, '$.project')) IS NULL OR COALESCE(project, json_extract(payload, '$.project')) = ?) AND json_extract(payload, '$.task_key') = ? "
         "AND json_extract(payload, '$.card_id') = ? AND json_extract(payload, '$.run_id') = ? LIMIT 1",
         (project, task_key, card_id, run_id),
     ).fetchone() is not None
@@ -832,7 +835,7 @@ def _record_error_once(
     log on every pass (the same reasoning as controller._refuse_once)."""
     message = events.redact({"e": f"{type(exc).__name__}: {exc}"[:300]})["e"]
     seen = conn.execute(
-        "SELECT 1 FROM events WHERE kind = 'recovery_error' AND json_extract(payload, '$.project') = ? "
+        "SELECT 1 FROM events WHERE kind = 'recovery_error' AND (COALESCE(project, json_extract(payload, '$.project')) IS NULL OR COALESCE(project, json_extract(payload, '$.project')) = ?) "
         "AND json_extract(payload, '$.task_key') = ? AND json_extract(payload, '$.card_id') = ? "
         "AND json_extract(payload, '$.action') = ? AND json_extract(payload, '$.error') = ? LIMIT 1",
         (project, task_key, card_id, action, message),
@@ -930,7 +933,7 @@ def _switch_target(conn, project, task_key, card_id, run_id) -> tuple[str, str] 
     """The (provider, model) an earlier pass already chose to switch this failed run's card to, or None."""
     row = conn.execute(
         "SELECT payload FROM events WHERE kind = 'recovery_switch_target' "
-        "AND json_extract(payload, '$.project') = ? AND json_extract(payload, '$.task_key') = ? "
+        "AND (COALESCE(project, json_extract(payload, '$.project')) IS NULL OR COALESCE(project, json_extract(payload, '$.project')) = ?) AND json_extract(payload, '$.task_key') = ? "
         "AND json_extract(payload, '$.card_id') = ? AND json_extract(payload, '$.run_id') = ? "
         "ORDER BY id DESC LIMIT 1",
         (project, task_key, card_id, run_id),

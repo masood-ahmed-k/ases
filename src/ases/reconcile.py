@@ -523,7 +523,10 @@ class _Pass:
         if self.apply:
             if action() is False:
                 return False
-            events.record(self.conn, "reconcile_repair", {"task_key": task, "kind": kind, "detail": detail})
+            events.record(
+                self.conn, "reconcile_repair", {"task_key": task, "kind": kind, "detail": detail},
+                project=self.project,
+            )
         self.repairs.append(Repair(task, kind, detail, self.apply))
         self.task_repaired.setdefault(task, []).append(kind)
         return True

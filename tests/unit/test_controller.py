@@ -988,11 +988,11 @@ def _record_gate_calls(monkeypatch):
 
     def fake(
         board, card_id, repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key,
-        allow_gate_config_changes=False,
+        allow_gate_config_changes=False, project=None,
     ):
         calls.append({"card_id": card_id, "branch": branch, "integration_branch": integration_branch,
                       "touches": touches, "task_key": task_key,
-                      "allow_gate_config_changes": allow_gate_config_changes})
+                      "allow_gate_config_changes": allow_gate_config_changes, "project": project})
         return True
 
     monkeypatch.setattr(review_mod, "gate_before_review", fake)
@@ -1328,6 +1328,22 @@ def test_review_lane_passes_the_tasks_allow_gate_config_changes_marker_to_the_ga
     controller.process_review_lane("b", tmp_path / "repo", plan, conn=conn)
 
     assert [c["allow_gate_config_changes"] for c in gate_calls] == [True]
+
+
+def test_review_lane_passes_the_plans_own_project_to_the_gate(tmp_path, monkeypatch):
+    """events.py package, round 9: gate_before_review's tamper_check_error/tamper_blocked events must carry the
+    same project as gate1_recheck_failed, the sibling event process_review_lane already records with
+    plan.project -- checked here so a caller that dropped project= is caught."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+    gate_calls = _record_gate_calls(monkeypatch)
+
+    controller.process_review_lane("b", tmp_path / "repo", plan, conn=conn)
+
+    assert [c["project"] for c in gate_calls] == [plan.project]
 
 
 def test_budget_gate_now_covers_a_fix_card_too(tmp_path, monkeypatch):
@@ -1836,7 +1852,7 @@ def test_a_card_its_own_implementer_completed_is_refused_not_merged(tmp_path, mo
     # Recorded once for the card, not once per poll.
     assert _refused_events(conn) == [{
         "task_key": "T1", "card_id": pair.work_card_id, "completed_by": "coder-1",
-        "needs_completion_by": "reviewer",
+        "needs_completion_by": "reviewer", "project": plan.project,
     }]
 
 
@@ -2652,6 +2668,9 @@ def test_a_reviewer_completion_with_no_verdict_metadata_is_refused(tmp_path, mon
     assert merged == [] and calls == [] and unreviewed == ["T1"]
     (event,) = _refusals(conn, "merge_refused_invalid_verdict")  # once, not once per poll
     assert event["card_id"] == pair.work_card_id and event["task_key"] == "T1" and event["problems"]
+    # events.py package, round 9: plan.project is in scope at this call site, so the refusal carries it too,
+    # the same as merge_queue_halted and reviewer_completed_with_changes_requested a few lines away.
+    assert event["project"] == plan.project
     assert _fix_cards(created) == [] and _task_row(conn)["fix_cards"] == 0  # a refusal is not a merge failure
 
 
@@ -2856,6 +2875,7 @@ def test_a_verdict_quoting_a_different_commit_than_the_checked_head_is_refused(t
     assert calls == []
     (event,) = _refusals(conn, "merge_refused_verdict_commit_mismatch")
     assert event["reviewed_commit"] == "aaaaaaa" and event["branch_head"].startswith("bbbbbbbb")
+    assert event["project"] == plan.project  # events.py package, round 9: plan.project is in scope right here
 
 
 def test_a_verdict_quoting_a_prefix_of_the_checked_head_merges(tmp_path, monkeypatch):

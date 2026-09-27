@@ -1475,6 +1475,23 @@ def test_other_event_kinds_for_the_project_are_not_a_release_report(conn):
     assert bounds.release_report_written(conn, "p1") is False
 
 
+def test_release_report_written_is_scoped_by_the_new_project_column_and_by_legacy_payloads(conn):
+    """events.py package, round 9 (ASES-ARC-03): schema v7's project column, once mark_release_report starts
+    filling it, must keep the SAME per-project isolation this reader already had through the payload alone (a
+    row written before schema v7, or by any caller that still only names it in the payload)."""
+    bounds.mark_release_report(conn, "p2", "p2-report.md")   # written through the column, via mark_release_report
+    # A legacy-shaped row for "p1": no project column, the project only in the payload, the way every row written
+    # before schema v7 (or before events.record grew its project= argument) still is.
+    conn.execute(
+        "INSERT INTO events (ts, kind, payload) VALUES (datetime('now'), ?, ?)",
+        (bounds.RELEASE_REPORT_EVENT, '{"project": "p1", "path": "p1-legacy-report.md"}'),
+    )
+
+    assert bounds.release_report_written(conn, "p1") is True     # p1's legacy, payload-only row is found
+    assert bounds.release_report_written(conn, "p2") is True     # p2's row, written through the column, is found
+    assert bounds.release_report_written(conn, "p3") is False    # a third project sees neither
+
+
 # ---------------------------------------------------------------------------------------------
 # is_finished and finish_project
 # ---------------------------------------------------------------------------------------------

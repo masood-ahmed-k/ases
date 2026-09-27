@@ -64,7 +64,7 @@ class BranchCheck:
 def gate_before_review(
     board: str, card_id: str, repo: pathlib.Path, branch: str, integration_branch: str,
     gate1_commands: list[str], touches: list[str], *, conn, task_key: str,
-    allow_gate_config_changes: bool = False,
+    allow_gate_config_changes: bool = False, project: str | None = None,
 ) -> bool:
     """ASES-REV-05 (Gate 1 re-check) + ASES-GIT-13 (touches-path check). Returns True if both pass
     (card stays in review for the reviewer), False if it sent the card back (a failed attempt, not a
@@ -87,7 +87,12 @@ def gate_before_review(
     found, so the report's findings show it: the send-back itself is only a comment on the card). A
     `tamper_check_error` result (git could not produce the diff) is NOT sent back: a check that failed to run says
     nothing about the card, and the merge-time check (check_branch_for_merge) is authoritative and fails closed,
-    so the card stays in review for the reviewer, a tamper_check_error event is recorded, and this returns True."""
+    so the card stays in review for the reviewer, a tamper_check_error event is recorded, and this returns True.
+
+    `project` (events.py package, round 9) is optional because this function's own signature has no plan to read
+    one from; its one caller, controller.process_review_lane, has `plan.project` in scope and passes it through so
+    the tamper_check_error/tamper_blocked events it records carry the same project as gate1_recheck_failed, the
+    sibling event that caller already records a few lines later."""
     result = check_branch(
         repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
         allow_gate_config_changes=allow_gate_config_changes,
@@ -95,13 +100,13 @@ def gate_before_review(
     if result.kind == "tamper_check_error":
         events_mod.record(conn, "tamper_check_error", {
             "task_key": task_key, "card_id": card_id, "head": result.head, "reason": result.detail,
-        })
+        }, project=project)
         return True
     if not result.ok:
         if result.kind == "tamper":
             events_mod.record(conn, "tamper_blocked", {
                 "task_key": task_key, "card_id": card_id, "head": result.head, "detail": result.detail,
-            })
+            }, project=project)
         hermes_mod.kanban_reopen_review(board, card_id, result.detail)
         return False
     return True

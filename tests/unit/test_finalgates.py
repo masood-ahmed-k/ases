@@ -1358,6 +1358,26 @@ def test_release_summary_counts_are_zero_on_a_quiet_project(world):
     assert summary["bounds_reached"] == [] and summary["notes"] == []
 
 
+def test_release_summary_reconcile_repairs_are_per_project_not_per_database(world):
+    """events.py package, round 9 (ASES-OBS-01): reconcile_repair carried no project at all before this package,
+    so _count_events had to fall back to counting the WHOLE database for it -- a second project's repairs (real,
+    "p2" here) would show up in p1's own release summary. Fixed at the source (reconcile._Pass.do now passes
+    project=self.project) plus the reader (_count_events's scoped branch). Covers both a repair recorded through
+    the new column and a legacy-shaped repair attributed only through its payload, the way a row from before
+    schema v7 (or before reconcile.py's own fix) still is."""
+    for _ in range(3):
+        events.record(world.conn, "reconcile_repair", {"task_key": "T1", "kind": "x", "detail": "p1"}, project="p1")
+    for _ in range(5):
+        events.record(world.conn, "reconcile_repair", {"task_key": "T1", "kind": "x", "detail": "p2"}, project="p2")
+    # A legacy-shaped row (written before this package: no project column, project only in the payload).
+    world.conn.execute(
+        "INSERT INTO events (ts, kind, payload) VALUES (datetime('now'), 'reconcile_repair', ?)",
+        (json.dumps({"project": "p1", "task_key": "T1", "kind": "x", "detail": "legacy"}),),
+    )
+
+    assert _summary(world)["reconcile_repairs"] == 4          # p1's 3 (column) + 1 legacy (payload-only)
+
+
 def test_release_summary_reports_the_bounds_that_were_reached(world):
     world.conn.execute("UPDATE plan_tasks SET fix_cards = 2 WHERE task_key = 'T1'")
     ledger.record_usage(world.conn, "openrouter", "m", 45)      # 50 a day minus the 10 percent reserve

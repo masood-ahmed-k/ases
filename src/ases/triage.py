@@ -242,7 +242,7 @@ def list_triage_cards(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Connecti
         except hermes_mod.HermesCommandError as exc:
             events.record(conn, "triage_read_failed", {
                 "card_id": card_id, "error": f"{type(exc).__name__}: {exc}"[:300],
-            })
+            }, project=plan.project)
             continue
         status = card.get("status", "triage")
         if status != "triage":
@@ -369,7 +369,7 @@ def record_decision(
     decision = Decision(decision)
     events.record(conn, "triage_decision", {
         "card_id": card_id, "decision": str(decision), "reason": reason, "raised_by_task": raised_by_task,
-    })
+    }, project=project)
     if raised_by_task:
         recovery_mod.bump(conn, project, raised_by_task, _LINEAGE_CHARGE_FIELD)
 

@@ -1,3 +1,5 @@
+import pytest
+
 from ases import db, events
 
 
@@ -86,3 +88,58 @@ def test_a_count_or_a_flag_under_a_credential_shaped_key_is_kept_but_a_string_is
 def test_redact_text_scans_one_string():
     assert events.redact_text("used nvapi-" + "z" * 30 + " ok") == "used [redacted] ok"
     assert events.redact_text("nothing to hide") == "nothing to hide"
+
+
+# --- events.py package (round 9): the schema v7 `project` column -----------------------------------------------
+
+
+def _project_column(conn, kind):
+    row = conn.execute("SELECT project FROM events WHERE kind = ?", (kind,)).fetchone()
+    return row["project"]
+
+
+def test_record_writes_the_project_column_from_the_keyword_argument(tmp_path):
+    """ASES-ARC-03: a call site with a project already in scope but not in the payload passes it explicitly."""
+    conn = db.connect(tmp_path / "ases.db")
+    events.record(conn, "k1", {"task_key": "T1"}, project="p1")
+    assert _project_column(conn, "k1") == "p1"
+    # The payload on disk is untouched: project= only fills the column, it does not rewrite the JSON.
+    assert "project" not in events.recent(conn)[0]["payload"]
+
+
+def test_record_writes_the_project_column_from_the_payload_with_no_call_site_change(tmp_path):
+    """Every existing call site whose payload already names its project (bounds.record_final_gate,
+    controller's project_paused, ...) needs no change at all: omitting project= falls back to payload["project"]."""
+    conn = db.connect(tmp_path / "ases.db")
+    events.record(conn, "k2", {"project": "p1", "task_key": "T1"})
+    assert _project_column(conn, "k2") == "p1"
+
+
+def test_record_with_neither_a_project_argument_nor_a_payload_project_leaves_the_column_null(tmp_path):
+    """A genuinely cross-project event (an eval run, credential health, a doctor check): the column stays NULL,
+    never a sentinel and never guessed."""
+    conn = db.connect(tmp_path / "ases.db")
+    events.record(conn, "eval_run", {"task": "E1"})
+    assert _project_column(conn, "eval_run") is None
+
+
+def test_record_project_argument_agreeing_with_the_payload_is_fine(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    events.record(conn, "k3", {"project": "p1", "task_key": "T1"}, project="p1")
+    assert _project_column(conn, "k3") == "p1"
+
+
+def test_record_project_argument_disagreeing_with_the_payload_raises(tmp_path):
+    """A project passed that is not the one the payload itself describes is a bug at the call site, not something
+    to silently resolve either way (ASES-ARC-03: every record is keyed consistently, or it is an error)."""
+    conn = db.connect(tmp_path / "ases.db")
+    with pytest.raises(ValueError, match="p1.*p2|p2.*p1"):
+        events.record(conn, "k4", {"project": "p2", "task_key": "T1"}, project="p1")
+    # Nothing was written: the row does not exist under either name.
+    assert conn.execute("SELECT COUNT(*) AS n FROM events WHERE kind = 'k4'").fetchone()["n"] == 0
+
+
+def test_record_project_none_explicitly_is_the_same_as_omitting_it(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    events.record(conn, "k5", {"project": "p1"}, project=None)
+    assert _project_column(conn, "k5") == "p1"

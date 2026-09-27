@@ -841,6 +841,23 @@ def test_a_should_stop_that_raises_is_treated_as_false_and_recorded_as_an_event(
     assert all(e["error"] == "RuntimeError: kill switch state unreadable" for e in events)
 
 
+def test_a_should_stop_that_raises_records_its_project(repo, tmp_path):
+    """events.py package, round 9: every _stop_requested call site is inside merge_task, which already has
+    `project` in scope, so should_stop_error carries it too instead of leaving the column NULL."""
+    _make_work_branch(repo, "swarm/S8B", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    def broken():
+        raise RuntimeError("kill switch state unreadable")
+
+    mergeq.merge_task(
+        repo, "integration", "swarm/S8B", "S8B", ["echo ok"], conn=conn, should_stop=broken, project="proj-c",
+    )
+
+    rows = conn.execute("SELECT project FROM events WHERE kind = 'should_stop_error'").fetchall()
+    assert rows and all(r["project"] == "proj-c" for r in rows)
+
+
 def test_a_should_stop_that_raises_with_no_connection_still_lets_the_merge_go_ahead(repo):
     _make_work_branch(repo, "swarm/S9", "new.txt", "hello\n")
 

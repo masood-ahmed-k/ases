@@ -1413,6 +1413,59 @@ def test_event_payloads_are_redacted_where_they_are_read(conn, tmp_path, monkeyp
                        "nested": {"token": "[redacted]"}}
 
 
+# --- Two projects sharing a database (events.py package, round 9; ASES-OBS-01) --------------------------------
+
+OTHER_PLAN = plan_mod.parse_and_validate({
+    "project": "p2",
+    "integration_branch": "integration",
+    "gate_profiles": {"trivial": ["echo ok"]},
+    "tasks": [_task("T1", "scaffold", "coder", [], ["a.py"])],
+}, known_roles=set(ROLES), max_cards=40)
+
+
+def test_the_events_panel_is_per_project_not_per_database(conn, tmp_path, monkeypatch):
+    """BEFORE this package, build_report's "events" panel had no project filter at all: p1's report showed p2's
+    events too (see the round 9 before/after proof in the builder's report). Covers both a row attributed through
+    the new project column (events.record(..., project=...)) and a legacy-shaped row attributed only through its
+    payload, the way every row written before schema v7 is."""
+    _fake_hermes(monkeypatch, {})
+    events.record(conn, "final_gate_recorded", {"gate": "gate4", "result": "pass"}, project="p1")
+    events.record(conn, "final_gate_recorded", {"gate": "gate4", "result": "pass"}, project="p2")
+    _event(conn, "2026-09-19T10:00:00+00:00", "legacy_kind", {"project": "p1", "detail": "pre-v7 row, p1"})
+    _event(conn, "2026-09-19T10:00:01+00:00", "legacy_kind", {"project": "p2", "detail": "pre-v7 row, p2"})
+    _event(conn, "2026-09-19T10:00:02+00:00", "unattributed_kind", {"detail": "no project anywhere"})
+
+    p1_events = _build(conn, tmp_path)["events"]
+    p2_events = report.build_report(
+        "b", OTHER_PLAN, _project(tmp_path, name="p2"), MODELS_CONFIG, conn, now=NOW,
+    )["events"]
+    p1_details = {e["payload"].get("detail") for e in p1_events}
+    p2_details = {e["payload"].get("detail") for e in p2_events}
+
+    assert sum(1 for e in p1_events if e["kind"] == "final_gate_recorded") == 1   # p1's own, via the column
+    assert sum(1 for e in p2_events if e["kind"] == "final_gate_recorded") == 1   # p2's own, via the column
+    assert "pre-v7 row, p1" in p1_details and "pre-v7 row, p1" not in p2_details  # legacy row, payload-only
+    assert "pre-v7 row, p2" in p2_details and "pre-v7 row, p2" not in p1_details  # p1 never sees p2's legacy row
+    assert "no project anywhere" in p1_details and "no project anywhere" in p2_details  # kept for every project
+
+
+def test_the_quality_panel_findings_are_per_project_not_per_database(conn, tmp_path, monkeypatch):
+    """The same leak, for _quality_panel's findings query (merge_refused_*/tamper_*/integrity_violation)."""
+    _fake_hermes(monkeypatch, {})
+    events.record(conn, "integrity_violation", {"problems": ["p1 problem"]}, project="p1")
+    events.record(conn, "integrity_violation", {"problems": ["p2 problem"]}, project="p2")
+
+    p1_findings = _build(conn, tmp_path)["quality"]["findings"]
+    p2_findings = report.build_report(
+        "b", OTHER_PLAN, _project(tmp_path, name="p2"), MODELS_CONFIG, conn, now=NOW,
+    )["quality"]["findings"]
+
+    assert any("p1 problem" in f["message"] for f in p1_findings)
+    assert not any("p2 problem" in f["message"] for f in p1_findings)
+    assert any("p2 problem" in f["message"] for f in p2_findings)
+    assert not any("p1 problem" in f["message"] for f in p2_findings)
+
+
 # --- Models ---------------------------------------------------------------------------------------------------
 
 

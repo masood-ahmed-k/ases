@@ -21,6 +21,27 @@ def _seed(conn, project="p1", task_key="T1", work="t_work", merge="t_merge"):
     )
 
 
+def test_do_writes_the_project_column_on_its_reconcile_repair_event(tmp_path):
+    """events.py package, round 9 (ASES-ARC-03): _Pass.do() is the only writer of reconcile_repair, and
+    finalgates.release_summary's count of them (a per-project panel) used to have no way to scope by project at
+    all -- reconcile_repair's payload never named one. self.project (plan.project) is now passed through, so the
+    schema v7 column is filled without changing the payload's own shape (existing payload-equality assertions
+    elsewhere, e.g. test_b_a_done_merge_card_with_a_landed_commit_gets_its_record_written_from_git, still hold)."""
+    conn = db.connect(tmp_path / "ases.db")
+    plan = plan_mod.Plan("p1", "integration", {"g": ["echo ok"]}, ())
+    pass_ = reconcile._Pass(
+        board="b", repo=tmp_path, plan=plan, conn=conn, apply=True,
+        alive=lambda pid: False, killer=lambda pid: True, command_line=lambda pid: None,
+    )
+
+    applied = pass_.do("T1", "some_repair", "detail text", lambda: True)
+
+    assert applied is True
+    row = conn.execute("SELECT project, payload FROM events WHERE kind = 'reconcile_repair'").fetchone()
+    assert row["project"] == "p1"
+    assert json.loads(row["payload"]) == {"task_key": "T1", "kind": "some_repair", "detail": "detail text"}
+
+
 def test_clean_state_has_no_findings(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "ases.db")
     _seed(conn)

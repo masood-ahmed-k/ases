@@ -580,7 +580,10 @@ def provision_running_cards(
             card["id"] for card in kanban_list(board, status="running") if card.get("status", "running") == "running"
         }
     except Exception as exc:  # noqa: BLE001 - best effort: a Hermes hiccup must not break the pass
-        events.record(conn, "provision_error", {"card_id": None, "error": f"{type(exc).__name__}: {exc}"[:300]})
+        events.record(
+            conn, "provision_error", {"card_id": None, "error": f"{type(exc).__name__}: {exc}"[:300]},
+            project=plan.project,
+        )
         return []
 
     provisioned: list[str] = []
@@ -601,7 +604,10 @@ def provision_running_cards(
             write_env_file(worktree, allocate(conn, plan.project, card_id))
             provisioned.append(card_id)
         except Exception as exc:  # noqa: BLE001 - one card must never stop the others
-            events.record(conn, "provision_error", {"card_id": card_id, "error": f"{type(exc).__name__}: {exc}"[:300]})
+            events.record(
+                conn, "provision_error", {"card_id": card_id, "error": f"{type(exc).__name__}: {exc}"[:300]},
+                project=plan.project,
+            )
     return provisioned
 
 
@@ -635,6 +641,8 @@ def sweep_finished(
                 if card.get("status", status) == status:
                     live.add(card["id"])
     except Exception as exc:  # noqa: BLE001 - see above: no listing, no sweep
-        events.record(conn, "lease_sweep_error", {"error": f"{type(exc).__name__}: {exc}"[:300]})
+        events.record(
+            conn, "lease_sweep_error", {"error": f"{type(exc).__name__}: {exc}"[:300]}, project=plan.project,
+        )
         return []
     return sweep(conn, plan.project, live, now=now)

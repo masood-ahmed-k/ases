@@ -134,7 +134,9 @@ def _intent(conn, project: str | None, kind: str, task_key: str, detail: str | N
     return intents_mod.intent(conn, project, kind, task_key, detail)
 
 
-def _stop_requested(should_stop: Callable[[], bool] | None, conn, task_key: str, step: str) -> bool:
+def _stop_requested(
+    should_stop: Callable[[], bool] | None, conn, task_key: str, step: str, project: str | None = None,
+) -> bool:
     """Ask the caller whether to stop before `step` (ASES-REC-06). No callable means never stop. A callable that
     raises counts as "keep going" (a broken kill-switch reader must not be able to block merging) and is recorded
     as a should_stop_error event, so it is visible instead of silent."""
@@ -144,9 +146,11 @@ def _stop_requested(should_stop: Callable[[], bool] | None, conn, task_key: str,
         return bool(should_stop())
     except Exception as exc:  # noqa: BLE001 - any failure of the caller's callable is treated the same way
         if conn is not None:
+            # events.py package, round 9: every call site is inside merge_task, which already has `project` in
+            # scope, so it is threaded straight through here instead of left NULL.
             events_mod.record(conn, "should_stop_error", {
                 "task_key": task_key, "step": step, "error": f"{type(exc).__name__}: {exc}"[:300],
-            })
+            }, project=project)
         return False
 
 
@@ -207,7 +211,7 @@ def merge_task(
     merged again kept reverted=1 forever, so reconcile.check() reported done_but_reverted for a healthy merge.
     Only a new candidate build resets the row: a call that ends before one exists (a wrong checkout, a moved
     branch, a conflict, an empty diff, a red secret scan) leaves whatever row the task already has untouched."""
-    if _stop_requested(should_stop, conn, task_key, STEP_CANDIDATE):
+    if _stop_requested(should_stop, conn, task_key, STEP_CANDIDATE, project):
         return _stopped(STEP_CANDIDATE)
 
     # Before mkdtemp and before any worktree, so refusing here leaves nothing behind to clean up.
@@ -251,14 +255,14 @@ def merge_task(
             if early is not None:
                 return early
 
-            if _stop_requested(should_stop, conn, task_key, STEP_GATE3):
+            if _stop_requested(should_stop, conn, task_key, STEP_GATE3, project):
                 return _stopped(STEP_GATE3)
             gate_result = gates_mod.run_gate(
                 candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key, project=project,
             )
             # The last checkpoint comes BEFORE the merge_records row is written, so a stop here leaves the row
             # exactly as it was. A red gate never reaches the fast-forward, so it has nothing left to stop.
-            if gate_result.passed and _stop_requested(should_stop, conn, task_key, STEP_FAST_FORWARD):
+            if gate_result.passed and _stop_requested(should_stop, conn, task_key, STEP_FAST_FORWARD, project):
                 return _stopped(STEP_FAST_FORWARD)
             if conn is not None:
                 _record_candidate(conn, task_key, candidate_sha, gate_result.passed, project)

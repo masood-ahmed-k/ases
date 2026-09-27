@@ -68,11 +68,29 @@ def redact_text(text: str) -> str:
     return _SECRET_VALUE_PATTERN.sub("[redacted]", text)
 
 
-def record(conn: sqlite3.Connection, kind: str, payload: dict | None = None) -> None:
-    safe = _redact(payload or {})
+def record(conn: sqlite3.Connection, kind: str, payload: dict | None = None, *, project: str | None = None) -> None:
+    """Insert one event. `project` (schema v7's column) is keyword-only and optional: omitted (the ordinary case for
+    every call site whose payload already names its project under the "project" key), it is taken from
+    `payload["project"]`, so an existing call whose payload already carries a project needs no change at the call
+    site to fill the column. Given explicitly, it is compared with `payload.get("project")`: agreeing (or the
+    payload naming none) is fine, but the two DISAGREEING is a bug at the call site (a project was passed that is
+    not the one the payload itself describes), so this raises ValueError rather than silently preferring one --
+    silently picking the keyword would hide a stale payload, and silently picking the payload would hide a caller
+    that passed the wrong variable. A call site with no project in scope at all (a doctor/eval event, credential
+    health, which is per provider, not per project) passes neither and the column stays NULL, which every reader
+    added alongside this treats as "no project recorded", never as a match for every project."""
+    payload = payload or {}
+    payload_project = payload.get("project")
+    if project is None:
+        project = payload_project
+    elif payload_project is not None and payload_project != project:
+        raise ValueError(
+            f"events.record({kind!r}): project={project!r} disagrees with payload['project']={payload_project!r}"
+        )
+    safe = _redact(payload)
     conn.execute(
-        "INSERT INTO events (ts, kind, payload) VALUES (?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(timespec="seconds"), kind, json.dumps(safe, default=str)),
+        "INSERT INTO events (ts, kind, payload, project) VALUES (?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(timespec="seconds"), kind, json.dumps(safe, default=str), project),
     )
 
 
