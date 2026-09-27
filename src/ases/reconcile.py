@@ -79,10 +79,15 @@ def _fetch_cards(board: str, row) -> dict:
     return cards
 
 
-def _check_cards(row, cards: dict, conn) -> list[Inconsistency]:
+def _check_cards(row, cards: dict, conn, project: str | None = None) -> list[Inconsistency]:
     """The per-task body of check(), on cards already fetched (reconcile() fetches each card once and shares them
     with its repair steps). A merge card that is done needs a completed merge_records row, and a done merge that
-    is recorded as reverted was rolled back after its card was completed."""
+    is recorded as reverted was rolled back after its card was completed.
+
+    `project` (schema v8: merge_records' primary key is (project, task_key), so two projects can share a task_key
+    as two separate rows) scopes the read the same NULL-tolerant way gates.last_gate_result does: this project's
+    own row or a legacy row with no project recorded, never a different project's row for the same task_key. Left
+    at the default None (the old call shape), nothing is filtered, exactly as before."""
     findings: list[Inconsistency] = []
     key = row["task_key"]
     for label, card_id in (("work", row["work_card_id"]), ("merge", row["merge_card_id"])):
@@ -94,9 +99,15 @@ def _check_cards(row, cards: dict, conn) -> list[Inconsistency]:
             continue
 
         if label == "merge" and card["status"] == "done":
-            mr = conn.execute(
-                "SELECT completed_at, reverted FROM merge_records WHERE task_key = ?", (key,)
-            ).fetchone()
+            if project is None:
+                mr = conn.execute(
+                    "SELECT completed_at, reverted FROM merge_records WHERE task_key = ?", (key,)
+                ).fetchone()
+            else:
+                mr = conn.execute(
+                    "SELECT completed_at, reverted FROM merge_records WHERE task_key = ? "
+                    "AND (project IS NULL OR project = ?)", (key, project),
+                ).fetchone()
             if mr is None or not mr["completed_at"]:
                 findings.append(Inconsistency(
                     key, "merge_done_without_record",
@@ -117,7 +128,7 @@ def check(board: str, project: str, *, conn) -> list[Inconsistency]:
     ).fetchall()
     findings: list[Inconsistency] = []
     for row in rows:
-        findings.extend(_check_cards(row, _fetch_cards(board, row), conn))
+        findings.extend(_check_cards(row, _fetch_cards(board, row), conn, project))
     return findings
 
 
@@ -520,29 +531,44 @@ class _Pass:
     # -- the write actions (each one statement, like mergeq's own) ----------------------------
 
     def _insert_recovered(self, key: str, sha: str) -> None:
+        # project (schema v8): stamped with self.project -- _merge_record already confirmed no row for this
+        # (project, task_key) exists yet (mr is None, the only caller of this action), so a plain INSERT cannot
+        # conflict.
         self.conn.execute(
-            "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, "
-            "completed_at) VALUES (?, ?, 'recovered', ?, 0, ?)",
-            (key, sha, sha, _now()),
+            "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+            "completed_at) VALUES (?, ?, ?, 'recovered', ?, 0, ?)",
+            (self.project, key, sha, sha, _now()),
         )
 
     def _finish_record(self, key: str, sha: str) -> None:
+        # Scoped the same NULL-tolerant way _merge_record reads it (this project's own row or a legacy row with
+        # no project recorded), and project is stamped at the same time: finishing a legacy row from git, inside
+        # THIS project's reconcile pass, is exactly the unambiguous attribution db.py's migration 8 backfill
+        # looks for, just discovered at runtime instead of at migration time.
         self.conn.execute(
-            "UPDATE merge_records SET squash_commit = ?, completed_at = ? WHERE task_key = ? AND completed_at IS NULL",
-            (sha, _now(), key),
+            "UPDATE merge_records SET squash_commit = ?, completed_at = ?, project = ? WHERE task_key = ? "
+            "AND completed_at IS NULL AND (project IS NULL OR project = ?)",
+            (sha, _now(), self.project, key, self.project),
         )
 
     def _write_noop(self, key: str) -> None:
+        # self.project is always a real project name here (plan.project), so ON CONFLICT(project, task_key)
+        # dispatches normally (schema v8) -- unlike mergeq._upsert_merge_record, no NULL-project branch is needed.
         self.conn.execute(
-            "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, "
-            "completed_at) VALUES (?, NULL, 'skipped', NULL, 0, ?) "
-            "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=NULL, gate3_result='skipped', squash_commit=NULL, "
-            "completed_at=excluded.completed_at",
-            (key, _now()),
+            "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+            "completed_at) VALUES (?, ?, NULL, 'skipped', NULL, 0, ?) "
+            "ON CONFLICT(project, task_key) DO UPDATE SET candidate_sha=NULL, gate3_result='skipped', "
+            "squash_commit=NULL, completed_at=excluded.completed_at",
+            (self.project, key, _now()),
         )
 
     def _mark_reverted(self, key: str) -> None:
-        self.conn.execute("UPDATE merge_records SET reverted = 1 WHERE task_key = ?", (key,))
+        # Scoped by project (schema v8), the same NULL-tolerant way _merge_record reads it: never flips
+        # reverted=1 on a DIFFERENT project's row that happens to share this task_key.
+        self.conn.execute(
+            "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND (project IS NULL OR project = ?)",
+            (key, self.project),
+        )
 
     def _complete_card(self, merge_id: str, sha: str | None) -> None:
         """Complete the merge card the way process_merge_queue does, marked as recovered."""
@@ -581,7 +607,7 @@ class _Pass:
         """check()'s findings for this task. missing_card and done_but_reverted are always blocked: nothing here can
         decide them. merge_done_without_record is reported and returned, for _merge to repair or escalate."""
         deferred = None
-        for finding in _check_cards(row, cards, self.conn):
+        for finding in _check_cards(row, cards, self.conn, self.project):
             if finding.kind == "merge_done_without_record":
                 deferred = self.add(finding)
             else:
@@ -589,9 +615,12 @@ class _Pass:
         return deferred
 
     def _merge_record(self, key: str):
+        # Scoped by project (schema v8) the same NULL-tolerant way gates.last_gate_result reads gate_runs: this
+        # project's own row or a legacy row with no project recorded, never a different project's row for the
+        # same task_key.
         return self.conn.execute(
             "SELECT candidate_sha, gate3_result, squash_commit, reverted, completed_at "
-            "FROM merge_records WHERE task_key = ?", (key,),
+            "FROM merge_records WHERE task_key = ? AND (project IS NULL OR project = ?)", (key, self.project),
         ).fetchone()
 
     def _landed(self, merge_id: str, mr) -> str | None:

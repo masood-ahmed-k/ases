@@ -279,6 +279,78 @@ CREATE INDEX IF NOT EXISTS idx_gate_runs_project_task_sha ON gate_runs (project,
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events (kind);
 """
 
+# Version 8 (phase 9, ASES-ARC-03 / ASES-GIT-05: "a separate, still-open risk for two projects reusing a task
+# key" -- the register's own words for this bug). merge_records' primary key was task_key alone since schema 1:
+# two projects that share this database and both run a task keyed 'T1' upsert onto the SAME row, silently
+# overwriting each other's candidate_sha, gate3_result, squash_commit, reverted and completed_at. Schema v7 added
+# a nullable project column but changed no key (round 6's CORE package: "task_key is still merge_records' only
+# primary key, so this cannot stop two projects that reuse a task_key from upserting onto the SAME row"). SQLite
+# cannot ALTER a primary key in place, so the table is rebuilt.
+#
+# The new key is (project, task_key). `project` stays NULLABLE, deliberately NOT NOT NULL: a NULL row means "no
+# project is recorded for this merge" (a row that predates this migration and could not be attributed, or a
+# caller that still does not pass one), and every other reader of this table written so far treats a NULL
+# project as "matches any project, never orphaned" -- gates.last_gate_result's own `(project IS NULL OR
+# project = ?)` pattern, which hardening.py's _squash_proof independently converged on for this very table. Some
+# NULL is safe to keep exactly because two projects' REAL, distinct names can never collide with each other or
+# with NULL; only two NULL rows sharing a task_key would be a problem, and the old schema already made that
+# impossible (task_key alone was unique, so at most one row per task_key exists to carry forward).
+#
+# What NULL is NOT safe for is ON CONFLICT dispatch on a FUTURE write: SQLite indexes -- and so ON CONFLICT --
+# treat every NULL as distinct from every other NULL ("NULLs never collide"), proven empirically before writing
+# this migration: two `INSERT ... ON CONFLICT(project, task_key) DO UPDATE` calls with project both NULL and the
+# same task_key do NOT conflict, they insert two rows. A caller that never names a project would therefore
+# accumulate a new row on every candidate build instead of resetting the one it already has (ASES-REC-04). Every
+# writer in mergeq.py and reconcile.py is updated in the same change: a real project uses ON CONFLICT(project,
+# task_key) exactly as a single-column key used to; a NULL project is found or created by hand (an explicit
+# UPDATE ... WHERE project IS NULL, an INSERT only when that matched nothing), so a NULL-project task_key still
+# resets in place, exactly as it did when task_key alone was the whole primary key.
+#
+# Legacy rows (project NULL before this migration runs) are backfilled from plan_tasks, which has been keyed
+# (project, task_key) since schema 2: a task_key that plan_tasks attributes to exactly one project is confidently
+# backfilled to it; a task_key with zero or more than one plan_tasks project is left NULL rather than guessed
+# (report.py, finalgates.py, reconcile.py and evalkit/codetasks.py, the other readers this package owns, are all
+# updated to scope their own reads by project with the same NULL-tolerant pattern).
+_V8_MERGE_RECORDS_SQL = """
+CREATE TABLE merge_records_v8_new (
+    project TEXT,
+    task_key TEXT NOT NULL,
+    candidate_sha TEXT,
+    gate3_result TEXT,
+    squash_commit TEXT,
+    reverted INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT,
+    PRIMARY KEY (project, task_key)
+);
+"""
+
+
+def _apply_v8(conn: sqlite3.Connection) -> None:
+    conn.execute(_V8_MERGE_RECORDS_SQL)
+    rows = conn.execute(
+        "SELECT task_key, project, candidate_sha, gate3_result, squash_commit, reverted, completed_at "
+        "FROM merge_records"
+    ).fetchall()
+    for row in rows:
+        project = row["project"]
+        if project is None:
+            matches = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT project FROM plan_tasks WHERE task_key = ?", (row["task_key"],),
+                ).fetchall()
+            ]
+            if len(matches) == 1:
+                project = matches[0]
+        conn.execute(
+            "INSERT INTO merge_records_v8_new (project, task_key, candidate_sha, gate3_result, squash_commit, "
+            "reverted, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project, row["task_key"], row["candidate_sha"], row["gate3_result"], row["squash_commit"],
+             row["reverted"], row["completed_at"]),
+        )
+    conn.execute("DROP TABLE merge_records")
+    conn.execute("ALTER TABLE merge_records_v8_new RENAME TO merge_records")
+
+
 # The one table the runner needs before it can read a version. Also part of migration 1, so the list describes the
 # whole schema.
 _BOOTSTRAP = """
@@ -347,6 +419,8 @@ MIGRATIONS: list[Migration] = [
     Migration(5, "lineage, project_state, intents", _apply_v5),
     Migration(6, "resource_leases, worktree_snapshots", _V6_SQL),
     Migration(7, "project column on gate_runs, merge_records and events; indexes on gate_runs and events", _apply_v7),
+    Migration(8, "merge_records rebuilt with PRIMARY KEY (project, task_key), legacy rows backfilled from "
+                 "plan_tasks where unambiguous", _apply_v8),
 ]
 
 

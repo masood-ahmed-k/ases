@@ -15,18 +15,20 @@ fast-forward ... revert"), so a crash between the two leaves an open intent that
 
 Round 6, project-scoping merge_records (found by the reconcile and evals builders: two projects sharing this
 database, or reusing a task key, share a merge_records row): schema v7 added a nullable `project` column here, the
-same as gate_runs. Every write in this module now stamps it, and revert_merge's own write is NULL-tolerant scoped
-by it (the same pattern gates.last_gate_result uses). That is deliberately the SMALLER, SAFER fix, not a full
-solution: merge_records.task_key is still the table's only primary key, so an INSERT ... ON CONFLICT(task_key)
-upsert (every write in _build_candidate and _record_candidate) cannot be made NULL-tolerant the way a SELECT or an
-UPDATE's WHERE clause can -- SQLite dispatches ON CONFLICT off the table's actual constraint, not a value passed at
-call time, so a second project's candidate for a reused task_key still lands on the SAME physical row as the
-first project's, overwriting it, not creating a row of its own. A true fix needs a schema migration (task_key
-alone is no longer enough for a primary key) touching db.py, which this package does not own and has not made:
-see the CORE package's final report for the exact migration proposed and why every other reader of merge_records
-(finalgates.py, report.py, reconcile.py, hardening.py, evalkit/codetasks.py -- none of them owned by this
-package either) would need updating in the same change, since they all read it by task_key alone today.
-"""
+same as gate_runs. Round 9 (package MERGEPK) finished the fix schema v7 left open: db.py's migration 8 rebuilds
+merge_records with PRIMARY KEY (project, task_key), so two projects' candidates for the SAME task_key are two
+DIFFERENT rows, never one overwriting the other.
+
+`project` stays NULLABLE on purpose (a row with no project recorded still matches gates.last_gate_result's own
+style of read -- see reconcile.py, report.py, finalgates.py and evalkit/codetasks.py, all updated in the same
+change). What changed here is how a NULL-project write is done: SQLite indexes, and so `ON CONFLICT`, treat every
+NULL as distinct from every other NULL, so `ON CONFLICT(project, task_key)` never dispatches for a NULL project
+(two calls with project NULL and the same task_key would insert TWO rows, not update one). `_build_candidate`,
+`_record_candidate` and `_fast_forward` use ON CONFLICT / a plain scoped UPDATE for a real project, exactly like a
+single-column key used to, and fall back to an explicit UPDATE-then-INSERT-if-absent for a NULL project, so a
+caller that still does not pass one keeps the pre-migration behavior exactly: one row per task_key, reset in
+place by a new candidate build. `revert_merge`'s write is scoped the same way in both branches now (never a bare,
+unscoped `WHERE task_key = ?`, which would have touched every project's row sharing that task_key)."""
 from __future__ import annotations
 
 import contextlib
@@ -271,6 +273,49 @@ def merge_task(
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+def _upsert_merge_record(
+    conn, project: str | None, task_key: str, *, candidate_sha: str | None, gate3_result: str | None,
+    squash_commit: str | None, reverted: int, completed_at: str | None,
+) -> None:
+    """INSERT a fresh merge_records row for a new candidate, or reset one that already exists for this
+    (project, task_key) -- schema v8's primary key, db.py. Called by both `_build_candidate`'s no-op path and
+    `_record_candidate`; the two always write the same five columns (candidate_sha, gate3_result, squash_commit,
+    reverted, completed_at), only their values differ.
+
+    With a real project, `ON CONFLICT(project, task_key)` dispatches exactly the way ON CONFLICT(task_key) used
+    to when task_key alone was the whole key: a second candidate for the SAME (project, task_key) updates the one
+    row in place, a different project's candidate for the same task_key is a DIFFERENT row entirely (the fix this
+    migration exists for).
+
+    With no project (an old call site, a unit test, or a caller not yet updated), ON CONFLICT cannot be used:
+    SQLite indexes treat every NULL as distinct from every other NULL, so two INSERTs with project NULL and the
+    same task_key never conflict -- proven empirically before this was written, not assumed. The row is found or
+    created by hand instead: an UPDATE scoped to `project IS NULL`, and only when that touches nothing (there is
+    no such row yet) does an INSERT follow. This is exactly the pre-migration behavior for a no-project caller:
+    one row per task_key, reset in place by every new candidate build, never a second row accumulating."""
+    if project is None:
+        updated = conn.execute(
+            "UPDATE merge_records SET candidate_sha = ?, gate3_result = ?, squash_commit = ?, reverted = ?, "
+            "completed_at = ? WHERE task_key = ? AND project IS NULL",
+            (candidate_sha, gate3_result, squash_commit, reverted, completed_at, task_key),
+        )
+        if updated.rowcount == 0:
+            conn.execute(
+                "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, "
+                "reverted, completed_at) VALUES (NULL, ?, ?, ?, ?, ?, ?)",
+                (task_key, candidate_sha, gate3_result, squash_commit, reverted, completed_at),
+            )
+    else:
+        conn.execute(
+            "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+            "completed_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(project, task_key) DO UPDATE SET candidate_sha = excluded.candidate_sha, "
+            "gate3_result = excluded.gate3_result, squash_commit = excluded.squash_commit, "
+            "reverted = excluded.reverted, completed_at = excluded.completed_at",
+            (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, completed_at),
+        )
+
+
 def _build_candidate(
     repo: pathlib.Path, integration_branch: str, work_branch: str, squash_ref: str, task_key: str,
     candidate: pathlib.Path, commit_message: str | None, allow_empty: bool, conn, project: str | None = None,
@@ -315,19 +360,13 @@ def _build_candidate(
             # column the no-op owns, so running it twice leaves one identical row. reverted is one of them: this
             # is a new candidate build too, so it starts the row over (see merge_task's ASES-REC-04 note).
             #
-            # project (schema v7, round 6): stamped the same way, and reset the same way on a new candidate. This
-            # is the smaller, safer fix the MR builder chose over a primary-key migration (see revert_merge and
-            # the module docstring note below): merge_records.task_key is still the ONLY primary key, so a second
-            # project's candidate for a reused task_key still upserts onto this SAME row rather than a row of its
-            # own -- writing project here does not stop that collision, it only lets a reader (this row's later
-            # UPDATEs, and any caller that filters by project) tell whether the row it is looking at is its own.
-            conn.execute(
-                "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
-                "reverted, completed_at, project) VALUES (?, ?, ?, NULL, 0, ?, ?) "
-                "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
-                "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, "
-                "completed_at=excluded.completed_at, project=excluded.project",
-                (task_key, base_sha, "skipped", datetime.now(timezone.utc).isoformat(timespec="seconds"), project),
+            # project (schema v8, round 9): a real project's row is its OWN row now (PRIMARY KEY (project,
+            # task_key)), never a different project's upsert target; see _upsert_merge_record for how a NULL
+            # project is still reset in place without relying on ON CONFLICT (SQLite never treats two NULLs as a
+            # conflict).
+            _upsert_merge_record(
+                conn, project, task_key, candidate_sha=base_sha, gate3_result="skipped", squash_commit=None,
+                reverted=0, completed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             )
         return None, MergeOutcome(True, None, None, "skipped", "no changes to merge (review-only task)")
 
@@ -354,13 +393,9 @@ def _record_candidate(conn, task_key: str, candidate_sha: str, passed: bool, pro
     over: reverted, squash_commit, completed_at and project are reset, because they describe the previous merge of
     this task (a revert, a fix card and a second merge is the case that used to leave reverted=1 behind). The
     fast-forward fills squash_commit and completed_at in again once it lands."""
-    conn.execute(
-        "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, "
-        "reverted, completed_at, project) VALUES (?, ?, ?, NULL, 0, NULL, ?) "
-        "ON CONFLICT(task_key) DO UPDATE SET candidate_sha=excluded.candidate_sha, "
-        "gate3_result=excluded.gate3_result, squash_commit=NULL, reverted=0, completed_at=NULL, "
-        "project=excluded.project",
-        (task_key, candidate_sha, "pass" if passed else "fail", project),
+    _upsert_merge_record(
+        conn, project, task_key, candidate_sha=candidate_sha, gate3_result="pass" if passed else "fail",
+        squash_commit=None, reverted=0, completed_at=None,
     )
 
 
@@ -394,15 +429,23 @@ def _fast_forward(
         return MergeOutcome(False, candidate_sha, None, "pass", detail, integration_moved=moved)
 
     if conn is not None:
-        # project is deliberately NOT touched here (2026-09-19 upsert already stamped it, this is a plain
-        # UPDATE): a fast-forward with no project given (an old caller) must still land on whichever row
-        # _record_candidate/_build_candidate just wrote moments ago, in the SAME merge_task call, under the
-        # SAME task_key -- there is only one row per task_key (merge_records has no composite key, see
-        # revert_merge's docstring), so task_key alone always finds it.
-        conn.execute(
-            "UPDATE merge_records SET squash_commit = ?, completed_at = ? WHERE task_key = ?",
-            (candidate_sha, datetime.now(timezone.utc).isoformat(timespec="seconds"), task_key),
-        )
+        # project is deliberately NOT touched here (the upsert moments ago already stamped it, this is a plain
+        # UPDATE): it IS scoped by project, though (schema v8, round 9) -- merge_records' key is now (project,
+        # task_key), so two projects can share a task_key as two different rows, and an unscoped `WHERE
+        # task_key = ?` would complete BOTH of them instead of only the one _record_candidate/_build_candidate
+        # just wrote in THIS merge_task call. A NULL project (an old caller) is matched by `project IS NULL`,
+        # never left unscoped, for the same reason.
+        if project is None:
+            conn.execute(
+                "UPDATE merge_records SET squash_commit = ?, completed_at = ? "
+                "WHERE task_key = ? AND project IS NULL",
+                (candidate_sha, datetime.now(timezone.utc).isoformat(timespec="seconds"), task_key),
+            )
+        else:
+            conn.execute(
+                "UPDATE merge_records SET squash_commit = ?, completed_at = ? WHERE task_key = ? AND project = ?",
+                (candidate_sha, datetime.now(timezone.utc).isoformat(timespec="seconds"), task_key, project),
+            )
     return MergeOutcome(True, candidate_sha, candidate_sha, "pass", "merged")
 
 
@@ -431,13 +474,13 @@ def revert_merge(
     that cleanup succeeded; `ok` is False either way; a caller that must tell "cleanly refused" from "still
     dirty" apart checks `aborted` too, matching the halt path controller.process_merge_queue wires this round.
 
-    The `reverted` write is NULL-tolerant by project (the same scoping run_gate and last_gate_result use, ASES
-    schema v7), the smaller, safer fix in place of a primary-key migration to merge_records (see the module-level
-    note in mergeq.py's docstring and the CORE package report): task_key is still merge_records' only primary
-    key, so this cannot stop two projects that reuse a task_key from upserting onto the SAME row (only a
-    composite key could); what it DOES stop is THIS write landing on a row a DIFFERENT project's more recent
-    candidate has since claimed, which would otherwise silently mark that other project's in-flight merge
-    reverted. With no project given (the old call shape), nothing is filtered, exactly as before."""
+    The `reverted` write is NULL-tolerant by project (the same scoping run_gate and last_gate_result use):
+    with a real project it matches that project's own row OR a legacy row with no project recorded, never a
+    DIFFERENT project's row that happens to share this task_key (schema v8, round 9: merge_records' primary key
+    is now (project, task_key), so that row genuinely exists as its own, separate record rather than the SAME
+    physical row a same-task_key upsert used to share). With no project given (the old call shape) the write is
+    now scoped to `project IS NULL` rather than left completely unscoped: an unscoped `WHERE task_key = ?` would
+    mark EVERY project's row for this task_key reverted, not just the one row this caller actually means."""
     with _intent(conn, project, intents_mod.KIND_REVERT, task_key, f"revert {squash_commit}"):
         result = _git(["revert", "--no-edit", squash_commit], repo)
         ok = result.returncode == 0
@@ -457,7 +500,9 @@ def revert_merge(
                 detail += f" (git revert --abort also raised: {type(exc).__name__}: {exc})"
         if ok and conn is not None and task_key:
             if project is None:
-                conn.execute("UPDATE merge_records SET reverted = 1 WHERE task_key = ?", (task_key,))
+                conn.execute(
+                    "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND project IS NULL", (task_key,),
+                )
             else:
                 conn.execute(
                     "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND (project IS NULL OR project = ?)",

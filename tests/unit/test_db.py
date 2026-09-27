@@ -363,7 +363,7 @@ def test_connection_keeps_autocommit_row_factory_and_foreign_keys(tmp_path):
 
 def test_migrations_are_numbered_from_one_without_gaps_and_the_version_is_derived():
     assert [m.version for m in db.MIGRATIONS] == list(range(1, len(db.MIGRATIONS) + 1))
-    assert db.SCHEMA_VERSION == db.MIGRATIONS[-1].version == db.latest_version() == 7
+    assert db.SCHEMA_VERSION == db.MIGRATIONS[-1].version == db.latest_version() == 8
     for migration in db.MIGRATIONS:
         assert migration.description
         assert isinstance(migration.apply, str) or callable(migration.apply)
@@ -422,8 +422,8 @@ def test_fresh_database_has_every_table_and_ends_at_the_newest_version(tmp_path)
     conn = db.connect(tmp_path / "ases.db")
 
     assert set(_user_tables(conn)) == _ALL_TABLES
-    assert db.current_version(conn) == db.latest_version() == 7
-    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]  # one row per migration, each stamped
+    assert db.current_version(conn) == db.latest_version() == 8
+    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7, 8]  # one row per migration, each stamped
     assert conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE applied_at IS NULL OR applied_at = ''").fetchone()[0] == 0
     assert db.pending(conn) == []
 
@@ -437,7 +437,7 @@ def test_a_new_database_is_not_backed_up_and_a_current_one_is_not_written_or_bac
 
     assert _backups(tmp_path) == []
     assert again.total_changes == 0  # nothing was inserted or updated by reconnecting to a current database
-    assert _versions(again) == [1, 2, 3, 4, 5, 6, 7]
+    assert _versions(again) == [1, 2, 3, 4, 5, 6, 7, 8]
     again.close()
 
 
@@ -447,7 +447,7 @@ def test_a_zero_byte_file_is_a_new_database_and_gets_no_backup(tmp_path):
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 7
+    assert db.current_version(conn) == 8
     assert _backups(tmp_path) == []
     conn.close()
 
@@ -458,7 +458,7 @@ def test_connect_works_for_a_path_with_spaces_and_a_non_ascii_directory(tmp_path
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 7
+    assert db.current_version(conn) == 8
     assert len(_backups(path.parent)) == 1
     conn.close()
 
@@ -480,10 +480,10 @@ def test_pending_lists_the_higher_migrations_oldest_first(tmp_path):
     path = _make_old_database(tmp_path / "ases.db", 5)
     raw = sqlite3.connect(str(path), isolation_level=None)
 
-    assert [m.version for m in db.pending(raw)] == [6, 7]
+    assert [m.version for m in db.pending(raw)] == [6, 7, 8]
     raw.execute("DELETE FROM schema_migrations")
-    assert [m.version for m in db.pending(raw)] == [1, 2, 3, 4, 5, 6, 7]
-    raw.execute("INSERT INTO schema_migrations VALUES (7, 'x')")
+    assert [m.version for m in db.pending(raw)] == [1, 2, 3, 4, 5, 6, 7, 8]
+    raw.execute("INSERT INTO schema_migrations VALUES (8, 'x')")
     assert db.pending(raw) == []
     raw.close()
 
@@ -499,7 +499,7 @@ def test_a_database_from_any_earlier_schema_upgrades_in_place_with_its_rows_and_
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 7
+    assert db.current_version(conn) == 8
     assert set(_user_tables(conn)) == _ALL_TABLES
     after = _snapshot(conn)
     for table, (columns, rows) in before.items():
@@ -512,7 +512,7 @@ def test_a_database_from_any_earlier_schema_upgrades_in_place_with_its_rows_and_
     assert len(_backups(tmp_path)) == 1
     assert f".bak-v{old_version}-" in _backups(tmp_path)[0]
     # the version rows: the old one is kept, and each migration that ran is recorded once
-    assert _versions(conn) == sorted({old_version, *range(old_version + 1, 8)})
+    assert _versions(conn) == sorted({old_version, *range(old_version + 1, 9)})
     conn.close()
 
 
@@ -531,13 +531,24 @@ def test_the_field_database_shape_v5_upgrades_and_the_new_columns_are_null_for_o
 
     conn = db.connect(path)
 
-    for table in ("gate_runs", "merge_records", "events"):
+    for table in ("gate_runs", "events"):
         columns = {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
         assert "project" in columns
         assert columns["project"][2].upper() == "TEXT"
         assert columns["project"][3] == 0  # nullable
         assert columns["project"][4] is None  # no default
         assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE project IS NOT NULL").fetchone()[0] == 0
+    # merge_records (schema v8, migration 8) also has a nullable project column with no default, but its one
+    # seeded row (task_key 'T1') is NOT null: plan_tasks names exactly one project ('p1') for that task_key, so
+    # the migration's backfill step attributes the row to it instead of leaving it NULL.
+    columns = {r[1]: r for r in conn.execute("PRAGMA table_info(merge_records)")}
+    assert "project" in columns
+    assert columns["project"][2].upper() == "TEXT"
+    assert columns["project"][3] == 0  # nullable
+    assert columns["project"][4] is None  # no default
+    assert conn.execute(
+        "SELECT project FROM merge_records WHERE task_key = 'T1'"
+    ).fetchone()["project"] == "p1"
     # the leases and snapshots of version 6 exist and work, including the partial unique index
     conn.execute("INSERT INTO resource_leases (project, resource, holder, acquired_at) VALUES ('p', 'r', 'h', 't')")
     with pytest.raises(sqlite3.IntegrityError):
@@ -545,7 +556,7 @@ def test_the_field_database_shape_v5_upgrades_and_the_new_columns_are_null_for_o
     conn.close()
 
 
-def test_upgrading_from_the_old_schema_6_changes_nothing_but_the_version_7_additions(tmp_path):
+def test_upgrading_from_the_old_schema_6_changes_nothing_but_the_version_7_and_8_additions(tmp_path):
     path = _make_old_database(tmp_path / "ases.db", 6)
     raw = sqlite3.connect(str(path), isolation_level=None)
     tables_before, indexes_before = _shape(raw)
@@ -557,7 +568,9 @@ def test_upgrading_from_the_old_schema_6_changes_nothing_but_the_version_7_addit
     tables_after, indexes_after = _shape(conn)
 
     for table, columns in tables_before.items():
-        if table in ("gate_runs", "merge_records", "events"):
+        if table == "merge_records":
+            continue  # migration 8 rebuilds this one from scratch: checked on its own below
+        if table in ("gate_runs", "events"):
             assert tables_after[table][:-1] == columns  # the old columns, unchanged and in order
             assert tables_after[table][-1][0] == "project"  # plus exactly one
         elif table == "schema_migrations":
@@ -567,9 +580,27 @@ def test_upgrading_from_the_old_schema_6_changes_nothing_but_the_version_7_addit
     assert set(tables_after) == set(tables_before)
     assert set(indexes_after) - set(indexes_before) == {"idx_gate_runs_project_task_sha", "idx_events_kind"}
     assert {k: v for k, v in indexes_after.items() if k in indexes_before} == indexes_before
+
+    # merge_records (migration 8): a rebuilt table, not an ALTER, so its columns are NOT the old ones plus one
+    # appended -- project moves to the front (matching plan_tasks' own (project, task_key) convention) and
+    # task_key gains an explicit NOT NULL it never had as a lone TEXT PRIMARY KEY (SQLite does not imply NOT NULL
+    # from PRIMARY KEY alone for a non-INTEGER column). Every other old column keeps its name, type and order.
+    old_mr = {c[0]: c for c in tables_before["merge_records"]}
+    new_mr = {c[0]: c for c in tables_after["merge_records"]}
+    assert [c[0] for c in tables_after["merge_records"]] == [
+        "project", "task_key", "candidate_sha", "gate3_result", "squash_commit", "reverted", "completed_at",
+    ]
+    for name in ("candidate_sha", "gate3_result", "squash_commit", "reverted", "completed_at"):
+        assert new_mr[name] == old_mr[name], name
+    assert new_mr["task_key"][:3] == (old_mr["task_key"][0], old_mr["task_key"][1], 1)  # type same, now NOT NULL
+    assert new_mr["project"] == ("project", "TEXT", 0, None, 1)  # nullable, no default, pk position 1
+
     primary_keys_after = {t: [c[0] for c in sorted((c for c in cols if c[4]), key=lambda c: c[4])]
                           for t, cols in tables_after.items()}
-    assert primary_keys_after == primary_keys_before  # no primary key changed
+    primary_keys_before["merge_records"] = ["task_key"]  # what it always was, for the comparison below
+    assert primary_keys_after["merge_records"] == ["project", "task_key"]  # the fix: no longer task_key alone
+    del primary_keys_after["merge_records"], primary_keys_before["merge_records"]
+    assert primary_keys_after == primary_keys_before  # no OTHER table's primary key changed
     conn.close()
 
 
@@ -581,6 +612,101 @@ def test_the_version_7_indexes_cover_the_columns_the_work_order_names(tmp_path):
     assert indexes["idx_gate_runs_project_task_sha"][:3] == ("gate_runs", 0, ["project", "task_key", "commit_sha"])
     assert indexes["idx_events_kind"][:3] == ("events", 0, ["kind"])
     assert "WHERE released_at IS NULL" in indexes["idx_resource_leases_active"][3]  # the partial index is intact
+
+
+def _make_v7_database(path, *, plan_task_rows=(), merge_rows=()):
+    """A database at exactly schema version 7: `_make_old_database`'s v6 shape, plus the nullable project column
+    and the two indexes v7 added (matching db.py's own `_apply_v7`), the given plan_tasks and merge_records rows,
+    and a version 7 row. Built from raw SQL, not from db.py's own code, so migration 8's backfill is tested
+    against a real v7 shape rather than a copy of the migration under test."""
+    _make_old_database(path, 6, seed=False, record_version=False)
+    raw = sqlite3.connect(str(path), isolation_level=None)
+    for table in ("gate_runs", "merge_records", "events"):
+        raw.execute(f"ALTER TABLE {table} ADD COLUMN project TEXT")
+    raw.execute("CREATE INDEX idx_gate_runs_project_task_sha ON gate_runs (project, task_key, commit_sha)")
+    raw.execute("CREATE INDEX idx_events_kind ON events (kind)")
+    for project, task_key in plan_task_rows:
+        raw.execute(
+            "INSERT INTO plan_tasks (project, task_key, role, created_at) VALUES (?, ?, 'coder', datetime('now'))",
+            (project, task_key),
+        )
+    for row in merge_rows:
+        raw.execute(
+            "INSERT INTO merge_records (task_key, project, candidate_sha, gate3_result, squash_commit, reverted, "
+            "completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", row,
+        )
+    for version in range(1, 8):
+        raw.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, '2026-09-19 10:00:00')", (version,))
+    raw.close()
+    return path
+
+
+def test_migration_8_backfills_legacy_merge_records_from_plan_tasks_only_when_unambiguous(tmp_path):
+    """ASES-ARC-03 / ASES-GIT-05 (the register's "a separate, still-open risk for two projects reusing a task
+    key"): the migration 8 backfill step, exercised directly against a real v7 shape with every case the work
+    order names -- a legacy row plan_tasks attributes to exactly one project, a row that already has one (a
+    hypothetical earlier writer), one plan_tasks makes ambiguous (two projects share the task key), and one no
+    plan_tasks row names at all."""
+    path = _make_v7_database(
+        tmp_path / "ases.db",
+        plan_task_rows=[("p1", "T1"), ("p2", "T2"), ("p1", "T3"), ("p2", "T3")],  # T3: two projects share it
+        merge_rows=[
+            ("T1", None, "sha1", "pass", "sha1", 0, "2026-09-19T10:00:00"),  # one plan_tasks match: backfilled
+            ("T2", "p2", "sha2", "pass", "sha2", 0, "2026-09-19T10:01:00"),  # already attributed: untouched
+            ("T3", None, "sha3", "pass", "sha3", 1, "2026-09-19T10:02:00"),  # ambiguous (p1 AND p2): left NULL
+            ("T4", None, "sha4", "fail", None, 0, None),                    # no plan_tasks row at all: left NULL
+        ],
+    )
+
+    conn = db.connect(path)
+
+    assert db.current_version(conn) == 8
+    rows = {r["task_key"]: dict(r) for r in conn.execute(
+        "SELECT task_key, project, candidate_sha, gate3_result, squash_commit, reverted, completed_at "
+        "FROM merge_records"
+    )}
+    assert rows["T1"]["project"] == "p1"  # backfilled: plan_tasks names exactly one project for T1
+    assert rows["T2"]["project"] == "p2"  # already attributed: left exactly as it was
+    assert rows["T3"]["project"] is None  # ambiguous: plan_tasks has BOTH p1 and p2 for T3, not guessed
+    assert rows["T4"]["project"] is None  # unattributable: no plan_tasks row names T4 at all
+    # every other column of every row survived the rebuild untouched
+    expected = {
+        "T1": ("sha1", "pass", "sha1", 0, "2026-09-19T10:00:00"),
+        "T2": ("sha2", "pass", "sha2", 0, "2026-09-19T10:01:00"),
+        "T3": ("sha3", "pass", "sha3", 1, "2026-09-19T10:02:00"),
+        "T4": ("sha4", "fail", None, 0, None),
+    }
+    for key, (candidate, gate3, squash, reverted, completed) in expected.items():
+        row = rows[key]
+        assert (row["candidate_sha"], row["gate3_result"], row["squash_commit"], row["reverted"],
+                row["completed_at"]) == (candidate, gate3, squash, reverted, completed), key
+    conn.close()
+
+
+def test_migration_8_lets_two_projects_keep_separate_rows_for_the_same_task_key(tmp_path):
+    """The bug this migration exists to fix: before it, merge_records.task_key alone was the primary key, so two
+    projects reusing a task key upserted onto the SAME row. After it, PRIMARY KEY (project, task_key) makes them
+    two distinct rows, proven here with a plain INSERT for each (the collision-safety mergeq.py's ON CONFLICT
+    upsert relies on)."""
+    path = _make_v7_database(tmp_path / "ases.db")
+    conn = db.connect(path)
+
+    conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES ('p1', 'T1', 'shaA', 'pass', 'shaA', 0, '2026-09-19T10:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES ('p2', 'T1', 'shaB', 'fail', NULL, 0, NULL)"
+    )  # would have collided onto the SAME row before this migration: task_key alone used to be the whole key
+
+    rows = {r["project"]: dict(r) for r in conn.execute(
+        "SELECT project, candidate_sha, gate3_result, squash_commit FROM merge_records WHERE task_key = 'T1'"
+    )}
+    assert set(rows) == {"p1", "p2"}
+    assert rows["p1"]["candidate_sha"] == "shaA" and rows["p1"]["gate3_result"] == "pass"
+    assert rows["p2"]["candidate_sha"] == "shaB" and rows["p2"]["gate3_result"] == "fail"
+    conn.close()
 
 
 def test_a_schema_4_database_whose_usage_table_predates_the_attribution_columns_gets_them(tmp_path):
@@ -606,8 +732,8 @@ def test_a_database_whose_version_row_is_missing_is_repaired_by_connecting(tmp_p
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 7
-    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7]
+    assert db.current_version(conn) == 8
+    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7, 8]
     for table, (columns, rows) in before.items():
         kept = [tuple(r) for r in conn.execute(f"SELECT {', '.join(columns)} FROM {table} ORDER BY rowid")]
         assert kept == rows, table
@@ -624,7 +750,7 @@ def test_a_project_column_that_already_exists_does_not_fail_migration_7(tmp_path
     conn = db.connect(path)
 
     assert [r[1] for r in conn.execute("PRAGMA table_info(gate_runs)")].count("project") == 1
-    assert db.current_version(conn) == 7
+    assert db.current_version(conn) == 8
     conn.close()
 
 
@@ -734,7 +860,7 @@ def test_a_same_second_backup_another_process_already_made_is_accepted_even_if_t
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 7  # the upgrade went ahead: a backup exists
+    assert db.current_version(conn) == 8  # the upgrade went ahead: a backup exists
     assert target.read_bytes() == b"a whole backup made by the other process"  # theirs was left alone
     assert not list(tmp_path.glob("*.tmp"))  # and ours was not left behind
     conn.close()
@@ -783,18 +909,18 @@ def _boom(conn):
 def test_a_failing_migration_rolls_back_leaves_the_version_and_raises_naming_it(tmp_path, monkeypatch):
     path = tmp_path / "ases.db"
     db.connect(path).close()
-    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(8, "will fail", _boom)])
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(9, "will fail", _boom)])
 
     with pytest.raises(db.MigrationError) as info:
         db.connect(path)
 
-    assert info.value.version == 8
-    assert "migration 8" in str(info.value) and "boom" in str(info.value) and "version 7" in str(info.value)
+    assert info.value.version == 9
+    assert "migration 9" in str(info.value) and "boom" in str(info.value) and "version 8" in str(info.value)
     assert isinstance(info.value.__cause__, RuntimeError)
     raw = sqlite3.connect(str(path), isolation_level=None)
-    assert db.current_version(raw) == 7  # the version stayed where it was
+    assert db.current_version(raw) == 8  # the version stayed where it was
     assert raw.execute("SELECT name FROM sqlite_master WHERE name = 'half_done'").fetchone() is None  # rolled back
-    assert _versions(raw) == [1, 2, 3, 4, 5, 6, 7]
+    assert _versions(raw) == [1, 2, 3, 4, 5, 6, 7, 8]
     raw.close()
 
 
@@ -802,16 +928,16 @@ def test_a_migration_written_as_sql_is_atomic_across_its_statements(tmp_path, mo
     path = tmp_path / "ases.db"
     db.connect(path).close()
     # the first statement works and the second cannot: the whole migration must vanish
-    broken = db.Migration(8, "sql that fails half way", "CREATE TABLE t_one (a INTEGER); CREATE TABLE t_one (b INTEGER);")
+    broken = db.Migration(9, "sql that fails half way", "CREATE TABLE t_one (a INTEGER); CREATE TABLE t_one (b INTEGER);")
     monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, broken])
 
     with pytest.raises(db.MigrationError) as info:
         db.connect(path)
 
-    assert info.value.version == 8
+    assert info.value.version == 9
     raw = sqlite3.connect(str(path), isolation_level=None)
     assert raw.execute("SELECT name FROM sqlite_master WHERE name = 't_one'").fetchone() is None
-    assert db.current_version(raw) == 7
+    assert db.current_version(raw) == 8
     raw.close()
 
 
@@ -834,14 +960,14 @@ def test_a_failed_upgrade_can_be_retried_once_the_migration_is_fixed(tmp_path, m
     path = tmp_path / "ases.db"
     db.connect(path).close()
     good = list(db.MIGRATIONS)
-    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(8, "will fail", _boom)])
+    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(9, "will fail", _boom)])
     with pytest.raises(db.MigrationError):
         db.connect(path)
 
-    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(8, "fixed", "CREATE TABLE half_done (a INTEGER)")])
+    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(9, "fixed", "CREATE TABLE half_done (a INTEGER)")])
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 8
+    assert db.current_version(conn) == 9
     assert "half_done" in _user_tables(conn)
     conn.close()
 
@@ -849,7 +975,7 @@ def test_a_failed_upgrade_can_be_retried_once_the_migration_is_fixed(tmp_path, m
 def test_a_failed_migration_closes_the_connection_so_the_file_can_be_removed(tmp_path, monkeypatch):
     path = tmp_path / "ases.db"
     db.connect(path).close()
-    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(8, "will fail", _boom)])
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(9, "will fail", _boom)])
     with pytest.raises(db.MigrationError):
         db.connect(path)
 
@@ -864,7 +990,7 @@ def test_a_failed_migration_closes_the_connection_so_the_file_can_be_removed(tmp
 def test_a_migration_already_applied_by_another_process_is_skipped_not_repeated(tmp_path):
     path = _make_old_database(tmp_path / "ases.db", 6)
     raw = sqlite3.connect(str(path), isolation_level=None)
-    seventh = db.MIGRATIONS[-1]
+    seventh = next(m for m in db.MIGRATIONS if m.version == 7)
 
     db._apply(raw, seventh)
     db._apply(raw, seventh)  # what a second process sees after waiting for the write lock: already there
@@ -899,9 +1025,9 @@ def test_processes_upgrading_the_same_database_at_the_same_time_all_succeed(tmp_
 
     for (out, err), code_ in outputs:
         assert code_ == 0, err
-        assert out.strip() == "7"
+        assert out.strip() == "8"
     raw = sqlite3.connect(str(path), isolation_level=None)
-    assert _versions(raw) == [5, 6, 7]  # applied once each: a double apply would have failed on the primary key
+    assert _versions(raw) == [5, 6, 7, 8]  # applied once each: a double apply would have failed on the primary key
     assert set(_user_tables(raw)) == _ALL_TABLES
     raw.close()
     assert len(_backups(tmp_path)) >= 1
@@ -940,10 +1066,10 @@ def test_a_database_one_version_ahead_is_refused_and_one_at_the_newest_is_accept
     path = tmp_path / "ases.db"
     db.connect(path).close()
     raw = sqlite3.connect(str(path), isolation_level=None)
-    raw.execute("INSERT INTO schema_migrations VALUES (8, 'x')")
+    raw.execute("INSERT INTO schema_migrations VALUES (9, 'x')")
     raw.close()
 
     with pytest.raises(db.MigrationError) as info:
         db.connect(path)
 
-    assert info.value.version == 8
+    assert info.value.version == 9
