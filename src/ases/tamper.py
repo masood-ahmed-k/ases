@@ -31,6 +31,7 @@ import re
 import subprocess
 
 from . import events as events_mod
+from . import gitexec
 
 _log = logging.getLogger(__name__)
 
@@ -943,7 +944,7 @@ def analyze_diff(
 
 # --- reading a range out of git -----------------------------------------------------------------------------
 
-_GIT = ("git", "--no-optional-locks", "-c", "core.quotepath=false")
+_GIT = gitexec.GIT + ("--no-optional-locks", "-c", "core.quotepath=false")
 
 
 def _run_git(repo: pathlib.Path, args: list[str], timeout: float | None, *, stdin: bytes | None = None) -> bytes:
@@ -951,7 +952,9 @@ def _run_git(repo: pathlib.Path, args: list[str], timeout: float | None, *, stdi
     a timeout, a non-zero exit) is a TamperCheckError, never an empty result: an empty diff and a failed diff
     must not look alike. --no-optional-locks so the check can never take index.lock from a real git operation."""
     try:
-        proc = subprocess.run([*_GIT, "-C", str(repo), *args], capture_output=True, timeout=timeout, input=stdin)
+        proc = subprocess.run(
+            [*_GIT, "-C", str(repo), *args], capture_output=True, timeout=timeout, input=stdin, env=gitexec.git_env(),
+        )
     except subprocess.TimeoutExpired as exc:
         raise TamperCheckError(f"git {args[0]} timed out after {timeout}s") from exc
     except (OSError, ValueError) as exc:  # git not installed, a repo path that cannot be used
@@ -1044,10 +1047,10 @@ def check_range(
     base, head = _check_rev("base", base), _check_rev("head", head)
     span = f"{base}...{head}"
     patch = _run_git(repo, [
-        "diff", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "-U3",
+        "diff", *gitexec.DIFF_SAFETY, "--no-renames", "--no-color", "-U3",
         "--src-prefix=a/", "--dst-prefix=b/", span, "--",
     ], timeout)
-    names = _run_git(repo, ["diff", "--name-status", "--no-renames", "-z", span, "--"], timeout)
+    names = _run_git(repo, ["diff", *gitexec.DIFF_SAFETY, "--name-status", "--no-renames", "-z", span, "--"], timeout)
     statuses = _parse_name_status(names)
 
     files = _reconcile_status(parse_diff(patch.decode("utf-8", errors="replace")), statuses)

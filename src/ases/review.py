@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 from . import events as events_mod
 from . import gates as gates_mod
+from . import gitexec
 from . import hermes as hermes_mod
 from . import integrity
 from . import tamper as tamper_mod
@@ -234,7 +235,8 @@ def _check_scope(
     # stdout while failing, so a missing branch used to come back as a non-empty "head" and sail past the
     # guard below (found 2026-09-19 by a test that asked for a branch that does not exist).
     resolved = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--verify", "-q", branch], capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "rev-parse", "--verify", "-q", branch],
+        capture_output=True, text=True, env=gitexec.git_env(),
     )
     head = resolved.stdout.strip() if resolved.returncode == 0 else ""
     if not head:
@@ -243,7 +245,8 @@ def _check_scope(
     # The merge-base is taken from the resolved head, not the branch name, so it and the diff below are
     # computed from the same commit even if the branch moves while this runs.
     base = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", integration_branch, head], capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "merge-base", integration_branch, head],
+        capture_output=True, text=True, env=gitexec.git_env(),
     ).stdout.strip()
     if not base:
         # Fail closed. Falling back to inspecting only the branch's LAST commit (what this used to do)
@@ -382,8 +385,8 @@ def _files_at(repo: pathlib.Path, head: str, paths: list[str]) -> list[str]:
         return []
     payload = "".join(f"{head}:{path}\n" for path in paths).encode("utf-8", errors="replace")
     proc = subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "--batch-check=%(objecttype)"],
-        input=payload, capture_output=True, timeout=30,
+        [*gitexec.GIT, "-C", str(repo), "cat-file", "--batch-check=%(objecttype)"],
+        input=payload, capture_output=True, timeout=30, env=gitexec.git_env(),
     )
     answers = proc.stdout.decode("utf-8", errors="replace").splitlines()
     # strict=False on purpose: git stops answering at the first name it dies on, and the answers it did give are
@@ -416,8 +419,8 @@ def _evidence(detail: str, limit: int = 1500) -> str:
 
 def _changed_since(repo: pathlib.Path, base: str, head: str) -> list[str]:
     result = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--name-only", "--no-renames", f"{base}..{head}"],
-        capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "diff", *gitexec.DIFF_SAFETY, "--name-only", "--no-renames", f"{base}..{head}"],
+        capture_output=True, text=True, env=gitexec.git_env(),
     )
     # --no-renames (2026-09-19): with rename detection `git mv SECRETS.md src/a.py` lists only src/a.py, so the
     # removed out-of-scope path was never seen by the touches check. Both sides of a rename must be in scope.

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from ases import db, guards
+from ases import db, gitexec, guards
 
 
 def _git(*args, cwd):
@@ -394,6 +394,39 @@ def test_git_is_only_used_read_only_and_always_time_limited(repo, monkeypatch):
         assert cmd[0] == "git" and "--no-optional-locks" in cmd  # never takes index.lock from a real git operation
         assert cmd[cmd.index("-C") + 2] in {"symbolic-ref", "rev-parse", "status"}
         assert kwargs["timeout"] > 0
+
+
+# --- round 9, package GITHARDEN: a planted fsmonitor hook does not fire on check_primary_checkout's status ----
+
+def test_a_planted_fsmonitor_hook_does_not_run_during_check_primary_checkouts_status(repo, tmp_path, monkeypatch):
+    """Item 3 of the round 8 sweep: guards._git's `status` call (check_primary_checkout's uncommitted-change
+    check) used to run with whatever core.fsmonitor a worker wrote into the shared .git/config, and a planted
+    fsmonitor hook fires on every status with nothing in git's own output to show it -- --no-optional-locks does
+    not affect it, only -c core.fsmonitor=false does.
+
+    Before/after in one test: the SAME hook, with gitexec.GIT weakened back to a bare "git" (no fsmonitor
+    override), DOES fire on the very next status call, proving the clean result above is the override's doing."""
+    marker = tmp_path / "fsmonitor_ran.txt"
+    # core.fsmonitor's value is a single executable path, not a shell command line (unlike diff/filter drivers,
+    # which run through `sh -c`): a shebang script is the plain way to plant one. It replies with nothing on
+    # stdout, which tells git "nothing is known to have changed", keeping `status` accurate. Kept OUTSIDE the
+    # repository (tmp_path, not repo) so it never shows up as an untracked file in the status being checked.
+    script = tmp_path / "fsmon-hook.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker.as_posix()}"\n', encoding="utf-8", newline="\n")
+    script.chmod(0o755)
+    # Forward slashes: an unquoted git-config value treats a backslash as a (mostly unrecognised) C-style
+    # escape and silently drops it, corrupting a native Windows path -- as_posix() (still "C:/Users/...", not a
+    # /c/... mount path) is what stays intact through git config's own value parser.
+    _git("config", "core.fsmonitor", script.as_posix(), cwd=repo)
+
+    result = guards.check_primary_checkout(repo, "integration")
+
+    assert result.ok is True
+    assert not marker.exists(), "a planted fsmonitor hook ran during check_primary_checkout's status call"
+
+    monkeypatch.setattr(gitexec, "GIT", ("git",))
+    guards.check_primary_checkout(repo, "integration")
+    assert marker.exists(), "fixture problem: the fsmonitor hook should fire once gitexec.GIT is weakened to plain git"
 
 
 # --- expected head in the database ---------------------------------------------------------------

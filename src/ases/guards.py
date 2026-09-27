@@ -33,6 +33,8 @@ import subprocess
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
+from . import gitexec
+
 _GIT_TIMEOUT = 60  # seconds per git call, the same as the merge queue's
 
 
@@ -56,7 +58,8 @@ def _git(repo: pathlib.Path, args: list[str]) -> tuple[int, str, str]:
     here raises."""
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(repo), *args], capture_output=True, timeout=_GIT_TIMEOUT,
+            [*gitexec.GIT, "--no-optional-locks", "-C", str(repo), *args],
+            capture_output=True, timeout=_GIT_TIMEOUT, env=gitexec.git_env(),
         )
     except subprocess.TimeoutExpired:
         return -1, "", f"git {args[0]} timed out after {_GIT_TIMEOUT}s"
