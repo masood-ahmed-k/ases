@@ -844,8 +844,10 @@ def _gate_summary(outcome: GateOutcome | None) -> dict:
 def _task_summaries(conn: sqlite3.Connection, plan) -> list[dict]:
     """One entry per plan task: task key, title, role, work card id (the task's CURRENT work card, which follows a
     fix or retry card), merge card id, the squash commit and the Gate 3 result from merge_records (None for a task
-    with no record; a review-only task's merge has no squash commit). merge_records has no project column, so it is
-    read by task key."""
+    with no record; a review-only task's merge has no squash commit). merge_records' primary key is (project,
+    task_key) (schema v8, round 9), so it is read scoped by this plan's project too, the same NULL-tolerant way
+    gates.last_gate_result reads gate_runs: this plan's own rows, or a legacy row with no project recorded, never
+    a different project's row for one of this plan's task keys."""
     rows = {
         row["task_key"]: row for row in conn.execute(
             "SELECT task_key, work_card_id, merge_card_id FROM plan_tasks WHERE project = ?", (plan.project,),
@@ -857,7 +859,8 @@ def _task_summaries(conn: sqlite3.Connection, plan) -> list[dict]:
         marks = ",".join("?" * len(keys))
         records = {
             row["task_key"]: row for row in conn.execute(
-                f"SELECT task_key, squash_commit, gate3_result FROM merge_records WHERE task_key IN ({marks})", keys,
+                f"SELECT task_key, squash_commit, gate3_result FROM merge_records "
+                f"WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?)", (*keys, plan.project),
             )
         }
     summaries = []

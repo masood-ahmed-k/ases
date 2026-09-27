@@ -497,14 +497,19 @@ def score_swarm_project(
     `project` must have a completed, not reverted, merge record; the integration branch of `repo` is exported and put
     through run_e8_checks; success is both. The counts are kept apart, as Appendix D.2 asks: tasks merged, reverts,
     review rounds (the controller's lineage counter, else the CHANGES_REQUIRED verdicts), model requests counted for
-    the project, and the human answers given (question_answered events for its tasks). Reads the database only."""
+    the project, and the human answers given (question_answered events for its tasks). Reads the database only.
+
+    merge_records' primary key is (project, task_key) (schema v8, round 9), so the read below is scoped to
+    `project` the same NULL-tolerant way gates.last_gate_result reads gate_runs: this project's own rows, or a
+    legacy row with no project recorded, never a different project's row for one of this project's task keys."""
     keys = [r["task_key"] for r in conn.execute(
         "SELECT task_key FROM plan_tasks WHERE project = ? ORDER BY task_key", (project,))]
     if not keys:
         return Score(False, findings={"tasks_total": 0}, notes=f"no plan tasks are recorded for project {text.ascii_safe(project)}")
     marks = ",".join("?" for _ in keys)
     merges = conn.execute(
-        f"SELECT task_key, completed_at, reverted FROM merge_records WHERE task_key IN ({marks})", keys).fetchall()
+        f"SELECT task_key, completed_at, reverted FROM merge_records "
+        f"WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?)", (*keys, project)).fetchall()
     merged = sum(1 for m in merges if m["completed_at"] and not m["reverted"])
     reverted = sum(1 for m in merges if m["reverted"])
     lineage = conn.execute(

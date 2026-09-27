@@ -493,9 +493,13 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
     the merge records, and the findings the controller recorded as events (a merge refused for want of a review,
     a moved or dirty primary checkout, anything with tamper in its kind).
 
-    gate_runs and merge_records have no project column, so they are scoped by task key (this plan's keys and
-    the final-gate key). Verdicts are scoped by project. Gate detail text is deliberately left out: it is command
-    output, the likeliest place for a secret, and it stays in gate_runs for whoever needs it."""
+    gate_runs has no project column, so it is scoped by task key (this plan's keys and the final-gate key).
+    merge_records (schema v8, round 9) IS scoped by project now -- its primary key is (project, task_key), so a
+    task key alone can legitimately name more than one row -- with the same NULL-tolerant read gates.last_gate_
+    result uses: this plan's own rows, or a legacy row with no project recorded, never a different project's row
+    that happens to share one of this plan's task keys. Verdicts are scoped by project. Gate detail text is
+    deliberately left out: it is command output, the likeliest place for a secret, and it stays in gate_runs for
+    whoever needs it."""
     keys = [task.key for task in plan.tasks]
     scope = [*keys, FINAL_GATE_KEY]
     marks = ",".join("?" * len(scope))
@@ -520,7 +524,8 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
     records = {
         row["task_key"]: row for row in conn.execute(
             f"SELECT task_key, candidate_sha, gate3_result, squash_commit, reverted, completed_at "
-            f"FROM merge_records WHERE task_key IN ({marks})", scope,
+            f"FROM merge_records WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?)",
+            (*scope, plan.project),
         )
     }
     merges = [
