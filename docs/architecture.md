@@ -637,7 +637,7 @@ unit test around it mocked the Hermes wrapper, so none of the following could ha
 ## The first real end-to-end run: lead, coder, reviewer, merge (2026-09-19)
 
 Project `greet-e2e` in the throwaway repo, board `ases-phase3`, run through the controller as it stood at
-commit 59d5abb. Times are the machine's local time (UTC+2). Nothing below was mocked: real Hermes, real git,
+commit 4643c3a. Times are the machine's local time (UTC+2). Nothing below was mocked: real Hermes, real git,
 real providers.
 
 | time | what happened |

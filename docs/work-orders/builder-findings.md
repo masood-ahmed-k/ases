@@ -902,7 +902,7 @@ skipped, 37 failed, all in CORE's `controller.py` files and two acceptance tests
 gave 282 passed, 0 failed, confirming the collision was transient.
 
 Ran Gate 4 against ASES's OWN repository (read-only, as the work order asked): 60 blocking `secret_in_tree` findings at HEAD
-8ae7372, all sample/fake keys, all inside `tests/` or `docs/`. With `allow_paths=["tests/**", "docs/**"]` all 60 are excused and Gate 4
+21496d4, all sample/fake keys, all inside `tests/` or `docs/`. With `allow_paths=["tests/**", "docs/**"]` all 60 are excused and Gate 4
 now PASSES. The 20 files it had to allowlist: `docs/architecture.md`, `docs/work-orders/r2_wp_questions.md`,
 `docs/work-orders/r2_wp_report.md`, and 17 files under `tests/unit/` (bounds, cli_commands, critic, evals, events, fakes, finalgates,
 gates, killswitch, mergeq, profiles, questions, recovery, report, review, sandbox, tamper).
@@ -1256,7 +1256,7 @@ policy-compatible but UNVERIFIED candidate is correctly treated as unsafe, not s
 
 ## Package ROLES2 (round 7 wave 2): greenfield bootstrap and the Tester role's hardcoded-role bug
 
-Read the REAL current `controller.py` (1939 lines) and `cli.py` (1619 lines) fresh off HEAD `a98b95e` rather than trusting the
+Read the REAL current `controller.py` (1939 lines) and `cli.py` (1619 lines) fresh off HEAD `e6bcf5b` rather than trusting the
 work order's snapshot, per its own warning, and confirmed the working tree was clean before starting.
 
 Built `controller.ensure_repo_bootstrapped(repo, integration_branch, *, conn=None) -> bool` (ASES-GIT-10): detects a truly empty
@@ -1681,7 +1681,7 @@ Checked and clean / lower risk: review.py (only rev-parse, merge-base, cat-file 
 
 ## Round 9 wave A (2026-09-27): Tier 2 and six Tier 1 packages
 
-Work orders: `r9_rules.md`, `r9_wp_tier2.md`, `r9_wp_mergepk.md`, `r9_wp_small.md`. The user asked for Tier 2 first, then the Tier 1 items, with multiple agents in parallel. T2A worked in the primary checkout (register only); every other package had its own git worktree under `C:\Users\masoo\ases-wt` cut from 89671e2, with its own pytest --basetemp. Per package: Sonnet build, independent Sonnet review with a nemotron lead (one fix round allowed), Haiku live verification last. Every report below is verbatim.
+Work orders: `r9_rules.md`, `r9_wp_tier2.md`, `r9_wp_mergepk.md`, `r9_wp_small.md`. The user asked for Tier 2 first, then the Tier 1 items, with multiple agents in parallel. T2A worked in the primary checkout (register only); every other package had its own git worktree under `C:\Users\masoo\ases-wt` cut from f2a2adc, with its own pytest --basetemp. Per package: Sonnet build, independent Sonnet review with a nemotron lead (one fix round allowed), Haiku live verification last. Every report below is verbatim.
 
 ### T2A builder
 
@@ -1924,7 +1924,7 @@ Verification methodology:
 3. Before/after independent test: Fails with HEAD (test expects ASES-GIT-16 in requirement_ids but finds only base IDs), passes with fix
 4. Doctor test suite: 42 passed, including all profile_state rows tests
 5. Character encoding: All modified files ASCII-only, no em-dashes or section signs
-6. No commits made; HEAD remains 89671e213efb14ab3f9f2d3ac0ac3c558a2117d2
+6. No commits made; HEAD remains f2a2adcb6c2810db9fd4209fc78c0f7e35617ff5
 
 Findings:
 - Minor diff --stat variance for doctor.py (12 lines vs initial recorded 11): implementation reconstruction detail, functionality verified working
@@ -2035,7 +2035,7 @@ Nemotron second opinion, as relayed by the reviewer: Consulted via fallback (MCP
 
 ### MERGEPK live verification (Haiku, all_pass=False)
 
-MERGE-FIRST: The package code changes are sound - all three new tests pass, and before/after verification confirms that db.py, mergeq.py, and finalgates.py changes are critical to the fix. However, the full test suite shows a significant regression: 15 failures instead of 1, with 5495 passed vs 5514 expected. The failures are concentrated in tests/unit/test_gates.py, test_finalgates.py, test_mergeq.py, test_review.py, and tests/acceptance/test_22_8_merge_conflict.py. Error messages reveal: (1) subprocess 'python' command not found in Windows environment for gate execution tests, (2) gate_worktree_cleaned_up test finding residual worktree, (3) hash mismatches in finalgates end-to-end tests. These appear partly environmental (Python not in PATH when subprocess runs) and partly code-related (query scoping or worktree cleanup). The 3-test before/after verification passes with all new changes in place, confirming the new features work as designed. However, the widespread test failures in gate-related and integration tests indicate either an environmental mismatch or a regression in dependent code paths not covered by the 3 new tests. File C:\Users\masoo\ases-wt\mergepk unchanged at commit 89671e213efb14ab3f9f2d3ac0ac3c558a2117d2; all modified files are ASCII-clean.
+MERGE-FIRST: The package code changes are sound - all three new tests pass, and before/after verification confirms that db.py, mergeq.py, and finalgates.py changes are critical to the fix. However, the full test suite shows a significant regression: 15 failures instead of 1, with 5495 passed vs 5514 expected. The failures are concentrated in tests/unit/test_gates.py, test_finalgates.py, test_mergeq.py, test_review.py, and tests/acceptance/test_22_8_merge_conflict.py. Error messages reveal: (1) subprocess 'python' command not found in Windows environment for gate execution tests, (2) gate_worktree_cleaned_up test finding residual worktree, (3) hash mismatches in finalgates end-to-end tests. These appear partly environmental (Python not in PATH when subprocess runs) and partly code-related (query scoping or worktree cleanup). The 3-test before/after verification passes with all new changes in place, confirming the new features work as designed. However, the widespread test failures in gate-related and integration tests indicate either an environmental mismatch or a regression in dependent code paths not covered by the 3 new tests. File C:\Users\masoo\ases-wt\mergepk unchanged at commit f2a2adcb6c2810db9fd4209fc78c0f7e35617ff5; all modified files are ASCII-clean.
 
 ### CIPIN builder
 
@@ -2220,7 +2220,7 @@ Scope: independent review of package IDLEWT (ASES-GIT-12, the idle-worktree chec
 
 1. Requirement quote. Confirmed verbatim: blueprint.txt line 296 (p185, ASES-GIT-12) reads exactly as quoted in both the builder's report and r9_wp_small.md's IDLEWT section: "Before a worker starts and after it stops, the controller snapshots git status --porcelain and HEAD of the primary checkout and of every other active worktree. Any change outside the worker's own worktree fails the card and raises a security event."
 
-2. Diff scope. `git -C C:\Users\masoo\ases-wt\idlewt status --porcelain` shows exactly two modified files (src/ases/guards.py, tests/unit/test_guards.py), no untracked files. `git diff --stat` shows 129 insertions/deletions in guards.py and 103 in the test file, matching the builder's "129 changed lines" claim for the file they own. No commits were added (HEAD still 89671e2). `_git` (guards.py) is untouched, as claimed. controller.py, db.py, spec/requirements.yaml, docs/architecture.md and docs/work-orders/ are all untouched.
+2. Diff scope. `git -C C:\Users\masoo\ases-wt\idlewt status --porcelain` shows exactly two modified files (src/ases/guards.py, tests/unit/test_guards.py), no untracked files. `git diff --stat` shows 129 insertions/deletions in guards.py and 103 in the test file, matching the builder's "129 changed lines" claim for the file they own. No commits were added (HEAD still f2a2adc). `_git` (guards.py) is untouched, as claimed. controller.py, db.py, spec/requirements.yaml, docs/architecture.md and docs/work-orders/ are all untouched.
 
 3. Logic review of check_idle_worktrees. I traced the full state machine by hand across every transition: never-run worktree (no grace, immediate report), vacate-then-quiet (grace spent, nothing reported), vacate-then-diverge-then-reowned (grace spent, pending row created then deleted without ever reporting), vacate-then-diverge-never-explained (reported one pass later, using the ORIGINAL pre-divergence baseline against the CURRENT state, per spec), diverge-then-fully-revert (never reported), and grace expiring after one full quiet pass (worktree then judged immediately on its next divergence, same as an always-idle worktree). All of these match both the work-order spec and the builder's report exactly. The final cleanup loop uses `_owner_key(stored) not in baselined` to decide what to drop; `baselined` is populated for every worktree that is currently running or that is idle-but-present (only a prunable/missing worktree is excluded), so a genuinely mid-cycle worktree's grace/pending row is never wrongly swept, and a vacated-and-gone worktree correctly loses all three of its rows (confirmed, grace, pending). The NUL-byte suffix scheme cannot collide with a real path (NUL is illegal in filesystem paths), and `_store_snapshot` (unchanged) is a proper `INSERT ... ON CONFLICT(project, path) DO UPDATE`, so repeated stores to the same grace/pending/confirmed key are always safe upserts, never a primary-key conflict.
 
@@ -2560,13 +2560,13 @@ The blocking finding (MINIMUM_CONTEXT_LENGTH 65,536 to 64,000) has been fixed in
 
 ## Round 9 wave B (2026-09-27): GITHARDEN and GATESANDBOX
 
-Work orders: r9_wp_githarden.md, r9_wp_gatesandbox.md. Both branches cut from 7e707d6 (round 8), in their own worktrees, started after the round 8 sweep reported. Sonnet build, independent Sonnet review with a nemotron lead (up to three rounds), Haiku live verification last. Every report below is verbatim.
+Work orders: r9_wp_githarden.md, r9_wp_gatesandbox.md. Both branches cut from ffacd9e (round 8), in their own worktrees, started after the round 8 sweep reported. Sonnet build, independent Sonnet review with a nemotron lead (up to three rounds), Haiku live verification last. Every report below is verbatim.
 
 ### GITHARDEN builder
 
 ROUND 9 PACKAGE GITHARDEN: one hardened way the controller runs git
 
-Worktree: C:\Users\masoo\ases-wt\githarden, branch r9/githarden, cut from 7e707d6 (already contains round 8: gates.py and procenv.py scrub the environment; GIT_AUTHOR_* are exempt from the scrub). Never touched the primary checkout or any other package's worktree (confirmed clean at the end).
+Worktree: C:\Users\masoo\ases-wt\githarden, branch r9/githarden, cut from ffacd9e (already contains round 8: gates.py and procenv.py scrub the environment; GIT_AUTHOR_* are exempt from the scrub). Never touched the primary checkout or any other package's worktree (confirmed clean at the end).
 
 REQUIREMENTS (quoted from blueprint.txt, the source; matches r9_wp_githarden.md verbatim, both checked against the blueprint directly):
 - ASES-CFG-04 (p212): "Hermes provider credentials must never be exposed to worker terminals. ASES MUST verify this for the exact provider/authentication path in use; if any provider key is visible, move it into Hermes credential storage or behind the approved egress mechanism before running unattended workers."
@@ -2598,7 +2598,7 @@ WHAT WAS BUILT
 4. The four required behaviour tests, each with an in-test before/after proof (see the before_after field above for the full description): a planted post-checkout hook does not run during mergeq's candidate worktree add; a planted core.fsmonitor hook does not run during guards's status call; a planted textconv driver does not hide a secret from the Gate 3 scan (the most important test in the package); a planted credential-shaped environment variable is not visible to a filter driver that still runs (the item-5 residual, capped not closed).
 
 TEST COUNTS
-Baseline (r9/githarden at 7e707d6, before any change): 5533 passed, 2 skipped, 0 failed (610.81s).
+Baseline (r9/githarden at ffacd9e, before any change): 5533 passed, 2 skipped, 0 failed (610.81s).
 Final (after all changes, full suite): 5546 passed, 2 skipped, 0 failed (634.04s).
 Net +13, all new tests (10 in test_gitexec.py, 2 in test_mergeq.py, 1 in test_guards.py); zero regressions, zero flaky reruns needed.
 
@@ -2610,11 +2610,11 @@ Only the files this package owns were touched (verified with `git diff --stat` a
 
 ### GITHARDEN independent review 1 (verdict: pass)
 
-Reviewed package GITHARDEN (r9/githarden, worktree C:\Users\masoo\ases-wt\githarden, cut from 7e707d6) against docs/work-orders/r9_wp_githarden.md, r9_rules.md and r8_rules.md, without editing any file.
+Reviewed package GITHARDEN (r9/githarden, worktree C:\Users\masoo\ases-wt\githarden, cut from ffacd9e) against docs/work-orders/r9_wp_githarden.md, r9_rules.md and r8_rules.md, without editing any file.
 
 What I verified directly against the source (not just the builder's report):
 
-1. Package boundaries. `git status --porcelain` / `git diff --stat` show exactly 14 modified + 2 new files, matching the report's own count. No changes to gates.py, spec/requirements.yaml, docs/architecture.md, docs/work-orders/, or any other worktree. `git stash list` is empty; no commit was made (branch head is still 7e707d6); the primary checkout and other packages' worktrees were untouched.
+1. Package boundaries. `git status --porcelain` / `git diff --stat` show exactly 14 modified + 2 new files, matching the report's own count. No changes to gates.py, spec/requirements.yaml, docs/architecture.md, docs/work-orders/, or any other worktree. `git stash list` is empty; no commit was made (branch head is still ffacd9e); the primary checkout and other packages' worktrees were untouched.
 
 2. Completeness of routing. I grepped all of src/ases (excluding fakes/ and gates.py) for every subprocess call and every literal "git"/`_GIT` reference myself, independent of the builder's own AST scanner. Every git subprocess call site outside gates.py and fakes/ is routed through `gitexec.GIT` (directly, or through a `_GIT = gitexec.GIT + (...)` tuple in finalgates.py/tamper.py). gates.py's two bare `["git", ...]` calls (worktree add/remove) remain, exactly as the work order's exclusion requires (owned by package GATESANDBOX). No other subprocess call site in src/ases (cli.py, critic.py, evalkit/codeeval.py, hermes.py, sandbox.py, killswitch.py, evals.py, reconcile.py's `run` defaults) is a git call; all are pytest, hermes, taskkill, ps, or powershell invocations, correctly left alone.
 
@@ -2638,7 +2638,7 @@ GITHARDEN package verification complete. All 20 checks pass. The new src/ases/gi
 
 ### GATESANDBOX builder
 
-Package GATESANDBOX (round 9), branch r9/gatesandbox cut from 7e707d6, worktree C:\Users\masoo\ases-wt\gatesandbox.
+Package GATESANDBOX (round 9), branch r9/gatesandbox cut from ffacd9e, worktree C:\Users\masoo\ases-wt\gatesandbox.
 
 REQUIREMENTS (quoted from C:\Users\masoo\ases-workspaces\tools\blueprint.txt, verified word for word before building, and cross-checked against spec/requirements.yaml's status/note fields, which agreed with the work order's "Where things stand" section in every particular):
 - ASES-QG-04 (p279): "Gates run in a clean checkout of the exact commit inside the sandbox, never in the worker's live directory, so leftover files cannot turn a red build green."
@@ -2679,7 +2679,7 @@ VERIFICATION: baseline on this branch was 5533 passed, 2 skipped, 0 failed. Afte
 
 ### GATESANDBOX independent review 1 (verdict: pass)
 
-Reviewed package GATESANDBOX (round 9) in C:\Users\masoo\ases-wt\gatesandbox, branch r9/gatesandbox cut from 7e707d6, against C:\Users\masoo\ases\docs\work-orders\r9_wp_gatesandbox.md. No files were edited; the worktree was left byte-identical to how it was found (git status/diff --stat confirmed clean before and after a temporary before/after swap of controller.py, which was fully restored).
+Reviewed package GATESANDBOX (round 9) in C:\Users\masoo\ases-wt\gatesandbox, branch r9/gatesandbox cut from ffacd9e, against C:\Users\masoo\ases\docs\work-orders\r9_wp_gatesandbox.md. No files were edited; the worktree was left byte-identical to how it was found (git status/diff --stat confirmed clean before and after a temporary before/after swap of controller.py, which was fully restored).
 
 REQUIREMENT IDS: all six quotes (ASES-QG-04, ASES-SEC-03, ASES-SEC-02, ASES-SEC-05, ASES-SEC-07, ASES-SEC-06) were checked word-for-word against C:\Users\masoo\ases-workspaces\tools\blueprint.txt and match exactly. spec/requirements.yaml's status/note fields for these IDs were also checked and confirm the "gap" the work order describes (controller's own gate runs did not use docker_run_argv yet; task-scoped exceptions were not modelled in the plan schema) -- consistent with what this diff fixes, no drift found.
 
@@ -2706,7 +2706,7 @@ Nemotron second opinion, as relayed by the reviewer: Ran nemotron super via C:\U
 
 ### GATESANDBOX live verification (Haiku, all_pass=True)
 
-SHIP - All verification checks passed. New tests pass (1848 passed, 1 skipped) when run from Bash with python on PATH. Before/after verification confirms new tests fail to collect with HEAD source files (expected, as they test new functionality), but pass with current versions. Full test suite passed (5597 passed, 2 skipped, 0 failed in 9m 33s). Git state unchanged, commit still 7e707d6, all files ASCII-only. No environment issues detected - initial PowerShell test failures were due to missing python on subprocess PATH, resolved by using Bash shell.
+SHIP - All verification checks passed. New tests pass (1848 passed, 1 skipped) when run from Bash with python on PATH. Before/after verification confirms new tests fail to collect with HEAD source files (expected, as they test new functionality), but pass with current versions. Full test suite passed (5597 passed, 2 skipped, 0 failed in 9m 33s). Git state unchanged, commit still ffacd9e, all files ASCII-only. No environment issues detected - initial PowerShell test failures were due to missing python on subprocess PATH, resolved by using Bash shell.
 
 ### Architect notes
 
@@ -2738,13 +2738,13 @@ SHIP - All verification checks passed. New tests pass (1848 passed, 1 skipped) w
 
 ## Round 9 EVENTSPROJ (2026-09-27): events carry their project
 
-Work order: r9_wp_eventsproj.md. Worktree cut from 4eae7f5 (round 8 plus wave A). Sonnet build, independent Sonnet review with a nemotron lead (three rounds, two fixes), Haiku live verification last. Every report below is verbatim.
+Work order: r9_wp_eventsproj.md. Worktree cut from 8a1fa67 (round 8 plus wave A). Sonnet build, independent Sonnet review with a nemotron lead (three rounds, two fixes), Haiku live verification last. Every report below is verbatim.
 
 ### EVENTSPROJ builder
 
 ## EVENTSPROJ (round 9): events carry their project
 
-Worked in C:\Users\masoo\ases-wt\eventsproj, branch r9/eventsproj, cut from 4eae7f5 (round 8 + round 9 wave A merged). Never touched any other worktree or the primary checkout. Never committed, never pushed, never used git stash.
+Worked in C:\Users\masoo\ases-wt\eventsproj, branch r9/eventsproj, cut from 8a1fa67 (round 8 + round 9 wave A merged). Never touched any other worktree or the primary checkout. Never committed, never pushed, never used git stash.
 
 ### Requirement IDs (quoted from blueprint.txt, matches the register)
 
@@ -2867,7 +2867,7 @@ See `open_issues`. In one line each: `_parked_cards`/`_health_panel` in report.p
 
 ## Review of EVENTSPROJ (round 9), independent, files not edited
 
-Read r9_rules.md, r8_rules.md, r9_wp_eventsproj.md (the spec), and the builder's report in full. Worked only in C:\Users\masoo\ases-wt\eventsproj; never touched another worktree or the primary checkout; never committed, pushed, or used git stash. Confirmed the branch's HEAD is 4eae7f5 as claimed. All temporary before/after-proof file swaps were fully restored and verified via `git diff --stat` to match the original 25-file, 380/-62 diff exactly, both mid-review and at the end.
+Read r9_rules.md, r8_rules.md, r9_wp_eventsproj.md (the spec), and the builder's report in full. Worked only in C:\Users\masoo\ases-wt\eventsproj; never touched another worktree or the primary checkout; never committed, pushed, or used git stash. Confirmed the branch's HEAD is 8a1fa67 as claimed. All temporary before/after-proof file swaps were fully restored and verified via `git diff --stat` to match the original 25-file, 380/-62 diff exactly, both mid-review and at the end.
 
 ### Independent census
 
@@ -2925,7 +2925,7 @@ Nemotron second opinion, as relayed by the reviewer: Ran nemotron super (via the
 
 ### EVENTSPROJ independent review 3 (verdict: pass)
 
-Independently reviewed package EVENTSPROJ (branch r9/eventsproj, C:\Users\masoo\ases-wt\eventsproj, cut from 4eae7f5) against C:\Users\masoo\ases\docs\work-orders\r9_wp_eventsproj.md. No files were edited during this review.
+Independently reviewed package EVENTSPROJ (branch r9/eventsproj, C:\Users\masoo\ases-wt\eventsproj, cut from 8a1fa67) against C:\Users\masoo\ases\docs\work-orders\r9_wp_eventsproj.md. No files were edited during this review.
 
 Method: read r9_rules.md + r8_rules.md, read the full spec, pulled the full uncommitted diff (`git diff`, 1431 lines across 19 src files + 10 test files), then did my own census independent of the builder's report: grepped every `events.record(`/`events_mod.record(` call site in src/ases (70 real sites, confirmed by reading each one's containing function/caller for whether a project is genuinely in scope) and every `FROM events` reader (about 20 distinct queries across bounds.py, controller.py, critic.py, evalkit/codetasks.py, finalgates.py, hardening.py, recovery.py, report.py), then classified each independently against the spec's (a)/(b)/(c) rules for writers and the payload-scoped/should-be-scoped/legitimately-global rules for readers.
 
@@ -2942,7 +2942,7 @@ Tests: ran the new/changed tests plus the full test files of every touched modul
 
 Nemotron second opinion: ran via the nemo.py file route per the task's working instructions (MCP tools 403'd this session) with the full diff and spec pasted into the prompt. It covered questions 1 through 5 of 7 before exhausting its reasoning budget (did not raise reasoning_budget past the 8192 default per house rule) and never produced a final verdict list. On the ground it covered it found no genuine defects in the project-scoping logic, disagreement-raise safety, or fallback-pattern usage; its one flagged item (a 3-param WHERE clause in _handle_merge_failure) was a false positive from reading diff context lines as if they were changed code  -  verified directly against the source that this is pre-existing, untouched code unrelated to the diff.
 
-House rules: confirmed zero em dash / section sign characters anywhere in the diff (checked programmatically). Confirmed no git stash was used, no commits exist beyond 4eae7f5, and the working tree is unchanged by this review (no files edited).
+House rules: confirmed zero em dash / section sign characters anywhere in the diff (checked programmatically). Confirmed no git stash was used, no commits exist beyond 8a1fa67, and the working tree is unchanged by this review (no files edited).
 
 No blocking correctness defects found. Verdict: pass.
 
@@ -2990,7 +2990,7 @@ No `git commit`, no `git push`, no `git stash` used anywhere. `git status --shor
 
 ### EVENTSPROJ fix 2
 
-Findings re-checked against the actual code in C:\Users\masoo\ases-wt\eventsproj (branch r9/eventsproj, cut from 4eae7f5).
+Findings re-checked against the actual code in C:\Users\masoo\ases-wt\eventsproj (branch r9/eventsproj, cut from 8a1fa67).
 
 FINDING 1 (controller.py) -- CONFIRMED, fixed. process_merge_queue receives `plan: plan_mod.Plan` and uses `plan.project` throughout (merge_queue_halted at 890, reviewer_completed_with_changes_requested at 950, tamper_check_error via _record_once at 964-967). The three refusal events were the only ones in that function omitting it:
   - merge_refused_unreviewed (via _refuse_unreviewed, called at line 908/910): _refuse_unreviewed gained a required keyword-only `project` parameter, put into its own payload dict, and its one call site now passes `project=plan.project`.
@@ -3028,11 +3028,11 @@ No requirement-ID conflicts found between blueprint.txt and the register for thi
 
 ### EVENTSPROJ live verification (Haiku, all_pass=True)
 
-SHIP. All six verification steps passed. The EVENTSPROJ package is fully tested and ready for landing. Key observations: (1) git state unchanged throughout verification (29 files modified, 505 insertions, 82 deletions). (2) All 15 new tests pass with current code and fail as expected with HEAD versions, proving the changes are necessary and sufficient. (3) Full suite baseline matched: 5588 passed, 2 skipped, 0 failed in 557 seconds. (4) No non-ASCII characters in any changed files. (5) Commit 4eae7f5 confirmed. The builder's summary is accurate: both findings were fixed, cost-free improvements applied, and suite is fully green matching baseline.
+SHIP. All six verification steps passed. The EVENTSPROJ package is fully tested and ready for landing. Key observations: (1) git state unchanged throughout verification (29 files modified, 505 insertions, 82 deletions). (2) All 15 new tests pass with current code and fail as expected with HEAD versions, proving the changes are necessary and sufficient. (3) Full suite baseline matched: 5588 passed, 2 skipped, 0 failed in 557 seconds. (4) No non-ASCII characters in any changed files. (5) Commit 8a1fa67 confirmed. The builder's summary is accurate: both findings were fixed, cost-free improvements applied, and suite is fully green matching baseline.
 
 ### Architect notes
 
-- Started from 4eae7f5 (wave A merged) while wave B was still building, to save wall-clock time; the hunks were kept to the
+- Started from 8a1fa67 (wave A merged) while wave B was still building, to save wall-clock time; the hunks were kept to the
   record lines and the queries so the later merge would stay mechanical. It still conflicted with GATESANDBOX and CIPIN on the
   Gate 1 call sites (EVENTSPROJ added `project`, the project name for the events gate_before_review records; GATESANDBOX had
   added `project_config`, the configuration object for the runner): all kept.
@@ -3052,7 +3052,7 @@ SHIP. All six verification steps passed. The EVENTSPROJ package is fully tested 
 
 ## Round 10 (2026-09-27): BASECHECK, GATEPIN, BUDGETFIX, CALLERS
 
-Work orders: r10_rules.md, r10_wp_basecheck.md, r10_wp_small.md. Each package in its own worktree cut from c62d780. Sonnet build, independent Sonnet review with a nemotron lead (up to three rounds), Haiku live verification last. Every report below is verbatim.
+Work orders: r10_rules.md, r10_wp_basecheck.md, r10_wp_small.md. Each package in its own worktree cut from f9dd592. Sonnet build, independent Sonnet review with a nemotron lead (up to three rounds), Haiku live verification last. Every report below is verbatim.
 
 ### BASECHECK builder
 
@@ -3079,7 +3079,7 @@ TESTS (the work order's own five scenarios, all covered): a card dispatched at t
 
 INDEPENDENT REVIEW (nemotron): per the project's standing instruction to use nemotron generously for first-pass review, I ran run_nemotron_super over the full source diff with the requirement text and my own design summary. It surfaced one genuine medium-severity issue -- _branch_created_from's reliance on git's ENGLISH reflog message ('branch: Created from'), which git localizes under gettext for a non-English LANG/LC_ALL if a translation is installed -- which I fixed (LC_ALL=C forced on every git call guards._git makes) and added a regression test for. It also raised a low-severity memoization edge case (a branch deleted and recreated under an identical name mid-run) which I judged acceptable given mergeq's own independent enforcement already catches it before anything merges, and documented that reasoning in the code rather than silently dismissing it; see Open Issues.
 
-Full-suite baseline and final counts, and the exact process failures I caught and corrected along the way, are under Tests. No git commit or push was made (all changes are uncommitted on r10/basecheck, branched from c62d780 as instructed). git stash was never used. Every file was written through the Write/Edit tool; the one narrow exception, disclosed rather than hidden, is a single bulk find-and-replace across tests/unit/test_db.py's pre-existing hardcoded 'latest schema version is 8' literals (bumping every one to 9, or 10 inside the fake-migration failure-injection tests, made necessary by adding a real migration 9) that I ran as a small Python script through a quoted bash heredoc rather than a sequence of individual Edit calls; I verified its result immediately afterward by reading the file back and it matched exactly what plain Edit calls would have produced, and every subsequent edit to that same file (including the migration-9-specific tests) was made through Edit. No em dash or section-sign character appears anywhere I wrote, checked by scanning every changed file.
+Full-suite baseline and final counts, and the exact process failures I caught and corrected along the way, are under Tests. No git commit or push was made (all changes are uncommitted on r10/basecheck, branched from f9dd592 as instructed). git stash was never used. Every file was written through the Write/Edit tool; the one narrow exception, disclosed rather than hidden, is a single bulk find-and-replace across tests/unit/test_db.py's pre-existing hardcoded 'latest schema version is 8' literals (bumping every one to 9, or 10 inside the fake-migration failure-injection tests, made necessary by adding a real migration 9) that I ran as a small Python script through a quoted bash heredoc rather than a sequence of individual Edit calls; I verified its result immediately afterward by reading the file back and it matched exactly what plain Edit calls would have produced, and every subsequent edit to that same file (including the migration-9-specific tests) was made through Edit. No em dash or section-sign character appears anywhere I wrote, checked by scanning every changed file.
 
 ### BASECHECK independent review 1 (verdict: pass)
 
@@ -3123,7 +3123,7 @@ Nemotron second opinion, as relayed by the reviewer: Nemotron super was run once
 
 ### BASECHECK live verification (Haiku, all_pass=False)
 
-FIX-FIRST. BASECHECK round 10 verification found one file-encoding violation. All 36 new tests pass (131+91+171+59+60+1 total); before/after verification shows expected test failures on HEAD versions and 0 failures when restored (lines 131/91/171/59/60/1); full suite runs green (5704 passed, 2 skipped, 0 failed) and matches builder's expected result exactly. However: tests/unit/test_db.py has CRLF line endings (working copy contains \r\n; HEAD version uses LF). This violates checklist requirement 5 (no CRLF). All other checks pass: git diff/status unchanged, HEAD is c62d780, no non-ASCII found. The CRLF was introduced during round 10 modifications to test_db.py; this is a code quality gate failure, not a test regression.
+FIX-FIRST. BASECHECK round 10 verification found one file-encoding violation. All 36 new tests pass (131+91+171+59+60+1 total); before/after verification shows expected test failures on HEAD versions and 0 failures when restored (lines 131/91/171/59/60/1); full suite runs green (5704 passed, 2 skipped, 0 failed) and matches builder's expected result exactly. However: tests/unit/test_db.py has CRLF line endings (working copy contains \r\n; HEAD version uses LF). This violates checklist requirement 5 (no CRLF). All other checks pass: git diff/status unchanged, HEAD is f9dd592, no non-ASCII found. The CRLF was introduced during round 10 modifications to test_db.py; this is a code quality gate failure, not a test regression.
 
 ### GATEPIN builder
 
@@ -3141,7 +3141,7 @@ What changed (all three build items):
 
 3. A new acceptance file, tests/acceptance/test_22_12_gate_config_pin.py (test_22_12_tampering.py and conftest.py read first, neither edited, per instruction), closing the register's own note that "acceptance 22.12 never exercises gate_config_changed end to end." Three scenarios: (a) a task whose touches name pytest.ini without the marker is refused at Gate 0 (plan.parse_and_validate raises PlanError, so world_factory itself raises before any card exists); (b) the same task WITH the marker: a real coder diff fixes the seeded failing test and edits pytest.ini inside its declared touches, tamper.analyze_diff never fires gate_config_changed, the real 'python -m pytest -q tests/test_feature.py' gate run goes green, the reviewer's PASS merges it, and the card reaches done -- the exact end-to-end path the register said was never exercised; (c) GATEPIN's own scenario -- a plan approved with the marker false (so Gate 0 has nothing to object to at approval time) is caught when re-parsed after plan.json is edited, post-approval, to add both the gate-config touches and the marker together: controller.verify_gate_pin (the exact function the CLI's swarm-run pre-flight calls) raises GateConfigTamperedError, called directly against the world's own conn/plan since conftest.py's world_factory does not itself wire pin/verify (only cli.cmd_approve/_run_loop do). One real bug found and fixed while writing scenario (b): my first attempt turned the failing assertion into a literal 'assert True', which tripped tamper.py's OWN unconditional_pass marker (a different finding entirely, from _UNCONDITIONAL_ROWS) -- reworked the seed to a genuine numeric assertion (assert 1 + 1 == 3, fixed to == 2) so the test exercises gate_config_changed specifically, not an unrelated tamper finding.
 
-Test evidence: baseline on branch r10/gatepin before any change (HEAD c62d780): 5668 passed, 2 skipped, 0 failed (644.8s) -- exactly matching r10_rules.md's stated baseline. Final full run after all changes: 5682 passed, 2 skipped, 0 failed (651.9s). Net +14, exactly the number of new tests added across the five files (3 in test_gates.py, 3 in test_plan.py, 4 in test_controller.py, 1 in test_cli_commands.py, 3 new acceptance tests), 0 regressions, baseline never went down.
+Test evidence: baseline on branch r10/gatepin before any change (HEAD f9dd592): 5668 passed, 2 skipped, 0 failed (644.8s) -- exactly matching r10_rules.md's stated baseline. Final full run after all changes: 5682 passed, 2 skipped, 0 failed (651.9s). Net +14, exactly the number of new tests added across the five files (3 in test_gates.py, 3 in test_plan.py, 4 in test_controller.py, 1 in test_cli_commands.py, 3 new acceptance tests), 0 regressions, baseline never went down.
 
 Independent review: ran the source diff through run_nemotron_super (MCP tool returned 403 as warned; used the file-based route, C:\Users\masoo\.claude\mcp-servers\nemotron\venv\Scripts\python.exe C:/Users/masoo/ases-workspaces/tools/nemo.py super, prompt file under the basetemp scratch dir). It found no correctness bugs across five targeted questions (empty-mapping correctness, hash sensitivity to either field, silent-drop risk in the collection loop, payload-shape consistency between the two call sites, and a general sweep) and independently surfaced, unprompted, exactly the same backward-compatibility boundary I designed for and disclose above.
 
@@ -3155,7 +3155,7 @@ Diff verified (git diff plus git status --porcelain for untracked files): 8 modi
 
 Item 1 (fold the marker into the pin): plan.pinned_task_fields() replaces sandbox_network_exceptions() with a generalized {task_key: {field: value}} mapping; gates.hash_gate_profiles and controller.pin_gate_profiles/verify_gate_pin all renamed their third/fourth parameter to match and pass it straight through unchanged in mechanism. Grepped pin_gate_profiles and verify_gate_pin across src/ases: exactly two call sites, both in cli.py (cmd_approve's pin at line 749, _run_loop's pre-flight verify at line 935), both updated to call plan_mod.pinned_task_fields(plan). Byte-identical-hash claim independently reproduced live in a Python session: hash_gate_profiles(profiles) == hash_gate_profiles(profiles, None) == hash_gate_profiles(profiles, {}) is True, and a task with just the marker changes the hash. Also independently reproduced that a task pinned with only sandbox_network, then given allow_gate_config_changes too without re-approval, raises GateConfigTamperedError (the "second pinned field" case).
 
-Item 2 (refusal test with before/after proof): reverted the four owned src files to HEAD (git show HEAD:<path>, confirmed HEAD == c62d780, the stated round 10 base commit) and ran the new test_run_refuses_when_a_tasks_allow_gate_config_changes_marker_changed_after_approval against the old code myself: it fails exactly as the builder described, exiting 3 (not 1) because the old verify_gate_pin doesn't raise and execution falls through to the unrelated ASES-GIT-12 dirty-checkout guard. Restored the four files afterward and confirmed via git diff --stat and a full diff-vs-diff comparison that the tree matched exactly what it was before my revert -- no residual changes from testing.
+Item 2 (refusal test with before/after proof): reverted the four owned src files to HEAD (git show HEAD:<path>, confirmed HEAD == f9dd592, the stated round 10 base commit) and ran the new test_run_refuses_when_a_tasks_allow_gate_config_changes_marker_changed_after_approval against the old code myself: it fails exactly as the builder described, exiting 3 (not 1) because the old verify_gate_pin doesn't raise and execution falls through to the unrelated ASES-GIT-12 dirty-checkout guard. Restored the four files afterward and confirmed via git diff --stat and a full diff-vs-diff comparison that the tree matched exactly what it was before my revert -- no residual changes from testing.
 
 Item 3 (new acceptance file, tests/acceptance/test_22_12_gate_config_pin.py): confirmed test_22_12_tampering.py (5 pre-existing scenarios, none touching a gate-config path, matching the file's own claim) and conftest.py are untouched. Confirmed pytest.ini is in tamper.GATE_CONFIG_PATTERNS, confirmed plan.py's Gate 0 (_gate_config_violation, called from parse_and_validate) raises PlanError containing "allow_gate_config_changes" for a touches entry naming it, and confirmed conftest.py's world_factory calls parse_and_validate directly inside make_world -- so scenario (a)'s claim that no card is ever created is accurate. All three scenarios (Gate-0 refusal without the marker, real end-to-end pass with the marker through tamper/gate/reviewer to done, and the pin-tamper catch via direct controller.pin_gate_profiles/verify_gate_pin calls) ran and passed.
 
@@ -3173,7 +3173,7 @@ Nemotron second opinion, as relayed by the reviewer: Ran the full source diff an
 
 GATEPIN round 10 verification complete: all checks pass, SHIP.
 
-Checklist results: (1) git diff and status match expected file changes. (2) All 15 new/modified tests pass: 4 from test_gates.py, 3 from test_plan.py, 4 from test_controller.py, 1 from test_cli_commands.py, 3 from test_22_12_gate_config_pin.py. (3) Before/after verification successful: cli.py HEAD test fails (missing sandbox_network_exceptions), plan.py HEAD test fails (missing pinned_task_fields), current versions pass; saved files match working tree. (4) Full suite: 5682 passed, 2 skipped, 0 failed (10 minutes 9 seconds, matches builder's final expectation exactly). (5) No non-ASCII characters, no CRLF line endings in any changed files. (6) HEAD commit c62d780 confirmed.
+Checklist results: (1) git diff and status match expected file changes. (2) All 15 new/modified tests pass: 4 from test_gates.py, 3 from test_plan.py, 4 from test_controller.py, 1 from test_cli_commands.py, 3 from test_22_12_gate_config_pin.py. (3) Before/after verification successful: cli.py HEAD test fails (missing sandbox_network_exceptions), plan.py HEAD test fails (missing pinned_task_fields), current versions pass; saved files match working tree. (4) Full suite: 5682 passed, 2 skipped, 0 failed (10 minutes 9 seconds, matches builder's final expectation exactly). (5) No non-ASCII characters, no CRLF line endings in any changed files. (6) HEAD commit f9dd592 confirmed.
 
 Work closes ASES-QG-02 gap by folding allow_gate_config_changes marker into gate-profile pinning, preventing plan.json modifications after approval from bypassing gate checks. Test coverage includes unit tests for hash changes, field listing, gate verification, CLI detection, and end-to-end acceptance tests.
 
@@ -3181,7 +3181,7 @@ Work closes ASES-QG-02 gap by folding allow_gate_config_changes marker into gate
 
 BUILDER REPORT: package BUDGETFIX (round 10)
 
-Repo: C:\Users\masoo\ases-wt\budgetfix, branch r10/budgetfix, cut from the round-8/9-merged commit (d1c4aab under a round-10-work-orders commit c62d780 that touches only docs). Read r10_rules.md, r9_rules.md, r8_rules.md and section "BUDGETFIX" of r10_wp_small.md in full before building. Quoted the blueprint (C:\Users\masoo\ases-workspaces\tools\blueprint.txt) directly, not a derived doc, per CLAUDE.md's "check the requirements source" rule.
+Repo: C:\Users\masoo\ases-wt\budgetfix, branch r10/budgetfix, cut from the round-8/9-merged commit (b533258 under a round-10-work-orders commit f9dd592 that touches only docs). Read r10_rules.md, r9_rules.md, r8_rules.md and section "BUDGETFIX" of r10_wp_small.md in full before building. Quoted the blueprint (C:\Users\masoo\ases-workspaces\tools\blueprint.txt) directly, not a derived doc, per CLAUDE.md's "check the requirements source" rule.
 
 REQUIREMENTS
 
@@ -3271,7 +3271,7 @@ Checklist completion:
 3. Independent before/after: All 4 key source files (ledger.py, bounds.py, policy.py, report.py) verified; HEAD versions fail new tests as expected, current versions pass; step 1 state reproduced exactly
 4. Full suite: 5676 passed, 2 skipped, 0 failed (10:19 duration matches 10-25 minute range; count matches builder: 5668 baseline + 8 new = 5676 final)
 5. File checks: No non-ASCII characters above 127, no CRLF line endings in any of 8 changed files
-6. Commit hash: c62d780 confirmed
+6. Commit hash: f9dd592 confirmed
 
 Work deliverables verified:
 - Shared daily-reserve default (ledger.DEFAULT_DAILY_RESERVE_PERCENT = 10) replaces three independent 0-defaults
@@ -3286,7 +3286,7 @@ Recommendation: SHIP
 
 CALLERS (round 10): the smoke test and the residual risks get their callers, ASES-MOD-04 and ASES-ROL-05.
 
-Working tree: C:\Users\masoo\ases-wt\callers, branch r10/callers, cut from d1c4aab (confirmed with `git merge-base --is-ancestor d1c4aab HEAD`). Baseline recorded before any change: 5668 passed, 2 skipped, 0 failed (634s), matching r10_rules.md's stated baseline exactly. Never went down: final full run after all changes was 5694 passed, 2 skipped, 0 failed (655.74s, 0:10:55), run once at the end per the work order. Never used git stash, never committed, never pushed, never called a real Hermes/model provider/Docker; every file was written with the Write/Edit tool.
+Working tree: C:\Users\masoo\ases-wt\callers, branch r10/callers, cut from b533258 (confirmed with `git merge-base --is-ancestor b533258 HEAD`). Baseline recorded before any change: 5668 passed, 2 skipped, 0 failed (634s), matching r10_rules.md's stated baseline exactly. Never went down: final full run after all changes was 5694 passed, 2 skipped, 0 failed (655.74s, 0:10:55), run once at the end per the work order. Never used git stash, never committed, never pushed, never called a real Hermes/model provider/Docker; every file was written with the Write/Edit tool.
 
 Requirement 1, ASES-MOD-04 (p125): "Before first use, run one smoke test per model through the real Hermes path: a tiny tool-calling task with a structured result. Record the result and the latency."
 
@@ -3318,7 +3318,7 @@ One minor open item, not a defect: the full-suite delta (5694 - 5668 = 26) is 2 
 
 ### CALLERS independent review 1 (verdict: fail)
 
-Reviewed package CALLERS in C:\Users\masoo\ases-wt\callers (branch r10/callers, cut from d1c4aab, confirmed ancestor). Read r8/r9/r10 rules and the CALLERS section of r10_wp_small.md in full before starting. Diff touches exactly the 4 files the builder reported (src/ases/cli.py +146/-5, src/ases/doctor.py +26, tests/unit/test_cli_commands.py +336, tests/unit/test_doctor.py +73); git status --porcelain shows nothing else changed, matching the builder's scope claim.
+Reviewed package CALLERS in C:\Users\masoo\ases-wt\callers (branch r10/callers, cut from b533258, confirmed ancestor). Read r8/r9/r10 rules and the CALLERS section of r10_wp_small.md in full before starting. Diff touches exactly the 4 files the builder reported (src/ases/cli.py +146/-5, src/ases/doctor.py +26, tests/unit/test_cli_commands.py +336, tests/unit/test_doctor.py +73); git status --porcelain shows nothing else changed, matching the builder's scope claim.
 
 Item 2 (ASES-ROL-05, residual risks as INFO rows) checks out cleanly: swarm init prints _print_residual_risks(profiles) unconditionally after the change list on both the dry-run and --apply paths (traced the call site plus the surrounding cmd_init flow directly); swarm doctor's _check_residual_risks only runs when profiles_unavailable is None, which I traced against _load_profiles_module's three return cases (real module / ImportError-as-pending / other-Exception-as-warn) and confirmed correct; a residual_risks() that itself raises is caught and downgraded to one WARN row, never a crash; the new 'info' status was added to cli.py's _GLYPH (pass/warn/fail/pending/info), which is the single place in the codebase that indexes _GLYPH by check.status (grepped to confirm), so the one-line addition is both necessary and sufficient to keep swarm doctor from raising KeyError the moment a real residual-risk row appears, exactly as the builder flagged it. Doctor's report.ok only special-cases 'fail', so the new INFO rows never flip a healthy report to unhealthy.
 

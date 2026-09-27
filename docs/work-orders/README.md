@@ -75,9 +75,9 @@ one message: "option A" (ASES may call Hermes's own `specify`, only from `triage
 | (no separate work order; a direct architect audit) | audit of the 3 rows wave 2 left not_covered: ASES-ARC-01, ASES-DOC-03, ASES-CFG-05 | done |
 | (no separate work order; two build-and-verify pairs dispatched from the audit's CFG-05 finding) | credential-scrubbed environment for every real hermes launch (ASES-CFG-05) | done, independently verified twice |
 
-Wave 1 (four packages) landed as commit `a98b95e`; wave 2 (ROLES2 plus the two verification/fix agents dispatched alongside it)
-landed as `2fc4bfa` and left three rows not_covered (ASES-ARC-01, ASES-DOC-03, ASES-CFG-05); an audit closed ARC-01 by design,
-found DOC-03 honestly partial, and found a concrete CFG-05 gap that two more build-and-verify pairs then fixed (`2cfc825` and the
+Wave 1 (four packages) landed as commit `e6bcf5b`; wave 2 (ROLES2 plus the two verification/fix agents dispatched alongside it)
+landed as `4e9d2fe` and left three rows not_covered (ASES-ARC-01, ASES-DOC-03, ASES-CFG-05); an audit closed ARC-01 by design,
+found DOC-03 honestly partial, and found a concrete CFG-05 gap that two more build-and-verify pairs then fixed (`dc14773` and the
 CFG-05 commit that follows it). See `builder-findings.md` for every report, including two architect fixes in wave 1
 (`FakeHermes.kanban_specify`, a `recovery.next_model` regression), the independent review in wave 2 that corrected its own site
 count (five hardcoded-role sites in controller.py, not six as first estimated), and the CFG-05 pairs' shared finding of a

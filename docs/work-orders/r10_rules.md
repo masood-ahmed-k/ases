@@ -8,7 +8,7 @@ one worktree per package under `C:\Users\masoo\ases-wt\<package>` on branch `r10
 blueprint (`C:\Users\masoo\ases-workspaces\tools\blueprint.txt`) before building.
 
 Round 10 specifics:
-- Every branch is cut from the master commit that adds these work orders (rounds 8 and 9 merged, code identical to `d1c4aab`).
+- Every branch is cut from the master commit that adds these work orders (rounds 8 and 9 merged, code identical to `b533258`).
   Baseline: 5668 passed, 2 skipped, 0 failed. It must never go down.
 - **Write files with the Write or Edit tool.** A shell heredoc on this machine eats backslashes: round 9 lost `\n` escapes inside a
   test's string literals that way. Never generate Python source through a heredoc.
