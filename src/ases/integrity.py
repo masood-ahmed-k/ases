@@ -13,13 +13,15 @@ import fnmatch
 import pathlib
 import subprocess
 
+from . import gitexec
+
 
 def changed_paths(repo: pathlib.Path, commit_sha: str) -> list[str]:
     """Paths touched by commit_sha relative to its first parent (or, if it has none, the paths in
     that initial commit)."""
     result = subprocess.run(
-        ["git", "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha],
-        capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha],
+        capture_output=True, text=True, env=gitexec.git_env(),
     )
     return [ln for ln in result.stdout.splitlines() if ln.strip()]
 
@@ -41,10 +43,10 @@ class WorktreeSnapshot:
 
 def snapshot(path: pathlib.Path) -> WorktreeSnapshot:
     head = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True, env=gitexec.git_env(),
     ).stdout.strip()
     status = subprocess.run(
-        ["git", "-C", str(path), "status", "--porcelain"], capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(path), "status", "--porcelain"], capture_output=True, text=True, env=gitexec.git_env(),
     ).stdout
     dirty = tuple(ln[3:] for ln in status.splitlines() if ln.strip())
     return WorktreeSnapshot(path, head, dirty)

@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from . import bounds
 from . import events
 from . import gates
+from . import gitexec
 from . import hermes as hermes_mod
 from . import intents
 from . import ledger
@@ -356,7 +357,7 @@ def scan_text(path: str, text: str) -> list[TreeFinding]:
 
 # --- reading the tracked tree out of git ----------------------------------------------------------------------
 
-_GIT = ("git", "--no-optional-locks", "-c", "core.quotepath=false")
+_GIT = gitexec.GIT + ("--no-optional-locks", "-c", "core.quotepath=false")
 
 
 class _GitFailure(Exception):
@@ -369,7 +370,9 @@ def _git(repo: pathlib.Path, args: list[str], timeout: float, *, stdin: bytes | 
     from the merge queue. Anything but a clean answer is a _GitFailure carrying one redacted line."""
     kwargs = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     try:
-        proc = subprocess.run([*_GIT, "-C", str(repo), *args], capture_output=True, timeout=timeout, **kwargs)
+        proc = subprocess.run(
+            [*_GIT, "-C", str(repo), *args], capture_output=True, timeout=timeout, env=gitexec.git_env(), **kwargs,
+        )
     except subprocess.TimeoutExpired as exc:
         raise _GitFailure(f"git {args[0]} timed out after {timeout}s") from exc
     except (OSError, ValueError) as exc:
@@ -1119,7 +1122,7 @@ def _integration_head(repo, branch: str) -> tuple[str | None, str]:
     try:
         proc = subprocess.run(
             [*_GIT, "-C", str(repo), "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}"],
-            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, env=gitexec.git_env(),
         )
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         return None, f"git could not read the integration branch: {_err(exc)}"

@@ -37,6 +37,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from . import events as events_mod
+from . import gitexec
 from . import guards as guards_mod
 from . import hermes as hermes_mod
 from . import intents as intents_mod
@@ -99,9 +100,9 @@ def _git(repo: str | os.PathLike, args: list[str], *, timeout: int = _GIT_TIMEOU
     it can never take index.lock from a git operation that is really running. The child's working directory is the
     repository, not wherever the operator stands: on Windows a directory that is some process's current directory
     cannot be deleted. A git that cannot be started or does not answer in time is exit code -1, so nothing raises."""
-    argv = ["git", *(["--no-optional-locks"] if read_only else []), "-C", str(repo), *args]
+    argv = [*gitexec.GIT, *(["--no-optional-locks"] if read_only else []), "-C", str(repo), *args]
     try:
-        result = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=str(repo))
+        result = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=str(repo), env=gitexec.git_env())
     except subprocess.TimeoutExpired:
         return -1, "", f"git {args[0]} timed out after {timeout}s"
     except OSError as exc:
@@ -554,7 +555,7 @@ class _Cleaner:
         return sorted(found)
 
     def _paths(self, a: str, b: str) -> set[str] | None:
-        code, out, _err = _git(self.repo, ["diff", "--name-only", "-z", "--no-renames", a, b])
+        code, out, _err = _git(self.repo, ["diff", *gitexec.DIFF_SAFETY, "--name-only", "-z", "--no-renames", a, b])
         return None if code != 0 else {p for p in out.split("\0") if p}
 
     def _squash_proof(self, tip: str, key: str) -> tuple[bool, str]:

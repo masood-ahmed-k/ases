@@ -37,6 +37,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 
 from . import events
+from . import gitexec
 from . import hermes as hermes_mod
 from . import plan as plan_mod
 
@@ -477,8 +478,8 @@ def _exclude_file(worktree: pathlib.Path) -> pathlib.Path:
     (the primary checkout reports .git/info/exclude) is relative to the directory git was run in."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(worktree), "rev-parse", "--git-path", "info/exclude"],
-            capture_output=True, timeout=_GIT_TIMEOUT,
+            [*gitexec.GIT, "-C", str(worktree), "rev-parse", "--git-path", "info/exclude"],
+            capture_output=True, timeout=_GIT_TIMEOUT, env=gitexec.git_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LeaseError(f"cannot ask git where {_ascii(worktree)} keeps its exclude file: {_ascii(exc)}") from exc

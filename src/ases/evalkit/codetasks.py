@@ -19,6 +19,7 @@ import sys
 import tempfile
 import zipfile
 
+from .. import gitexec
 from . import codeeval, text
 from .model import KIND_REPO, KIND_SWARM, EvalTask, InvokeResult, Score
 from .texttasks import CALL_REQUESTS
@@ -410,9 +411,13 @@ E8_REFUSAL = (
 
 
 def _git(repo: pathlib.Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Routed through gitexec (round 9, GITHARDEN): _e8_fixture's own init/add/commit run before any model has
+    touched `repo`, but _export_branch's `git archive` runs against it AFTER a swarm build (E8), i.e. against a
+    repository a model's worker may have written into -- the same worker-controlled-repo case gitexec exists for,
+    so every call this helper makes gets the same hardened prefix and scrubbed environment, not just that one."""
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout,
+        [*gitexec.GIT, "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout, env=gitexec.git_env(),
     )
 
 

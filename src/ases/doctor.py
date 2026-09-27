@@ -26,6 +26,7 @@ import subprocess
 import sys
 
 from . import config as ases_config
+from . import gitexec
 from . import hermes as hermes_mod
 from . import models as models_mod
 from . import sandbox as sandbox_mod
@@ -90,8 +91,8 @@ def _check_git_longpaths(project: ases_config.ProjectConfig) -> DoctorCheck:
         return DoctorCheck("git_longpaths", "pending", "only checked on native Windows", ())
     try:
         result = subprocess.run(
-            ["git", "-C", str(_repo_root()), "config", "--get", "core.longpaths"],
-            capture_output=True, text=True, timeout=10,
+            [*gitexec.GIT, "-C", str(_repo_root()), "config", "--get", "core.longpaths"],
+            capture_output=True, text=True, timeout=10, env=gitexec.git_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return DoctorCheck("git_longpaths", "fail", f"could not run git: {exc}", ("ASES-ENV-01",))
@@ -125,7 +126,9 @@ def _check_python_version() -> DoctorCheck:
 
 def _check_git_version() -> DoctorCheck:
     try:
-        result = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            [*gitexec.GIT, "--version"], capture_output=True, text=True, timeout=10, env=gitexec.git_env(),
+        )
         return DoctorCheck("git_version", "pass", result.stdout.strip(), ())
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return DoctorCheck("git_version", "fail", f"git not usable: {exc}", ())

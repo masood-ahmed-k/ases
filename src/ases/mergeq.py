@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 from . import events as events_mod
 from . import gates as gates_mod
+from . import gitexec
 from . import intents as intents_mod
 
 # The three places merge_task asks whether to stop, named for the "stopped by the kill switch before <step>" text.
@@ -106,7 +107,9 @@ class RevertOutcome:
 
 
 def _git(args: list[str], cwd: pathlib.Path, timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        [*gitexec.GIT, "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout, env=gitexec.git_env(),
+    )
 
 
 def _head_sha(repo: pathlib.Path) -> str:
@@ -292,6 +295,9 @@ def _build_candidate(
     # Empty or not is decided from the index (2026-09-19). --quiet implies --exit-code: 0 means nothing
     # is staged, 1 means something is, and any other code is git failing to answer, which is reported
     # rather than guessed at (guessing "empty" would silently record a merge that never happened).
+    # --quiet means the answer is the exit code alone (0/1/failure), never rendered diff text, so a worker-
+    # configured external-diff/textconv driver has nothing to hide here: gitexec.DIFF_SAFETY is left off this
+    # call on purpose (it is added below, to the Gate 3 diff, which DOES read rendered text).
     staged = _git(["diff", "--cached", "--quiet"], candidate)
     if staged.returncode not in (0, 1):
         return None, MergeOutcome(
@@ -341,7 +347,7 @@ def _build_candidate(
 
     candidate_sha = _head_sha(candidate)
 
-    diff = _git(["diff", f"{base_sha}..{candidate_sha}"], candidate).stdout
+    diff = _git(["diff", *gitexec.DIFF_SAFETY, f"{base_sha}..{candidate_sha}"], candidate).stdout
     secret_findings = gates_mod.scan_for_secrets(diff)
     if secret_findings:
         return None, MergeOutcome(False, candidate_sha, None, None,

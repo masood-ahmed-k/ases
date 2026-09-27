@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 from . import controller as controller_mod
 from . import events
+from . import gitexec
 from . import hermes as hermes_mod
 from . import intents as intents_mod
 
@@ -399,7 +400,8 @@ def _git(repo, args: list[str]) -> tuple[int, str, str]:
     as exit code -1 with the reason in stderr, so callers deal in one failure shape."""
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(repo), *args], capture_output=True, timeout=_GIT_TIMEOUT,
+            [*gitexec.GIT, "--no-optional-locks", "-C", str(repo), *args],
+            capture_output=True, timeout=_GIT_TIMEOUT, env=gitexec.git_env(),
         )
     except subprocess.TimeoutExpired:
         return -1, "", f"git {args[0]} timed out after {_GIT_TIMEOUT}s"

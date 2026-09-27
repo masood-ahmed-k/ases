@@ -33,6 +33,7 @@ from . import config as ases_config
 from . import db as ases_db
 from . import events
 from . import gates as gates_mod
+from . import gitexec
 from . import guards as guards_mod
 from . import hermes as hermes_mod
 from . import intents as intents_mod
@@ -65,8 +66,8 @@ def _bootstrap_git(repo: pathlib.Path, args: list[str]) -> subprocess.CompletedP
     chains several in a row with the same error handling, which is what earns it a helper."""
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=60,
+            [*gitexec.GIT, "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, env=gitexec.git_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(args, 1, "", f"git could not be run: {exc}")
@@ -189,30 +190,35 @@ def publish_plan(repo: pathlib.Path, integration_branch: str) -> str:
     Phase 3's `swarm plan` writes straight into the primary checkout, so this is a plain commit, not a
     merge from a separate planning worktree (a real multi-worktree planning flow is a later refinement)."""
     current = subprocess.run(
-        ["git", "-C", str(repo), "branch", "--show-current"], capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "branch", "--show-current"], capture_output=True, text=True,
+        env=gitexec.git_env(),
     ).stdout.strip()
     if current != integration_branch:
         raise RuntimeError(
             f"publish_plan expected {repo} to be on {integration_branch!r}, found {current!r}"
         )
-    subprocess.run(["git", "-C", str(repo), "add", "docs/ases"], check=True, capture_output=True)
+    subprocess.run(
+        [*gitexec.GIT, "-C", str(repo), "add", "docs/ases"], check=True, capture_output=True, env=gitexec.git_env(),
+    )
     status = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--", "docs/ases"],
-        capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "status", "--porcelain", "--", "docs/ases"],
+        capture_output=True, text=True, env=gitexec.git_env(),
     ).stdout
     if not status.strip():
         # Nothing staged -- plan.json was already committed (e.g. a re-run of `swarm approve`).
         return subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+            [*gitexec.GIT, "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+            env=gitexec.git_env(),
         ).stdout.strip()
     commit = subprocess.run(
-        ["git", "-C", str(repo), "commit", "-q", "-m", "ASES: publish approved plan (Gate P)"],
-        capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "commit", "-q", "-m", "ASES: publish approved plan (Gate P)"],
+        capture_output=True, text=True, env=gitexec.git_env(),
     )
     if commit.returncode != 0:
         raise RuntimeError(f"could not commit the approved plan: {commit.stdout}{commit.stderr}")
     return subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+        [*gitexec.GIT, "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+        env=gitexec.git_env(),
     ).stdout.strip()
 
 
@@ -1451,14 +1457,17 @@ def _branch_diff(repo, integration_branch: str, old_card: dict, task: plan_mod.P
     branch = old_card.get("branch_name") or f"swarm/{task.key}-{task.role}"
     try:
         exists = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
-            capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace",
+            [*gitexec.GIT, "-C", str(repo), "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace", env=gitexec.git_env(),
         )
         if exists.returncode != 0:
             return ""
+        # ASES-SEC-01/ASES-SEC-04: this text is embedded verbatim into the next attempt's retry card
+        # (recovery.failure_bundle), so it must be git's own diff, never a worker-configured external-diff or
+        # textconv driver's rendering of it (gitexec.DIFF_SAFETY).
         diff = subprocess.run(
-            ["git", "-C", str(repo), "diff", f"{integration_branch}...{branch}"],
-            capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace",
+            [*gitexec.GIT, "-C", str(repo), "diff", *gitexec.DIFF_SAFETY, f"{integration_branch}...{branch}"],
+            capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace", env=gitexec.git_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""

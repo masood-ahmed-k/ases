@@ -2,6 +2,7 @@ import dataclasses
 import json
 import pathlib
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 
@@ -126,6 +127,78 @@ def test_merge_blocks_on_a_planted_secret(repo, tmp_path):
     before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
 
     outcome = mergeq.merge_task(repo, "integration", "swarm/secret", "T7", ["echo ok"])
+
+    assert outcome.merged is False
+    assert "secret scan failed" in outcome.detail
+    after = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    assert after == before
+
+
+# --- round 9, package GITHARDEN: gitexec hardens every git call this module makes -----------------------------
+
+def test_a_planted_post_checkout_hook_does_not_run_during_a_candidate_worktree_add(repo, tmp_path, monkeypatch):
+    """Item 1 of the round 8 sweep: _build_candidate's first git call (mergeq._git's `worktree add --detach`)
+    used to run with the repository's own (shared) .git/hooks on the path -- a worker who can write there
+    (extensions.worktreeConfig is off by default, so every linked worktree shares one .git/hooks) got a
+    post-checkout hook run with the controller's own environment on every merge attempt.
+
+    An empty (`_branch_at_tip`) branch with allow_empty=True is used so merge_task takes the no-op path and
+    never reaches Gate 3 (gates.run_gate does its OWN separate worktree add, out of this package's files and
+    already covered by round 8's own environment scrub, which would otherwise also trip the same hook and make
+    this test unable to tell the two apart). `_branch_at_tip` is a bare `git branch`, no checkout, so the only
+    checkout _build_candidate's own worktree add performs is the one under test.
+
+    Before/after in one test: the SAME hook, with gitexec.GIT weakened back to a bare "git" (no hooksPath
+    override), DOES fire on the very next worktree add, proving the clean result above is the override's doing,
+    not a hook that was never wired up."""
+    marker = tmp_path / "hook_ran.txt"
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    (hooks_dir / "post-checkout").write_text(f'#!/bin/sh\necho ran > "{marker.as_posix()}"\n', encoding="utf-8")
+    (hooks_dir / "post-checkout").chmod(0o755)
+    _branch_at_tip(repo, "swarm/hookcheck")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/hookcheck", "T-HOOK", ["echo ok"], conn=conn, allow_empty=True)
+
+    assert outcome.merged is True and outcome.gate3_result == "skipped"  # confirms Gate 3 (gates.py) never ran
+    assert not marker.exists(), "a planted post-checkout hook ran during the candidate worktree add"
+
+    monkeypatch.setattr(mergeq.gitexec, "GIT", ("git",))
+    _branch_at_tip(repo, "swarm/hookcheck2")
+    mergeq.merge_task(repo, "integration", "swarm/hookcheck2", "T-HOOK-2", ["echo ok"], conn=conn, allow_empty=True)
+    assert marker.exists(), "fixture problem: the hook should fire once gitexec.GIT is weakened to plain git"
+
+
+def test_a_planted_textconv_driver_does_not_hide_a_secret_from_the_gate_3_scan(repo, tmp_path):
+    """The most important test in package GITHARDEN (round 9): before this package, mergeq's Gate 3 diff (the
+    `git diff <base>..<candidate>` in _build_candidate, read by gates.scan_for_secrets) had no
+    --no-ext-diff/--no-textconv, unlike tamper.py's equivalent diff. A worker-committed .gitattributes naming a
+    textconv driver defined in the repo's own config could make the scanner see innocent, redacted text while the
+    real blob still carried the secret -- exactly what this test plants."""
+    redact_script = tmp_path / "redact.py"
+    redact_script.write_text("import sys\nsys.stdout.write('REDACTED\\n')\n", encoding="utf-8")
+    _git_ok("config", "diff.hider.textconv", f'"{sys.executable}" "{redact_script}"', cwd=repo)
+    (repo / ".gitattributes").write_text("config.py diff=hider\n", encoding="utf-8")
+    _git_ok("add", ".gitattributes", cwd=repo)
+    _git_ok("commit", "-q", "-m", "gitattributes", cwd=repo)
+
+    _git_ok("checkout", "-q", "-b", "swarm/textconv-secret", cwd=repo)
+    (repo / "config.py").write_text(f"API_KEY = '{SECRET}'\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "oops", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    # Proof the textconv driver really does hide the secret from a diff that skips --no-textconv: this is the
+    # OLD call's shape (mergeq._git's argv before this package, just without gitexec's hooksPath/fsmonitor -c's,
+    # which are not what is under test here).
+    plain_diff = subprocess.run(
+        ["git", "-C", str(repo), "diff", f"{before}..swarm/textconv-secret"], capture_output=True, text=True,
+    ).stdout
+    assert SECRET not in plain_diff, "fixture problem: the textconv driver should hide the secret without the flag"
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/textconv-secret", "T-TEXTCONV", ["echo ok"])
 
     assert outcome.merged is False
     assert "secret scan failed" in outcome.detail
