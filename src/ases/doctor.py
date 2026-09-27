@@ -28,6 +28,7 @@ import sys
 from . import config as ases_config
 from . import hermes as hermes_mod
 from . import models as models_mod
+from . import procenv as procenv_mod
 from . import sandbox as sandbox_mod
 
 Status = str  # "pass" | "warn" | "fail" | "pending"
@@ -420,11 +421,29 @@ def _check_reviewer_diversity(project: ases_config.ProjectConfig) -> DoctorCheck
 
 
 def _check_limits_table(models_config: dict) -> DoctorCheck:
+    """ASES-CAP-01 / ASES-VER-01 (5.3, Appendix E): "swarm doctor MUST display the value it is using, the
+    source URL and the checked date." The value and date were already shown; this also shows `source` (a
+    URL from the blueprint's Appendix E, or one already written in config/models.yaml's own comments --
+    config.py's _validate_verification_source_field is what keeps an invented one out). Not every provider
+    has a source yet (some numbers, like xkiro's, are genuinely unpublished), so a missing one is a WARN,
+    never a FAIL: the number itself may still be right, but nobody can re-check it without a page to check
+    against."""
     lines = []
+    missing_source = []
     for name, p in models_config.get("providers", {}).items():
         limits = p.get("limits", {})
-        lines.append(f"{name}: {limits or '(no published cap)'} [verified {p.get('verified_on', '?')}]")
-    return DoctorCheck("limits_displayed", "pass", "; ".join(lines), ("ASES-CAP-01",))
+        verified_on = p.get("verified_on", "?")
+        source = p.get("source")
+        if source:
+            lines.append(f"{name}: {limits or '(no published cap)'} [verified {verified_on}, source {source}]")
+        else:
+            lines.append(f"{name}: {limits or '(no published cap)'} [verified {verified_on}, source unknown]")
+            missing_source.append(name)
+    detail = "; ".join(lines)
+    if missing_source:
+        detail += f" -- no source URL on record for: {', '.join(missing_source)} (ASES-VER-01)"
+        return DoctorCheck("limits_displayed", "warn", detail, ("ASES-CAP-01", "ASES-VER-01"))
+    return DoctorCheck("limits_displayed", "pass", detail, ("ASES-CAP-01", "ASES-VER-01"))
 
 
 def _check_key_pooling(models_config: dict) -> DoctorCheck:
@@ -467,6 +486,54 @@ def _check_key_pooling(models_config: dict) -> DoctorCheck:
     )
 
 
+_KEY_EXPOSURE_IDS = ("ASES-CFG-04", "ASES-CFG-05")
+
+
+def _check_provider_keys_not_exported(models_config: dict) -> DoctorCheck:
+    """Blueprint p213: "Never export provider keys in the shell that launches the gateway or the
+    controller." (ASES-CFG-04 and ASES-CFG-05 depend on it.)
+
+    WARN, never FAIL: ASES-CFG-05 (procenv.scrubbed_environ) already strips every credential-shaped
+    variable from any subprocess ASES itself starts on Hermes's behalf, so a key sitting in this
+    process's own environment does not reach a worker launched through ASES today. But `swarm doctor`
+    runs IN that same shell, and so would a gateway or controller a person starts by hand from it
+    (exactly what p213 warns about) -- neither of those is scrubbed, so a key set here is a real, if
+    not yet realised, exposure. Only the variable NAME is ever shown, never its value
+    (_check_no_secrets_in_output double-checks that no row, this one included, leaks one).
+
+    Also lists, as an informational note and never a WARN by itself, any OTHER credential-shaped
+    variable present in the environment (procenv's own pattern -- key/token/secret/passw/credential/
+    auth/cookie/session, case-insensitive -- so the definition of "credential-shaped" lives in exactly
+    one place) that is not already one of the provider key_env names above, names only."""
+    import os
+
+    key_envs = sorted({
+        str(entry["key_env"])
+        for entry in (models_config.get("providers") or {}).values()
+        if isinstance(entry, dict) and entry.get("key_env")
+    })
+    set_and_present = [name for name in key_envs if os.environ.get(name)]
+    other_credential_shaped = sorted(
+        name for name in os.environ
+        if name not in key_envs and procenv_mod._CREDENTIAL_ENV.search(name)
+    )
+    if set_and_present:
+        status = "warn"
+        detail = (
+            f"provider key_env variable(s) set in this process's own environment: {', '.join(set_and_present)} "
+            "-- blueprint p213: \"Never export provider keys in the shell that launches the gateway or the "
+            "controller.\" ASES-CFG-05 scrubs a worker ASES itself launches, but a gateway or controller "
+            "started BY HAND from this same shell would inherit it; move it into Hermes credential storage "
+            "or the approved egress mechanism instead."
+        )
+    else:
+        status = "pass"
+        detail = "no provider key_env variable from config/models.yaml is set in this process's environment"
+    if other_credential_shaped:
+        detail += f"; other credential-shaped variable(s) present (names only): {', '.join(other_credential_shaped)}"
+    return DoctorCheck("provider_keys_not_exported", status, detail, _KEY_EXPOSURE_IDS)
+
+
 def _check_no_secrets_in_output(report_text_so_far: str) -> DoctorCheck:
     import os
     secret_env_names = [
@@ -503,6 +570,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> Doctor
           else _check_profile_state(project, models_config, profiles_mod)),
         _check_limits_table(models_config),
         _check_key_pooling(models_config),
+        _check_provider_keys_not_exported(models_config),
     ]
     # The secrets check needs to see everything decided above it, so it runs last, over the detail text
     # of every other check plus the raw hermes doctor output already folded into hermes_doctor's detail.

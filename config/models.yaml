@@ -41,6 +41,11 @@ providers:
     #                                           # cite where (this provider is not yet safe for
     #                                           # private/confidential regardless: see policy._SAFE_FOR_PRIVATE).
     verified_on: "2026-09-17"
+    # ASES-VER-01 (5.3, Appendix E): the page the limits above were read from, so swarm doctor can show it.
+    # Blueprint Appendix E, [S12]: "OpenRouter API limits: free-model request caps, account-wide limits, key
+    # endpoint". Only the rpm/per_day numbers above have a page like this; do not add a source anywhere else
+    # in this file unless it is really either an Appendix E URL or a URL already written in a comment here.
+    source: "https://openrouter.ai/docs/api-reference/limits"
 
   xkiro:
     type: openai_compatible          # a router (like unorouter/openrouter), not a single vendor: one
