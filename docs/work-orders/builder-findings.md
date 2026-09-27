@@ -1376,3 +1376,305 @@ terminal tool; a human decision for later, not touched.
 
 Architect's own final clean run on the fully combined tree (no concurrent editors) before committing: 5512 passed, 2 skipped,
 0 failed.
+
+## Round 8 (2026-09-27): housekeeping, then gate commands stop seeing the operator's credentials
+
+Work orders: `r8_rules.md`, `r8_wp_housekeeping.md`, `r8_wp_gateenv.md`. One workflow: HK-PATH and HK-GAPS in parallel (Sonnet builders, HK-PATH checked by a Haiku checklist, HK-GAPS by an independent Sonnet review, one fix round, and a re-review), then GATEENV (Sonnet build, independent Sonnet review with a nemotron second opinion, Haiku live verification last) with a read-only Sonnet sweep of the sibling git-hook exposure alongside. Every report below is verbatim.
+
+### HK-PATH builder
+
+HK-PATH (round 8 housekeeping) - builder report
+
+Scope: spec/check_requirements.py and its test file only, per r8_wp_housekeeping.md and r8_rules.md. Did not touch HK-GAPS (docs/architecture.md), which is another agent's package.
+
+What was wrong: spec/check_requirements.py --check (no flags) failed with "blueprint docx not found: C:\Users\masoo\OneDrive\Desktop\ASES_Swarm_Implementation_Blueprint_v1.2.docx". The docx had moved to C:\Users\masoo\OneDrive\Desktop\AISES\ASES_Swarm_Implementation_Blueprint_v1.2.docx and DEFAULT_DOCX still pointed at the old location.
+
+What I changed in spec/check_requirements.py:
+1. DEFAULT_DOCX now points at the new AISES subfolder path.
+2. Added an ASES_BLUEPRINT_DOCX environment variable and a new resolve_docx_path(cli_docx) helper implementing precedence: --docx flag, then the env var, then DEFAULT_DOCX. main() now computes docx_path once via resolve_docx_path(args.docx) and passes it to both cmd_check and cmd_regenerate. The --docx argparse default was changed from DEFAULT_DOCX to None so resolve_docx_path can tell an explicit flag apart from nothing given.
+3. The not-found error raised by extract_appendix_f now names the path it tried and tells the reader to use --docx PATH or set ASES_BLUEPRINT_DOCX; exit code on this path is still 2 (unchanged control flow, only the message text and args.docx replaced by the resolved docx_path).
+4. Documented the precedence order and the env var usage in the module docstring.
+
+Tests added: tests/unit/test_check_requirements.py (new file; none existed before - grepped first and confirmed). The module has no __init__.py and spec/ is not on pythonpath (only src/ is, per pyproject.toml), so the test file loads spec/check_requirements.py directly from its file path via importlib.util.spec_from_file_location rather than importing it by dotted name. 10 tests: DEFAULT_DOCX value, resolve_docx_path under all three precedence combinations plus an empty-env-var edge case, extract_appendix_f's not-found message contents, and three end-to-end main() invocations (cli flag, env-var fallback, cli overriding env var) all using tmp_path files that are intentionally never created, so no real docx is read anywhere in the suite - exactly the "exercise path resolution, not extraction" instruction in the work order.
+
+Verification:
+- pytest -q --tb=short tests/unit/test_check_requirements.py through the quiet wrapper: 10 passed, run twice (immediately after writing, and again after the before/after proof), both green in about 0.5s wall / 0.12-0.13s test time.
+- python spec/check_requirements.py --check with no flags: "OK: 103 requirement IDs in sync between ASES_Swarm_Implementation_Blueprint_v1.2.docx and requirements.yaml" (exit 0), matching the work order's required outcome exactly.
+- Before/after proof done the safe way the rules require (no bare git stash, since other agents may have uncommitted edits in this tree): copied my fixed spec/check_requirements.py aside to the session scratchpad, restored the old committed version with "git show HEAD:spec/check_requirements.py > spec/check_requirements.py", reran the check and got the original failure message verbatim (exit 2), then copied the fixed file back. git diff --stat and git status --porcelain were byte-identical before and after this sequence (only spec/check_requirements.py modified; tests/unit/test_check_requirements.py and the pre-existing untracked r8_*.md work-order files untouched), confirming nothing else in the shared tree was disturbed.
+- Grepped the repo (excluding .venv) and C:\Users\masoo\ases-workspaces\tools for any other live reference to the stale full path (OneDrive\Desktop\ASES_Swarm... without the AISES subfolder). Found only two: the historical description inside docs/work-orders/r8_wp_housekeeping.md (a work order, not code, not mine to touch, and correctly describing the bug that was observed) and the line in spec/check_requirements.py itself, which I fixed. CLAUDE.md, docs/architecture.md, and spec/requirements.yaml only reference the blueprint's filename (no directory path), so they were not stale and needed no change. No matches at all under ases-workspaces/tools.
+- Confirmed no source under src/ases imports or shells out to check_requirements.py (grepped src/, no hits), so this is a self-contained fix with no other callers to update.
+- Scanned both files I touched for the banned em dash and section sign characters: none found.
+
+Hard rules honored: never called a real Hermes, a real model provider, or Docker (this package never touches Hermes at all); never ran git commit or git push; never ran a bare git stash (used a plain file copy plus git show HEAD:<path> instead, restricted to the one file I own); ran only my own test file and the no-flag drift check, not the full suite, per the work order's instruction that this change is isolated.
+
+Nothing found but not fixed for this package. (HK-GAPS's docs/architecture.md drift is out of scope and owned by another agent.)
+
+### HK-PATH verifier (Haiku checklist)
+
+All 6 checklist tests pass individually, but one critical deliverable issue: The test file tests/unit/test_check_requirements.py exists and all 10 tests pass, but the file is NOT committed to git (git status shows ?? - untracked). It sits outside version control at C:\Users\masoo\ases\tests\unit\test_check_requirements.py.
+
+Per the build spec, the test file should be added (implying committed). Untracked test files mean the deliverable is incomplete - CI and other developers cannot access this code. Other test files in tests/unit/ are tracked normally in git; this one standing out as untracked indicates an oversight in the build completion.
+
+The implementation is correct: DEFAULT_DOCX points at the new AISES path, env var override works, CLI flag precedence is correct, error messages name the path and explain both override mechanisms, exit code is non-zero. All code passes its tests and has no non-ASCII characters.
+
+Minor note: The actual output includes filenames in the OK message ("OK: 103 requirement IDs in sync between ASES_Swarm_Implementation_Blueprint_v1.2.docx and requirements.yaml") rather than the minimalist format the spec showed ("OK: 103 requirement IDs in sync"), but this is supplementary helpful detail that does not violate the requirement.
+
+Recommendation: FIX-FIRST. The test file must be added to git (either commit it or remove it). Otherwise the deliverable is incomplete and CI/other users cannot run these critical tests.
+
+### HK-GAPS builder
+
+## HK-GAPS build report (docs/architecture.md, "Known gaps" and "Running things" sections only)
+
+Repo: C:\Users\masoo\ases, branch master. No commits made, nothing pushed, no bare git stash used, no real Hermes/model provider/Docker calls made. `swarm doctor` was never run (it shells out to a real hermes.exe on PATH on this machine); I verified its command syntax by reading src/ases/doctor.py and src/ases/cli.py instead.
+
+### What I did
+
+Read docs/work-orders/r8_rules.md and docs/work-orders/r8_wp_housekeeping.md first, as instructed. Then, for every bullet in "Known gaps (tracked, not hidden)", checked the claim against src/ases/ (via Grep/Read, and code-review-graph's query/semantic-search tools where they saved a lookup -- the graph itself was not used as the final source of truth for anything load-bearing, per the work order's own warning that it predates recent commits), against spec/requirements.yaml's status/note for every register ID the bullet names or implies, and, where relevant, against a real installed Hermes config file. Also checked every command in "## Running things" actually works on this machine.
+
+### Table: every original bullet, classification, evidence, what changed
+
+| # | Original bullet (paraphrased) | Classification | Evidence (file:line or register ID + status) | What I changed |
+|---|---|---|---|---|
+| 1 | `glm-5.3-thinking:free`'s context length not declared in config/models.yaml; confirm before pinning in Phase 2 | **Stale** | config/models.yaml has no `glm` model row at all (grep confirms only a historical comment); `swarm models` output shows lead pinned to `xkiro/qwen/qwen3.8-max:free`, `context=1050000 smoke=pass pinned`; register `ASES-MOD-02` (`in_progress`) still describes the old gap, itself drifted | Struck through with a 2026-09-27 dated note explaining the model row is gone entirely, not just demoted, and naming the model that replaced it |
+| 2 | Blueprint Appendix B names the UnoRouter secret `OPENAI_API_KEY`; the real installed config.yaml uses `HERMES_CUSTOM_UNOROUTER_API_KEY`, which is "what config/models.yaml uses here"; since 2026-09-19 `OPENAI_API_KEY` is also `lead`'s new home on the `openai` provider | **Partly true** | The core naming-difference observation is still true: the machine's default installed Hermes config.yaml (`%LOCALAPPDATA%\hermes\config.yaml`) still shows `key_env: HERMES_CUSTOM_UNOROUTER_API_KEY`. But config/models.yaml has zero `unorouter` or `openai` provider rows left (grep confirms), so "that's what config/models.yaml uses here" and "`lead`'s new home [is `openai`]" are both stale; `lead` is on `xkiro` today | Rewrote in place: kept the still-true naming-coincidence point, flagged the two stale sub-claims, stated what config/models.yaml actually uses today |
+| 3 | ~~"No Hermes profiles exist yet"~~ (already struck through) | **Still true** (as a correctly-struck bullet) | register `ASES-ROL-10` (`covered`): "all three profiles created fresh" | None |
+| 4 | ~~"Gate P plan publication (ASES-ARC-09)..."~~ (already struck through) | **Still true** (as a correctly-struck bullet) | register `ASES-ARC-09` (`covered`) | None |
+| 5 | `ASES-GIT-16` (`partial`): worktree pinned to exact local integration HEAD; whether `worktree_sync` needs to be turned off explicitly for a repo with a remote is "still open" | **Partly true** | `src/ases/profiles.py:901-905` (`_config_rows`, cites ASES-GIT-16, sets `worktree_sync: false` on every profile) and `:1530-1533` (`_check_profile`, flags it as a problem if left on), both built in Round 5, after the run this bullet describes; register `ASES-GIT-16` still `partial` (real guard case -- a repo whose remote tip differs from local HEAD -- still never exercised) | Rewrote: the "is it turned off explicitly" design question is now answered (yes, by code); the genuinely-still-open part (never tested against a real divergent remote) is kept, restated precisely |
+| 6 | "Gaps the first real run exposed": reviewer has `write_file`/`patch` (ASES-ROL-05 partial); reviewer can't see gate records, only trusts the coder's claim; integrity snapshots (ASES-GIT-12) not wired; Docker sandbox (ASES-SEC-03) is Phase 5 | **Partly true** | Reviewer tool scope: register `ASES-ROL-05` (`partial`), unchanged, still true. Gate-record trust: `src/ases/review.py:62` (`gate_before_review`) and `:121` (`check_branch_for_merge`) now independently re-verify Gate 1, seen firing for real 2026-09-19 (register `ASES-REV-05`, `partial`). Integrity snapshots: `src/ases/guards.py:117` (`check_primary_checkout`, wired and acceptance-proven 2026-09-22) vs `:373` (`check_idle_worktrees`, still only WARNs, documented false-positive gap) (register `ASES-GIT-12`, `partial`) | Rewrote all three sub-claims: kept the reviewer-tools claim, corrected the "only trusts the coder's claim" claim (controller now independently re-checks), corrected "not wired" (primary-checkout half is wired; the bullet's own pip-install example is still uncaught by either half, only Docker sandbox would catch it) |
+| 7 | Credentials as of 2026-09-19: `lead`/`coder-1` on xKiro, `reviewer` on OpenRouter, UnoRouter removed entirely | **Still true** | config/models.yaml: coder still pinned `xkiro/qwen/qwen3-coder-plus:free`; reviewer still pinned `openrouter/cohere/north-mini-code:free`; no `unorouter` row anywhere | None |
+| 8 | Gate 1/3 run directly on the host, not inside Docker (Phase 5 requirement, not built) | **Partly true** | `src/ases/gates.py:58` (`run_gate` has an injectable `runner` param, citing ASES-QG-04/ASES-SEC-03); `src/ases/finalgates.py:649` and `:709` (Gate 4/5 already forward `runner`); but `src/ases/review.py:382` (Gate 1), `src/ases/mergeq.py:254` (Gate 3), `src/ases/controller.py:1011` (Gate 3 postmerge) and `src/ases/controller.py:1941` (`finalize` call) all pass no `runner`, so it defaults to `None` everywhere; register `ASES-SEC-03` (`in_progress`): "the controller's own gate runs do not use docker_run_argv yet" | Rewrote: the practical conclusion (host-only, not sandboxed) is unchanged and still true for every gate, but the "(Phase 5 requirement, not built)" framing was wrong -- the sandbox plumbing IS built, just not wired into any real call site; cited exactly which four call sites still need a runner |
+| new | (none previously) | **New bullet added** | register `ASES-REV-01` (`partial`): "Plan critique (the critic role in Gate P) is not built." (quoted verbatim) | Added a new bullet: this is a genuine, explicitly-open register gap directly tied to two things this section already discusses (Gate P, and the Reviewer's first real run), so a reader of "Known gaps" would reasonably expect to find it and it was missing |
+
+### "## Running things" section
+
+- The bare `.venv\Scripts\python.exe -m pytest -q` line was wrong on this machine: `tests/integration/test_doctor_real_hermes.py` only self-skips via `pytestmark = pytest.mark.skipif(shutil.which("hermes") is None, ...)`, and a real `hermes.exe` is on this machine's PATH (per r8_rules.md), so a bare run would call the real Hermes for real, which the round's hard rule forbids. Fixed by adding `--ignore=tests/integration/test_doctor_real_hermes.py`, exactly as r8_rules.md's own required test command does. Proved with `--collect-only`: 5527 tests collected without the ignore flag, 5524 with it (the 3 real-hermes tests are exactly what gets excluded).
+- `.venv\Scripts\python.exe spec\check_requirements.py --check` was left exactly as written (no `--docx` flag): HK-PATH (the parallel package) already appears to have landed its default-path fix in this shared working tree, and running the command directly confirms it: "OK: 103 requirement IDs in sync". Per the work order, I wrote/kept the command as it will work once HK-PATH lands, which it already does here.
+- `swarm doctor` and `swarm models` left unchanged (still the correct current CLI subcommands, confirmed by reading `src/ases/cli.py`'s `add_parser` calls). `swarm models` was actually run (safe, makes no real-Hermes call) and its output is what grounded bullet 1's "stale" classification above. `swarm doctor` was NOT run, per the hard rule; `src/ases/doctor.py` confirms it really does call `hermes_mod.hermes_version()`, `run_doctor()` and `gateway_status()`, i.e. the real Hermes binary, so the ban is correct and the doc line needs no change beyond what's already there.
+- Added one short dated paragraph under the code block explaining both of the above, for a reader who wasn't here.
+
+### Verification run
+
+Full suite (this machine's exact required command, through the output compressor): 5522 passed, 2 skipped, 0 failed, in 762.03s (12:42). Round-8 baseline was 5,512 passed, 2 skipped, 0 failed -- count went up (other parallel work already in this shared tree), never down, exit code 0.
+
+### Style check
+
+Scanned the entire file (not just the sections I own) for em dash (U+2014) and section-sign (U+00A7) characters before and after editing: zero occurrences either time. Nothing to report there.
+
+### Scope discipline
+
+Touched only the "## Known gaps (tracked, not hidden)" and "## Running things" sections of docs/architecture.md. Did not touch spec/check_requirements.py or tests/unit/test_check_requirements.py (HK-PATH's files, changed in parallel by another agent -- confirmed via `git status` that only that agent's edits touch those paths). Did not edit any of the dated historical round sections earlier in the file, per instructions, even where they're now superseded.
+
+### HK-GAPS independent review
+
+Repo: C:\Users\masoo\ases, branch master. No files edited (review only), no commits, no push, no bare `git stash`, no real Hermes/model-provider/Docker calls made. Read r8_rules.md and r8_wp_housekeeping.md (HK-GAPS spec) first, as instructed.
+
+Verified `git -C C:\Users\masoo\ases diff docs/architecture.md` directly and checked every bullet in the new "Known gaps" section against src/ases/*.py (via Read/Grep, exact line numbers), spec/requirements.yaml's status/note fields (loaded via Python+yaml), config/models.yaml, and the installed Hermes config at %LOCALAPPDATA%\hermes\config.yaml.
+
+(a) Scope: the diff has exactly two hunks, one at original line 1143 (the "Known gaps" section, which starts at line 1144) and one at original line 1188 (the "Running things" section, which starts at line 1225, the last section in the file). Nothing above line 1143 changed. Confirmed clean.
+
+(b) Bullet-by-bullet fact-check against code and register (every ID cited was pulled fresh from spec/requirements.yaml, not taken on faith):
+- glm-5.3-thinking:free bullet (struck through, ASES-MOD-02 in_progress): confirmed no `glm` model row exists in config/models.yaml (grep), confirmed `xkiro/qwen/qwen3.8-max:free` is the pinned lead with context_length 1050000 by actually running `swarm models` myself (output: `xkiro/qwen/qwen3.8-max:free role=lead context=1050000 smoke=pass pinned`, matching the doc's quoted line exactly), and confirmed ASES-MOD-02's register status is `in_progress` with a note that still describes the old glm gap. Accurate.
+- UnoRouter secret naming bullet: confirmed the installed %LOCALAPPDATA%\hermes\config.yaml still has `key_env: HERMES_CUSTOM_UNOROUTER_API_KEY`; confirmed config/models.yaml has zero `provider: unorouter` and zero `provider: openai` rows (grep of every `provider:` line shows only xkiro and openrouter); confirmed lead's key_env is `XKIRO_API_KEY` under the xkiro provider block; cross-checked against blueprint.txt Appendix B, which does name `OPENAI_API_KEY` for the UnoRouter secret, and against the "Lead moved off GLM, then to OpenAI via xKiro" section (line 220) which corroborates the demote-then-remove history. Accurate.
+- Two already-struck-through bullets (Hermes profiles, Gate P publication): unchanged by this diff; register status for ASES-ROL-10 and ASES-ARC-09 both `covered`, matching. Correct to leave untouched.
+- ASES-GIT-16 (worktree_sync) bullet: confirmed `profiles._config_rows` (src/ases/profiles.py:901-905) and `profiles._check_profile` (src/ases/profiles.py:1530-1533) exist exactly as cited and cite ASES-GIT-16 by name; register status is `partial` with the exact "never exercised against a real divergent remote" gap the bullet describes. Accurate.
+- "Gaps the first real run exposed" bullet: verified ASES-ROL-05 (partial, unchanged), verified `review.gate_before_review` at review.py:62 and `review.check_branch_for_merge` at review.py:121 exist as cited, verified `guards.check_primary_checkout` (guards.py:117, wired into controller.py:2014, runs every pass) and `guards.check_idle_worktrees` (guards.py:373, called from controller.py:1912, confirmed WARN-only via controller.py:1913-1914) exactly as described. One overstatement found here -- see blocking finding.
+- Credentials bullet: unchanged; confirmed coder still pinned to xkiro/qwen/qwen3-coder-plus:free and reviewer to openrouter/cohere/north-mini-code:free, no unorouter row. Accurate, correctly left untouched.
+- Gate 1/3 Docker bullet (fully rewritten): confirmed `gates.run_gate`'s `runner` parameter at gates.py:58 with the exact `(ASES-QG-04, ASES-SEC-03)` citation in its own docstring; confirmed `run_gate4`/`run_gate5` in finalgates.py (lines 649, 709) forward `runner`; confirmed all four cited call sites (review.py:382, mergeq.py:254, controller.py:1011, controller.py:1941) call run_gate/finalize without a runner argument, defaulting to None; confirmed ASES-SEC-03 register status `in_progress` with the exact quoted note "the controller's own gate runs do not use docker_run_argv yet"; confirmed sandbox.py:18's docstring quote. Accurate (two trivial non-blocking nits noted below).
+- New ASES-REV-01 bullet: confirmed register status `partial` and the quoted sentence "Plan critique (the critic role in Gate P) is not built." is a verbatim, correct quote of the register note. Accurate, and it is a genuine gap the section would be expected to carry, so adding it was correct per the work order's rule 3.
+
+(c) The one genuinely stale bullet (glm) was struck through with `~~...~~` plus a dated 2026-09-27 note, matching the file's established convention, not silently deleted. Partly-true bullets were rewritten in place without strikethrough, which is correct per the work order (strikethrough is only required for stale bullets).
+
+(d) Running things: confirmed a real hermes.exe is on PATH (`where hermes` resolved it) and tests/integration/test_doctor_real_hermes.py only self-skips via `shutil.which("hermes") is None`, so the added `--ignore=...` flag is required, exactly as the doc now says. I ran `pytest --collect-only` with and without the ignore flag myself: 5527 collected without it, 5524 with it, a difference of exactly 3 (the real-Hermes tests), matching the build report's numbers. I ran `spec/check_requirements.py --check` with no flags myself: it printed "OK: 103 requirement IDs in sync" (HK-PATH's fix has landed in this shared tree, confirmed via grep of DEFAULT_DOCX in spec/check_requirements.py). I read (did not run) src/ases/doctor.py and confirmed it calls `hermes_mod.hermes_version()`, `run_doctor()` and `gateway_status()` -- real Hermes calls -- so leaving `swarm doctor` in the doc and not running it is correct.
+
+(e) Scanned both the diff's added lines and the entire current docs/architecture.md file programmatically for U+2014 (em dash) and U+00A7 (section sign): zero occurrences in either.
+
+One blocking finding: the rewritten "Gaps the first real run exposed" bullet claims `gate_before_review` "independently re-runs Gate 1 itself before the reviewer ever sees the card" as an unqualified fact. This directly contradicts the docstring of `check_branch_for_merge` (cited two lines later in the same bullet), which says Hermes's gateway dispatcher "can claim a review card and start the reviewer before gate_before_review has seen it" -- and the register note for ASES-REV-05 (also cited in the same bullet) confirms this race is a real, occurring behavior ("when Hermes's dispatcher wins the race the re-check happens at merge time instead of when the card enters review"), not merely a hypothetical. The bullet acknowledges one caveat (the send-back path has never fired for real) but omits this different, code-documented ordering caveat while asserting the ordering as settled fact.
+
+Two non-blocking style/precision nits: (1) "finalgates.gate4"/"finalgates.gate5" should be `run_gate4`/`run_gate5` (line numbers and behavior are correct, only the name is off); (2) a docstring quote from sandbox.py has a capitalization mismatch that doesn't affect substance.
+
+Could not get a nemotron second opinion: all three nemotron MCP tools returned 403 Authorization failed for this session (an auth problem with that server, unrelated to this task). All verification above was done by direct inspection of source, the register, and by running the document's own listed safe commands.
+
+### HK-GAPS fix
+
+## HK-GAPS review-finding fix (docs/architecture.md)
+
+Scope: one blocking finding on sub-package HK-GAPS, file docs/architecture.md, "Known gaps" section only (per r8_wp_housekeeping.md, files owned are docs/architecture.md's Known gaps and Running things sections). No other file was touched.
+
+### Finding re-checked
+
+Claim under review: the "Gaps the first real run exposed" bullet (around line 1191) said, as an unqualified fact, that `review.gate_before_review` (src/ases/review.py:62) "independently re-runs Gate 1 itself before the reviewer ever sees the card."
+
+I re-checked this against the code and the register myself rather than taking the reviewer's word:
+
+- src/ases/review.py:121-129, the docstring of `check_branch_for_merge` (the very function cited two lines later in the same bullet), says verbatim: "Hermes's own gateway dispatcher can claim a review card and start the reviewer before gate_before_review has seen it, so a card can reach the merge queue with the scope check and the Gate 1 record never having happened."
+- spec/requirements.yaml, ASES-REV-05 (status: partial), says verbatim: "...and when Hermes's dispatcher wins the race the re-check happens at merge time instead of when the card enters review."
+
+Both the code's own docstring and the register row the bullet itself cites describe this ordering race as a real, occurring behavior, not a hypothetical. The bullet's unqualified "before the reviewer ever sees the card" therefore overstated what the code guarantees. The reviewer's finding is CONFIRMED.
+
+### Fix applied
+
+Edited the bullet (docs/architecture.md, "Known gaps" section) to:
+- Say `gate_before_review` re-runs Gate 1 "when a card enters review" (not an absolute "before the reviewer ever sees the card").
+- Add the qualifier, sourced from the function's own docstring, that Hermes's gateway dispatcher can sometimes start the reviewer first.
+- State explicitly that when that race is lost, `check_branch_for_merge` is what actually catches it at merge time -- preserving the bullet's true, substantive point (two independent checks together mean the controller no longer merely trusts the coder's claim) without asserting a strict ordering guarantee the code does not always hold.
+- Extend the `ASES-REV-05` parenthetical to also note the register's own caveat about the dispatcher-wins-the-race case resolving at merge time, not at review entry.
+
+No other clause in the bullet, and no other section of the file, was touched. I did not touch spec/check_requirements.py, spec/requirements.yaml, or the other work-order/test files that appeared as untracked/modified in `git status` -- those are other agents' concurrent, disjoint HK-PATH and round-9 work, not part of this HK-GAPS finding.
+
+### Verification
+
+- Read src/ases/review.py:1-150 (module docstring, `gate_before_review`, `check_branch`, `check_branch_for_merge`) directly to confirm the finding rather than trusting the reviewer's quoted evidence blindly.
+- Read the ASES-REV-05 row in spec/requirements.yaml directly (lines 791-803) to confirm the register note's exact wording.
+- Re-read the edited paragraph in context (docs/architecture.md lines 1186-1203) to confirm it reads coherently and does not contradict the rest of the bullet.
+- Scanned the whole file for em dash (U+2014) and section sign (U+00A7) characters: zero hits, so the housekeeping character rule still holds.
+- Confirmed via `git status --porcelain` that only docs/architecture.md was modified by me; the other modified/untracked files (spec/check_requirements.py, spec/requirements.yaml, tests/unit/test_check_requirements.py, various docs/work-orders/*.md) belong to the parallel HK-PATH package and other round work, not to this task.
+- No test suite covers this file's prose (grepped tests/ for "architecture.md": the only hits are in test_critic.py and test_profiles.py, which reference an unrelated fixture path `docs/ases/architecture.md`, not the repo's own top-level docs/architecture.md), so no test run applies to this documentation-only fix. Did not run the full pytest suite since this change touches no code path.
+
+### Anything found but not fixed
+
+Nothing else in scope was found wrong. The rest of the "Gaps the first real run exposed" bullet, and the rest of the Known gaps / Running things sections, were left as-is since no other finding was given for this sub-package in this pass.
+
+### HK-GAPS re-review
+
+Verdict: PASS. The single blocking finding is resolved and the fix introduces no new wrong claim.
+
+What I checked directly (not taking the fixer's word for it):
+
+1. Code: read src/ases/review.py lines 1-150 myself.
+   - `gate_before_review` is at line 62 (confirmed).
+   - `check_branch_for_merge` is at line 121 (confirmed), and its docstring says verbatim: "Hermes's own gateway dispatcher can claim a review card and start the reviewer before gate_before_review has seen it, so a card can reach the merge queue with the scope check and the Gate 1 record never having happened," and later: "otherwise there is no green record at all (for example the review-lane re-check was skipped by that race), so Gate 1 runs now on the head."
+
+2. Register: read spec/requirements.yaml lines 785-800 myself. ASES-REV-05 is `status: partial`, and its note ends verbatim: "...when Hermes's dispatcher wins the race the re-check happens at merge time instead of when the card enters review."
+
+3. Current doc text (docs/architecture.md lines 1187-1198, read directly): the bullet now says `gate_before_review` "independently re-runs Gate 1 when a card enters review, though its own docstring says Hermes's gateway dispatcher can sometimes claim the card and start the reviewer before gate_before_review has run; when that race is lost, `review.check_branch_for_merge` ... is what actually catches it, re-checking scope and Gate 1 again, independently, at merge time," and the `ASES-REV-05` parenthetical now adds "the register note also records that when the dispatcher wins the race, the re-check happens at merge time rather than at review entry."
+
+This tracks the code and the register exactly: the absolute "before the reviewer ever sees the card" claim is gone, replaced by "when a card enters review" plus an explicit, sourced caveat about the race and which check catches the lost-race case. The one wording nuance -- the docstring says "before gate_before_review has seen it" and the fix paraphrases it as "before gate_before_review has run" -- is a faithful, non-material paraphrase (gate_before_review "sees" a card precisely by running its checks on it), not a new inaccuracy. Line citations (review.py:62, review.py:121) are both correct.
+
+Scope and hygiene checks: confirmed via `git status --porcelain` that only docs/architecture.md is modified in this agent's area of concern (the other modified/untracked files -- spec/check_requirements.py, spec/requirements.yaml, tests/unit/test_check_requirements.py, docs/work-orders/*.md -- belong to concurrent HK-PATH/round-9 work, matching the fixer's account). Independently re-counted em dash (U+2014) and section-sign (U+00A7) characters in the whole file via a small Python check: zero of each, consistent with the project's character-ban rule.
+
+One non-blocking observation for a later pass (not part of this finding, not touched by this fix): the very next, untouched sentence in the same bullet -- "Both paths were seen firing for real on the 2026-09-19 run" -- sits a bit uneasily next to the register note's "Since then the merge queue re-checks independently" (implying the merge-time-recheck-from-scratch capability was built after 2026-09-19) and the register's own silence on whether the dispatcher-actually-won-the-race case occurred that day. This may be a pre-existing, separate overclaim worth a future look, but it predates and is unrelated to the specific finding I was asked to re-review, so it is not a blocking item here.
+
+nemotron: attempted an independent second-opinion pass via mcp__nemotron__run_nemotron_super (pasting the docstring, register note, and fixed bullet text verbatim and asking for an independent RESOLVED/NOT-RESOLVED verdict), but the call failed with a 403 PermissionDeniedError ("Authorization failed") -- the nemotron endpoint is not authorized in this environment/session. Proceeded with my own direct source verification instead (code + register + doc, read firsthand, not from the fixer's quotes).
+
+Files involved: C:\Users\masoo\ases\docs\architecture.md (re-reviewed, not edited), C:\Users\masoo\ases\src\ases\review.py (read for verification), C:\Users\masoo\ases\spec\requirements.yaml (read for verification). No files were edited by me, per instructions.
+
+### GATEENV builder
+
+## Package GATEENV (round 8): gate commands no longer see the operator's credentials
+
+### What changed
+
+**src/ases/gates.py**
+- `_run_commands` (the default host `runner` for `run_gate`) now starts every command with `procenv.scrubbed_environ()` instead of the controller's own environment. A gate command can run model-authored code (a test a coder committed), so it must not be able to read a provider key the operator's shell happens to hold.
+- `run_gate`'s own `git worktree add`/`worktree remove` subprocess calls also now run with `procenv.scrubbed_environ()`, closing the side door named in the work order: a `post-checkout` hook in the shared `.git/hooks` (writable by a worker on the local backend) that runs during the gate checkout now sees no credential either.
+- Module docstring and `_run_commands`'s docstring updated to quote ASES-CFG-04/ASES-CFG-05 and state coverage precisely: the host runner and the gate checkout are covered; a gateway-dispatched worker's own shell is not, because ASES never spawns one; Docker sandbox runners are unaffected (they never inherited the host environment); no pass-through allowlist exists this round (documented as a follow-up, per the architect's decision).
+- Added `from . import procenv as procenv_mod` import.
+
+**src/ases/procenv.py**
+- Added `_EXEMPT_EXACT_NAMES = frozenset({"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE"})`, matched case-insensitively (`name.upper() in _EXEMPT_EXACT_NAMES`), and `scrubbed_environ()` now keeps a variable if its exact name is in that set even when it matches `_CREDENTIAL_ENV` (all three match only because "AUTHOR" contains "auth"). `SSH_AUTH_SOCK` and `XAUTHORITY` deliberately get no exemption (capability-bearing: an ssh-agent socket lets model-written code authenticate as the operator); `SESSIONNAME` is left as is (still dropped via the pre-existing "session" match).
+- Module and function docstrings updated to explain the exemption and name every caller it now reaches (gates.py's host runner and its git worktree subprocesses, plus the five pre-existing hermes launch sites and evalkit).
+
+**tests/unit/test_procenv.py** -- 5 new tests: the exemption fires for GIT_AUTHOR_NAME/EMAIL/DATE, is case-insensitive, does NOT extend to SSH_AUTH_SOCK/XAUTHORITY, leaves SESSIONNAME dropped, and is an exact-name match (not a substring match, e.g. `GIT_AUTHOR_NAME_EXTRA` still gets dropped).
+
+**tests/unit/test_gates.py** -- 5 new tests, every one using a presence-marker probe (KEYSEEN/NOKEY), never asserting on the secret value itself (since `run_gate` redacts secret-shaped values in its output, so a value-based assertion could pass for the wrong reason):
+- a credential-shaped var (`OPENROUTER_API_KEY`) and a generic one (`MY_SERVICE_TOKEN`) are invisible to a gate command;
+- `PATH` and a made-up `ASES_GATE_PROBE` are still visible (the fix didn't just empty the environment);
+- a `shell=True` command still runs on Windows (COMSPEC/SYSTEMROOT survive);
+- `GIT_AUTHOR_NAME` survives into a gate command, `SSH_AUTH_SOCK` does not;
+- a planted `post-checkout` hook in the test repo's `.git/hooks` runs during `run_gate` (proven non-vacuous by its own marker file) and cannot see a planted `OPENROUTER_API_KEY`; the test fails loudly (rather than skipping silently) if a POSIX shell is available but the hook somehow didn't run, and only skips with an honest reason if neither `sh` nor `bash` is on PATH.
+
+**tests/acceptance/test_22_10_gate_env.py (new file)** -- one acceptance-level test, following test_22_10_secrets.py's and conftest.py's style without editing either: a `world_factory` world whose only gate command is the presence probe, with `OPENROUTER_API_KEY` planted in the TEST PROCESS's own environment, driven through a real controller pass (create_cards_from_plan, run_pass) on FakeHermes to `all_merge_cards_done()`. Asserts every `gate1` and `gate3*` row in `gate_runs` says `NOKEY` (the scenario reaches `gate1`, `gate3`, and `gate3-postmerge`, confirmed by inspection during development), and that the planted key literal never appears in any `gate_runs.detail`.
+
+### Before/after proof (required)
+Copied the new `gates.py` aside, restored the pre-round-8 version from git (`git show HEAD:src/ases/gates.py > src/ases/gates.py` -- never a bare `git stash`, since other agents have uncommitted edits in the same tree), ran the new tests, then restored the fix. Full output is in `before_after`. Summary: against the OLD code, 3 of the 5 new unit tests fail (`KEYSEEN`/`SOCKSEEN`/the hook's own marker file containing `KEYSEEN`) and the new acceptance test fails (`KEYSEEN`); against the restored fix, all pass. `git diff --stat` confirmed the tree was byte-identical to what I'd left it before and after the swap.
+
+### Sweep (WP requirement)
+Every call site of `run_gate` -- `review.py` Gate 1 (`_run_gate1`), `mergeq.py` Gate 3, `controller.py`'s post-merge `gate3-postmerge` check, and `finalgates.py`'s Gate 4/Gate 5 -- goes through the same function, so all four now inherit the fix through the one choke point; I read each call site to confirm none passes its own environment. Ran their full unit-test files (test_review.py, test_mergeq.py, test_controller.py, test_finalgates.py: 787 passed) to confirm no regression. Grepped all of `src/ases` for `shell=True`: the only other hit is `evalkit/texttasks.py:390`, a deliberately-vulnerable Flask fixture route (`ping = subprocess.run("ping -c 1 " + host, shell=True, ...)`) used as sample content for `finalgates.py`'s own injection-heuristic scanner tests, not a gate or check command ASES runs -- reported, not fixed, since it isn't the same shape as this gap.
+
+### Confirmed unaffected (design decision items)
+- `sandbox.py`'s `docker_run_argv` never inherits the host environment (grepped: no `os.environ`/`scrubbed_environ` reference in it) and I did not touch `sandbox.default_runner` (its key-leak probes still use the real environment, per the round 7 CFG-05 note).
+- None of the five real hermes launch sites (`hermes.py::_run`, `evals.py`, `evalkit/codeeval.py`, `cli.py`, `critic.py`, plus `profiles.py`'s use of `hermes_mod.scrubbed_environ()` for its sandbox default runner) or `evalkit` depend on `GIT_AUTHOR_*` being absent: grepped for `GIT_AUTHOR`/`SSH_AUTH_SOCK`/`XAUTHORITY` across `src/ases` (no other references), and ran their full unit-test files (test_hermes_env.py, test_profiles.py, test_critic.py, test_cli_commands.py, test_evals.py: 915 passed).
+- Out of scope, per the work order: the controller's other git calls (merge queue, review, reconcile, guards, hardening, leases, integrity) still run with the full environment; a separate sweep covers that in parallel, so I only confirmed (via grep) none of them uses `shell=True`, and did not otherwise touch them.
+
+### Characters and files
+Scanned every file I wrote or edited for em dash and section sign characters: none found. Files touched: `src/ases/gates.py`, `src/ases/procenv.py`, `tests/unit/test_gates.py`, `tests/unit/test_procenv.py`, and the new `tests/acceptance/test_22_10_gate_env.py` -- exactly the files the work order names as mine. I did not touch `spec/requirements.yaml`, `docs/architecture.md`, or anything under `docs/work-orders/`.
+
+### Full suite (once, at the end, per r8_rules.md)
+`python C:/Users/masoo/.claude/scripts/quiet.py -l pytest -- .venv/Scripts/python.exe -m pytest -q --tb=line --ignore=tests/integration/test_doctor_real_hermes.py`
+Result: **5533 passed, 2 skipped in 969.99s (0:16:09)**. Round-8 baseline was 5,512 passed, 2 skipped, 0 failed -- it did not go down, and 0 failed. Never called a real Hermes, a real model provider, or Docker at any point (everything ran on `FakeHermes` or plain unit fakes); never committed or pushed; never ran a bare `git stash`.
+
+See `open_issues` for the handful of judgment calls and out-of-scope findings worth the architect's attention.
+
+### GATEENV independent review 1 (verdict: pass)
+
+Verdict: PASS. Reviewed package GATEENV (round 8) without editing any file, per C:\Users\masoo\ases\docs\work-orders\r8_wp_gateenv.md and r8_rules.md.
+
+What I checked and found:
+
+1. Design decision items 1-5, verified against the actual diff (git diff -- src/ases/gates.py src/ases/procenv.py tests/unit/test_gates.py tests/unit/test_procenv.py) and the old code (via `git show HEAD:...`, never touching the working tree):
+   - Item 1: `_run_commands` now does `env = procenv_mod.scrubbed_environ()` and passes it to every `subprocess.run(cmd, shell=True, ...)`. Old code had no `env=` kwarg at all (confirmed by reading `git show HEAD:src/ases/gates.py`), so it inherited the full environment - this is a real behavior change, not cosmetic.
+   - Item 2: both the `git worktree add` and `git worktree remove` subprocess calls in `run_gate` now also pass `env=procenv_mod.scrubbed_environ()`. Confirmed old code passed no env there either.
+   - Item 3: no allowlist mechanism was added anywhere; docstrings in both files state this and describe the follow-up. Confirmed by reading the full diff.
+   - Item 4: `procenv._EXEMPT_EXACT_NAMES = frozenset({"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE"})`, checked via `name.upper() in _EXEMPT_EXACT_NAMES` (a set-membership check, so it is exact-name only, never a substring/prefix match) `or not _CREDENTIAL_ENV.search(name)`. This is case-insensitive by construction and does not touch `SSH_AUTH_SOCK` or `XAUTHORITY` (neither is in the frozenset, so both still fall through to the regex and get dropped, as tests confirm).
+   - Item 5: read `sandbox.py` directly - `docker_run_argv`'s docstring and body confirm "Environment: ONLY the variables in env... The parent's environment is never forwarded", and `default_runner` (untouched by this diff) still defaults to inheriting the real environment when no `env` is passed, exactly as the round-7 note says its key-leak probes require. `sandbox.py` does not appear anywhere in the reviewed diff.
+
+2. Read `tests/acceptance/test_22_10_gate_env.py` in full and the new tests in `test_gates.py`/`test_procenv.py`. Every credential-presence test uses a SEEN/NOxxx presence marker, never asserts on the secret value (correctly avoiding a false pass from `run_gate`'s own output redaction). The `post-checkout` hook test asserts the hook actually ran (via its own marker file) before checking the marker's content, so it is not vacuous, and fails loudly rather than skipping silently unless neither `sh` nor `bash` is on PATH - I read `tests/unit/test_gates.py`'s `repo` fixture and confirmed it is a real `git init` repo with a genuine `.git/hooks` directory, so planting a hook there is legitimate.
+
+3. Checked each new test would fail against the pre-round-8 code for the right reason: since the old `_run_commands` and the old `git worktree add/remove` calls had no `env=` argument at all, they inherited the full test-process environment, meaning `OPENROUTER_API_KEY`/`MY_SERVICE_TOKEN`/`SSH_AUTH_SOCK`/the planted hook's `OPENROUTER_API_KEY` would all have been visible, producing `KEYSEEN`/`SOCKSEEN`/a hook marker of `KEYSEEN` - exactly the 3-of-5 unit-test and 1 acceptance-test failures the builder's before/after proof reports. (I did not personally reconstruct the old file and re-run it, since I was told not to edit any file; I verified this analytically from the `git show HEAD` content, which is sufficient to confirm the claim.) The other 2 new unit tests (non-credential vars still visible; a shell=True command still runs on Windows) are sanity/coverage checks that would already pass on the old code too - this is expected and matches the builder's own report, not a defect.
+
+4. Swept `src/ases` myself for other subprocess call sites of the same shape and for other callers of `procenv.scrubbed_environ()`:
+   - `grep -rn "shell=True" src/ases` -> only `gates.py:73` (now fixed) and `evalkit/texttasks.py:390`, which I read directly and confirmed is a deliberately-vulnerable Flask fixture route (`ping = subprocess.run("ping -c 1 " + host, shell=True, ...)`) used as sample content for `finalgates.py`'s own injection-heuristic scanner tests, not a gate/check command ASES runs.
+   - `grep -rn "scrubbed_environ" src` -> `hermes.py`, `critic.py`, `cli.py`, `evals.py`, `evalkit/codeeval.py`, `profiles.py` (via `hermes_mod.scrubbed_environ()`, which is a direct re-export of `procenv.scrubbed_environ`), and the new `gates.py` sites. This matches the report's "five hermes launch sites plus evalkit plus profiles" enumeration.
+   - `grep -rn "GIT_AUTHOR\|SSH_AUTH_SOCK\|XAUTHORITY" src/ases tests/unit/test_hermes_env.py tests/unit/test_profiles.py tests/unit/test_critic.py tests/unit/test_cli_commands.py tests/unit/test_evals.py` -> no hits outside `procenv.py` itself, confirming none of those callers depends on `GIT_AUTHOR_*` being absent.
+   - `grep -n "run_gate("` across `src/ases` -> exactly the four call sites named in the work order (`review.py::_run_gate1`, `mergeq.py` Gate 3, `controller.py`'s post-merge check, `finalgates.py`'s Gate 4 and Gate 5), and I read each call site directly: none passes its own `env` or its own runner that would bypass the scrub; all either use the default `_run_commands` or forward a `runner` parameter meant for the (already-unaffected) sandbox path.
+
+5. Ran the targeted tests via the quiet wrapper (absolute python path was required; the bare relative `.venv/Scripts/python.exe` failed under the wrapper on this machine):
+   `python C:/Users/masoo/.claude/scripts/quiet.py -l pytest_gateenv -- C:/Users/masoo/ases/.venv/Scripts/python.exe -m pytest -q --tb=short tests/unit/test_gates.py tests/unit/test_procenv.py tests/acceptance/test_22_10_gate_env.py tests/acceptance/test_22_10_secrets.py`
+   Result: **80 passed** in 26.6s.
+   I also ran the broader regression set the builder's report claims to have covered (test_review.py, test_mergeq.py, test_controller.py, test_finalgates.py, test_hermes_env.py, test_profiles.py, test_critic.py, test_cli_commands.py, test_evals.py) to independently confirm no regression from the exemption or the scrubbing: **1702 passed** in 406s, 0 failed.
+
+6. Got a second opinion from nemotron (see the `nemotron` field for the 403-then-fallback path). It found zero defects after an extensive (if repetitive) self-directed trace through the regex, the exemption's exact/case-insensitive matching, the shell=True/env interaction on Windows, and the acceptance test's assertions, and confirmed the tests are not vacuous. I treated this as one input and independently verified everything myself rather than taking its word for it.
+
+I also noticed (git status) that docs/architecture.md, spec/check_requirements.py and spec/requirements.yaml are modified in the working tree even though the work order says GATEENV must not touch them. I diffed those three files and confirmed the changes are about the blueprint docx path (matching r8_rules.md's mention of a separate package, HK-PATH) and contain no GATEENV/ASES-CFG-04/05 content - this is another in-flight package's uncommitted work in the same tree, not a violation by this builder. I did not edit anything.
+
+No blocking defects found. Files reviewed (read-only): src/ases/gates.py, src/ases/procenv.py, src/ases/sandbox.py, tests/unit/test_gates.py, tests/unit/test_procenv.py, tests/acceptance/test_22_10_gate_env.py, plus review.py/mergeq.py/controller.py/finalgates.py/evalkit/texttasks.py/evalkit/codetasks.py/fakes/worker.py/fakes/board.py for the sweep.
+
+### GATEENV live verification (Haiku)
+
+FIX-FIRST: Windows environment misconfiguration blocks test verification. Step 2 shows 5 test failures (expected 0) due to subprocess.run() inability to locate python command in PATH, which is an environmental issue not a code bug. However, this prevents proper verification of the credential scrubbing feature tests. Code quality checks show: Step 5 (requirements) PASS; Step 6 (ASCII) PASS; Step 3 (before/after) PASS; subset tests including new procenv tests (6/6) and project scoping tests PASS. Step 4 (full suite) still running after 600s timeout, cannot verify. Root cause: Windows PATH configuration prevents subprocess discovery of python executable. Recommend: fix Windows PATH to include python before retest, or configure subprocess calls to use full python.exe path. Code implementation appears correct based on review and subset test passes.
+
+### Sibling sweep: the controller's other git calls (read-only)
+
+Outcome: the sibling exposure GATEENV's work order flags as "out of scope, report only" is real and already reachable by unmodified production code, proved empirically twice against the real ASES helper functions (not a hypothetical).
+
+Proof 1: mergeq._git(['worktree','add','--detach',...]) against a throwaway repo with a planted post-checkout hook leaked a planted OPENROUTER_API_KEY-shaped env var into the hook.
+Proof 2: guards._git(['status','--porcelain',...]) against a repo with core.fsmonitor set to a script leaked the same env var, with git's own stdout/stderr completely silent about it.
+Proof 3: plain 'git config' run from a linked worktree wrote into the shared .git/config (extensions.worktreeConfig off by default), confirming the worker-plant path the other two proofs depend on.
+
+High severity: mergeq.py (worktree add/merge/commit/revert), mergeq.py:344's own secret-scan diff (missing --no-ext-diff/--no-textconv that the sibling call in tamper.py:1018 already has), and every status-calling _git in guards.py/hardening.py/reconcile.py/integrity.py.
+Medium: controller.py's bootstrap/publish_plan/_branch_diff, hardening.py's branch -d/-D.
+Info: filter/merge driver names can't be pre-empted by one flag (env-scrub is the real backstop there); Hermes's own worktree-creation subprocess and a worker's direct edits to its own account (~/.gitconfig, PATH binaries) are outside anything src/ases can reach.
+
+Fix proposed: one hardened git helper (scrubbed env, -c core.hooksPath=<empty dir>, -c core.fsmonitor=false, --no-ext-diff/--no-textconv on diff-capable subcommands, GIT_CONFIG_NOSYSTEM=1) used by every site above. Note: this dispatch is read-only per its own instructions and my tool grant (no edit tools); the "build and fix" part of the relayed request is for the build-track agents, not this audit.
+
+Checked and clean / lower risk: review.py (only rev-parse, merge-base, cat-file --batch, and 'diff --name-only' between two commits, no working-tree interaction, no content diff); leases.py (only 'rev-parse --git-path', pure plumbing); doctor.py and cli.py's git calls (config --get, --version, no repo content); killswitch.py (no git at all, only taskkill/pgrep/ps/docker); finalgates.py and tamper.py's cat-file/ls-tree calls (plumbing, no filter/hook path); tamper.py's own content diff at line 1018 (already passes --no-ext-diff --no-textconv, a good precedent to copy).
+
+### Architect notes
+
+- HK-PATH's checklist came back `all_pass: false` with every individual check passing: the verifier's only objection was that
+  the new test file is untracked, which is by design (builders never commit; the architect does). Not a defect.
+- GATEENV's Haiku pass reported 5 targeted failures ("subprocess cannot find python") and a full-suite timeout. Re-run by the
+  architect in Git Bash: the 5 are pre-existing tests that run a bare `python ok.py` as a gate command and so depend on `python`
+  being on the caller's PATH (the verifier's shell did not have it); none is a round 8 test and all pass here. The timeout was the
+  tool's 600 s limit, not the suite.
+- One real, pre-existing test fragility found by the architect's re-run: `test_gate_worktree_cleaned_up` asserted that the text
+  "wt" does not appear in `git worktree list`, so it failed whenever pytest's temp directory path contained "wt" (this round's
+  `--basetemp` sits under a folder named `ases-wt`). Rewritten to compare the actual worktree entries (`--porcelain`, exactly the
+  primary checkout left). Every round 9 worktree will see the old failure as a pre-existing baseline failure until this merges.
+- The nemotron MCP tools still return 403. The GATEENV reviewer found a working fallback: `tools/nemo.py` run with the nemotron
+  MCP server's own venv interpreter (`C:\Users\masoo\.claude\mcp-servers\nemotron\venv\Scripts\python.exe nemo.py super
+  < task.txt`), since neither the system Python nor the ASES venv has the `mcp` package.
+- The sweep's findings became round 9 package GITHARDEN (`r9_wp_githarden.md`), with one deliberate change to its proposal: no
+  `GIT_CONFIG_NOSYSTEM`, because the system config is not worker-writable and on Windows carries `core.autocrlf`.
+- Architect's full-suite run on the combined round 8 tree: 5533 passed, 2 skipped, 0 failed (657 s, clean tree apart from the in-progress round 9 register edits, which no test depends on).
+

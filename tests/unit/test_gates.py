@@ -1,4 +1,7 @@
+import os
+import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -135,8 +138,10 @@ def test_last_gate_result_scoped_to_a_project_the_latest_row_still_wins(repo, tm
 
 def test_gate_worktree_cleaned_up(repo):
     gates.run_gate(repo, _head_sha(repo), "gate1", ["echo x"])
-    result = subprocess.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True)
-    assert "wt" not in result.stdout
+    result = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    # Only the primary checkout is left. Counting entries, not searching for "wt" in the text: a temp directory whose path
+    # happens to contain "wt" (pytest --basetemp under a folder named ases-wt, say) made the old substring check fail.
+    assert [ln for ln in result.stdout.splitlines() if ln.startswith("worktree ")] == [f"worktree {repo.as_posix()}"]
 
 
 @pytest.mark.parametrize("diff,should_flag", [
@@ -485,3 +490,117 @@ def test_a_runner_result_that_is_not_text_is_passed_through_instead_of_crashing_
 
     assert result.passed is True and result.detail is None
     assert conn.execute("SELECT detail FROM gate_runs WHERE task_key = 'T3'").fetchone()["detail"] is None
+
+
+# --- round 8, ASES-CFG-04/ASES-CFG-05: the host runner scrubs credential-shaped env vars ------------------------
+#
+# Every probe below prints a PRESENCE marker (KEYSEEN/NOKEY), never the value: run_gate redacts secret-shaped
+# VALUES in its output (see the ASES-SEC-01 tests above), so asserting on the value itself could pass for the
+# wrong reason (redaction hiding it, not the scrub actually removing it from the subprocess's environment).
+# sys.executable is quoted so the probe does not depend on a PATH lookup of "python".
+
+
+def _probe(*names: str) -> str:
+    """A python -c command that prints one SEEN/UNSEEN word per name in `names`, in order, space separated."""
+    body = ", ".join(
+        f"'{name.upper()}SEEN' if os.environ.get('{name}') else 'NO{name.upper()}'" for name in names
+    )
+    return f'"{sys.executable}" -c "import os; print({body})"'
+
+
+def _last_line(detail: str) -> str:
+    """The probe's own printed line, never the echoed `$ <cmd>` line above it (which contains the SEEN/NOxxx
+    words as literal source text, so checking the whole `detail` for them would pass or fail for the wrong
+    reason)."""
+    return detail.strip().splitlines()[-1]
+
+
+def test_run_gate_hides_credential_shaped_env_vars_from_a_gate_command(repo, monkeypatch):
+    """A gate command can run model-authored code (a test a coder committed), so it must not be able to read a
+    provider key -- or any other credential-shaped variable -- that the operator's shell happens to hold."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-shouldnotbevisible0123456789")
+    monkeypatch.setenv("MY_SERVICE_TOKEN", "also-should-not-be-visible")
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", [_probe("OPENROUTER_API_KEY", "MY_SERVICE_TOKEN")])
+
+    assert result.passed is True
+    assert _last_line(result.detail) == "NOOPENROUTER_API_KEY NOMY_SERVICE_TOKEN"
+
+
+def test_run_gate_still_shows_non_credential_env_vars(repo, monkeypatch):
+    """The fix scrubs credential-shaped names only: PATH (needed to find an interpreter under shell=True) and an
+    ordinary, made-up project variable are still visible, so this did not just empty the environment."""
+    monkeypatch.setenv("ASES_GATE_PROBE", "1")
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", [_probe("PATH", "ASES_GATE_PROBE")])
+
+    assert result.passed is True
+    assert _last_line(result.detail) == "PATHSEEN ASES_GATE_PROBESEEN"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="COMSPEC/SYSTEMROOT only matter to a shell=True command on Windows")
+def test_run_gate_shell_command_still_runs_on_windows_with_the_scrubbed_environment(repo):
+    """A shell=True command needs COMSPEC (which .exe interprets the command line) and Windows programs need
+    SYSTEMROOT to start at all; scrubbed_environ keeps both because neither name is credential-shaped."""
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["echo hello-from-shell"])
+
+    assert result.passed is True and "hello-from-shell" in result.detail
+
+
+def test_run_gate_keeps_git_author_identity_but_drops_ssh_auth_sock(repo, monkeypatch):
+    """Round 8 exemption (procenv._EXEMPT_EXACT_NAMES): GIT_AUTHOR_NAME survives into a gate command (a gate
+    command that makes a commit can need it) even though "AUTHOR" contains "auth"; SSH_AUTH_SOCK, which is
+    capability-bearing, does not."""
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "A U Thor")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    probe = (
+        f'"{sys.executable}" -c '
+        '"import os; print(os.environ.get(\'GIT_AUTHOR_NAME\', \'MISSING\'), '
+        '\'SOCKSEEN\' if os.environ.get(\'SSH_AUTH_SOCK\') else \'NOSOCK\')"'
+    )
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", [probe])
+
+    assert result.passed is True
+    assert _last_line(result.detail) == "A U Thor NOSOCK"
+
+
+def _posix_shell_available() -> bool:
+    return shutil.which("sh") is not None or shutil.which("bash") is not None
+
+
+def _write_post_checkout_hook(repo, marker_path) -> None:
+    """A post-checkout hook that writes KEYSEEN/NOKEY to `marker_path` depending on whether OPENROUTER_API_KEY is
+    visible to it. Git for Windows runs a `#!/bin/sh` hook through its bundled sh.exe."""
+    hooks_dir = repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / "post-checkout"
+    marker = str(marker_path).replace("\\", "/")
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ -n \"$OPENROUTER_API_KEY\" ]; then\n"
+        f"  echo KEYSEEN > \"{marker}\"\n"
+        "else\n"
+        f"  echo NOKEY > \"{marker}\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+
+def test_run_gate_worktree_checkout_hook_cannot_see_a_planted_key(repo, tmp_path, monkeypatch):
+    """ASES-CFG-04, the side door named in r8_wp_gateenv.md: run_gate's own `git worktree add` runs the
+    repository's hooks under whatever environment that git process has. Plant a fake key in the test process's
+    environment and confirm the hook -- which DID run, proven by the marker file it writes, so this assertion is
+    not vacuous -- could not see it."""
+    marker = tmp_path / "hook-marker.txt"
+    _write_post_checkout_hook(repo, marker)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-PLANTEDHOOKVALUE0123456789")
+
+    gates.run_gate(repo, _head_sha(repo), "gate1", ["echo x"])
+
+    if not marker.exists():
+        if _posix_shell_available():
+            pytest.fail("the post-checkout hook did not run even though a POSIX shell is available on this machine")
+        pytest.skip("no sh or bash on PATH to run a #!/bin/sh post-checkout hook on this machine")
+    assert marker.read_text(encoding="utf-8").strip() == "NOKEY"

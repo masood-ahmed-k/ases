@@ -7,6 +7,20 @@ by default they run locally (_run_commands), and the sandbox module supplies a r
 same commands inside a container (ASES-SEC-03). Without one, the commands run on the host: a known gap,
 not hidden.
 
+ASES-CFG-04 (p212): "Hermes provider credentials must never be exposed to worker terminals ... if any provider
+key is visible, move it into Hermes credential storage or behind the approved egress mechanism before running
+unattended workers." ASES-CFG-05 (Appendix F): "do not export provider keys into worker shells." Round 8: the
+host runner (_run_commands) and run_gate's own `git worktree add`/`worktree remove` now start every subprocess
+with procenv.scrubbed_environ() instead of the controller's full environment, so a gate command -- which can run
+model-authored code, such as a test a coder committed -- cannot read a provider key the operator's shell happens
+to hold, and neither can a git hook (a `post-checkout` hook in the shared .git/hooks, which a worker on the local
+backend can write) that runs during the worktree checkout. This covers the HOST runner and the gate checkout. It
+does NOT cover a gateway-dispatched worker's own shell: ASES never spawns one, so there is nothing here to scrub.
+Docker sandbox runners (sandbox.docker_run_argv) are unchanged: they never inherit the host environment at all.
+No pass-through allowlist exists this round: a gate command that genuinely needs a credential-shaped variable now
+fails, loudly, with its output recorded in gate_runs; a plan-level allowlist published and reviewed at Gate P is
+a follow-up, not built here.
+
 The controller believes only these records, never a worker's self-report (ASES-QG-01, section 14.2).
 
 The text checks over a diff (the tamper check, the secret scan) live in tamper.py; detect_tamper and
@@ -26,6 +40,7 @@ from datetime import datetime, timezone
 
 from . import db as ases_db
 from . import events as events_mod
+from . import procenv as procenv_mod
 from . import tamper as tamper_mod
 
 
@@ -38,12 +53,25 @@ class GateResult:
 
 
 def _run_commands(cwd: pathlib.Path, commands: list[str], timeout: int) -> tuple[bool, str]:
+    """Runs `commands` on the host, in order, stopping at the first non-zero exit: the default `runner` for
+    run_gate, used whenever no sandbox runner is given.
+
+    ASES-CFG-04/ASES-CFG-05: every command starts with procenv.scrubbed_environ(), a credential-scrubbed copy of
+    the controller's environment, never the controller's own os.environ -- a command here can run model-authored
+    code (a test a coder committed), so it must not be able to read a provider key the operator's shell happens to
+    hold. PATH, COMSPEC, SYSTEMROOT, PATHEXT, TEMP/TMP and the profile directories do not match the
+    credential-shaped pattern and survive unchanged, so a shell=True command still finds its interpreter and
+    Windows programs still start. This is the HOST runner only: a sandbox runner (sandbox.py) never inherits the
+    host environment at all, and a gateway-dispatched worker's own shell is out of scope, since ASES never spawns
+    one. No pass-through allowlist: a command that needs a credential-shaped variable fails here, loudly, and that
+    failure is recorded like any other red gate (see the module docstring)."""
+    env = procenv_mod.scrubbed_environ()
     lines = []
     for cmd in commands:
         try:
             result = subprocess.run(
                 cmd, shell=True, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
-                encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace", env=env,
             )
         except subprocess.TimeoutExpired:
             lines.append(f"$ {cmd}\n[TIMEOUT after {timeout}s]")
@@ -75,6 +103,10 @@ def run_gate(
     same thing either way. A runner that raises is not caught: the worktree is still torn down, no row is
     written, and the caller decides what an infrastructure failure means (it is not a red gate).
 
+    ASES-CFG-04/ASES-CFG-05 (round 8): the `git worktree add`/`worktree remove` subprocesses below also run with
+    procenv.scrubbed_environ(), not the controller's environment, so a `post-checkout` hook the checkout triggers
+    (a hook in the shared .git/hooks, which a worker on the local backend can write) sees no credential either.
+
     ASES-SEC-01 ("nothing secret-shaped in stored gate output or in text handed to a card"): the command output
     is redacted ONCE here (events.redact_text), before it is stored in gate_runs.detail and before it is returned
     in GateResult.detail. Command output is the likeliest place for a secret (a failing test that prints its
@@ -87,7 +119,7 @@ def run_gate(
     try:
         add = subprocess.run(
             ["git", "-C", str(repo_path), "worktree", "add", "--detach", str(worktree), commit_sha],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=procenv_mod.scrubbed_environ(),
         )
         if add.returncode != 0:
             passed, output = False, f"could not create gate worktree: {add.stdout}{add.stderr}"
@@ -96,7 +128,7 @@ def run_gate(
     finally:
         subprocess.run(
             ["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree)],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=procenv_mod.scrubbed_environ(),
         )
         shutil.rmtree(tmp_root, ignore_errors=True)
 

@@ -86,3 +86,15 @@ separate, deferred gap in `gates.py` (same family as ASES-SEC-01/03, not fixed u
 Paths inside the older files that point at a session scratchpad (the blueprint text extract, for example) are stale: the extract
 lives at `C:\Users\masoo\ases-workspaces\tools\blueprint.txt`, next to the helper scripts used during the build (`nemo.py` to call
 nemotron, `regtool.py` to rewrite register rows, the seeded-bug scripts `mutate4.py` and `mutate5.py`).
+
+## Round 8 (2026-09-27): housekeeping, then the gate-command environment
+
+The user asked for "the housekeeping items first, then close the gates.py gap", built by Sonnet agents, "we will test properly
+later". One workflow, zero quota.
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r8_rules.md` | shared rules addendum: the round 8 suite command, no bare `git stash` in a shared tree | in use |
+| `r8_wp_housekeeping.md` | HK-PATH: the drift check's blueprint path and an `ASES_BLUEPRINT_DOCX` override (ASES-DOC-02); HK-GAPS: the "Known gaps" list re-checked against the code | done, independently verified |
+| `r8_wp_gateenv.md` | GATEENV: gate commands and the gate checkout run with a credential-scrubbed environment (ASES-CFG-04/05) | done, independently reviewed and live-verified |
+| (no separate work order; a read-only sweep dispatched alongside GATEENV) | the controller's other git calls: hooks, fsmonitor, textconv in worker-writable repositories | done; became round 9's GITHARDEN |

@@ -1141,21 +1141,59 @@ runner still executes with the operator's full, unscrubbed environment, a separa
 (same family as ASES-SEC-01/03) two independent agents found and correctly declined to patch under this fix's
 scope. Suite: 5,512 passed, 2 skipped, 0 failed.
 
+## Round 8: housekeeping, then gate commands stop seeing the operator's credentials (2026-09-27)
+
+Zero quota throughout; one workflow of Sonnet builders, independent Sonnet reviewers and a Haiku live-verification pass last. Two
+housekeeping fixes first. The register drift check (ASES-DOC-02) had been failing for a reason unrelated to drift: the blueprint
+docx moved into a `Desktop\AISES` folder. `spec/check_requirements.py` now defaults to the new path and takes an
+`ASES_BLUEPRINT_DOCX` override (precedence: `--docx`, then the variable, then the default), with a not-found message that says
+how to point it elsewhere. And the "Known gaps" list below was re-checked bullet by bullet against the code and the register:
+stale bullets struck through with a dated note, partly true ones rewritten with their register IDs; one overstated claim the
+first rewrite made (that Gate 1 always re-runs before the reviewer sees a card) was caught by the independent review and fixed.
+
+Then the gap the CFG-05 close-out left open (ASES-CFG-04, ASES-CFG-05; blueprint p213, "Never export provider keys in the shell
+that launches the gateway or the controller"). `gates._run_commands` now starts every gate command with
+`procenv.scrubbed_environ()`, and `run_gate`'s own `git worktree add`/`remove` do too, so neither model-authored code under a gate
+nor a `post-checkout` hook planted in the shared `.git/hooks` can read a provider key from the controller's shell. Design, decided
+by the architect: no pass-through allowlist (a gate that needs a credential now fails, visibly; if a real project ever needs one,
+it belongs on the plan, published at Gate P and covered by the gate-profile pin, like `gate4_allowlist`); `GIT_AUTHOR_NAME`,
+`GIT_AUTHOR_EMAIL` and `GIT_AUTHOR_DATE` exempted by exact name in `procenv.py` (they match the pattern only because "AUTHOR"
+contains "auth"); `SSH_AUTH_SOCK` and `XAUTHORITY` stay stripped because they are capability-bearing. Proven before and after:
+against the old `gates.py` the new tests print `KEYSEEN`, and the planted hook records the key. A new acceptance test
+(`tests/acceptance/test_22_10_gate_env.py`) drives it through a real controller pass on the fake board.
+
+A read-only sweep alongside found the same exposure one level out, and proved it empirically against unmodified ASES helpers in
+throwaway repositories: the controller's OTHER git calls (merge queue, guards, reconcile, hardening, integrity, controller) run
+with the full environment in repositories a local-backend worker can write `.git/config` and `.git/hooks` into, so a planted
+`post-checkout` hook or `core.fsmonitor` script captured planted keys; and the merge queue's Gate 3 secret-scan diff lacks the
+`--no-ext-diff --no-textconv` that `tamper.py` already uses, so a worker-defined textconv driver could hide a secret from it. That
+became round 9's GITHARDEN package. An architect re-run also fixed a pre-existing test fragility (`test_gate_worktree_cleaned_up`
+searched `git worktree list` for the text "wt", so any temp path containing "wt" failed it). Suite: 5,533 passed, 2 skipped, 0 failed.
+
 ## Known gaps (tracked, not hidden)
 
-- `glm-5.3-thinking:free`'s context length is **not declared** in `config/models.yaml` -- native
-  Hermes `config.yaml` doesn't set `model.context_length` either, so it's presumably auto-probed but
-  never confirmed. `swarm doctor` WARNs on this by design. Confirm and set the real number before
-  pinning this model in Phase 2.
+- ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and
+  set the real number before pinning this model in Phase 2.~~ -- stale, 2026-09-27: `glm-5.3-thinking:free`
+  is no longer a model row in `config/models.yaml` at all. It was demoted (`role_class: lead_retired`,
+  `pinned: false`) the same day this bullet was written (see "Lead moved off GLM, then to OpenAI via
+  xKiro" above) and has since been removed from the file entirely, not just demoted; only a historical
+  comment names it now. The lead role is pinned today to `xkiro/qwen/qwen3.8-max:free`, whose
+  `context_length: 1050000` is declared and smoke-tested (`swarm models` reports
+  `context=1050000 smoke=pass pinned`). The register's `ASES-MOD-02` (`in_progress`) note still describes
+  the old `glm` gap; that note has drifted from the code and is not fixed by this pass (HK-GAPS owns only
+  this file, not `spec/requirements.yaml`).
 - The blueprint's Appendix B illustrative config (v1.2) names the UnoRouter Hermes secret as
-  `OPENAI_API_KEY`. The **actual** installed `config.yaml` on this machine says
-  `key_env: HERMES_CUSTOM_UNOROUTER_API_KEY` -- that's what `config/models.yaml` uses here. Appendix
-  B is explicitly illustrative ("map this to the installed Hermes configuration format instead of
-  blindly pasting it"), so this isn't a bug in the blueprint, just a reminder that the illustrative
-  name and the real one differ on this install. Since 2026-09-19, `OPENAI_API_KEY` is also the *real*
-  env var for the actual `openai` provider (`lead`'s new home) -- a naming coincidence with Appendix B's
-  illustrative UnoRouter name, not the same key or the same purpose. Don't confuse the two when reading
-  older notes in this file.
+  `OPENAI_API_KEY`. This machine's default installed Hermes `config.yaml` (`%LOCALAPPDATA%\hermes\config.yaml`,
+  the base install, not any ASES role profile) still shows `key_env: HERMES_CUSTOM_UNOROUTER_API_KEY` for
+  its `unorouter` provider block, so the illustrative name and a real one still differ on this install,
+  exactly as this note originally said. Partly true, updated 2026-09-27: the rest of the original note is
+  now stale. `config/models.yaml` no longer uses `HERMES_CUSTOM_UNOROUTER_API_KEY`, or UnoRouter, at all --
+  it was removed from the file entirely on 2026-09-19 (see "Lead moved off GLM, then to OpenAI via xKiro"
+  above); no `unorouter` provider row remains there, only a historical comment. The claim that
+  `OPENAI_API_KEY` was "`lead`'s new home" is stale too: `lead` moved again the same day, to `xkiro`
+  (`key_env: XKIRO_API_KEY`), which is what `config/models.yaml` still pins `lead` to today
+  (`qwen/qwen3.8-max:free`); no `openai` provider row exists in the file either any more. Nothing in
+  `config/models.yaml` today shares Appendix B's illustrative `OPENAI_API_KEY` name.
 - ~~No Hermes profiles exist yet~~ -- stale, fixed 2026-09-18: `lead`/`coder-1`/`reviewer` were created
   fresh (no `--clone-from`, ASES-ROL-10, `covered`) earlier in Phase 3; this bullet just never got
   removed when that happened. Left struck through instead of silently deleted so the drift is visible.
@@ -1166,21 +1204,71 @@ scope. Suite: 5,512 passed, 2 skipped, 0 failed.
   worktree_sync is disabled or manual creation is used." `gates.py`/`mergeq.py`'s own throwaway
   worktrees already satisfy this (detached at an exact SHA). The WORK card's worktree, which Hermes itself
   creates on dispatch (`workspace: worktree`), was observed at the exact integration tip on both real
-  dispatches of the 2026-09-19 run (232e12e, then 676628f after G1's merge). What is still unverified is the
-  case the requirement really guards against: this test repo has no remote, so Hermes's default of syncing a
-  worktree from the freshly fetched REMOTE tip was never exercised, and whether `worktree_sync` needs to be
-  turned off explicitly for a repo that has one is still open.
-- **Gaps the first real run exposed** (details in "The first real end-to-end run"): the reviewer profile has
-  `write_file` and `patch` (Hermes toolsets are per group, no per-tool deny; ASES-ROL-05 `partial`); the reviewer
-  cannot see the controller's gate records, so it can only trust the coder's claim about them; a worker changed
-  the machine outside its worktree (`pip install` into Hermes's own venv) and nothing detected it (integrity
-  snapshots, ASES-GIT-12, are not wired; Docker sandbox, ASES-SEC-03, is Phase 5).
+  dispatches of the 2026-09-19 run (232e12e, then 676628f after G1's merge). Partly true, updated
+  2026-09-27: the bullet's own open question ("whether `worktree_sync` needs to be turned off explicitly...
+  is still open") is now answered in code, built in Round 5 (after this run): `profiles._config_rows`
+  (`src/ases/profiles.py:901-905`) sets `worktree_sync: false` on every profile whenever it isn't already,
+  citing ASES-GIT-16 by name, and `profiles._check_profile` (`src/ases/profiles.py:1530-1533`) reports a
+  live profile with it left on as a problem. What the register (`ASES-GIT-16`, still `partial`) correctly
+  says remains open: this test repo still has no remote, so Hermes's default of syncing a worktree from a
+  freshly fetched REMOTE tip that actually differs from local HEAD (the case the requirement guards
+  against) has still never been exercised for real.
+- **Gaps the first real run exposed** (details in "The first real end-to-end run"), updated 2026-09-27
+  against the current code: the reviewer profile still has `write_file` and `patch` (Hermes toolsets are
+  per group, no per-tool deny; `ASES-ROL-05`, `partial`, unchanged). Partly true: the reviewer itself still
+  has no direct read access to the controller's gate records, but the controller no longer merely trusts
+  the coder's claim about them -- `review.gate_before_review` (`src/ases/review.py:62`) independently
+  re-runs Gate 1 when a card enters review, though its own docstring says Hermes's gateway dispatcher can
+  sometimes claim the card and start the reviewer before gate_before_review has run; when that race is
+  lost, `review.check_branch_for_merge` (`src/ases/review.py:121`) is what actually catches it,
+  re-checking scope and Gate 1 again, independently, at merge time. Both paths were seen firing for real
+  on the 2026-09-19 run (`ASES-REV-05`, `partial`: the pass path is acceptance-proven, the send-back path
+  has never fired for real, and the register note also records that when the dispatcher wins the race,
+  the re-check happens at merge time rather than at review entry). Partly true: "integrity snapshots
+  (ASES-GIT-12) are not wired" is now wrong
+  for the primary checkout -- `guards.check_primary_checkout` (`src/ases/guards.py:117`) runs at the start
+  of every controller pass and at run start, and halts the run on a violation, acceptance-proven 2026-09-22
+  (`ASES-GIT-12`, `partial`). Still genuinely open: the other-worktree half
+  (`guards.check_idle_worktrees`, `src/ases/guards.py:373`) only WARNs and has a documented false-positive
+  gap, and neither half inspects anything outside a git worktree's own tracked state, so the bullet's own
+  example -- `pip install` into Hermes's own venv -- would still go undetected today; only the Docker
+  sandbox (`ASES-SEC-03`, `in_progress`, see below) would close that.
 - Credentials, as of 2026-09-19: `lead` and `coder-1` are on xKiro (own key each), `reviewer` is on
   OpenRouter, and UnoRouter is removed entirely (an explicit decision). The first complete real end-to-end
   run (acceptance test 22.2's shape: two tasks, both merge cards done) finished on 2026-09-19 and is
   written up in "The first real end-to-end run" above, including what it did NOT exercise.
-- Gate 1/3 run directly on the host, not inside Docker (Phase 5 requirement, not built). Documented in
-  `gates.py`'s own docstring so this isn't quietly assumed to be sandboxed.
+- Partly true, updated 2026-09-27 (was: "Gate 1/3 run directly on the host, not inside Docker, Phase 5
+  requirement, not built"): `gates.run_gate` (`src/ases/gates.py:58`) has since grown an injectable
+  `runner` parameter (`ASES-QG-04`, `ASES-SEC-03`) that a sandboxed runner could plug into, and
+  `finalgates.run_gate4`/`run_gate5` (`src/ases/finalgates.py:648`, `:708`) already forward it. But no real call
+  site actually supplies one: `review.py`'s Gate 1 re-check (`src/ases/review.py:382`), `mergeq.py`'s
+  pre-merge Gate 3 (`src/ases/mergeq.py:254`), `controller.py`'s post-merge Gate 3
+  (`src/ases/controller.py:1011`) and `controller.process_finalize`'s own call into
+  `finalgates.finalize` (`src/ases/controller.py:1941`) all call it with the default `runner=None`. So
+  every gate that actually runs today -- 1, 3, 4 and 5 alike -- still runs directly on the host, matching
+  the register's own `ASES-SEC-03` (`in_progress`) note: "the controller's own gate runs do not use
+  docker_run_argv yet". `sandbox.py` (`src/ases/sandbox.py`) exists and builds a real, tested
+  `docker run` argv (`docker_run_argv`), but by its own docstring "nothing here starts Docker or pulls an
+  image" -- wiring a real runner into any of the four call sites above is the Phase 5 work still left.
+- **ASES-REV-01 (`partial`)**, added 2026-09-27, corrected the same day by the architect: diff review by the
+  independent Reviewer profile happened for real on 2026-09-19 and is covered above ("Credentials, as of
+  2026-09-19"). Plan critique IS built: `src/ases/critic.py` is Gate P (a one-shot, toolless call to the
+  reviewer profile behind `swarm critique`, its verdict validated as JSON, a malformed one repaired once then
+  blocked for the user), unit-tested in `tests/unit/test_critic.py` and acceptance-tested at zero quota in
+  `tests/acceptance/test_22_14_plan_rejection.py`. The register's note "Plan critique (the critic role in Gate
+  P) is not built" predates it and is stale (round 9's register hygiene package corrects it). What is still
+  open is the live half: the critic has never run against a real plan with a real reviewer model.
+- **The controller's other git calls** (round 8 sweep, 2026-09-27; ASES-CFG-04, ASES-CFG-05, ASES-SEC-01):
+  outside `gates.py`, every git subprocess the controller starts (merge queue, guards, reconcile, hardening,
+  integrity, controller) runs with the operator's full environment in a repository whose shared `.git/config`
+  and `.git/hooks` a local-backend worker can write, so a planted hook or `core.fsmonitor` script runs with the
+  controller's credentials (proven empirically), and the merge queue's Gate 3 secret-scan diff has no
+  `--no-ext-diff --no-textconv`. Round 9's GITHARDEN package is the fix. Residual even after it: filter and
+  merge drivers have worker-chosen names no single flag disables (the environment scrub caps them), and a
+  worker's own shell on the local backend runs as the operator's user; only the Docker sandbox closes that.
+- **ASES-CFG-05 (`partial`)**: a Hermes-gateway-dispatched worker is spawned by Hermes's own gateway, a process
+  ASES never touches, so no ASES-side scrub reaches it (ASES-ARC-01). If a provider key leaks there, it was
+  exported into the shell that started the gateway, which blueprint p213 forbids.
 
 ## Running things
 
@@ -1188,6 +1276,17 @@ scope. Suite: 5,512 passed, 2 skipped, 0 failed.
 cd C:\Users\masoo\ases
 .venv\Scripts\swarm.exe doctor
 .venv\Scripts\swarm.exe models
-.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe -m pytest -q --ignore=tests/integration/test_doctor_real_hermes.py
 .venv\Scripts\python.exe spec\check_requirements.py --check
 ```
+
+Updated 2026-09-27: the bare `pytest -q` line above used to be wrong on any machine with a real
+`hermes.exe` on PATH. `tests/integration/test_doctor_real_hermes.py` only skips itself when
+`shutil.which("hermes") is None`; on a machine where Hermes is actually installed, a bare `pytest -q`
+run collects it and calls the real `hermes.hermes_version()` / `run_doctor()` / `gateway_status()` for
+real, which every round of this project's rules forbids. The `--ignore` above is required whenever a
+real `hermes` binary is on PATH; the test itself is exactly what `swarm doctor` above documents, so
+running it here is redundant with `swarm doctor` anyway, never a loss of coverage. `check_requirements.py
+--check` above needs no `--docx` flag: this file's "Known gaps" doesn't own `spec/check_requirements.py`,
+but `--check` with no flags already passes on this machine (`OK: 103 requirement IDs in sync`) once the
+default docx path points at its current location (package HK-PATH, landing in parallel).

@@ -9,27 +9,48 @@ should run.
 not_covered, drops IDs no longer in the docx (printing what it removed), and leaves the status/note of
 every ID that's still present untouched. Meant to be run by a person after the docx changes, not by CI.
 
+Where the docx is found, in order of precedence:
+    1. --docx PATH               explicit flag, always wins.
+    2. ASES_BLUEPRINT_DOCX       environment variable, used when --docx is not given.
+    3. DEFAULT_DOCX              hardcoded fallback below, used when neither is given.
+
 Usage:
     python spec/check_requirements.py --check                 (default)
     python spec/check_requirements.py --regenerate
     python spec/check_requirements.py --check --docx "path\\to\\blueprint.docx"
+    ASES_BLUEPRINT_DOCX="path\\to\\blueprint.docx" python spec/check_requirements.py --check
 """
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 
 import yaml
 from docx import Document
 
-DEFAULT_DOCX = pathlib.Path(r"C:\Users\masoo\OneDrive\Desktop\ASES_Swarm_Implementation_Blueprint_v1.2.docx")
+DEFAULT_DOCX = pathlib.Path(r"C:\Users\masoo\OneDrive\Desktop\AISES\ASES_Swarm_Implementation_Blueprint_v1.2.docx")
+DOCX_ENV_VAR = "ASES_BLUEPRINT_DOCX"
 REQUIREMENTS_YAML = pathlib.Path(__file__).resolve().parent / "requirements.yaml"
+
+
+def resolve_docx_path(cli_docx: pathlib.Path | None) -> pathlib.Path:
+    """Apply the --docx / ASES_BLUEPRINT_DOCX / DEFAULT_DOCX precedence documented above."""
+    if cli_docx is not None:
+        return cli_docx
+    env_value = os.environ.get(DOCX_ENV_VAR)
+    if env_value:
+        return pathlib.Path(env_value)
+    return DEFAULT_DOCX
 
 
 def extract_appendix_f(docx_path: pathlib.Path) -> list[dict]:
     if not docx_path.exists():
-        raise FileNotFoundError(f"blueprint docx not found: {docx_path}")
+        raise FileNotFoundError(
+            f"blueprint docx not found: {docx_path}\n"
+            f"Point the check elsewhere with --docx PATH, or set the {DOCX_ENV_VAR} environment variable."
+        )
     doc = Document(str(docx_path))
 
     # Find the "Appendix F" heading, then the first table that follows it in document order.
@@ -137,13 +158,19 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="Fail on drift (default).")
     mode.add_argument("--regenerate", action="store_true", help="Merge Appendix F into requirements.yaml.")
-    parser.add_argument("--docx", type=pathlib.Path, default=DEFAULT_DOCX, help="Path to the blueprint docx.")
+    parser.add_argument(
+        "--docx",
+        type=pathlib.Path,
+        default=None,
+        help=f"Path to the blueprint docx. Falls back to the {DOCX_ENV_VAR} environment variable, then DEFAULT_DOCX.",
+    )
     args = parser.parse_args(argv)
+    docx_path = resolve_docx_path(args.docx)
 
     try:
         if args.regenerate:
-            return cmd_regenerate(args.docx)
-        return cmd_check(args.docx)
+            return cmd_regenerate(docx_path)
+        return cmd_check(docx_path)
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
