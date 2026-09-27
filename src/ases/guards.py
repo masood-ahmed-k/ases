@@ -55,11 +55,19 @@ def _git(repo: pathlib.Path, args: list[str]) -> tuple[int, str, str]:
     as UTF-8: `status -z` prints paths verbatim, so the locale code page would mangle a non-ASCII name and text
     mode would rewrite a carriage return inside one. A git that cannot be started, or does not answer within the
     timeout, comes back as exit code -1 with the reason in stderr: callers deal in one failure shape and nothing
-    here raises."""
+    here raises.
+
+    LC_ALL=C (round 10, package BASECHECK, found by nemotron's review of this package): git's own porcelain output
+    (status -z, worktree list --porcelain) is already stable regardless of locale, but _branch_created_from parses
+    a HUMAN-readable reflog message ("branch: Created from ..."), which git localises through gettext when the
+    operator's environment sets a non-English LANG/LC_ALL/LANGUAGE and the matching translation is installed.
+    Forcing C here makes that parse deterministic on every machine this runs on, not only this one."""
+    env = gitexec.git_env()
+    env["LC_ALL"] = "C"
     try:
         result = subprocess.run(
             [*gitexec.GIT, "--no-optional-locks", "-C", str(repo), *args],
-            capture_output=True, timeout=_GIT_TIMEOUT, env=gitexec.git_env(),
+            capture_output=True, timeout=_GIT_TIMEOUT, env=env,
         )
     except subprocess.TimeoutExpired:
         return -1, "", f"git {args[0]} timed out after {_GIT_TIMEOUT}s"
@@ -184,17 +192,29 @@ def expected_head(conn: sqlite3.Connection, project: str) -> str | None:
 
 
 def set_expected_head(conn: sqlite3.Connection, project: str, sha: str) -> None:
-    """Record the primary checkout HEAD ASES has just written (a merge) or verified. An upsert, so calling it
-    again, with the same SHA or a new one, leaves one row per project. Refuses a blank SHA: recording one would
-    make every later check report a moved HEAD."""
+    """Record the primary checkout HEAD ASES has just written (a merge, a revert) or verified (adopt_current_head).
+    An upsert against integrity_state, so calling it again, with the same SHA or a new one, leaves one row per
+    project there. Refuses a blank SHA: recording one would make every later check report a moved HEAD.
+
+    Round 10 (package BASECHECK, ASES-GIT-01, ASES-GIT-16): every SHA this function is ever called with is ALSO
+    logged, once, to integrity_heads -- the full history written_heads reads back, never just the current head
+    integrity_state keeps. This is the one place adopt_current_head, a fast-forward and a revert all funnel
+    through, so it is the one place that needs to remember: nothing else needs to change to keep that set
+    complete."""
     sha = sha.strip()
     if not sha:
         raise ValueError("expected head must be a commit SHA, not an empty string")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     conn.execute(
         "INSERT INTO integrity_state (project, expected_head, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(project) DO UPDATE SET expected_head=excluded.expected_head, "
         "updated_at=excluded.updated_at",
-        (project, sha, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        (project, sha, now),
+    )
+    conn.execute(
+        "INSERT INTO integrity_heads (project, sha, recorded_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(project, sha) DO NOTHING",
+        (project, sha, now),
     )
 
 
@@ -208,6 +228,19 @@ def adopt_current_head(conn: sqlite3.Connection, project: str, repo: pathlib.Pat
         raise RuntimeError(f"cannot read HEAD of the primary checkout at {repo}: {why}")
     set_expected_head(conn, project, head)
     return head
+
+
+def written_heads(conn: sqlite3.Connection, project: str) -> frozenset[str]:
+    """Every primary-checkout HEAD ASES itself has adopted (adopt_current_head), fast-forwarded to, or reverted to
+    (both through the merge queue's own set_expected_head calls) for `project`: the full history set_expected_head
+    has ever recorded there, not just the current one integrity_state/expected_head keeps. This is the set
+    check_card_base treats as legitimate for a work card's base commit -- a card dispatched before a later merge
+    legitimately has an older one of these as its base (round 10, package BASECHECK, ASES-GIT-01, ASES-GIT-16).
+    Empty before the first adopt_current_head call for this project; a caller that means "nothing recorded yet,
+    skip the check" rather than "everything fails" reads it the same way check_primary_checkout's own
+    expected_head=None already does."""
+    rows = conn.execute("SELECT sha FROM integrity_heads WHERE project = ?", (project,)).fetchall()
+    return frozenset(row[0] for row in rows)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -558,3 +591,97 @@ def refresh_snapshots(
             _store_snapshot(conn, project, key, head, status_hash)
             stored += 1
     return stored
+
+
+# ---------------------------------------------------------------------------------------------
+# A work card's base commit (round 10, package BASECHECK; ASES-GIT-01, ASES-GIT-16)
+# ---------------------------------------------------------------------------------------------
+#
+# Blueprint p169's second sentence: "Current Hermes can sync a worktree from the freshly fetched remote tip by
+# default; ASES requires the worktree base to be the exact local integration HEAD. ... Phase 3 MUST verify the
+# actual base commit before a worker starts." The installed Hermes 0.21.3's Kanban dispatcher ignores
+# worktree_sync entirely and always runs `git worktree add -b <branch> <path> HEAD` from the board's repository
+# (kanban_db_workspace._ensure_git_worktree, read-only, under
+# C:\Users\masoo\AppData\Local\hermes\hermes-agent; see profiles.py's module docstring item 4), so a new card's
+# base is always whatever the primary checkout's HEAD was at the moment Hermes dispatched it -- which is why this
+# is worth checking at all: a HEAD that moved there by anything other than ASES itself (this Hermes version's own
+# remote-tip default is the one the blueprint names, but any other cause reads the same way here) produces
+# exactly this signature, a branch whose creation commit is not one of ASES's own written heads.
+
+
+@dataclasses.dataclass(frozen=True)
+class CardBaseResult:
+    """One check of check_card_base. ok is True exactly when the branch's own creation commit is one of the
+    heads ASES itself is known to have written (written_heads). base is that creation commit, "" when none could
+    be found at all -- a MISSING signal, never guessed at and never treated as a pass. reason is "" when ok, else
+    why not: the wrong base and that it is not in the expected set, or why no base could be found."""
+    ok: bool
+    base: str
+    reason: str
+
+
+def _branch_created_from(repo: pathlib.Path, branch: str) -> tuple[str, str]:
+    """(the commit `branch` was created at, "") or ("", why it could not be found).
+
+    Reads the branch's OWN reflog: `git reflog show --format="%H<TAB>%gs" refs/heads/<branch>` lists entries
+    newest first, so the LAST line is the oldest one this repository still remembers. A ref's reflog starts empty
+    the moment the ref is created (there is nothing before that to have logged), so if the reflog reaches back
+    that far at all, its oldest entry IS the creation, and git's own message for it is "branch: Created from
+    <start-point>" whichever way the branch was made: `git branch <name> <start-point>`, or, as Hermes's Kanban
+    dispatcher does it, `git worktree add -b <branch> <path> <start-point>`. The exact start-point named (`HEAD`,
+    a branch name, a SHA) is not checked here, only that this IS the creation entry: once a commit is made on a
+    branch, `git merge-base` can no longer tell its first commit from an ancestor every branch shares, so this
+    reflog line is the only durable record git keeps of where a branch actually began. Reusing an existing branch
+    for a worktree (`git worktree add <path> <branch>`, no `-b`: a retried card's own worktree, or a branch
+    planted by hand ahead of time) writes no new reflog entry, so the oldest one, and the base it names, is
+    unaffected by how many times that happens.
+
+    "" and a reason, never a guess, when: git fails outright; the branch's reflog is empty (`core.logAllRefUpdates`
+    was off in this repository when the branch was made, or the entry has since expired -- `swarm doctor`'s
+    log_all_ref_updates check warns about the first); or the oldest entry's own message does not start "branch:
+    Created from" (whatever wrote that oldest surviving entry, this parser does not recognise it as a creation).
+    Never raises: a git that cannot be run or does not answer in time is exit code -1 from `_git`, handled the
+    same as any other non-zero exit."""
+    code, out, err = _git(repo, ["reflog", "show", "--format=%H\t%gs", f"refs/heads/{branch}"])
+    if code != 0:
+        return "", _first_line(err) or f"git exited {code}"
+    lines = [line for line in out.splitlines() if line.strip()]
+    if not lines:
+        return "", (
+            f"branch {branch!r} has no reflog entries (core.logAllRefUpdates may have been off in this "
+            "repository when the branch was created, or the entry has since expired)"
+        )
+    sha, _, subject = lines[-1].partition("\t")
+    sha = sha.strip()
+    if not subject.startswith("branch: Created from"):
+        return "", (
+            f"the oldest reflog entry of branch {branch!r} is not its creation "
+            f"(git says {_first_line(subject)!r}): the reflog may not reach back far enough"
+        )
+    if not sha:
+        return "", f"the creation entry of branch {branch!r} names no commit"
+    return sha, ""
+
+
+def check_card_base(repo: pathlib.Path, branch: str, allowed_heads: Iterable[str]) -> CardBaseResult:
+    """ASES-GIT-01, ASES-GIT-16 (blueprint p169's second sentence: "Phase 3 MUST verify the actual base commit
+    before a worker starts"). `branch`'s own creation commit (_branch_created_from) must be one of
+    `allowed_heads` (normally written_heads(conn, project)): a base outside that set was not cut from a
+    primary-checkout HEAD ASES itself wrote or adopted, which is exactly the signature of Current Hermes's
+    remote-tip `worktree_sync` default that this Hermes version ignores (see this section's own module-level
+    comment above) -- or of anything else that moved the primary checkout's HEAD without going through ASES,
+    which check_primary_checkout is already watching for on its own.
+
+    A base that cannot be found at all (_branch_created_from returns "") is treated exactly like a wrong one,
+    never like a pass: "the signal is missing" fails closed, it does not default to trusting the branch. Pure and
+    read-only (through _git, --no-optional-locks); never raises."""
+    allowed = frozenset(allowed_heads)
+    base, why = _branch_created_from(repo, branch)
+    if not base:
+        return CardBaseResult(False, "", f"cannot verify the base commit of branch {branch!r}: {why}")
+    if base not in allowed:
+        return CardBaseResult(
+            False, base,
+            f"branch {branch!r} was created from {base[:12]}, which is not a commit ASES itself wrote or adopted",
+        )
+    return CardBaseResult(True, base, "")
