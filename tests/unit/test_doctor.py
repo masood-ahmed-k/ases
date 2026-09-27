@@ -2,6 +2,7 @@
 path is covered separately by tests/integration/test_doctor_real_hermes.py."""
 import dataclasses
 import pathlib
+import subprocess
 import sys
 import types
 
@@ -874,3 +875,76 @@ def test_worker_profiles_fall_back_to_the_role_map_when_no_spec_qualifies(tmp_pa
 
     (_, profile_dirs, _), = world.sandbox_calls
     assert profile_dirs == [project.hermes_native_home / "profiles" / "coder-1"]  # the roles map still says coder
+
+
+# --- log_all_ref_updates (round 10, package BASECHECK; ASES-GIT-01, ASES-GIT-16) --------------------------------
+
+def _git_repo(tmp_path, *, log_all_ref_updates=None):
+    """A real git repository (not the ASES checkout doctor's other checks inspect), with core.logAllRefUpdates
+    left at its non-bare default (True), explicitly set (True/False), or explicitly unset again."""
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "integration"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+    if log_all_ref_updates is True:
+        subprocess.run(["git", "config", "core.logAllRefUpdates", "true"], cwd=str(repo), check=True)
+    elif log_all_ref_updates is False:
+        subprocess.run(["git", "config", "core.logAllRefUpdates", "false"], cwd=str(repo), check=True)
+    elif log_all_ref_updates == "unset":
+        subprocess.run(["git", "config", "--unset", "core.logAllRefUpdates"], cwd=str(repo), check=True)
+    return repo
+
+
+def test_log_all_ref_updates_is_pending_without_a_repository_path():
+    check = doctor._check_log_all_ref_updates(None)
+
+    assert check.status == "pending"
+    assert check.requirement_ids == ("ASES-GIT-01", "ASES-GIT-16")
+
+
+def test_log_all_ref_updates_passes_when_explicitly_true(tmp_path):
+    repo = _git_repo(tmp_path, log_all_ref_updates=True)
+
+    check = doctor._check_log_all_ref_updates(repo)
+
+    assert check.status == "pass" and "true" in check.detail
+
+
+def test_log_all_ref_updates_passes_when_unset_the_non_bare_default(tmp_path):
+    """git itself defaults core.logAllRefUpdates to true for a non-bare repository (and `git init` writes it
+    explicitly), so an unset value must read as healthy too, not as a WARN nothing actually set."""
+    repo = _git_repo(tmp_path, log_all_ref_updates="unset")
+
+    check = doctor._check_log_all_ref_updates(repo)
+
+    assert check.status == "pass" and "unset" in check.detail
+
+
+def test_log_all_ref_updates_warns_when_explicitly_false(tmp_path):
+    repo = _git_repo(tmp_path, log_all_ref_updates=False)
+
+    check = doctor._check_log_all_ref_updates(repo)
+
+    assert check.status == "warn"
+    assert "core.logAllRefUpdates" in check.detail and str(repo) in check.detail
+    assert check.requirement_ids == ("ASES-GIT-01", "ASES-GIT-16")
+
+
+def test_log_all_ref_updates_is_pending_through_run_by_default(tmp_path, monkeypatch):
+    _, _report, checks = _run(tmp_path, monkeypatch)
+
+    assert checks["log_all_ref_updates"].status == "pending"
+
+
+def test_log_all_ref_updates_is_wired_into_run_when_a_repo_is_given(tmp_path, monkeypatch):
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+    repo = _git_repo(tmp_path, log_all_ref_updates=False)
+
+    report = doctor.run(project, MODELS_CONFIG, conn, repo=repo)
+
+    checks = {c.name: c for c in report.checks}
+    assert checks["log_all_ref_updates"].status == "warn"

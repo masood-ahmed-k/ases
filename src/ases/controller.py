@@ -2055,6 +2055,99 @@ def process_idle_worktrees(board: str, repo: pathlib.Path, plan: plan_mod.Plan, 
     return problems
 
 
+def _card_base_verified(conn, card_id: str, branch: str) -> bool:
+    """Whether process_card_base_checks already recorded a passing base-commit check for this exact (card_id,
+    branch) pair: its own "once verified, never recheck" memory, read without writing. A card_base_verified event
+    is written only once the check has actually run and passed (_record_once, matched on card_id and branch)."""
+    return conn.execute(
+        "SELECT 1 FROM events WHERE kind = 'card_base_verified' "
+        "AND json_extract(payload, '$.card_id') = ? AND json_extract(payload, '$.branch') = ? LIMIT 1",
+        (card_id, branch),
+    ).fetchone() is not None
+
+
+def process_card_base_checks(board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn) -> list[str]:
+    """ASES-GIT-01, ASES-GIT-16 (blueprint p169's second sentence: "Phase 3 MUST verify the actual base commit
+    before a worker starts"). This is the DETECTION half; mergeq.merge_task's own `_check_base` (wired into every
+    merge_task call, round 10 package BASECHECK) is the ENFORCEMENT half, independent of this one, so a card this
+    misses can still never have its branch land.
+
+    ASES never spawns a worker and cannot stop one from STARTING -- Hermes's own gateway does that (see
+    guards.check_card_base's module-level comment, and profiles.py's module docstring item 4) -- so "before a
+    worker starts" is enforced here as: every pass, for every work card of THIS plan that Hermes reports
+    `running` and this function has not already verified, check guards.check_card_base(repo, branch,
+    guards.written_heads(conn, plan.project)). Called right after run_pass's own hermes_mod.kanban_dispatch, so a
+    card dispatched THIS pass is checked on the very same pass it starts running, not one pass late.
+
+    A verified card is recorded once (a card_base_verified event, matched on card_id and branch:
+    _card_base_verified) and never rechecked: a card can stay `running` for many passes, and a branch's creation
+    point in its reflog cannot move once it has verified, so rereading it every pass would only cost a git call
+    for nothing. A wrong or unverifiable base blocks the card for the user (questions.ask_user: the existing
+    question path, never a silent requeue -- recovery and the merge queue already leave a card with an open
+    question alone) and records a card_base_violation event naming the card, its task, its branch, the base found
+    (or why none could be) and the expected set (capped at 20, the same as the primary-checkout guard's own
+    problems). Blocking moves the card out of `running` (Hermes), so it also leaves the population this function
+    looks at from the very next pass: no separate bookkeeping is needed for the blocked case the way verified
+    needs one, and _refuse_once still guards the event itself against the rare case Hermes reports the card
+    running again before the block has taken effect.
+
+    A project that has not adopted any head yet (guards.written_heads empty: swarm run's own start-up sequence
+    calls guards.adopt_current_head before the first pass, so "empty" means "not started", never "started and
+    forgot everything") is skipped entirely, the same reading check_primary_checkout already gives an
+    expected_head of None: there is nothing yet to compare a base against, so nothing here can call one wrong.
+
+    Only this plan's own work cards (the plan_tasks rows of plan.project) are looked at: a merge card is never
+    `running` (the merge queue is the only writer to the integration branch, never a worker), and another
+    project's card on the same board is left to its own controller pass, exactly like process_budget_gate scopes
+    its own `ready` listing.
+
+    Returns the reasons recorded this pass, the same shape process_idle_worktrees returns for run_pass's warnings
+    list."""
+    allowed = guards_mod.written_heads(conn, plan.project)
+    if not allowed:
+        return []
+    reasons: list[str] = []
+    for card in hermes_mod.kanban_list(board, status="running"):
+        card_id = card.get("id")
+        if not card_id:
+            continue
+        row = conn.execute(
+            "SELECT task_key FROM plan_tasks WHERE work_card_id = ? AND project = ?",
+            (card_id, plan.project),
+        ).fetchone()
+        if row is None:
+            continue  # another project's card, or not a plan work card at all
+        task_key = row["task_key"]
+        task = plan.task(task_key)
+        branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
+        if _card_base_verified(conn, card_id, branch):
+            continue
+        result = guards_mod.check_card_base(repo, branch, allowed)
+        if result.ok:
+            _record_once(conn, "card_base_verified", {
+                "card_id": card_id, "task_key": task_key, "branch": branch, "base": result.base,
+                "project": plan.project,
+            }, match=("card_id", "branch"))
+            continue
+        reason = (
+            f"{task_key} (card {card_id}, branch {branch}): base commit check failed "
+            f"(ASES-GIT-01, ASES-GIT-16): {result.reason}"
+        )
+        reasons.append(reason)
+        text = (
+            f"{task_key}'s branch {branch} did not verify against the base-commit check (ASES-GIT-01, "
+            f"ASES-GIT-16): {result.reason}. This can mean the worktree was cut from a commit other than "
+            "ASES's own pinned integration HEAD (blueprint p169). Confirm the branch's true base is safe to "
+            "build on before answering."
+        )
+        questions_mod.ask_user(board, card, text, conn=conn)
+        _refuse_once(conn, "card_base_violation", card, {
+            "task_key": task_key, "branch": branch, "base": result.base, "reason": result.reason,
+            "expected": sorted(allowed)[:20], "project": plan.project,
+        })
+    return reasons
+
+
 def _finalgates():
     """The final-gates module, imported on first use: it is built at the same time as this one, and only needed once
     every merge card is done."""
@@ -2138,8 +2231,8 @@ def run_pass(
       2. idle worktrees (warnings)                    3. usage ingest into the ledger (ASES-CAP-03)
       4. failure recovery and spent budgets           5. bounds: a project-stopping bound pauses and returns
       6. the budget gate, then unpark                 7. review-lane policing (Gate 1 re-check)
-      8. dispatch, then provisioning                  9. the merge queue (halt checks inside; ASES-GIT-05: a
-                                                           post-merge revert that cannot repair the branch also
+      8. dispatch, then the base-commit check          9. the merge queue (halt checks inside; ASES-GIT-05: a
+         (ASES-GIT-01/16, warnings), then provisioning     post-merge revert that cannot repair the branch also
                                                            returns with `integrity` set)
      10. the final gates, once every merge card is done
 
@@ -2226,6 +2319,13 @@ def run_pass(
     )
     summary["sent_back"] = process_review_lane(board, repo, plan, project, conn=conn)
     summary["dispatch"] = hermes_mod.kanban_dispatch(board)
+    # ASES-GIT-01, ASES-GIT-16 (round 10, package BASECHECK): right after dispatch, so a card dispatched THIS
+    # pass is checked the same pass it starts running, not one pass late (process_card_base_checks' own
+    # docstring). Isolated like idle_worktrees: a step here failing outright must not stop the merge queue below.
+    summary["warnings"].extend(_isolated(
+        conn, summary, "card_base", lambda: process_card_base_checks(board, repo, plan, conn=conn), [],
+        plan.project,
+    ))
     summary["provisioned"] = _isolated(
         conn, summary, "provision", lambda: process_provision(board, plan, conn=conn), [],
         plan.project,

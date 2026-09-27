@@ -2334,6 +2334,103 @@ def test_a_worktree_that_changes_while_no_card_runs_is_reported_once_against_a_r
 
 
 # =============================================================================================================
+# process_card_base_checks (round 10, package BASECHECK; ASES-GIT-01, ASES-GIT-16)
+# =============================================================================================================
+
+
+def _plant_branch(repo, branch, base_of="integration"):
+    """A branch named `branch` cut from a NEW commit off `base_of`, itself never adopted by ASES -- the way a
+    remote-tip sync would plant one. Returns the planted commit's SHA."""
+    git("checkout", "-q", "-b", "planted-tmp", base_of, cwd=repo)
+    (repo / "planted.txt").write_text("a commit ASES never wrote\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-q", "-m", "a commit ASES never wrote", cwd=repo)
+    planted = git("rev-parse", "HEAD", cwd=repo).strip()
+    git("checkout", "-q", base_of, cwd=repo)
+    git("branch", branch, planted, cwd=repo)
+    git("branch", "-D", "planted-tmp", cwd=repo)
+    return planted
+
+
+def test_process_card_base_checks_skips_everything_when_no_head_has_been_written_yet(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path)  # swarm/T1-coder already exists, cut from integration's own current tip
+    w = make_world(tmp_path, monkeypatch)
+    w.board.cards[w.work("T1")].update(status="running", branch_name="swarm/T1-coder")
+
+    assert controller.process_card_base_checks("b", repo, w.plan, conn=w.conn) == []
+
+    assert w.board.cards[w.work("T1")]["status"] == "running"  # not blocked: nothing to compare a base against yet
+    assert not any(kind.startswith("card_base_") for kind in kinds(w.conn))
+
+
+def test_process_card_base_checks_verifies_a_card_cut_from_the_adopted_head_and_remembers_it(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path)
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    w.board.cards[w.work("T1")].update(status="running", branch_name="swarm/T1-coder")
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+
+    assert problems == []
+    assert w.board.cards[w.work("T1")]["status"] == "running"
+    (payload,) = payloads(w.conn, "card_base_verified")
+    assert payload["card_id"] == w.work("T1") and payload["task_key"] == "T1" and payload["branch"] == "swarm/T1-coder"
+
+    calls = []
+    monkeypatch.setattr(guards, "check_card_base", lambda *a, **kw: calls.append(1))
+    assert controller.process_card_base_checks("b", repo, w.plan, conn=w.conn) == []
+    assert calls == []  # memoized: no second git-reading check at all
+    assert len(payloads(w.conn, "card_base_verified")) == 1  # still just the one event
+
+
+def test_process_card_base_checks_blocks_a_card_planted_from_a_commit_ases_never_wrote(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path, with_branch=False)
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    planted = _plant_branch(repo, "swarm/T1-coder")
+    w.board.cards[w.work("T1")].update(status="running", branch_name="swarm/T1-coder")
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+
+    assert len(problems) == 1 and "ASES-GIT-01" in problems[0] and "T1" in problems[0]
+    card = w.board.cards[w.work("T1")]
+    assert card["status"] == "blocked"
+    question = questions.open_question(card)
+    assert question is not None
+    assert "ASES-GIT-01" in question.reason and "swarm/T1-coder" in question.reason
+    (payload,) = payloads(w.conn, "card_base_violation")
+    assert payload["task_key"] == "T1" and payload["branch"] == "swarm/T1-coder" and payload["base"] == planted
+    assert payload["expected"]  # the allowed set was included
+    assert not payloads(w.conn, "card_base_verified")
+
+
+def test_process_card_base_checks_only_looks_at_this_plans_own_running_cards(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path)
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    w.board.add("other_project_card", status="running", branch_name="not-a-real-branch-at-all")
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+
+    assert problems == []  # no plan_tasks row for it: skipped without even trying to read a nonexistent branch
+
+
+def test_process_card_base_checks_falls_back_to_the_default_branch_name(tmp_path, monkeypatch):
+    """Hermes normally always reports branch_name (controller.create_cards_from_plan passes --branch), but the
+    fallback mirrors process_merge_queue's own, for a card whose branch_name comes back empty."""
+    repo = git_repo(tmp_path)
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    w.board.cards[w.work("T1")].update(status="running", branch_name=None)
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+
+    assert problems == []
+    (payload,) = payloads(w.conn, "card_base_verified")
+    assert payload["branch"] == "swarm/T1-coder"  # f"swarm/{key}-{task.role}"
+
+
+# =============================================================================================================
 # process_finalize
 # =============================================================================================================
 
@@ -2490,7 +2587,7 @@ def test_the_final_gates_module_is_imported_lazily():
 # =============================================================================================================
 
 STEPS = ["guard", "idle_worktrees", "usage", "recovery", "bounds", "budget", "unpark", "review", "dispatch",
-         "provision", "merge", "finalize"]
+         "card_base", "provision", "merge", "finalize"]
 SUMMARY_KEYS = {"parked", "dispatch", "sent_back", "merged", "unreviewed", "usage_sessions", "integrity", "warnings",
                 "recovery", "unparked", "provisioned", "stopped", "stop_reason", "final", "finished"}
 
@@ -2504,8 +2601,8 @@ class PassRig:
         self.args = {}
         self.raises = {}
         self.results = {"idle_worktrees": [], "usage": ["s1", "s2"], "recovery": [], "bounds": (False, None),
-                        "budget": ["T9"], "unpark": [], "review": [], "dispatch": {"spawned": 1}, "provision": [],
-                        "merge": ["T1"], "finalize": None}
+                        "budget": ["T9"], "unpark": [], "review": [], "dispatch": {"spawned": 1}, "card_base": [],
+                        "provision": [], "merge": ["T1"], "finalize": None}
         self.conn = db.connect(tmp_path / "ases.db")
         self.plan = types.SimpleNamespace(project="p", integration_branch="integration")
         self.project = types.SimpleNamespace(budgets={"k": 1})
@@ -2546,6 +2643,7 @@ class PassRig:
         for name, target in (("idle_worktrees", "process_idle_worktrees"), ("recovery", "process_recovery"),
                              ("bounds", "process_bounds"), ("budget", "process_budget_gate"),
                              ("unpark", "process_unpark"), ("review", "process_review_lane"),
+                             ("card_base", "process_card_base_checks"),
                              ("provision", "process_provision"), ("finalize", "process_finalize")):
             monkeypatch.setattr(controller, target, step(name))
         monkeypatch.setattr(controller, "process_merge_queue", merge)
@@ -2574,6 +2672,7 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
     rig.results["idle_worktrees"] = ["warn one"]
     rig.results["recovery"] = [{"task_key": "T1", "action": "fresh_attempt", "kind": "capability"}]
     rig.results["unpark"] = ["T2"]
+    rig.results["card_base"] = ["card base problem"]
     rig.results["provision"] = ["n1"]
 
     summary = rig.run(now=moment)
@@ -2588,11 +2687,12 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
     assert rig.args["unpark"] == (("b", rig.plan, rig.models),
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
     assert rig.args["review"] == (("b", "the-repo", rig.plan, rig.project), {"conn": rig.conn})
+    assert rig.args["card_base"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
     assert rig.args["provision"] == (("b", rig.plan), {"conn": rig.conn})
     assert rig.args["merge"][1]["models_config"] is rig.models
     assert rig.args["finalize"] == (everything, timed)
     assert (summary["warnings"], summary["recovery"], summary["unparked"], summary["provisioned"]) == (
-        ["warn one"], rig.results["recovery"], ["T2"], ["n1"])
+        ["warn one", "card base problem"], rig.results["recovery"], ["T2"], ["n1"])
 
 
 @pytest.mark.parametrize("status", ["stopped", "paused"])
@@ -2634,7 +2734,8 @@ def test_a_bound_that_stops_the_project_ends_the_pass_before_anything_is_dispatc
     assert summary["dispatch"] == {} and summary["merged"] == []
 
 
-@pytest.mark.parametrize("step", ["idle_worktrees", "usage", "recovery", "bounds", "unpark", "provision", "finalize"])
+@pytest.mark.parametrize("step", ["idle_worktrees", "usage", "recovery", "bounds", "unpark", "card_base",
+                                   "provision", "finalize"])
 def test_a_step_that_is_not_safety_critical_cannot_stop_the_pass(tmp_path, monkeypatch, step):
     """A stale ledger, a failed lease or a final gate that cannot run must not stop the merge queue: the failure is a
     pass_step_error event naming the step, a warning, and every later step still runs."""

@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from . import events as events_mod
 from . import gates as gates_mod
 from . import gitexec
+from . import guards as guards_mod
 from . import intents as intents_mod
 
 # The three places merge_task asks whether to stop, named for the "stopped by the kill switch before <step>" text.
@@ -161,6 +162,37 @@ def _stopped(step: str) -> MergeOutcome:
     return MergeOutcome(False, None, None, None, f"stopped by the kill switch before {step}", stopped=True)
 
 
+def _check_base(repo: pathlib.Path, work_branch: str, conn, project: str | None) -> MergeOutcome | None:
+    """ASES-GIT-01, ASES-GIT-16 (blueprint p169's second sentence): refuse a merge before anything is built when
+    `work_branch`'s own base commit is not one ASES itself wrote (guards.check_card_base against
+    guards.written_heads). This is the merge queue's OWN, independent half of the base-commit check: the
+    controller's per-pass detector (controller.process_card_base_checks) only looks at cards it currently sees
+    Hermes report `running`, so a card whose worktree was cut from a bad base but that the detector missed for
+    any reason (a race between two polls, a card that left `running` before a pass ever saw it) can still never
+    have its branch actually land, because this runs on every merge_task call, not once per card.
+
+    None (nothing to refuse) when there is nothing to check the base against: no `conn`/`project` given (the
+    pre-round-10 call shape, and every caller that does not pass them), or this project has not adopted any head
+    yet (guards.written_heads empty) -- the same "nothing recorded, skip the comparison" reading
+    check_primary_checkout already gives an expected_head of None, never "everything fails". Otherwise a
+    MergeOutcome refusal (merged=False) naming the branch and why, with a merge_refused_bad_base event, or None
+    when the base verifies."""
+    if conn is None or project is None:
+        return None
+    allowed = guards_mod.written_heads(conn, project)
+    if not allowed:
+        return None
+    result = guards_mod.check_card_base(repo, work_branch, allowed)
+    if result.ok:
+        return None
+    events_mod.record(conn, "merge_refused_bad_base", {
+        "branch": work_branch, "base": result.base, "reason": result.reason,
+    }, project=project)
+    return MergeOutcome(
+        False, None, None, None, f"branch {work_branch} refused (ASES-GIT-01, ASES-GIT-16): {result.reason}",
+    )
+
+
 def merge_task(
     repo: pathlib.Path, integration_branch: str, work_branch: str, task_key: str,
     gate3_commands: list[str], *, conn=None, commit_message: str | None = None, allow_empty: bool = False,
@@ -175,6 +207,13 @@ def merge_task(
     advances whatever branch is checked out, so from any other branch (or a detached HEAD) it could
     fast-forward THAT branch, report merged=True, and leave integration where it was. That is refused up
     front, before any worktree exists.
+
+    ASES-GIT-01, ASES-GIT-16 (round 10, package BASECHECK): refused up front too, right after that, when
+    `work_branch`'s own base commit is not one ASES itself wrote (`_check_base`, against
+    `guards.written_heads(conn, project)`) -- this project's own, independent enforcement of the base-commit
+    check, so a card the controller's per-pass detector missed can still never have its branch land. Only
+    checked when both `conn` and `project` are given and this project has adopted at least one head; see
+    `_check_base`'s own docstring.
 
     A refused fast-forward returns gate3_result="pass" with `integration_moved` decided from git, not
     assumed: True only if the integration tip is no longer the candidate's parent (a real race, safe for
@@ -241,6 +280,12 @@ def merge_task(
             f"ASES refuses to merge into a checkout that isn't on it (git merge --ff-only would advance "
             f"whatever branch is checked out, not '{integration_branch}')",
         )
+
+    # ASES-GIT-01, ASES-GIT-16 (round 10, package BASECHECK): before mkdtemp and before any worktree, exactly
+    # like the branch check just above, so refusing here leaves nothing behind to clean up either.
+    refused = _check_base(repo, work_branch, conn, project)
+    if refused is not None:
+        return refused
 
     squash_ref = work_branch
     if expected_head is not None:

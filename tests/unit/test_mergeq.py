@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ases import db, gates, hermes, intents, mergeq, reconcile
+from ases import db, gates, guards, hermes, intents, mergeq, reconcile
 
 
 def _git(*args, cwd):
@@ -1555,5 +1555,77 @@ def test_merge_task_with_the_sandbox_off_calls_run_gate_with_todays_exact_keywor
         repo, "integration", "swarm/PC4", "PC4", ["echo gate3-ok"], conn=conn,
         project_config=_FakeProjectConfig(enabled=False), task=_FakeTask(),
     )
+
+    assert outcome.merged is True
+
+
+# --- the base-commit check (round 10, package BASECHECK; ASES-GIT-01, ASES-GIT-16) ------------------------------
+
+
+def test_merge_task_merges_normally_when_the_branch_base_is_a_written_head(repo, tmp_path):
+    base = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+    _make_work_branch(repo, "swarm/B1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    guards.set_expected_head(conn, "p1", base)
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/B1", "B1", ["echo ok"], conn=conn, project="p1")
+
+    assert outcome.merged is True and outcome.gate3_result == "pass"
+
+
+def test_merge_task_refuses_when_the_branch_base_is_not_a_written_head(repo, tmp_path):
+    """The planted-base case: a branch cut from a commit ASES never wrote, the way a remote-tip sync would."""
+    _make_work_branch(repo, "swarm/B2", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    guards.set_expected_head(conn, "p1", "f" * 40)  # a head ASES wrote, but not the one B2 was cut from
+    before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/B2", "B2", ["echo ok"], conn=conn, project="p1")
+
+    assert outcome.merged is False
+    assert "ASES-GIT-01" in outcome.detail and "swarm/B2" in outcome.detail
+    assert _git_ok("rev-parse", "integration", cwd=repo).stdout.strip() == before  # untouched
+    assert _worktree_count(repo) == 1  # nothing was built: no candidate worktree left behind
+    assert _merge_row(conn, "B2") is None  # refused before any merge_records row was ever written
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM events WHERE kind = 'merge_refused_bad_base'"
+    ).fetchone()["payload"])
+    assert payload["branch"] == "swarm/B2" and payload["reason"]
+
+
+def test_merge_task_skips_the_base_check_when_no_head_has_been_written_yet(repo, tmp_path):
+    """A project that has never called guards.adopt_current_head/set_expected_head (written_heads empty) reads
+    as "not started", never "started and forgot everything" -- the same reading check_primary_checkout already
+    gives an expected_head of None."""
+    _make_work_branch(repo, "swarm/B3", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/B3", "B3", ["echo ok"], conn=conn, project="p1")
+
+    assert outcome.merged is True
+
+
+def test_merge_task_skips_the_base_check_without_a_project_or_a_connection(repo, tmp_path):
+    _make_work_branch(repo, "swarm/B4", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    guards.set_expected_head(conn, "p1", "f" * 40)  # would refuse B4/B5 if this project/conn pair were actually used
+
+    without_project = mergeq.merge_task(repo, "integration", "swarm/B4", "B4", ["echo ok"], conn=conn)
+    _make_work_branch(repo, "swarm/B5", "new.txt", "hello again\n")
+    without_conn = mergeq.merge_task(repo, "integration", "swarm/B5", "B5", ["echo ok"], project="p1")
+
+    assert without_project.merged is True
+    assert without_conn.merged is True
+
+
+def test_merge_task_before_this_check_existed_the_planted_base_test_would_have_merged(repo, tmp_path, monkeypatch):
+    """Before/after proof (the work order's own words): with the base check disabled, the exact branch the test
+    above refuses is merged instead, proving the refusal is this check's own doing."""
+    _make_work_branch(repo, "swarm/B6", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    guards.set_expected_head(conn, "p1", "f" * 40)
+    monkeypatch.setattr(mergeq, "_check_base", lambda *a, **kw: None)  # the pre-round-10 behaviour
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/B6", "B6", ["echo ok"], conn=conn, project="p1")
 
     assert outcome.merged is True

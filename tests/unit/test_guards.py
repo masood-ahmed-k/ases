@@ -535,6 +535,192 @@ def test_adopt_current_head_refuses_an_unreadable_head_and_records_nothing(tmp_p
     assert guards.expected_head(conn, "proj") is None
 
 
+# --- written_heads: the full history set_expected_head has ever recorded (round 10, BASECHECK) -----------------
+
+def test_written_heads_is_empty_until_something_is_recorded(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    assert guards.written_heads(conn, "proj") == frozenset()
+
+
+def test_set_expected_head_also_logs_to_written_heads(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    guards.set_expected_head(conn, "proj", "a" * 40)
+
+    assert guards.written_heads(conn, "proj") == {"a" * 40}
+
+
+def test_written_heads_keeps_every_head_ever_recorded_not_just_the_current_one(tmp_path):
+    """A card dispatched before a later merge legitimately has an older head as its base, so written_heads must
+    remember every SHA set_expected_head has ever recorded, not only the one integrity_state keeps now."""
+    conn = db.connect(tmp_path / "ases.db")
+
+    guards.set_expected_head(conn, "proj", "a" * 40)
+    guards.set_expected_head(conn, "proj", "b" * 40)
+    guards.set_expected_head(conn, "proj", "c" * 40)
+
+    assert guards.written_heads(conn, "proj") == {"a" * 40, "b" * 40, "c" * 40}
+    assert guards.expected_head(conn, "proj") == "c" * 40  # integrity_state still keeps only the current one
+
+
+def test_set_expected_head_does_not_duplicate_a_head_it_already_logged(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    guards.set_expected_head(conn, "proj", "a" * 40)
+    guards.set_expected_head(conn, "proj", "a" * 40)
+    guards.set_expected_head(conn, "proj", "b" * 40)
+    guards.set_expected_head(conn, "proj", "a" * 40)  # back to an earlier one (a revert can do this)
+
+    assert guards.written_heads(conn, "proj") == {"a" * 40, "b" * 40}
+    assert conn.execute("SELECT COUNT(*) FROM integrity_heads WHERE project = 'proj'").fetchone()[0] == 2
+
+
+def test_written_heads_is_scoped_per_project(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    guards.set_expected_head(conn, "proj-a", "a" * 40)
+    guards.set_expected_head(conn, "proj-b", "b" * 40)
+
+    assert guards.written_heads(conn, "proj-a") == {"a" * 40}
+    assert guards.written_heads(conn, "proj-b") == {"b" * 40}
+    assert guards.written_heads(conn, "proj-c") == frozenset()
+
+
+def test_set_expected_head_refuses_a_blank_sha_and_logs_nothing(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+
+    with pytest.raises(ValueError):
+        guards.set_expected_head(conn, "proj", "")
+
+    assert guards.written_heads(conn, "proj") == frozenset()
+
+
+def test_adopt_current_head_followed_by_a_moved_head_keeps_both_in_written_heads(repo, tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    first = guards.adopt_current_head(conn, "proj", repo)
+    _commit_new_file(repo)
+    second = guards.adopt_current_head(conn, "proj", repo)
+
+    assert guards.written_heads(conn, "proj") == {first, second}
+
+
+# --- check_card_base: a work card's branch, checked against written_heads (round 10, BASECHECK) ----------------
+
+def _branch(repo, name, start_point="HEAD", *, reuse_from=None):
+    """A branch created the way Hermes's Kanban dispatcher does it (`git worktree add -b <branch> <path>
+    <start-point>`), or, when `reuse_from` is given, a NEW worktree pointed at that already-existing branch with
+    no `-b` (a retried card whose old worktree is gone and gets a fresh one on the same branch, or a branch
+    planted ahead of time being picked up for the first time): its OLD worktree is removed first (git refuses two
+    worktrees on the same branch at once), the same way a retry's old worktree is gone by the time this happens.
+    Returns the branch name."""
+    target = repo / ".worktrees" / name
+    if reuse_from is not None:
+        _git("worktree", "remove", "--force", str(repo / ".worktrees" / reuse_from), cwd=repo)
+        _git("worktree", "add", "-q", str(target), reuse_from, cwd=repo)
+        return reuse_from
+    _git("worktree", "add", "-q", "-b", name, str(target), start_point, cwd=repo)
+    return name
+
+
+def test_check_card_base_passes_when_created_from_an_allowed_head(repo):
+    branch = _branch(repo, "swarm/t1")
+
+    result = guards.check_card_base(repo, branch, {_head(repo)})
+
+    assert result == guards.CardBaseResult(True, _head(repo), "")
+
+
+def test_check_card_base_passes_for_an_older_allowed_head(repo):
+    """A card dispatched before a later merge: its branch was cut from an OLDER head that is still in the
+    allowed set, not the primary checkout's current one."""
+    old_head = _head(repo)
+    branch = _branch(repo, "swarm/t1", old_head)
+    new_head = _commit_new_file(repo)
+
+    result = guards.check_card_base(repo, branch, {old_head, new_head})
+
+    assert result.ok is True
+    assert result.base == old_head
+
+
+def test_check_card_base_fails_when_the_base_is_not_in_the_allowed_set(repo):
+    """The planted-base case: a branch cut from a commit ASES never wrote, the way a remote-tip sync would."""
+    planted = _commit_new_file(repo)
+    branch = _branch(repo, "swarm/t1", planted)
+
+    result = guards.check_card_base(repo, branch, frozenset())
+
+    assert result.ok is False
+    assert result.base == planted
+    assert planted[:12] in result.reason
+    assert "not a commit ASES itself wrote or adopted" in result.reason
+
+
+def test_check_card_base_fails_closed_when_the_signal_is_missing(repo):
+    """core.logAllRefUpdates was off when the branch was made: no reflog entry records its creation at all, so
+    the base cannot be verified. Missing is treated exactly like wrong, never like a pass."""
+    _git("config", "core.logAllRefUpdates", "false", cwd=repo)
+    branch = _branch(repo, "swarm/t1")
+
+    result = guards.check_card_base(repo, branch, {_head(repo)})
+
+    assert result.ok is False
+    assert result.base == ""
+    assert "no reflog entries" in result.reason
+
+
+def test_check_card_base_fails_closed_when_the_branch_does_not_exist(repo):
+    result = guards.check_card_base(repo, "swarm/never-created", {_head(repo)})
+
+    assert result.ok is False
+    assert result.base == ""
+
+
+def test_check_card_base_still_passes_after_the_branch_is_reused_for_a_retry(repo):
+    """A retried card keeps its original worktree/branch (Hermes: `git worktree add <path> <branch>`, no `-b`),
+    which writes no new reflog entry, so the branch's original creation commit -- and the check's answer -- is
+    unaffected by how many times that happens."""
+    head = _head(repo)
+    branch = _branch(repo, "swarm/t1")
+    reused = _branch(repo, "swarm/t1-retry", reuse_from=branch)
+
+    result = guards.check_card_base(repo, reused, {head})
+
+    assert result == guards.CardBaseResult(True, head, "")
+
+
+def test_check_card_base_ignores_the_start_point_named_in_the_creation_message(repo):
+    """The reflog names whatever start-point the branch was created from ('HEAD', a branch name, a SHA); only
+    the resulting commit is compared against the allowed set, never the text of the message."""
+    branch = _branch(repo, "swarm/t1", "integration")  # named by branch, not "HEAD"
+
+    result = guards.check_card_base(repo, branch, {_head(repo)})
+
+    assert result.ok is True
+
+
+def test_branch_created_from_forces_the_c_locale_so_the_reflog_message_is_never_translated(repo, monkeypatch):
+    """Git localises the reflog's "branch: Created from" message when the operator's environment sets a
+    non-English locale and a matching translation is installed, which would otherwise make
+    _branch_created_from's parse depend on the machine it runs on. LC_ALL=C makes it deterministic everywhere."""
+    branch = _branch(repo, "swarm/t1")
+    seen = []
+    real_run = guards.subprocess.run
+
+    def spy(cmd, **kwargs):
+        seen.append((list(cmd), kwargs.get("env")))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(guards.subprocess, "run", spy)
+
+    guards.check_card_base(repo, branch, {_head(repo)})
+
+    reflog_calls = [env for cmd, env in seen if "reflog" in cmd]
+    assert reflog_calls  # the reflog call itself went through the spy
+    assert all(env is not None and env.get("LC_ALL") == "C" for env in reflog_calls)
+
+
 # --- the other worktrees (ASES-GIT-12) -----------------------------------------------------------
 
 @pytest.fixture

@@ -108,6 +108,60 @@ def _check_git_longpaths(project: ases_config.ProjectConfig) -> DoctorCheck:
     )
 
 
+def _check_log_all_ref_updates(repo: pathlib.Path | None) -> DoctorCheck:
+    """[ASES-GIT-01] [ASES-GIT-16] (blueprint p169's second sentence: "Phase 3 MUST verify the actual base commit
+    before a worker starts"). guards.check_card_base reads a work card branch's base commit from its OWN reflog's
+    "branch: Created from ..." entry (see guards.py's module-level comment on that section for why: it is the
+    only durable record git keeps of where a branch began), which only exists when `core.logAllRefUpdates` is on
+    -- for the PROJECT repository the swarm dispatches cards into, not this ASES checkout, which is what every
+    other check in this module inspects (`repo` is a separate parameter for exactly that reason).
+
+    `git init` has written `core.logAllRefUpdates = true` into a fresh non-bare repository's own config since
+    long before this Hermes version, so an EXPLICIT "true" and an UNSET value are both healthy (a non-bare
+    repository's own default is true either way); only an explicit "false" is a real WARN, since that repository
+    would then be unable to answer a base-commit check at all, and guards.check_card_base fails a card's base
+    closed (blocks it) whenever the signal is missing, so a real remote-tip sync would go undetected right along
+    with every legitimate card.
+
+    `repo` is None when the caller has not been given the project repository's path: `swarm doctor` is not yet
+    wired to accept one (cmd_doctor has no `--repo`, unlike `swarm run`/`swarm approve`; no round 10 package adds
+    it), so this stays "pending" rather than silently checking the wrong repository or claiming a pass it cannot
+    back up."""
+    if repo is None:
+        return DoctorCheck(
+            "log_all_ref_updates", "pending",
+            "not checked: swarm doctor is not yet given the project repository's path (cmd_doctor has no --repo "
+            "flag). The base-commit check (guards.check_card_base) depends on core.logAllRefUpdates being on "
+            "there, not in this ASES checkout.",
+            ("ASES-GIT-01", "ASES-GIT-16"),
+        )
+    try:
+        result = subprocess.run(
+            [*gitexec.GIT, "-C", str(repo), "config", "--get", "core.logAllRefUpdates"],
+            capture_output=True, text=True, timeout=10, env=gitexec.git_env(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return DoctorCheck(
+            "log_all_ref_updates", "warn", f"could not read core.logAllRefUpdates in {repo}: {exc}",
+            ("ASES-GIT-01", "ASES-GIT-16"),
+        )
+    value = result.stdout.strip().lower()
+    if value in ("true", ""):
+        why = "core.logAllRefUpdates=true" if value == "true" else "core.logAllRefUpdates is unset (default true for a non-bare repository)"
+        return DoctorCheck(
+            "log_all_ref_updates", "pass", f"{why} in {repo}: the base-commit check can read branch reflogs",
+            ("ASES-GIT-01", "ASES-GIT-16"),
+        )
+    return DoctorCheck(
+        "log_all_ref_updates", "warn",
+        f"core.logAllRefUpdates={value!r} in {repo}, expected true (or unset): the base-commit check "
+        "(guards.check_card_base) reads a branch's creation commit from its reflog and fails a card's base "
+        "closed, blocking it, whenever that signal is missing -- so with this off, a real remote-tip sync would "
+        "go undetected right along with every legitimate card",
+        ("ASES-GIT-01", "ASES-GIT-16"),
+    )
+
+
 def _check_gitattributes(project: ases_config.ProjectConfig) -> DoctorCheck:
     if project.environment != "native":
         return DoctorCheck("gitattributes_eol", "pending", "only checked on native Windows", ())
@@ -585,12 +639,16 @@ def _check_no_secrets_in_output(report_text_so_far: str) -> DoctorCheck:
     )
 
 
-def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> DoctorReport:
+def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: pathlib.Path | None = None) -> DoctorReport:
+    """`repo` (round 10, package BASECHECK): the project repository's path, for _check_log_all_ref_updates. Keyword
+    -only and optional so every existing caller (cmd_doctor has no --repo flag yet; see that check's own
+    docstring) keeps working unchanged, getting a "pending" row for it instead of a forced signature change."""
     profiles_mod, profiles_unavailable = _load_profiles_module()
     checks: list[DoctorCheck] = [
         _check_environment_decision(project),
         _check_not_under_onedrive(project),
         _check_git_longpaths(project),
+        _check_log_all_ref_updates(repo),
         _check_gitattributes(project),
         _check_python_version(),
         _check_git_version(),

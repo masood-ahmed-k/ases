@@ -351,6 +351,35 @@ def _apply_v8(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE merge_records_v8_new RENAME TO merge_records")
 
 
+# Version 9 (round 10, package BASECHECK; ASES-GIT-01, ASES-GIT-16, blueprint p169's second sentence: "Phase 3 MUST
+# verify the actual base commit before a worker starts"). guards.check_card_base needs the FULL history of every
+# primary-checkout HEAD ASES itself has adopted, fast-forwarded to or reverted to for a project, not just the
+# CURRENT one integrity_state (schema v4) keeps: a card dispatched before a later merge legitimately has an older
+# head as its base. guards.set_expected_head now writes here too, every time it writes integrity_state.
+_V9_SQL = """
+CREATE TABLE IF NOT EXISTS integrity_heads (
+    project TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (project, sha)
+);
+"""
+
+
+def _apply_v9(conn: sqlite3.Connection) -> None:
+    _run_script(conn, _V9_SQL)
+    # Backfill: a database that already has a current expected_head (integrity_state, schema v4) predates
+    # integrity_heads and would otherwise start this project's history empty, making its own last-adopted head
+    # look like one ASES never wrote. The current head is real ASES-written history either way, so it is carried
+    # forward as this project's first known entry.
+    for row in conn.execute("SELECT project, expected_head, updated_at FROM integrity_state").fetchall():
+        conn.execute(
+            "INSERT INTO integrity_heads (project, sha, recorded_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(project, sha) DO NOTHING",
+            (row["project"], row["expected_head"], row["updated_at"]),
+        )
+
+
 # The one table the runner needs before it can read a version. Also part of migration 1, so the list describes the
 # whole schema.
 _BOOTSTRAP = """
@@ -421,6 +450,8 @@ MIGRATIONS: list[Migration] = [
     Migration(7, "project column on gate_runs, merge_records and events; indexes on gate_runs and events", _apply_v7),
     Migration(8, "merge_records rebuilt with PRIMARY KEY (project, task_key), legacy rows backfilled from "
                  "plan_tasks where unambiguous", _apply_v8),
+    Migration(9, "integrity_heads: the full history of primary-checkout HEADs ASES has written, for the "
+                 "base-commit check (ASES-GIT-01, ASES-GIT-16), backfilled from integrity_state", _apply_v9),
 ]
 
 
