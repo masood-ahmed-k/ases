@@ -102,9 +102,12 @@ def check_data_class(
 def check_budget(
     conn, provider_limits: dict, provider: str, estimated_requests: int, *, budgets: dict
 ) -> ledger.Affordability:
+    """ASES-CAP-03. A budgets mapping that omits daily_reserve_percent still reserves the blueprint's 10
+    percent (ledger.DEFAULT_DAILY_RESERVE_PERCENT), the same fallback bounds.Bounds and report's budget
+    panel use; an explicit daily_reserve_percent of 0 means 0, never the default."""
     return ledger.can_afford(
         conn, provider_limits, provider, estimated_requests,
-        reserve_percent=budgets.get("daily_reserve_percent", 0),
+        reserve_percent=budgets.get("daily_reserve_percent", ledger.DEFAULT_DAILY_RESERVE_PERCENT),
         extra_reserve=budgets.get("review_reserve_requests", 0),
     )
 

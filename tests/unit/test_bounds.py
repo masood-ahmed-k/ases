@@ -221,6 +221,18 @@ def test_from_budgets_rejects_a_reserve_over_100():
         bounds.Bounds.from_budgets({"daily_reserve_percent": 101})
 
 
+def test_default_daily_reserve_percent_is_the_one_shared_definition():
+    """ASES-CAP-03: bounds.Bounds's own default is ledger.DEFAULT_DAILY_RESERVE_PERCENT itself (not a second
+    literal 10), the same constant policy.check_budget and report's budget panel fall back to, so a budgets
+    block missing the key reserves the blueprint's 10 percent everywhere, not just here."""
+    assert bounds.Bounds().daily_reserve_percent == ledger.DEFAULT_DAILY_RESERVE_PERCENT == 10
+
+
+def test_from_budgets_daily_reserve_percent_of_zero_means_zero_not_the_default():
+    limits = bounds.Bounds.from_budgets({"daily_reserve_percent": 0})
+    assert limits.daily_reserve_percent == 0
+
+
 def test_from_budgets_rejects_something_that_is_not_a_mapping():
     with pytest.raises(ValueError, match="mapping"):
         bounds.Bounds.from_budgets([("max_cards", 3)])

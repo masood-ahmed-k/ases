@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 
 import pytest
 
-from ases import config, db, events, hermes, ledger, models, plan as plan_mod, questions, report
+from ases import bounds, config, db, events, hermes, ledger, models, plan as plan_mod, questions, report
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
 NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)
@@ -478,21 +478,50 @@ def test_a_configured_wall_clock_limit_needs_a_start_time_to_measure_against(con
 
 
 @pytest.mark.parametrize("status, updated_at, expected_used", [
-    ("running", "2026-09-19T11:00:00+00:00", 120),    # a live project's clock runs to now
-    ("paused", "2026-09-19T11:00:00+00:00", 120),
-    ("finished", "2026-09-19T11:00:00+00:00", 60),    # a finished or stopped project's clock stopped
-    ("stopped", "2026-09-19T11:00:00+00:00", 60),
+    ("finished", "2026-09-19T11:00:00+00:00", 60),    # a finished project's clock stopped
     ("finished", "2026-09-19T09:00:00+00:00", 120),   # updated before it started: not believable, use now
     ("finished", "2026-09-19T13:00:00+00:00", 120),   # updated after now (clock skew): never run past now
     ("finished", "2026-09-19T10:00:00+00:00", 0),     # finished the minute it started
     ("finished", "garbage", 120),                     # updated_at is NOT NULL, but it can be unreadable text
 ])
-def test_wall_clock_stops_when_the_project_is_finished_or_stopped(
+def test_wall_clock_freezes_only_when_the_project_is_finished(
     conn, tmp_path, monkeypatch, status, updated_at, expected_used,
 ):
     _fake_hermes(monkeypatch, {})
     _state(conn, status=status, started_at="2026-09-19T10:00:00+00:00", updated_at=updated_at)
     assert _bounds(_build(conn, tmp_path))["wall clock minutes"]["used"] == expected_used
+
+
+@pytest.mark.parametrize("status", ["running", "paused", "stopped"])
+def test_wall_clock_keeps_counting_live_for_every_status_but_finished(conn, tmp_path, monkeypatch, status):
+    """bounds._project_wall_clock_status never freezes for any status (a pause or a kill-switch stop does not
+    move deadline_at, and neither is a terminal state: killswitch.clear_stop and swarm resume put the project
+    back to running with the same deadline). A STOPPED project used to freeze here too (the bug this test
+    guards against): that hid the fact that resuming re-evaluates the SAME live clock, which can immediately
+    re-pause the project on a deadline that passed while it sat stopped. Only 'finished' may freeze
+    (test_wall_clock_freezes_only_when_the_project_is_finished): a finished project is never resumed."""
+    _fake_hermes(monkeypatch, {})
+    _state(conn, status=status, started_at="2026-09-19T10:00:00+00:00", updated_at="2026-09-19T11:00:00+00:00")
+    assert _bounds(_build(conn, tmp_path))["wall clock minutes"]["used"] == 120  # to NOW (12:00), not to updated_at
+
+
+def test_wall_clock_agrees_with_the_bound_it_describes_for_every_resumable_status(conn, tmp_path, monkeypatch):
+    """The concrete regression: report._wall_clock and bounds._project_wall_clock_status must show the SAME
+    breach for every status a project can still be resumed from (running, paused, stopped), so a report read
+    before `swarm resume` never promises budget that the bound will immediately take back. Only 'finished' is
+    allowed to diverge, because bounds.evaluate_bounds is never asked about a finished project again."""
+    _fake_hermes(monkeypatch, {})
+    started = "2026-09-19T10:00:00+00:00"
+    deadline = "2026-09-19T11:30:00+00:00"  # 90 minutes: already passed by NOW (12:00), well before updated_at too
+    for status in ("running", "paused", "stopped"):
+        conn.execute("DELETE FROM project_state")
+        _state(conn, status=status, started_at=started, deadline_at=deadline, updated_at="2026-09-19T10:45:00+00:00")
+        report_bound = _bounds(_build(conn, tmp_path))["wall clock minutes"]
+        state = bounds.get_state(conn, "p1")
+        live = bounds._project_wall_clock_status(state, bounds.Bounds.from_budgets(BUDGETS), NOW)
+        assert (report_bound["used"], report_bound["limit"]) == (int(live.used), int(live.limit))
+        assert report_bound["used"] >= report_bound["limit"]  # both agree: breached, deadline already passed
+        assert live.breached is True
 
 
 def test_bounds_fall_back_to_the_blueprints_defaults_and_honour_the_config(conn, tmp_path, monkeypatch):
@@ -576,9 +605,15 @@ def test_providers_follow_the_models_config_and_show_a_configured_status(conn, t
 
 
 def test_the_daily_reserve_comes_from_the_budgets(conn, tmp_path, monkeypatch):
+    """ASES-CAP-03: a budgets block that omits daily_reserve_percent still reserves the blueprint's 10 percent
+    (ledger.DEFAULT_DAILY_RESERVE_PERCENT), the same fallback policy.check_budget and bounds.Bounds use, not 0
+    -- the report must never claim more usable quota than the gate that actually parks cards allows."""
     _fake_hermes(monkeypatch, {})
     rep = _build(conn, tmp_path, project=_project(tmp_path, budgets={}))
-    assert rep["budget"]["reserve_percent"] == 0
+    assert rep["budget"]["reserve_percent"] == 10
+    assert rep["budget"]["providers"][0]["reserve"] == 5  # int(50 * 10 / 100)
+    rep = _build(conn, tmp_path, project=_project(tmp_path, budgets={"daily_reserve_percent": 0}))
+    assert rep["budget"]["reserve_percent"] == 0  # an explicit 0 still means 0, never the default
     assert rep["budget"]["providers"][0]["reserve"] == 0
     rep = _build(conn, tmp_path, project=_project(tmp_path, budgets={"daily_reserve_percent": 25}))
     assert rep["budget"]["reserve_percent"] == 25

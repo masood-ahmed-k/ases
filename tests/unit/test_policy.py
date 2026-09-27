@@ -1,6 +1,8 @@
 import pytest
 
-from ases import policy
+from ases import db, ledger, policy
+
+_LIMITS = {"openrouter": {"limits": {"per_day": 50}}}
 
 
 def test_public_allows_anything():
@@ -122,3 +124,43 @@ def test_calendar_time_none_when_rpm_is_zero():
     assert policy.estimate_calendar_minutes(
         limits, "unorouter", requests_for_model=5, requests_for_provider=5,
     ) is None
+
+
+# =====================================================================================================================
+# check_budget: ASES-CAP-03's daily reserve default (ledger.DEFAULT_DAILY_RESERVE_PERCENT)
+# =====================================================================================================================
+
+
+def test_check_budget_reserves_10_percent_when_the_key_is_missing(tmp_path):
+    """A budgets block that omits daily_reserve_percent must still hold back the blueprint's 10 percent, not 0:
+    otherwise the budget gate would let a card become ready that report.py and bounds.Bounds would both call
+    over budget. 50 a day - a 10% reserve (5) = 45 usable; asking for 46 is refused."""
+    conn = db.connect(tmp_path / "ases.db")
+    verdict = policy.check_budget(conn, _LIMITS, "openrouter", 46, budgets={})
+    assert verdict.can_afford is False
+    assert "10% daily reserve" in verdict.reason
+
+
+def test_check_budget_missing_key_matches_an_explicit_10(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    missing = policy.check_budget(conn, _LIMITS, "openrouter", 40, budgets={})
+    explicit = policy.check_budget(conn, _LIMITS, "openrouter", 40, budgets={"daily_reserve_percent": 10})
+    assert missing == explicit
+    assert missing.can_afford is True  # 50 - 5 (10%) = 45 usable, covers 40
+
+
+def test_check_budget_an_explicit_zero_reserve_means_zero_not_the_default(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    verdict = policy.check_budget(conn, _LIMITS, "openrouter", 50, budgets={"daily_reserve_percent": 0})
+    assert verdict.can_afford is True  # no reserve held back: all 50 usable
+    assert verdict.limit_today == 50
+
+
+def test_check_budget_uses_the_shared_default_constant_not_a_second_hardcoded_number(tmp_path, monkeypatch):
+    """policy.check_budget's fallback IS ledger.DEFAULT_DAILY_RESERVE_PERCENT, not a second literal 10 that could
+    drift from it: patching the one constant changes what an omitted key reserves."""
+    conn = db.connect(tmp_path / "ases.db")
+    monkeypatch.setattr(ledger, "DEFAULT_DAILY_RESERVE_PERCENT", 50)
+    verdict = policy.check_budget(conn, _LIMITS, "openrouter", 26, budgets={})
+    assert verdict.can_afford is False  # 50 - 50% reserve (25) = 25 usable, needs 26
+    assert "50% daily reserve" in verdict.reason

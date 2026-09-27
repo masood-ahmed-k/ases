@@ -61,3 +61,18 @@ def test_uses_after_credits_limit_once_flag_flipped(tmp_path):
     result = ledger.can_afford(conn, purchased, "openrouter", 10)
     assert result.can_afford is True
     assert result.limit_today == 1000
+
+
+def test_can_afford_reserves_10_percent_by_default_when_reserve_percent_is_omitted(tmp_path):
+    """ASES-CAP-03: can_afford's own reserve_percent default is ledger.DEFAULT_DAILY_RESERVE_PERCENT (10), the
+    same number every other reader of a missing daily_reserve_percent falls back to. A caller that means no
+    reserve at all must say reserve_percent=0 explicitly (test_can_afford_true_when_well_within_budget and
+    test_can_afford_false_when_short already cover an explicit reserve)."""
+    conn = db.connect(tmp_path / "ases.db")
+    assert ledger.DEFAULT_DAILY_RESERVE_PERCENT == 10
+    omitted = ledger.can_afford(conn, LIMITS, "openrouter", 46)          # 50 - 10% (5) = 45 usable, needs 46
+    explicit = ledger.can_afford(conn, LIMITS, "openrouter", 46, reserve_percent=10)
+    assert omitted == explicit
+    assert omitted.can_afford is False
+    zero_reserve = ledger.can_afford(conn, LIMITS, "openrouter", 46, reserve_percent=0)
+    assert zero_reserve.can_afford is True  # an explicit 0 still means 0, never the default

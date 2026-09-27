@@ -88,7 +88,8 @@ class Bounds:
     The first four are lineage and project counters (attempts per card, review rounds per plan task, fix cards per
     plan task, re-plans per project), max_cards is Gate 0's ceiling on tasks in a plan, card_runtime_minutes is
     the per-card wall clock (--max-runtime), and daily_reserve_percent is the share of a provider's daily cap held
-    back (ASES-CAP-03). project_wall_clock_minutes has no default because the table says "Set at Gate P": None
+    back (ASES-CAP-03; the same default as ledger.DEFAULT_DAILY_RESERVE_PERCENT, the one place that number is
+    defined). project_wall_clock_minutes has no default because the table says "Set at Gate P": None
     means no configured limit, and a deadline recorded in project_state still applies."""
     attempts_per_card: int = 3
     review_rounds_per_task: int = 3
@@ -96,7 +97,7 @@ class Bounds:
     replans_per_project: int = 2
     max_cards: int = 40
     card_runtime_minutes: int = 45
-    daily_reserve_percent: int = 10
+    daily_reserve_percent: int = ledger.DEFAULT_DAILY_RESERVE_PERCENT
     project_wall_clock_minutes: int | None = None
 
     @classmethod

@@ -10,6 +10,13 @@ import dataclasses
 import sqlite3
 from datetime import datetime, timezone
 
+# ASES-CAP-03 / blueprint [p133], bounds table section 9.3: "the limit in section 5.3 minus a 10 percent
+# reserve". This is the ONE place the 10 percent default lives; every reader of a budgets mapping that may
+# omit daily_reserve_percent (bounds.Bounds, policy.check_budget, report's budget panel, and this module's
+# own can_afford) falls back to this constant instead of each guessing its own number. An explicit
+# daily_reserve_percent of 0 in a project's budgets still means 0: this is only the fallback for a missing key.
+DEFAULT_DAILY_RESERVE_PERCENT = 10
+
 
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -79,13 +86,15 @@ def can_afford(
     provider: str,
     estimated_requests: int,
     *,
-    reserve_percent: float = 0.0,
+    reserve_percent: float = DEFAULT_DAILY_RESERVE_PERCENT,
     extra_reserve: int = 0,
 ) -> Affordability:
     """ASES-CAP-03: no card becomes ready unless the budget covers it plus a review reserve.
 
     reserve_percent holds back that fraction of the day's cap (project.budgets.daily_reserve_percent);
     extra_reserve holds back a flat number of requests on top (project.budgets.review_reserve_requests).
+    The default matches DEFAULT_DAILY_RESERVE_PERCENT above; a caller that means no reserve at all must
+    pass reserve_percent=0 explicitly.
     """
     limit = daily_limit(provider_limits, provider)
     if limit is None:

@@ -241,21 +241,33 @@ def _limit(budgets: dict, key: str) -> int | None:
 
 
 def _wall_clock(state, budgets: dict, now: datetime) -> dict:
-    """The project wall-clock bound in whole minutes (section 9.3: "Set at Gate P"). used is the time since
-    started_at, and limit is the time from started_at to deadline_at, or budgets.project_wall_clock_minutes when
-    the project has no deadline (the deadline wins, as in bounds.evaluate_bounds). Both are None ("not set")
-    until the project has a start time. A project that is finished or stopped stops the clock at
-    project_state.updated_at, so a report read days later does not show a run as over its deadline for the time
-    it sat idle."""
+    """The project wall-clock bound in whole minutes (section 9.3: "Set at Gate P"), the same arithmetic as
+    bounds._project_wall_clock_status: used is the time since started_at, and limit is the time from started_at
+    to deadline_at, or budgets.project_wall_clock_minutes when the project has no deadline (the deadline wins,
+    as in bounds.evaluate_bounds). Both are None ("not set") until the project has a start time.
+
+    Only a FINISHED project freezes the clock at project_state.updated_at: it is genuinely over (killswitch.
+    clear_stop and cli._resume_one both leave a finished project exactly as it is, and bounds.evaluate_bounds is
+    never asked about it again once the polling loop has exited), so freezing here costs nothing and keeps a
+    report read long afterwards from showing a finished run as still running past its deadline.
+
+    A STOPPED project (the kill switch, ASES-REC-06) is deliberately NOT frozen, even though it looks just as
+    idle: killswitch.clear_stop puts it back to running, and neither a stop nor a pause moves deadline_at (only
+    `swarm resume --extend-minutes` does, cli.py's _resume_one), so bounds.evaluate_bounds keeps counting live
+    against the same fixed deadline the whole time the project sits stopped. Freezing a stopped project's
+    reading here would tell an operator they still have wall-clock budget left when the very next `swarm run`
+    pass, using that same live arithmetic, may find the deadline already passed and pause it right back -- a
+    report that disagrees with the bound it is describing. `paused` was already live before this fix (a bound
+    reached mid-run pauses, it does not stop, ASES-CTL-01); `stopped` now agrees with it for the same reason."""
     started = _parse_ts(state["started_at"]) if state is not None else None
     deadline = _parse_ts(state["deadline_at"]) if state is not None else None
     used = limit = None
     if started is not None:
         end = now
-        if state["status"] in ("finished", "stopped"):
-            stopped = _parse_ts(state["updated_at"])
-            if stopped is not None and started <= stopped < now:
-                end = stopped
+        if state["status"] == "finished":
+            frozen_at = _parse_ts(state["updated_at"])
+            if frozen_at is not None and started <= frozen_at < now:
+                end = frozen_at
         used = max(int((end - started).total_seconds() // 60), 0)
         if deadline is not None:
             limit = int((deadline - started).total_seconds() // 60)
@@ -376,10 +388,14 @@ def _budget_panel(
     reserve held back (budgets.daily_reserve_percent of the limit, the same arithmetic ledger.can_afford uses),
     then the cards parked for budget and the requests ingested today per provider, model and profile.
 
+    A missing daily_reserve_percent falls back to ledger.DEFAULT_DAILY_RESERVE_PERCENT (the blueprint's 10
+    percent), the same default policy.check_budget and bounds.Bounds use, so the report never shows a more
+    permissive number than the gate that actually parks cards. An explicit 0 still means 0.
+
     A provider with no known daily cap has limit, remaining and reserve None: the report never invents a number
     for it. `next_reset` is the next UTC midnight, when the ledger's day rolls over."""
     providers = models_config.get("providers", {})
-    reserve_percent = project.budgets.get("daily_reserve_percent", 0)
+    reserve_percent = project.budgets.get("daily_reserve_percent", ledger.DEFAULT_DAILY_RESERVE_PERCENT)
     rows = []
     for name, entry in providers.items():
         limit = ledger.daily_limit(providers, name)
