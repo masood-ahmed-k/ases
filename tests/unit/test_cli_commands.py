@@ -1221,7 +1221,7 @@ def _approve_world(world, monkeypatch):
     monkeypatch.setattr(cli.controller_mod, "publish_plan",
                         lambda repo, branch: calls.append(("publish", branch)) or "abc1234")
     monkeypatch.setattr(cli.controller_mod, "pin_gate_profiles",
-                        lambda conn, project, gate_profiles: calls.append(("pin", project)) or "hash")
+                        lambda conn, project, gate_profiles, *rest: calls.append(("pin", project)) or "hash")
 
     def create(board, project_id, repo, plan, project, *, conn):
         calls.append(("create", board, project_id))
@@ -3244,6 +3244,24 @@ def _real_startup(world, monkeypatch):
 
 def _run_argv(world):
     return ["run", "--repo", str(world.repo), "--max-iterations", "2", "--sleep-seconds", "0"]
+
+
+def test_run_refuses_when_a_tasks_sandbox_network_exception_changed_after_approval(world, monkeypatch, capsys):
+    """ASES-QG-02 with ASES-SEC-05/SEC-07 (round 9): the pin taken at approve time covers each task's network
+    exception, and `swarm run`'s pre-flight passes the plan's CURRENT exceptions, so a plan.json edited after
+    approval to grant a task network is refused exactly like an edited gate command."""
+    passes = _real_startup(world, monkeypatch)  # pinned with PLAN_RAW: no task has a network exception
+    plan_file = world.repo / "docs" / "ases" / "plan.json"
+    raw = json.loads(plan_file.read_text(encoding="utf-8"))
+    raw["tasks"][0]["sandbox_network"] = True
+    raw["tasks"][0]["sandbox_network_reason"] = "added after approval"
+    plan_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert cli.main(_run_argv(world)) == 1
+
+    assert passes == []
+    out, err = _console(capsys)
+    assert "REFUSED (ASES-QG-02)" in err
 
 
 def test_run_startup_with_the_real_guard_pin_bounds_and_reconcile(world, monkeypatch, capsys):

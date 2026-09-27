@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from ases import sandbox
-from ases.sandbox import SandboxConfigError, SandboxPolicy
+from ases.sandbox import SandboxConfigError, SandboxInfrastructureError, SandboxPolicy
 
 HOME = "C:/Users/tester"
 POSIX_HOME = "/home/tester"
@@ -2428,6 +2428,117 @@ def test_the_terminal_block_a_policy_produces_is_not_shared_between_calls():
 def test_a_unc_share_is_a_root():
     assert mp(["\\\\server\\share"]) == ["mount \\\\server\\share is a drive root"]
     assert "outside the worktree" in mp(["\\\\server\\share\\dir"])[0]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# sandbox_command_runner (round 9, ASES-QG-04, ASES-SEC-03/05/06/07): the `runner` hook gates.run_gate takes
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def commands_run(handler):
+    """A FakeDocker `run` handler that answers by the LAST word of the `sh -lc <command>` argv (the command
+    string itself), so a test can script pass/fail per command without caring about the rest of the argv."""
+    def inner(argv):
+        return handler(argv[-1])
+    return inner
+
+
+def test_sandbox_command_runner_runs_one_docker_run_per_command_with_only_the_worktree_mounted(worktree, monkeypatch):
+    monkeypatch.setattr(sandbox, "host_user_spec", lambda: None)
+    docker = FakeDocker(run=commands_run(lambda cmd: result(0, f"ran {cmd}")))
+    run = sandbox.sandbox_command_runner(POLICY, process_runner=docker)
+
+    passed, output = run(worktree, ["pytest -q", "ruff check"], 60)
+
+    assert passed is True
+    assert "ran pytest -q" in output and "ran ruff check" in output
+    assert len(docker.runs) == 2
+    for call in docker.runs:
+        assert pair(call, "--network") == "none"
+        assert call[call.index("--mount") + 1].startswith(f"type=bind,source={worktree}")
+        assert "-e" not in call  # no environment is ever forwarded
+        assert call[-3:-1] == ["sh", "-lc"]
+
+
+def test_sandbox_command_runner_defaults_to_no_network_and_grants_it_only_when_asked(worktree, monkeypatch):
+    monkeypatch.setattr(sandbox, "host_user_spec", lambda: None)
+
+    off = FakeDocker(run=commands_run(lambda cmd: result(0, "")))
+    sandbox.sandbox_command_runner(POLICY, process_runner=off)(worktree, ["x"], 60)
+    assert pair(off.runs[0], "--network") == "none"
+
+    on = FakeDocker(run=commands_run(lambda cmd: result(0, "")))
+    sandbox.sandbox_command_runner(POLICY, network=True, process_runner=on)(worktree, ["x"], 60)
+    assert pair(on.runs[0], "--network") == "bridge"
+
+
+def test_sandbox_command_runner_uses_the_host_user_when_the_platform_has_one(worktree, monkeypatch):
+    monkeypatch.setattr(sandbox, "host_user_spec", lambda: "1000:1000")
+    docker = FakeDocker(run=commands_run(lambda cmd: result(0, "")))
+
+    sandbox.sandbox_command_runner(POLICY, process_runner=docker)(worktree, ["x"], 60)
+
+    assert pair(docker.runs[0], "--user") == "1000:1000"
+
+
+def test_sandbox_command_runner_stops_at_the_first_failing_command(worktree, monkeypatch):
+    monkeypatch.setattr(sandbox, "host_user_spec", lambda: None)
+    docker = FakeDocker(run=commands_run(
+        lambda cmd: result(0, "first ok") if cmd == "first" else result(1, "", "boom")
+    ))
+    run = sandbox.sandbox_command_runner(POLICY, process_runner=docker)
+
+    passed, output = run(worktree, ["first", "second", "third"], 60)
+
+    assert passed is False
+    assert "first ok" in output and "boom" in output and "[exit 1]" in output
+    assert "third" not in output
+    assert len(docker.runs) == 2  # third never ran
+
+
+def test_sandbox_command_runner_a_timeout_is_a_red_result_with_a_clear_line(worktree, monkeypatch):
+    monkeypatch.setattr(sandbox, "host_user_spec", lambda: None)
+
+    def timing_out(argv):
+        return result(sandbox.RC_TIMEOUT, "", "timed out after 5s")
+
+    run = sandbox.sandbox_command_runner(POLICY, process_runner=FakeDocker(run=timing_out))
+
+    passed, output = run(worktree, ["sleep 999"], 5)
+
+    assert passed is False and "[TIMEOUT after 5s]" in output
+
+
+def test_sandbox_command_runner_raises_infrastructure_error_when_docker_is_unavailable(worktree):
+    docker = FakeDocker(info=result(127, "", "docker: command not found"))
+    run = sandbox.sandbox_command_runner(POLICY, process_runner=docker)
+
+    with pytest.raises(SandboxInfrastructureError, match="docker CLI not found"):
+        run(worktree, ["x"], 60)
+
+    assert docker.runs == []  # never attempted a docker run it could not have started
+
+
+def test_sandbox_command_runner_raises_infrastructure_error_when_the_image_is_missing(worktree):
+    docker = FakeDocker(inspect=result(1, "", "no such image"))
+    run = sandbox.sandbox_command_runner(POLICY, process_runner=docker)
+
+    with pytest.raises(SandboxInfrastructureError, match=re.escape(IMAGE)):
+        run(worktree, ["x"], 60)
+
+    assert docker.runs == []
+
+
+def test_sandbox_command_runner_infrastructure_error_never_a_silent_pass_or_host_fallback(worktree, monkeypatch):
+    """Docker down must raise, never return (True, ...) and never run the command on the host instead."""
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError(
+        "the host must never run a gate command when the sandbox is enabled"
+    )))
+    docker = FakeDocker(info=result(1, "", "daemon not running"))
+    run = sandbox.sandbox_command_runner(POLICY, process_runner=docker)
+
+    with pytest.raises(SandboxInfrastructureError):
+        run(worktree, ["echo hi"], 60)
 
 
 def test_the_sandbox_files_contain_neither_the_em_dash_nor_the_section_sign():

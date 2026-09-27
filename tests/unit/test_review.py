@@ -1768,3 +1768,121 @@ def test_gate_config_paths_never_raises_when_git_cannot_answer(gate_repo, tmp_pa
     monkeypatch.setattr(review.subprocess, "run", no_git)
 
     assert review.gate_config_paths(["python tools/check.py"], repo, head) == []
+
+
+# --- round 9 (ASES-QG-04, ASES-SEC-03/05/07): Gate 1 routes through gates.resolve_runner -----------------------
+
+
+class _FakeProjectConfig:
+    def __init__(self, enabled=True):
+        self.sandbox_enabled = enabled
+
+    def sandbox_policy_config(self):
+        return {"sandbox": {"image": "registry.example/toolchain:1.0"}}
+
+
+class _FakeTask:
+    def __init__(self, sandbox_network=False, sandbox_network_reason=""):
+        self.sandbox_network = sandbox_network
+        self.sandbox_network_reason = sandbox_network_reason
+
+
+def _watch_resolve_runner(monkeypatch):
+    calls = []
+    real = gates.resolve_runner
+
+    def spy(project_config, task=None):
+        calls.append((project_config, task))
+        return real(project_config, task)
+
+    monkeypatch.setattr(gates, "resolve_runner", spy)
+    return calls
+
+
+def test_check_branch_passes_project_config_and_task_to_resolve_runner(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/RR1", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    calls = _watch_resolve_runner(monkeypatch)
+    project_config, task = _FakeProjectConfig(enabled=False), _FakeTask()
+
+    review.check_branch(
+        repo, "swarm/RR1", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RR1",
+        project_config=project_config, task=task,
+    )
+
+    assert calls == [(project_config, task)]
+
+
+def test_check_branch_for_merge_passes_project_config_and_task_to_resolve_runner(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/RR2", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    calls = _watch_resolve_runner(monkeypatch)
+    project_config, task = _FakeProjectConfig(enabled=False), _FakeTask()
+
+    review.check_branch_for_merge(
+        repo, "swarm/RR2", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RR2",
+        project_config=project_config, task=task,
+    )
+
+    assert calls == [(project_config, task)]
+
+
+def test_check_branch_with_no_project_config_resolves_the_host_runner_exactly_as_before(repo, tmp_path):
+    """Default None/None: today's behaviour, unchanged (the resolution call still happens, but resolves to the
+    host runner, exactly as gates.run_gate's own default)."""
+    _branch_with_changes(repo, "swarm/RR3", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    head = _head(repo, "swarm/RR3")
+
+    result = review.check_branch(
+        repo, "swarm/RR3", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RR3",
+    )
+
+    assert (result.ok, result.head) == (True, head)
+    assert _gate_rows(conn, "RR3") == [("gate1", head, "pass")]
+
+
+def test_check_branch_when_sandbox_enabled_gives_run_gate_the_sandbox_runner_and_self_contained_checkout(
+    repo, tmp_path, monkeypatch,
+):
+    _branch_with_changes(repo, "swarm/RR4", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = {}
+
+    def fake_run_gate(repo_arg, head, gate_name, commands, *, conn, task_key, runner=None,
+                       self_contained_checkout=False, **kwargs):
+        seen["runner"] = runner
+        seen["self_contained_checkout"] = self_contained_checkout
+        return gates.GateResult(gate_name, head, True, "ok")
+
+    monkeypatch.setattr(gates, "run_gate", fake_run_gate)
+
+    review.check_branch(
+        repo, "swarm/RR4", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RR4",
+        project_config=_FakeProjectConfig(enabled=True), task=_FakeTask(),
+    )
+
+    assert seen["self_contained_checkout"] is True
+    assert callable(seen["runner"])
+
+
+def test_gate_before_review_passes_project_config_and_task_through_to_check_branch(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/RR5", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = {}
+
+    def fake_check_branch(repo_arg, branch, integration_branch, commands, touches, *, conn, task_key,
+                           project_config=None, task=None):
+        seen["project_config"] = project_config
+        seen["task"] = task
+        return review.BranchCheck(True, "ok", "stubbed", "a" * 40)
+
+    monkeypatch.setattr(review, "check_branch", fake_check_branch)
+    project_config, task = _FakeProjectConfig(), _FakeTask()
+
+    review.gate_before_review(
+        "b", "card1", repo, "swarm/RR5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RR5",
+        project_config=project_config, task=task,
+    )
+
+    assert (seen["project_config"], seen["task"]) == (project_config, task)

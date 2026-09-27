@@ -604,3 +604,250 @@ def test_run_gate_worktree_checkout_hook_cannot_see_a_planted_key(repo, tmp_path
             pytest.fail("the post-checkout hook did not run even though a POSIX shell is available on this machine")
         pytest.skip("no sh or bash on PATH to run a #!/bin/sh post-checkout hook on this machine")
     assert marker.read_text(encoding="utf-8").strip() == "NOKEY"
+
+
+# --- _git (round 9 coordination note, r9_rules.md): the one local git-launcher GITHARDEN's gitexec.py can swap in
+
+
+def test_git_helper_builds_a_dash_c_argv_and_scrubs_the_environment(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        seen["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(gates.subprocess, "run", fake_run)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-SHOULDNEVERSURVIVE0123456789")
+
+    gates._git(["status"], cwd="C:/some/repo", timeout=42)
+
+    assert seen["argv"] == ["git", "-C", "C:/some/repo", "status"]
+    assert seen["timeout"] == 42
+    assert "OPENROUTER_API_KEY" not in seen["env"]
+
+
+def test_git_helper_without_cwd_has_no_dash_c(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(gates.subprocess, "run", lambda argv, **kw: seen.update(argv=argv) or
+                         subprocess.CompletedProcess(argv, 0, "", ""))
+
+    gates._git(["clone", "a", "b"], timeout=42)
+
+    assert seen["argv"] == ["git", "clone", "a", "b"]
+
+
+# --- resolve_runner (round 9, ASES-QG-04, ASES-SEC-03/05/07) ---------------------------------------------------
+
+
+class _FakeProjectConfig:
+    """A duck-typed stand-in for ases.config.ProjectConfig: resolve_runner reads only these two members."""
+
+    def __init__(self, *, enabled=True, image="registry.example/toolchain:1.0"):
+        self.sandbox_enabled = enabled
+        self._image = image
+
+    def sandbox_policy_config(self):
+        return {"sandbox": {"image": self._image}}
+
+
+class _FakeTask:
+    """A duck-typed stand-in for ases.plan.PlanTask: resolve_runner reads only these two members."""
+
+    def __init__(self, sandbox_network=False, sandbox_network_reason=""):
+        self.sandbox_network = sandbox_network
+        self.sandbox_network_reason = sandbox_network_reason
+
+
+def test_resolve_runner_off_with_no_project_config():
+    choice = gates.resolve_runner(None)
+    assert choice == gates.GateRunner(None, False)
+
+
+def test_resolve_runner_off_when_sandbox_enabled_is_false():
+    choice = gates.resolve_runner(_FakeProjectConfig(enabled=False))
+    assert choice == gates.GateRunner(None, False)
+
+
+def test_resolve_runner_on_returns_a_callable_sandbox_runner_and_self_contained_true():
+    choice = gates.resolve_runner(_FakeProjectConfig(enabled=True))
+    assert choice.self_contained is True
+    assert callable(choice.runner)
+
+
+def test_resolve_runner_builds_the_policy_from_the_projects_own_sandbox_config(monkeypatch):
+    seen = []
+
+    def fake_command_runner(policy, *, network=False, **kwargs):
+        seen.append((policy.image, network))
+        return lambda *a: (True, "")
+
+    monkeypatch.setattr(gates.sandbox_mod, "sandbox_command_runner", fake_command_runner)
+
+    gates.resolve_runner(_FakeProjectConfig(image="registry.example/special:9.9"))
+
+    assert seen == [("registry.example/special:9.9", False)]
+
+
+def test_resolve_runner_grants_network_only_to_a_task_with_an_explicit_non_empty_reason(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        gates.sandbox_mod, "sandbox_command_runner",
+        lambda policy, *, network=False, **kwargs: seen.append(network) or (lambda *a: (True, "")),
+    )
+
+    gates.resolve_runner(_FakeProjectConfig(), task=None)
+    gates.resolve_runner(_FakeProjectConfig(), task=_FakeTask(False, ""))
+    gates.resolve_runner(_FakeProjectConfig(), task=_FakeTask(False, "installs a package"))  # flag off: ignored
+    gates.resolve_runner(_FakeProjectConfig(), task=_FakeTask(True, ""))  # no reason: no exception
+    gates.resolve_runner(_FakeProjectConfig(), task=_FakeTask(True, "   "))  # blank reason: no exception
+    gates.resolve_runner(_FakeProjectConfig(), task=_FakeTask(True, "installs a package"))
+
+    assert seen == [False, False, False, False, False, True]
+
+
+def test_resolve_runner_never_grants_network_when_the_switch_is_off():
+    """Gates 4/5 and every other caller that passes no task, or a project with the sandbox off, always gets
+    GateRunner(None, False): there is no runner at all to carry a network flag."""
+    choice = gates.resolve_runner(_FakeProjectConfig(enabled=False), task=_FakeTask(True, "needs the registry"))
+    assert choice == gates.GateRunner(None, False)
+
+
+# --- self-contained checkout (round 9, ASES-QG-04, ASES-SEC-03): sandbox mode's own checkout, no Docker needed --
+
+
+def test_self_contained_checkout_is_a_real_directory_at_the_exact_sha_with_no_alternates(repo, tmp_path):
+    target = tmp_path / "checkout"
+    sha = _head_sha(repo)
+
+    result = gates._self_contained_checkout(repo, sha, target)
+
+    assert result.returncode == 0
+    assert (target / ".git").is_dir()  # never a FILE pointing back at the host repo, unlike a linked worktree
+    head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+    assert head == sha
+    assert (target / "ok.py").is_file()  # the commit's tree was actually checked out, not left bare
+    assert not (target / ".git" / "objects" / "info" / "alternates").exists()
+
+
+def test_self_contained_checkout_never_shares_a_host_object_file(repo, tmp_path):
+    """--no-hardlinks: writing through the clone's own object file must never reach the host repository's copy.
+    A real hardlink would make this mutation visible on both sides."""
+    target = tmp_path / "checkout"
+    gates._self_contained_checkout(repo, _head_sha(repo), target)
+
+    checked = False
+    for shard in (target / ".git" / "objects").iterdir():
+        if shard.name in ("pack", "info") or not shard.is_dir():
+            continue
+        for obj in shard.iterdir():
+            source_obj = repo / ".git" / "objects" / shard.name / obj.name
+            assert source_obj.is_file(), "the clone has an object the source repository does not"
+            before = source_obj.read_bytes()
+            with open(obj, "ab") as fh:
+                fh.write(b"\x00not-shared")
+            assert source_obj.read_bytes() == before, "the clone's object and the host's are the same file (hardlinked)"
+            checked = True
+            break
+        if checked:
+            break
+    assert checked, "expected at least one loose object to compare"
+
+
+def test_self_contained_checkout_does_not_share_the_host_repositorys_hooks(repo, tmp_path):
+    """Unlike run_gate's own worktree-add checkout (test_run_gate_worktree_checkout_hook_cannot_see_a_planted_key
+    above), a clone's .git/hooks holds only git's own .sample files: a hook planted in the host repository never
+    runs at all here, not even without a credential to see."""
+    marker = tmp_path / "marker.txt"
+    _write_post_checkout_hook(repo, marker)
+    target = tmp_path / "checkout"
+
+    result = gates._self_contained_checkout(repo, _head_sha(repo), target)
+
+    assert result.returncode == 0
+    assert not marker.exists()
+
+
+def test_self_contained_checkout_a_bad_commit_fails_cleanly(repo, tmp_path):
+    target = tmp_path / "checkout"
+
+    result = gates._self_contained_checkout(repo, "0" * 40, target)
+
+    assert result.returncode != 0
+
+
+# --- run_gate(self_contained_checkout=True) (round 9) ------------------------------------------------------------
+
+
+def test_run_gate_self_contained_checkout_gives_the_runner_a_standalone_clone(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    seen = {}
+
+    def runner(worktree, commands, timeout):
+        # Captured DURING the call: run_gate tears the checkout down again as soon as this returns.
+        seen["is_git_dir"] = (worktree / ".git").is_dir()
+        seen["commands"] = list(commands)
+        return True, "ran in the sandbox"
+
+    result = gates.run_gate(
+        repo, _head_sha(repo), "gate1", ["pytest -q"], runner=runner, self_contained_checkout=True,
+    )
+
+    assert (result.passed, result.detail) == (True, "ran in the sandbox")
+    assert seen == {"is_git_dir": True, "commands": ["pytest -q"]}
+
+
+def test_run_gate_self_contained_checkout_cleans_up_afterward(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    runner = FakeRunner()
+
+    gates.run_gate(repo, _head_sha(repo), "gate1", ["x"], runner=runner, self_contained_checkout=True)
+
+    worktree = runner.calls[0][0]
+    assert not worktree.exists() and not worktree.parent.exists()
+    # unlike the worktree mode, nothing was ever registered with the source repository to unregister
+    listing = subprocess.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True).stdout
+    assert len(listing.strip().splitlines()) == 1
+
+
+def test_run_gate_self_contained_checkout_bad_commit_never_calls_the_runner(repo, monkeypatch):
+    _forbid_local_runner(monkeypatch)
+    runner = FakeRunner()
+
+    result = gates.run_gate(
+        repo, "0" * 40, "gate1", ["x"], runner=runner, self_contained_checkout=True,
+    )
+
+    assert result.passed is False and "could not create gate checkout" in result.detail
+    assert runner.calls == []
+
+
+def test_run_gate_self_contained_checkout_false_is_still_todays_worktree_message(repo):
+    """The host-mode failure text must stay exactly what it was before this round, since an existing caller or
+    test may match on it."""
+    result = gates.run_gate(repo, "0" * 40, "gate1", ["x"])
+    assert "could not create gate worktree" in result.detail
+
+
+# --- hash_gate_profiles with sandbox_network_exceptions (round 9, ASES-SEC-05/07) --------------------------------
+
+
+def test_hash_gate_profiles_with_no_exceptions_matches_the_hash_before_this_parameter_existed():
+    profiles = {"default": ["pytest -q"]}
+    assert gates.hash_gate_profiles(profiles) == gates.hash_gate_profiles(profiles, None) \
+        == gates.hash_gate_profiles(profiles, {})
+
+
+def test_hash_gate_profiles_changes_when_a_network_exception_is_added_or_edited():
+    profiles = {"default": ["pytest -q"]}
+    plain = gates.hash_gate_profiles(profiles)
+    with_exception = gates.hash_gate_profiles(profiles, {"T1": [True, "installs a package"]})
+    different_reason = gates.hash_gate_profiles(profiles, {"T1": [True, "a different reason"]})
+
+    assert plain != with_exception != different_reason
+    assert len({plain, with_exception, different_reason}) == 3
+    # deterministic and order-independent, same as the base hash
+    assert gates.hash_gate_profiles(profiles, {"T1": [True, "installs a package"]}) == with_exception

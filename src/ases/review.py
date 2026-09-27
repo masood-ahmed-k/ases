@@ -62,6 +62,7 @@ class BranchCheck:
 def gate_before_review(
     board: str, card_id: str, repo: pathlib.Path, branch: str, integration_branch: str,
     gate1_commands: list[str], touches: list[str], *, conn, task_key: str,
+    project_config=None, task=None,
 ) -> bool:
     """ASES-REV-05 (Gate 1 re-check) + ASES-GIT-13 (touches-path check). Returns True if both pass
     (card stays in review for the reviewer), False if it sent the card back (a failed attempt, not a
@@ -81,9 +82,17 @@ def gate_before_review(
     found, so the report's findings show it: the send-back itself is only a comment on the card). A
     `tamper_check_error` result (git could not produce the diff) is NOT sent back: a check that failed to run says
     nothing about the card, and the merge-time check (check_branch_for_merge) is authoritative and fails closed,
-    so the card stays in review for the reviewer, a tamper_check_error event is recorded, and this returns True."""
+    so the card stays in review for the reviewer, a tamper_check_error event is recorded, and this returns True.
+
+    `project_config`/`task` (round 9, ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07) reach
+    gates.resolve_runner through check_branch/_run_gate1, so the Gate 1 re-check runs in the sandbox when the
+    project has it enabled, with `task`'s own network exception if it carries one. Both are optional and None by
+    default (today's behaviour, the host runner). sandbox.SandboxInfrastructureError from the gate call is NOT
+    caught here: it is an infrastructure failure, never a red Gate 1, and the caller (controller.py's
+    process_review_lane) decides what to do about it."""
     result = check_branch(
         repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
+        project_config=project_config, task=task,
     )
     if result.kind == "tamper_check_error":
         events_mod.record(conn, "tamper_check_error", {
@@ -102,26 +111,31 @@ def gate_before_review(
 
 def check_branch(
     repo: pathlib.Path, branch: str, integration_branch: str, gate1_commands: list[str],
-    touches: list[str], *, conn, task_key: str,
+    touches: list[str], *, conn, task_key: str, project_config=None, task=None,
 ) -> BranchCheck:
     """The decision behind gate_before_review, with no Hermes call: resolve the branch head, find its
     merge-base with the integration branch, hold the diff to the card's touches, run the tamper check over the
     same range (ASES-QG-03, ASES-QG-02, ASES-GIT-07), then re-run Gate 1 on the head (which records a gate_runs
     row). Gate 1 always runs when the scope and tamper checks pass; the merge queue uses check_branch_for_merge
-    instead, which reuses a record the controller already holds."""
+    instead, which reuses a record the controller already holds.
+
+    `project_config`/`task` (round 9): passed straight through to _run_gate1's gates.resolve_runner call; see
+    gate_before_review's own docstring."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope
     tampered = _check_tamper(repo, base, scope.head, touches, gate1_commands)
     if tampered is not None:
         return tampered
-    return _run_gate1(repo, scope.head, gate1_commands, conn=conn, task_key=task_key)
+    return _run_gate1(
+        repo, scope.head, gate1_commands, conn=conn, task_key=task_key, project_config=project_config, task=task,
+    )
 
 
 def check_branch_for_merge(
     repo: pathlib.Path, branch: str, integration_branch: str, gate1_commands: list[str],
     touches: list[str], *, conn, task_key: str, require_binding: bool = False,
-    reviewed_commit: str | None = None,
+    reviewed_commit: str | None = None, project_config=None, task=None,
 ) -> BranchCheck:
     """The merge queue's own branch check (ASES-GIT-03, ASES-GIT-13, ASES-QG-01). It does not rely on the
     review lane: Hermes's own gateway dispatcher can claim a review card and start the reviewer before
@@ -155,7 +169,13 @@ def check_branch_for_merge(
     (which may predate the check, or come from a path that never ran it) does not excuse a diff that tampers. It
     reads git only, it never runs a gate. A `tamper` or `tamper_check_error` result is returned as it is and the
     caller decides: `tamper` is a failure like any other, `tamper_check_error` means nothing is known and the
-    merge must not go ahead on it (it fails closed, and is worth retrying)."""
+    merge must not go ahead on it (it fails closed, and is worth retrying).
+
+    `project_config`/`task` (round 9, ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07): passed straight
+    through to _run_gate1's gates.resolve_runner call when Gate 1 actually runs here (the "otherwise" case
+    above), so this task's own network exception, if it carries one, reaches its Gate 1 re-run just as it does
+    the Gate 1 review-lane check. sandbox.SandboxInfrastructureError is NOT caught here: the caller
+    (controller.py's merge loop) decides what an infrastructure failure means for the merge."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope
@@ -205,7 +225,9 @@ def check_branch_for_merge(
             head,
         )
 
-    return _run_gate1(repo, head, gate1_commands, conn=conn, task_key=task_key)
+    return _run_gate1(
+        repo, head, gate1_commands, conn=conn, task_key=task_key, project_config=project_config, task=task,
+    )
 
 
 def _check_scope(
@@ -376,10 +398,20 @@ def _files_at(repo: pathlib.Path, head: str, paths: list[str]) -> list[str]:
 
 def _run_gate1(
     repo: pathlib.Path, head: str, gate1_commands: list[str], *, conn, task_key: str,
+    project_config=None, task=None,
 ) -> BranchCheck:
     """Run Gate 1 on `head` through the gate runner (which records the result in gate_runs) and translate
-    it. The red reason text is what gate_before_review has always sent to Hermes for a failed re-check."""
-    result = gates_mod.run_gate(repo, head, "gate1", gate1_commands, conn=conn, task_key=task_key)
+    it. The red reason text is what gate_before_review has always sent to Hermes for a failed re-check.
+
+    Round 9 (ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07): `project_config`/`task` go through
+    gates.resolve_runner, the ONE place that decides whether this Gate 1 run uses the host or a sandbox runner,
+    and whether `task`'s own network exception applies. A sandbox.SandboxInfrastructureError from run_gate is
+    NOT caught here: an infrastructure failure is not a red gate, and the caller decides what it means."""
+    choice = gates_mod.resolve_runner(project_config, task)
+    result = gates_mod.run_gate(
+        repo, head, "gate1", gate1_commands, conn=conn, task_key=task_key,
+        runner=choice.runner, self_contained_checkout=choice.self_contained,
+    )
     if not result.passed:
         return BranchCheck(
             False, "gate1_red", f"Gate 1 failed on the controller's re-check:\n{_evidence(result.detail)}", head,

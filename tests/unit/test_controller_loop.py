@@ -2409,6 +2409,58 @@ def test_finalize_uses_the_real_merge_card_statuses(tmp_path, monkeypatch):
     assert run_finalize(w) == "finished" and len(fake.calls) == 1
 
 
+# --- round 9 (ASES-QG-04, ASES-SEC-03): Gates 4/5 route through gates.resolve_runner, with no task ---------------
+
+
+def _sandbox_project(project):
+    return dataclasses.replace(project, sandbox={
+        "enabled": True, "terminal_backend": "docker", "network_default": False, "mount": "worktree_only",
+        "forward_env": [], "network_exceptions": "explicit_allowlist", "image": "registry.example/tool:1.0",
+    })
+
+
+def test_process_finalize_asks_resolve_runner_with_no_task(tmp_path, monkeypatch):
+    """Gates 4/5 are project-wide, not task-scoped: resolve_runner is called with no task at all, so no task's
+    network exception can ever reach a final gate (ASES-SEC-05, ASES-SEC-07)."""
+    w, fake = finalize_world(tmp_path, monkeypatch)
+    seen = []
+    real = gates_mod.resolve_runner
+    monkeypatch.setattr(gates_mod, "resolve_runner", lambda *a, **kw: seen.append((a, kw)) or real(*a, **kw))
+
+    controller.process_finalize("b", w.repo, w.plan, w.project, MODELS, conn=w.conn)
+
+    assert seen == [((w.project,), {})]
+
+
+def test_process_finalize_with_the_sandbox_off_calls_finalize_with_todays_exact_keywords(tmp_path, monkeypatch):
+    """FakeFinalgates.finalize has a fixed signature (now= only, no runner/run4/run5): reaching "finished" here
+    at all, with no TypeError, proves the sandbox kwargs are omitted when the switch is off."""
+    w, fake = finalize_world(tmp_path, monkeypatch)
+
+    assert run_finalize(w) == "finished"
+    assert fake.calls == [("b", w.repo, w.plan, w.project, MODELS, w.conn, None)]
+
+
+def test_process_finalize_wires_runner_and_self_contained_run4_run5_when_the_sandbox_is_enabled(tmp_path, monkeypatch):
+    w, fake = finalize_world(tmp_path, monkeypatch)
+    fake.run_gate4 = lambda *a, **kw: None  # finalgates.run_gate4/run_gate5 stand-ins: only their identity matters
+    fake.run_gate5 = lambda *a, **kw: None
+    seen = {}
+
+    def fake_finalize(board, repo, plan, project, models_config, conn, *, now=None, runner=None, run4=None,
+                       run5=None):
+        seen.update(runner=runner, run4=run4, run5=run5)
+        return fake.outcome
+
+    monkeypatch.setattr(fake, "finalize", fake_finalize)
+
+    controller.process_finalize("b", w.repo, w.plan, _sandbox_project(w.project), MODELS, conn=w.conn)
+
+    assert callable(seen["runner"])
+    assert seen["run4"].func is fake.run_gate4 and seen["run4"].keywords == {"self_contained_checkout": True}
+    assert seen["run5"].func is fake.run_gate5 and seen["run5"].keywords == {"self_contained_checkout": True}
+
+
 def test_the_final_gates_module_is_imported_lazily():
     """Importing the controller must not import finalgates: it is built at the same time as the controller and is only
     needed once every merge card is done."""
@@ -2520,7 +2572,7 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
     assert rig.args["unpark"] == (("b", rig.plan, rig.models),
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
-    assert rig.args["review"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
+    assert rig.args["review"] == (("b", "the-repo", rig.plan, rig.project), {"conn": rig.conn})
     assert rig.args["provision"] == (("b", rig.plan), {"conn": rig.conn})
     assert rig.args["merge"][1]["models_config"] is rig.models
     assert rig.args["finalize"] == (everything, timed)

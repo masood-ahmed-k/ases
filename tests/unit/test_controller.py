@@ -9,6 +9,7 @@ from ases import config, controller, db, events, hermes, mergeq, plan as plan_mo
 from ases import gates as gates_mod
 from ases import guards as guards_mod
 from ases import questions as questions_mod
+from ases import sandbox as sandbox_mod
 from ases import usage as usage_mod
 
 
@@ -887,6 +888,123 @@ def test_successful_merge_needs_no_fix_card(tmp_path, monkeypatch):
     assert fix_cards == []
 
 
+def _repo_with_one_commit_on_a_work_branch(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_ok("init", "-q", "-b", "integration", cwd=repo)
+    _git_ok("config", "user.email", "t@t", cwd=repo)
+    _git_ok("config", "user.name", "t", cwd=repo)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "init", cwd=repo)
+    _git_ok("checkout", "-q", "-b", "swarm/T1-coder", cwd=repo)
+    (repo / "new.txt").write_text("x\n", encoding="utf-8")
+    _git_ok("add", "-A", cwd=repo)
+    _git_ok("commit", "-q", "-m", "add file", cwd=repo)
+    _git_ok("checkout", "-q", "integration", cwd=repo)
+    return repo
+
+
+def _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo):
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [REVIEWER_COMPLETED]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
+    ))
+    monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: None)
+    return plan, conn, project, pair, created
+
+
+# --- round 9 (ASES-QG-04, ASES-SEC-03): an infrastructure failure at any of the three merge-queue gate calls is
+# recorded and holds the merge, never a red gate and never a silently completed merge on the host instead --------
+
+
+def test_merge_queue_pre_merge_check_branch_for_merge_infrastructure_failure_holds_the_merge(tmp_path, monkeypatch):
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
+    merge_task_calls = []
+    monkeypatch.setattr(mergeq, "merge_task", lambda *a, **kw: merge_task_calls.append(1) or _CONFLICT)
+
+    def boom(*a, **kw):
+        raise sandbox_mod.SandboxInfrastructureError("the sandbox is enabled but docker CLI not found on PATH")
+
+    monkeypatch.setattr(review_mod, "check_branch_for_merge", boom)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    assert merge_task_calls == []  # never reached: nothing was built and nothing needs undoing
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1 and rows[0] == {
+        "task_key": "T1", "card_id": pair.work_card_id, "gate": "gate1",
+        "error": "the sandbox is enabled but docker CLI not found on PATH",
+    }
+    assert _refusals(conn, "merge_failed") == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []
+
+
+def test_merge_queue_gate3_candidate_infrastructure_failure_holds_the_merge(tmp_path, monkeypatch):
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
+    before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    def boom(*a, **kw):
+        raise sandbox_mod.SandboxInfrastructureError("the sandbox is enabled but image x is not present locally")
+
+    monkeypatch.setattr(mergeq, "merge_task", boom)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1 and rows[0] == {
+        "task_key": "T1", "card_id": pair.merge_card_id, "gate": "gate3",
+        "error": "the sandbox is enabled but image x is not present locally",
+    }
+    assert _refusals(conn, "merge_failed") == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []
+    # the integration branch itself was never touched
+    assert _git_ok("rev-parse", "integration", cwd=repo).stdout.strip() == before
+
+
+def test_merge_queue_post_merge_infrastructure_failure_still_completes_the_merge(tmp_path, monkeypatch):
+    """The fast-forward already landed on the integration branch by the time the post-merge re-check runs: an
+    infra failure there must not trigger a revert (nothing is actually known to be wrong) and must not leave the
+    merge card open either (a repeat pass would re-run merge_task on content already merged, which mergeq itself
+    then correctly refuses as "nothing to commit", opening a spurious fix card for a task that succeeded)."""
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
+    completed = []
+    monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: completed.append(cid))
+    reverts = []
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: reverts.append(1))
+    real_run_gate = gates_mod.run_gate
+
+    def boom_on_postmerge_only(repo_arg, sha, gate_name, commands, **kwargs):
+        # The Gate 3 CANDIDATE run (inside mergeq.merge_task, which also calls gates_mod.run_gate) must still
+        # succeed for real, so the fast-forward actually happens and this test reaches the post-merge re-check
+        # it means to exercise; only "gate3-postmerge" fails to start.
+        if gate_name == "gate3-postmerge":
+            raise sandbox_mod.SandboxInfrastructureError("the sandbox is enabled but docker CLI not found on PATH")
+        return real_run_gate(repo_arg, sha, gate_name, commands, **kwargs)
+
+    monkeypatch.setattr(gates_mod, "run_gate", boom_on_postmerge_only)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == ["T1"]
+    assert completed == [pair.merge_card_id]
+    assert reverts == []
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1
+    assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate3-postmerge"
+    assert _refusals(conn, "post_merge_reverted") == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []
+
+
 # ---------------------------------------------------------------------------------------------
 # process_merge_queue: the fix-card lifecycle and the benign fast-forward race (2026-09-19 fixes).
 # These pin how process_merge_queue branches on the SHAPE of a MergeOutcome and on which card
@@ -971,7 +1089,7 @@ def _script_merge_task(monkeypatch, *outcomes):
     queue = list(outcomes)
 
     def fake(repo, integration_branch, work_branch, task_key, gate3_commands, *, conn=None, commit_message=None,
-             allow_empty=False, expected_head=None, project=None, should_stop=None):
+             allow_empty=False, expected_head=None, project=None, should_stop=None, project_config=None, task=None):
         calls.append({"integration_branch": integration_branch, "work_branch": work_branch, "task_key": task_key,
                       "commit_message": commit_message, "allow_empty": allow_empty,
                       "expected_head": expected_head, "project": project, "should_stop": should_stop})
@@ -986,7 +1104,8 @@ def _record_gate_calls(monkeypatch):
     passing the wrong arguments fails loudly instead of being swallowed by *args."""
     calls = []
 
-    def fake(board, card_id, repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key):
+    def fake(board, card_id, repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key,
+              project_config=None, task=None):
         calls.append({"card_id": card_id, "branch": branch, "integration_branch": integration_branch,
                       "touches": touches, "task_key": task_key})
         return True
@@ -1307,6 +1426,72 @@ def test_review_lane_passes_the_plans_own_integration_branch_to_the_gate(tmp_pat
     assert [(c["card_id"], c["integration_branch"]) for c in gate_calls] == [(pair.work_card_id, "main-line")]
 
 
+def test_review_lane_passes_the_project_and_task_to_gate_before_review(tmp_path, monkeypatch):
+    """Round 9 (ASES-QG-04, ASES-SEC-03/05/07): the caller hands gate_before_review the project (for
+    gates.resolve_runner) and the task itself (for its own network exception)."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+    seen = {}
+
+    def fake(board, card_id, repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key,
+              project_config=None, task=None):
+        seen["project_config"] = project_config
+        seen["task"] = task
+        return True
+
+    monkeypatch.setattr(review_mod, "gate_before_review", fake)
+
+    controller.process_review_lane("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert seen["project_config"] is project
+    assert seen["task"] is plan.task("T1")
+
+
+def test_review_lane_an_infrastructure_failure_is_recorded_and_the_card_is_held_not_sent_back(tmp_path, monkeypatch):
+    """Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox is enabled but Gate 1's re-check could not even start.
+    Not a red gate: the card stays in review (never sent back) to be re-checked next pass, and a
+    sandbox_infrastructure_error event records what happened."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+
+    def boom(*args, **kwargs):
+        raise sandbox_mod.SandboxInfrastructureError("the sandbox is enabled but docker CLI not found on PATH")
+
+    monkeypatch.setattr(review_mod, "gate_before_review", boom)
+
+    sent_back = controller.process_review_lane("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert sent_back == []
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1
+    assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate1"
+    assert "docker CLI not found" in rows[0]["error"]
+    assert _refusals(conn, "gate1_recheck_failed") == []  # never treated as a red gate
+
+
+def test_review_lane_an_infrastructure_failure_is_recorded_only_once_per_card_per_pass(tmp_path, monkeypatch):
+    """A persistent outage must not flood the events table: same reasoning as tamper_check_error (_record_once)."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+    monkeypatch.setattr(review_mod, "gate_before_review", lambda *a, **kw: (_ for _ in ()).throw(
+        sandbox_mod.SandboxInfrastructureError("the sandbox is enabled but docker CLI not found on PATH")
+    ))
+
+    controller.process_review_lane("b", tmp_path / "repo", plan, project, conn=conn)
+    controller.process_review_lane("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert len(_refusals(conn, "sandbox_infrastructure_error")) == 1
+
+
 def test_budget_gate_now_covers_a_fix_card_too(tmp_path, monkeypatch):
     """Side effect of the repoint (2026-09-19), pinned deliberately: process_budget_gate finds a 'ready'
     card by that same work_card_id column, so a fix card, which spends the same provider's daily requests
@@ -1378,6 +1563,53 @@ def test_verify_gate_pin_scoped_per_project(tmp_path):
     conn = db.connect(tmp_path / "ases.db")
     controller.pin_gate_profiles(conn, "a", {"default": ["pytest -q"]})
     controller.verify_gate_pin(conn, "b", {"default": ["a completely different command"]})  # must not raise
+
+
+# --- round 9 (ASES-SEC-05/-07): sandbox_network_exceptions is pinned alongside the gate profiles ----------------
+
+
+def test_pin_and_verify_with_no_network_exceptions_behaves_exactly_as_before(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles, None)
+    controller.verify_gate_pin(conn, "t3", dict(profiles), {})  # must not raise: None and {} agree
+
+
+def test_verify_gate_pin_raises_when_a_network_exception_is_added_after_approval(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles)  # approved with no exception at all
+
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(conn, "t3", profiles, {"T1": [True, "installs a package"]})
+
+
+def test_verify_gate_pin_raises_when_a_network_exception_is_edited_after_approval(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles, {"T1": [True, "installs a package"]})
+
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(conn, "t3", profiles, {"T1": [True, "a different reason entirely"]})
+
+
+def test_verify_gate_pin_raises_when_a_network_exception_is_removed_after_approval(tmp_path):
+    """The flag itself was flipped back off after approval without a fresh `swarm approve`: still a change from
+    what Gate P saw, so it must be caught exactly like adding one."""
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles, {"T1": [True, "installs a package"]})
+
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(conn, "t3", profiles, {})
+
+
+def test_pin_and_verify_with_the_same_network_exception_passes(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    exceptions = {"T1": [True, "installs a package"]}
+    controller.pin_gate_profiles(conn, "t3", profiles, exceptions)
+    controller.verify_gate_pin(conn, "t3", dict(profiles), dict(exceptions))  # must not raise
 
 
 # ---------------------------------------------------------------------------------------------

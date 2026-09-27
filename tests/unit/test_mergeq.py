@@ -1375,3 +1375,95 @@ def test_a_real_gate3_that_prints_a_secret_is_redacted_in_the_outcome_and_in_gat
     stored = conn.execute("SELECT detail FROM gate_runs WHERE task_key = 'R4'").fetchone()["detail"]
     assert SECRET not in outcome.detail and SECRET not in stored
     assert "[redacted]" in outcome.detail and "[redacted]" in stored
+
+
+# --- round 9 (ASES-QG-04, ASES-SEC-03/05/07): the Gate 3 candidate routes through gates.resolve_runner ----------
+
+
+class _FakeProjectConfig:
+    def __init__(self, enabled=True):
+        self.sandbox_enabled = enabled
+
+    def sandbox_policy_config(self):
+        return {"sandbox": {"image": "registry.example/toolchain:1.0"}}
+
+
+class _FakeTask:
+    def __init__(self, sandbox_network=False, sandbox_network_reason=""):
+        self.sandbox_network = sandbox_network
+        self.sandbox_network_reason = sandbox_network_reason
+
+
+def test_merge_task_passes_project_config_and_task_to_resolve_runner(repo, tmp_path, monkeypatch):
+    _make_work_branch(repo, "swarm/PC1", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    calls = []
+    real = gates.resolve_runner
+
+    def spy(project_config, task=None):
+        calls.append((project_config, task))
+        return real(project_config, task)
+
+    monkeypatch.setattr(gates, "resolve_runner", spy)
+    project_config, task = _FakeProjectConfig(enabled=False), _FakeTask()
+
+    mergeq.merge_task(
+        repo, "integration", "swarm/PC1", "PC1", ["echo gate3-ok"], conn=conn,
+        project_config=project_config, task=task,
+    )
+
+    assert calls == [(project_config, task)]
+
+
+def test_merge_task_with_no_project_config_merges_exactly_as_before(repo, tmp_path):
+    """Default None/None: today's behaviour, unchanged."""
+    _make_work_branch(repo, "swarm/PC2", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    outcome = mergeq.merge_task(repo, "integration", "swarm/PC2", "PC2", ["echo gate3-ok"], conn=conn)
+
+    assert outcome.merged is True and outcome.gate3_result == "pass"
+
+
+def test_merge_task_when_sandbox_enabled_gives_run_gate_the_sandbox_runner_and_self_contained_checkout(
+    repo, tmp_path, monkeypatch,
+):
+    _make_work_branch(repo, "swarm/PC3", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+    seen = {}
+
+    def fake_run_gate(repo_arg, sha, gate_name, commands, *, conn, task_key, project=None, runner=None,
+                       self_contained_checkout=False, **kwargs):
+        seen["runner"] = runner
+        seen["self_contained_checkout"] = self_contained_checkout
+        return gates.GateResult(gate_name, sha, True, "ok")
+
+    monkeypatch.setattr(gates, "run_gate", fake_run_gate)
+
+    mergeq.merge_task(
+        repo, "integration", "swarm/PC3", "PC3", ["echo gate3-ok"], conn=conn,
+        project_config=_FakeProjectConfig(enabled=True), task=_FakeTask(),
+    )
+
+    assert seen["self_contained_checkout"] is True
+    assert callable(seen["runner"])
+
+
+def test_merge_task_with_the_sandbox_off_calls_run_gate_with_todays_exact_keywords(repo, tmp_path, monkeypatch):
+    """A run_gate stand-in with a fixed signature (no **kwargs, no self_contained_checkout) must keep working:
+    the sandbox kwargs are added to the call only when the sandbox is actually enabled."""
+    _make_work_branch(repo, "swarm/PC4", "new.txt", "hello\n")
+    conn = db.connect(tmp_path / "ases.db")
+
+    def fixed_signature_run_gate(repo_arg, sha, gate_name, commands, *, conn=None, task_key="", project=None,
+                                  timeout_per_command=120, runner=None):
+        return gates.GateResult(gate_name, sha, True, "ok")
+
+    monkeypatch.setattr(gates, "run_gate", fixed_signature_run_gate)
+
+    outcome = mergeq.merge_task(
+        repo, "integration", "swarm/PC4", "PC4", ["echo gate3-ok"], conn=conn,
+        project_config=_FakeProjectConfig(enabled=False), task=_FakeTask(),
+    )
+
+    assert outcome.merged is True

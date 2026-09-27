@@ -13,6 +13,9 @@ injectable, so the tests never need Docker:
   mount and to mask a committed .env with an empty file (test 22.10: reading .env from inside the sandbox fails).
 - docker_run_argv: the `docker run` argv for the controller's own sandboxed gate runs (ASES-QG-04). It is built
   from the worktree and the masks only and refuses anything else.
+- sandbox_command_runner (round 9): wraps docker_run_argv as the `runner` hook gates.run_gate takes, one `docker
+  run` per gate command, with the task-scoped network exception (ASES-SEC-05, ASES-SEC-07) as its one parameter.
+  gates.resolve_runner is the single place that decides whether a gate call gets one of these or the host runner.
 - key_visibility_test / exfiltration_probe: tests 22.10 and 22.11 as runnable probes.
 
 Nothing here starts Docker or pulls an image: both are stop-condition actions that need the user (section 16).
@@ -67,6 +70,7 @@ import pathlib
 import posixpath
 import re
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, NamedTuple
 
@@ -104,6 +108,15 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 class SandboxConfigError(Exception):
     """A sandbox: value is unknown or malformed, or a docker command would break the sandbox rules."""
+
+
+class SandboxInfrastructureError(Exception):
+    """Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox switch is on but a gate run could not even start -- Docker
+    is unreachable, the pinned image is not present locally, or the docker argv could not be built. Raised by
+    the runner sandbox_command_runner hands to gates.run_gate, and deliberately NOT a SandboxConfigError: this is
+    an infrastructure failure, never a red gate, and a caller must catch this exact type to record a clean, visible
+    infrastructure event and hold the card or merge, never fail the task and never fall back to the host silently
+    (see gates.resolve_runner and each gate caller's own exception handling)."""
 
 
 def looks_like_credential(name: str) -> bool:
@@ -1087,6 +1100,70 @@ def image_present(image: str, runner: Callable = default_runner) -> bool:
         return False
     result = _safe_run(runner, [_DOCKER, "image", "inspect", "--format", "{{.Id}}", image], _INFO_TIMEOUT)
     return result.returncode == 0
+
+
+def sandbox_command_runner(
+    policy: SandboxPolicy, *, network: bool = False, process_runner: Callable = default_runner,
+    home: object = None,
+) -> Callable[[pathlib.Path, list[str], int], tuple[bool, str]]:
+    """Round 9 (ASES-QG-04, ASES-SEC-02, ASES-SEC-03, ASES-SEC-05, ASES-SEC-06, ASES-SEC-07): build the `runner`
+    gates.run_gate calls instead of its own host runner (_run_commands), so a gate's commands each execute inside
+    a container built by docker_run_argv over the gate's own checkout, never on the host.
+
+    Same contract as gates._run_commands: the returned runner(worktree, commands, timeout) -> (passed, output)
+    stops at the first non-zero command, and a timeout is a red result ending in a "[TIMEOUT after Ns]" line --
+    so the controller's gate_runs row means the same thing whichever runner produced it.
+
+    `network` is the ONE task-scoped permission this runner ever grants (ASES-SEC-05, ASES-SEC-07): False (the
+    default) unless the caller (gates.resolve_runner) resolved an explicit, Gate-0-approved exception for this
+    one gate call. Every command of every call gets only the worktree mounted (plus a mask over each sensitive
+    file inside it, since a gate command runs committed, model-authored code and docker_run_argv's own docstring
+    says callers like this one MUST mask), no inherited environment and no --env-file (ASES-SEC-06), the policy's
+    CPU/memory/PID limits, and the host user where the platform has one (host_user_spec; None on native Windows,
+    where the container then runs as the image's own user, same as docker_run_argv's own default).
+
+    Before running anything, this checks docker_available() and, when the policy names an image, image_present():
+    either missing raises SandboxInfrastructureError instead of attempting a `docker run` that would fail with an
+    unhelpful "docker: command not found" or "no such image" and be misread as an ordinary red gate. A
+    SandboxConfigError while building one command's argv (a worktree that fails mount_problems, a stray NUL byte)
+    is raised the same way: none of these are the code under test failing, so none of them may become a red gate
+    (see SandboxInfrastructureError's own docstring -- callers must catch it specifically)."""
+
+    def run(worktree: pathlib.Path, commands: list[str], timeout: int) -> tuple[bool, str]:
+        ok, why = docker_available(process_runner)
+        if not ok:
+            raise SandboxInfrastructureError(f"the sandbox is enabled but {why}")
+        if policy.image and not image_present(policy.image, process_runner):
+            try:
+                pull = " ".join(pull_command(policy.image))
+            except SandboxConfigError:
+                pull = "(the image name is not a valid reference)"
+            raise SandboxInfrastructureError(
+                f"the sandbox is enabled but image {policy.image} is not present locally; a human runs: {pull}"
+            )
+        user = host_user_spec()
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="ases-sandbox-mask-") as mask_dir:
+            empty_file = pathlib.Path(mask_dir) / "empty"
+            empty_file.touch()
+            for cmd in commands:
+                try:
+                    argv = docker_run_argv(
+                        policy, worktree, cmd, user=user, network=network, empty_file=empty_file, home=home,
+                    )
+                except SandboxConfigError as exc:
+                    raise SandboxInfrastructureError(f"could not build the sandboxed command: {exc}") from exc
+                result = _safe_run(process_runner, argv, timeout)
+                lines.append(f"$ {cmd}\n{result.stdout}{result.stderr}".rstrip())
+                if result.returncode == RC_TIMEOUT:
+                    lines.append(f"[TIMEOUT after {timeout}s]")
+                    return False, "\n".join(lines)
+                if result.returncode != 0:
+                    lines.append(f"[exit {result.returncode}]")
+                    return False, "\n".join(lines)
+        return True, "\n".join(lines)
+
+    return run
 
 
 @dataclasses.dataclass(frozen=True)
