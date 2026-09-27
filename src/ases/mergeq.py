@@ -115,6 +115,28 @@ def _git(args: list[str], cwd: pathlib.Path, timeout: int = 60) -> subprocess.Co
     )
 
 
+def _report_candidate_leak_if_any(
+    conn, tmp_root: pathlib.Path, teardown_result: subprocess.CompletedProcess, *, task_key: str,
+    project: str | None,
+) -> None:
+    """Round 12 (finding 11): mergeq's own counterpart to gates._report_worktree_leak_if_any (same reasoning,
+    same reproduced mechanism -- a Windows file lock on the throwaway candidate worktree, most commonly a gate
+    command that outlived its timeout, can make `git worktree remove --force` fail to delete the directory even
+    though it deregisters it, so nothing built on `git worktree list` can ever find it again). merge_task's
+    finally block used to discard `_git`'s CompletedProcess entirely and run shutil.rmtree with
+    ignore_errors=True, so a leak here was, until now, completely invisible. `tmp_root.exists()` after rmtree is
+    the reliable signal; best effort and never raises, so a broken events table can never mask whatever
+    exception merge_task's own try body is already propagating out of this finally block."""
+    if conn is None or not tmp_root.exists():
+        return
+    try:
+        events_mod.record(conn, "merge_worktree_leak", {
+            "task_key": task_key, "path": str(tmp_root), "git_exit_code": teardown_result.returncode,
+        }, project=project)
+    except Exception:  # noqa: BLE001 - best effort, see the docstring above
+        pass
+
+
 def _head_sha(repo: pathlib.Path) -> str:
     return _git(["rev-parse", "HEAD"], repo).stdout.strip()
 
@@ -240,7 +262,8 @@ def merge_task(
     `project_config` is an ases.config.ProjectConfig (or a duck-typed stand-in, see resolve_runner); `task` is
     this task's own ases.plan.PlanTask, so its sandbox_network exception, if it carries one, applies to this one
     candidate run. Both default to None: today's behaviour, the host runner. A
-    sandbox.SandboxInfrastructureError from the Gate 3 run is NOT caught here -- nothing has been built or
+    sandbox.SandboxInfrastructureError, or (round 12, finding 0) a gates.GateCheckoutError -- the candidate's own
+    checkout could not even be created -- from the Gate 3 run is NOT caught here -- nothing has been built or
     merged yet at that point, so there is nothing to undo -- and propagates to the caller.
 
     ASES-REC-06 (`should_stop`): "stop the merge queue between steps". A zero-argument callable, polled before the
@@ -337,8 +360,9 @@ def merge_task(
                      f"fast-forward {integration_branch} to {candidate_sha}"):
             return _fast_forward(repo, integration_branch, candidate_sha, task_key, conn, project)
     finally:
-        _git(["worktree", "remove", "--force", str(candidate)], repo)
+        teardown_result = _git(["worktree", "remove", "--force", str(candidate)], repo)
         shutil.rmtree(tmp_root, ignore_errors=True)
+        _report_candidate_leak_if_any(conn, tmp_root, teardown_result, task_key=task_key, project=project)
 
 
 def _upsert_merge_record(

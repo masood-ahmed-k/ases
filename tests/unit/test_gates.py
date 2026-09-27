@@ -1,11 +1,14 @@
+import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
-from ases import db, gates, gitexec, tamper
+from ases import db, events, gates, gitexec, tamper
 
 # Non-ASCII test data is built with chr() so that this file stays pure ASCII.
 E_ACUTE = chr(0xE9)
@@ -51,9 +54,35 @@ def test_run_gate_stops_at_first_failing_command(repo):
 
 
 def test_run_gate_bad_commit(repo):
-    result = gates.run_gate(repo, "0000000000000000000000000000000000000000", "gate1", ["echo x"])
-    assert result.passed is False
-    assert "could not create gate worktree" in result.detail
+    """Round 12 (finding 0): a checkout that fails raises GateCheckoutError instead of returning
+    GateResult(passed=False, ...) -- it is never a red gate. See
+    test_run_gate_checkout_infrastructure_failure_raises_not_a_red_gate below for the finding's own
+    reproduction (a pre-occupied worktree path, unrelated to the commit)."""
+    with pytest.raises(gates.GateCheckoutError, match="could not create gate worktree"):
+        gates.run_gate(repo, "0000000000000000000000000000000000000000", "gate1", ["echo x"])
+
+
+def test_run_gate_checkout_infrastructure_failure_raises_not_a_red_gate(repo, tmp_path, monkeypatch):
+    """Finding 0's own reproduction method (r12_audit_findings.md): pre-occupy the exact path run_gate's own
+    worktree checkout targets -- simulating a stale leftover directory, an AV lock, or a worktree-limit
+    collision, something with nothing to do with the commit or the gate commands -- and confirm run_gate raises
+    GateCheckoutError instead of returning GateResult(passed=False, ...). Before this fix that GateResult was
+    indistinguishable from a real failing gate command: mergeq.py spent real fix-card budget on it, and
+    controller.py's post-merge re-check reverted an already-landed, correct merge because of it (see
+    test_controller.py's own reproductions of those two call sites)."""
+    tmp_root = tmp_path / "fixed-tmp-root"
+    tmp_root.mkdir()
+    (tmp_root / "wt").write_bytes(b"")  # pre-occupies the path `git worktree add` targets (a FILE, not an
+    # already-existing empty directory, which git accepts): unrelated to the commit
+    monkeypatch.setattr(gates.tempfile, "mkdtemp", lambda prefix="": str(tmp_root))
+
+    with pytest.raises(gates.GateCheckoutError) as excinfo:
+        gates.run_gate(repo, _head_sha(repo), "gate1", ["echo hi"])
+
+    detail = str(excinfo.value)
+    assert "could not create gate worktree" in detail
+    assert "already exists" in detail
+    assert not tmp_root.exists()  # still torn down, exactly like a runner that raises
 
 
 def test_run_gate_records_to_db(repo, tmp_path):
@@ -374,13 +403,58 @@ def test_run_gate_with_a_runner_cleans_the_worktree_up(repo, monkeypatch):
     assert len(listing.strip().splitlines()) == 1
 
 
+def test_run_gate_records_an_event_when_the_worktree_cannot_be_removed(repo, tmp_path, monkeypatch):
+    """Finding 11 (round 12): run_gate's finally block used to discard the teardown outcome completely (the git
+    exit code was never checked, and shutil.rmtree ran with ignore_errors=True), so a Windows file lock left a
+    throwaway worktree on disk with nothing anywhere saying so. Simulated deterministically here (a mocked
+    rmtree that leaves the directory in place -- the same observable end state a real lock produces) rather
+    than a real, timing-dependent lock; test_mergeq.py's counterpart does the same for merge_task."""
+    conn = db.connect(tmp_path / "ases.db")
+    seen_paths = []
+    real_rmtree = shutil.rmtree
+
+    def fake_rmtree(path, ignore_errors=False):
+        seen_paths.append(pathlib.Path(path))
+        # does not actually remove anything: simulates a lock that survives the finally block's own attempt
+
+    monkeypatch.setattr(gates.shutil, "rmtree", fake_rmtree)
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["echo ok"], conn=conn, task_key="T-leak")
+
+    assert result.passed is True  # the leak-reporting must never affect the gate's own outcome
+    assert len(seen_paths) == 1
+    rows = [json.loads(e["payload"]) for e in events.recent(conn, limit=50) if e["kind"] == "gate_worktree_leak"]
+    assert len(rows) == 1
+    assert rows[0] == {
+        "task_key": "T-leak", "gate": "gate1", "path": str(seen_paths[0]), "git_exit_code": 0,
+    }
+    real_rmtree(seen_paths[0], ignore_errors=True)  # actually clean up what the fake left behind
+
+
+def test_run_gate_reports_no_leak_when_conn_is_none(repo, monkeypatch):
+    """The leak event needs somewhere to write: a caller that gave no conn (most of finalgates.py, for example)
+    gets exactly the pre-round-12 behaviour, no event, never an exception from the reporting itself."""
+    real_rmtree = shutil.rmtree
+    seen_paths = []
+
+    def fake_rmtree(path, ignore_errors=False):
+        seen_paths.append(pathlib.Path(path))
+
+    monkeypatch.setattr(gates.shutil, "rmtree", fake_rmtree)
+
+    result = gates.run_gate(repo, _head_sha(repo), "gate1", ["echo ok"])  # conn defaults to None
+
+    assert result.passed is True
+    real_rmtree(seen_paths[0], ignore_errors=True)
+
+
 def test_run_gate_with_a_runner_never_calls_it_for_a_bad_commit(repo, monkeypatch):
     _forbid_local_runner(monkeypatch)
     runner = FakeRunner()
 
-    result = gates.run_gate(repo, "0000000000000000000000000000000000000000", "gate1", ["x"], runner=runner)
+    with pytest.raises(gates.GateCheckoutError, match="could not create gate worktree"):
+        gates.run_gate(repo, "0000000000000000000000000000000000000000", "gate1", ["x"], runner=runner)
 
-    assert result.passed is False and "could not create gate worktree" in result.detail
     assert runner.calls == []
 
 
@@ -463,11 +537,14 @@ def test_run_gate_redacts_what_a_runner_hands_back(repo, tmp_path, monkeypatch):
 
 def test_run_gate_redacts_the_worktree_error_too(repo):
     """git echoes the bad ref back in its error, so a value shaped like a key in the commit argument would land in
-    the detail of a gate that never ran."""
-    result = gates.run_gate(repo, PLANTED, "gate1", ["echo x"])
+    the raised GateCheckoutError's own message (round 12, finding 0: a checkout failure raises rather than
+    returning a GateResult, but ASES-SEC-01's redaction still happens before the exception is built)."""
+    with pytest.raises(gates.GateCheckoutError) as excinfo:
+        gates.run_gate(repo, PLANTED, "gate1", ["echo x"])
 
-    assert result.passed is False and "could not create gate worktree" in result.detail
-    assert PLANTED not in result.detail and "[redacted]" in result.detail
+    detail = str(excinfo.value)
+    assert "could not create gate worktree" in detail
+    assert PLANTED not in detail and "[redacted]" in detail
 
 
 def test_run_gate_leaves_output_with_no_secret_exactly_as_it_was(repo, monkeypatch):
@@ -613,6 +690,115 @@ def test_run_gate_worktree_checkout_does_not_run_a_planted_hook(repo, tmp_path, 
     gates.run_gate(repo, _head_sha(repo), "gate1", ["echo x"])
 
     assert not marker.exists()
+
+
+# --- finding 10 (round 12): the timeout must bound real wall-clock, not just the text that comes back ----------
+
+
+def test_run_commands_kills_a_hung_command_within_the_timeout_on_real_windows(tmp_path):
+    """The finding's own reproduction method (r12_audit_findings.md): a command that spawns a long-lived child
+    (here, shell=True's own cmd.exe/sh wrapper around a sleeping python process is the "child") must be dead,
+    and _run_commands must have returned, within the timeout plus a small margin -- not the ~6x-the-timeout
+    real elapsed time the bug produced (subprocess.run's Windows TimeoutExpired handling kills only the
+    cmd.exe wrapper, then drains its pipes with a second, UNTIMED communicate() that blocks until the real
+    command, a grandchild that inherited the same pipe handles, exits on its own)."""
+    marker = tmp_path / "still-running.txt"
+    cmd = (
+        f'"{sys.executable}" -c '
+        f'"import time; open(r\'{marker}\', \'w\').close(); time.sleep(8)"'
+    )
+
+    started = time.monotonic()
+    passed, output = gates._run_commands(tmp_path, [cmd], timeout=1)
+    elapsed = time.monotonic() - started
+
+    assert passed is False
+    assert "[TIMEOUT after 1s]" in output
+    assert marker.exists()  # the command really started (not a false pass from never launching at all)
+    assert elapsed < 6, f"_run_commands took {elapsed:.1f}s to return for a 1s timeout: the tree was not killed"
+
+
+def test_run_commands_stops_at_the_first_timeout_and_never_runs_a_later_command(tmp_path):
+    cmd = f'"{sys.executable}" -c "import time; time.sleep(8)"'
+
+    passed, output = gates._run_commands(tmp_path, [cmd, "echo never"], timeout=1)
+
+    assert passed is False
+    assert "[TIMEOUT after 1s]" in output
+    assert "never" not in output
+
+
+class _FakeTimingOutProcess:
+    """An injectable stand-in for subprocess.Popen: communicate() times out once, then returns partial output,
+    exactly like evals.py's own test of _run_process's equivalent branch."""
+
+    pid = 4242
+
+    def __init__(self):
+        self.calls = 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired("cmd", timeout)
+        return "partial stdout", "partial stderr"
+
+
+def test_run_commands_kills_the_whole_tree_on_timeout_then_drains_and_reports_it(tmp_path):
+    """The branch-level proof (fast, deterministic, no real process) that mirrors evals.py's own
+    test_run_process_stops_the_whole_process_tree_on_a_timeout_and_never_raises: the real-process test above
+    proves this actually works on Windows; this one proves _run_commands' own logic without a real hang."""
+    killed = []
+
+    passed, output = gates._run_commands(
+        tmp_path, ["some command"], timeout=9,
+        popen=lambda *a, **k: _FakeTimingOutProcess(), kill_tree=killed.append,
+    )
+
+    assert killed == [4242]  # the whole tree, not just this Popen's own handle
+    assert passed is False
+    assert "partial stdout" in output and "partial stderr" in output
+    assert "[TIMEOUT after 9s]" in output
+
+
+def test_run_commands_a_command_that_finishes_in_time_still_works_with_the_new_popen_shape(tmp_path):
+    passed, output = gates._run_commands(tmp_path, ["echo hello-from-popen"], timeout=30)
+
+    assert passed is True
+    assert "hello-from-popen" in output
+
+
+def test_run_commands_stops_at_the_first_non_zero_exit_with_the_new_popen_shape(tmp_path):
+    passed, output = gates._run_commands(tmp_path, ["echo first", "exit 1", "echo never"], timeout=30)
+
+    assert passed is False
+    assert "first" in output and "[exit 1]" in output and "never" not in output
+
+
+def test_kill_process_tree_uses_taskkill_on_windows_and_never_killpg(monkeypatch):
+    """os.killpg does not exist on Windows at all (raising=False lets the attribute be set anyway, for this
+    fake), so this also proves the Windows branch never even reaches for it."""
+    calls = []
+    monkeypatch.setattr(gates, "_IS_WINDOWS", True)
+    monkeypatch.setattr(gates.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
+    monkeypatch.setattr(
+        gates.os, "killpg", lambda *a: pytest.fail("killpg ends a process GROUP on POSIX only"), raising=False,
+    )
+
+    gates._kill_process_tree(4242)
+
+    assert calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
+
+
+def test_kill_process_tree_never_raises_when_the_process_is_already_gone(monkeypatch):
+    monkeypatch.setattr(gates, "_IS_WINDOWS", True)
+
+    def boom(argv, **kwargs):
+        raise subprocess.SubprocessError("no such process")
+
+    monkeypatch.setattr(gates.subprocess, "run", boom)
+
+    gates._kill_process_tree(4242)  # must not raise
 
 
 # --- _git: the one local git-launcher, running git through gitexec since the round 9 merge
@@ -826,19 +1012,18 @@ def test_run_gate_self_contained_checkout_bad_commit_never_calls_the_runner(repo
     _forbid_local_runner(monkeypatch)
     runner = FakeRunner()
 
-    result = gates.run_gate(
-        repo, "0" * 40, "gate1", ["x"], runner=runner, self_contained_checkout=True,
-    )
+    with pytest.raises(gates.GateCheckoutError, match="could not create gate checkout"):
+        gates.run_gate(repo, "0" * 40, "gate1", ["x"], runner=runner, self_contained_checkout=True)
 
-    assert result.passed is False and "could not create gate checkout" in result.detail
     assert runner.calls == []
 
 
 def test_run_gate_self_contained_checkout_false_is_still_todays_worktree_message(repo):
     """The host-mode failure text must stay exactly what it was before this round, since an existing caller or
-    test may match on it."""
-    result = gates.run_gate(repo, "0" * 40, "gate1", ["x"])
-    assert "could not create gate worktree" in result.detail
+    test may match on it. Round 12 (finding 0): it is now the message of a raised GateCheckoutError, not a
+    returned GateResult."""
+    with pytest.raises(gates.GateCheckoutError, match="could not create gate worktree"):
+        gates.run_gate(repo, "0" * 40, "gate1", ["x"])
 
 
 # --- hash_gate_profiles with pinned_task_fields (round 9 ASES-SEC-05/07; round 10 ASES-QG-02, GATEPIN) ------------

@@ -741,7 +741,8 @@ def process_review_lane(
     `project` (round 9, ASES-QG-04, ASES-SEC-03; optional and None by default, so an older caller keeps working
     unchanged with the host runner) is handed to gates.resolve_runner through review.gate_before_review, along
     with the task itself for its own network exception (ASES-SEC-05, ASES-SEC-07). A gate call that cannot even
-    start (sandbox.SandboxInfrastructureError: Docker down, the pinned image missing) is not a red gate: it is
+    start (sandbox.SandboxInfrastructureError: Docker down, the pinned image missing; round 12 finding 0:
+    gates.GateCheckoutError, its own throwaway checkout could not be created) is not a red gate: it is
     recorded once per card as a `sandbox_infrastructure_error` event and the card is left exactly where it is,
     to be re-checked next pass, never sent back and never silently run on the host instead."""
     sent_back = []
@@ -762,7 +763,7 @@ def process_review_lane(
                 conn=conn, task_key=task_key, allow_gate_config_changes=task.allow_gate_config_changes,
                 project_config=project, task=task, project=plan.project,
             )
-        except sandbox_mod.SandboxInfrastructureError as exc:
+        except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
             _record_once(conn, "sandbox_infrastructure_error", {
                 "task_key": task_key, "card_id": card["id"], "gate": "gate1", "error": _clean(str(exc), 300),
             }, match=("task_key", "gate"))
@@ -1000,10 +1001,11 @@ def process_merge_queue(
                     allow_gate_config_changes=task.allow_gate_config_changes,
                     project_config=project, task=task,
                 )
-            except sandbox_mod.SandboxInfrastructureError as exc:
+            except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
                 # Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox is enabled but this task's Gate 1 re-check could
-                # not even start (Docker down, the pinned image missing). Not a red gate and not a scope
-                # violation: recorded once per card and retried next pass, exactly like a tamper_check_error.
+                # not even start (Docker down, the pinned image missing; round 12 finding 0: or its own
+                # throwaway checkout could not be created). Not a red gate and not a scope violation: recorded
+                # once per card and retried next pass, exactly like a tamper_check_error.
                 _record_once(conn, "sandbox_infrastructure_error", {
                     "task_key": key, "card_id": work_card["id"], "gate": "gate1", "error": _clean(str(exc), 300),
                 }, match=("task_key", "gate"))
@@ -1053,11 +1055,12 @@ def process_merge_queue(
                 expected_head=expected_head, project=plan.project, should_stop=should_stop,
                 project_config=project, task=task,
             )
-        except sandbox_mod.SandboxInfrastructureError as exc:
+        except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
             # Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox is enabled but this task's Gate 3 candidate could
-            # not even start (Docker down, the pinned image missing). Not a red gate: nothing was built and
-            # nothing was merged, so there is nothing to revert either. Recorded once per card and retried next
-            # pass, the same shape as the Gate 1 case above -- never fall back to the host silently.
+            # not even start (Docker down, the pinned image missing; round 12 finding 0: or its own throwaway
+            # checkout could not be created). Not a red gate: nothing was built and nothing was merged, so
+            # there is nothing to revert either. Recorded once per card and retried next pass, the same shape
+            # as the Gate 1 case above -- never fall back to the host silently.
             _record_once(conn, "sandbox_infrastructure_error", {
                 "task_key": key, "card_id": row["merge_card_id"], "gate": "gate3", "error": _clean(str(exc), 300),
             }, match=("task_key", "gate"))
@@ -1111,15 +1114,17 @@ def process_merge_queue(
                         repo, outcome.squash_commit, "gate3-postmerge", gate_cmds, conn=conn, task_key=key,
                         project=plan.project, **sandbox_kwargs,
                     )
-                except sandbox_mod.SandboxInfrastructureError as exc:
-                    # The fast-forward already landed on the integration branch: an infra failure here is NOT a
-                    # red gate, so it must not trigger a revert (the reasoning below), and it must not leave the
-                    # merge card open either -- a repeat pass would re-run merge_task on a work branch whose
-                    # content the integration tip already has, which mergeq.merge_task then correctly refuses as
-                    # "nothing to commit" (allow_empty is False for a committing role), opening a spurious fix
-                    # card for a task that actually succeeded. So the merge is accepted as it stands, the
-                    # re-verification is recorded as skipped this pass (never silently treated as green), and the
-                    # completion path below runs exactly as it would with no postcheck at all.
+                except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
+                    # The fast-forward already landed on the integration branch: an infra failure here (Docker
+                    # down or the pinned image missing; round 12 finding 0: or the re-check's own throwaway
+                    # checkout could not be created) is NOT a red gate, so it must not trigger a revert (the
+                    # reasoning below), and it must not leave the merge card open either -- a repeat pass would
+                    # re-run merge_task on a work branch whose content the integration tip already has, which
+                    # mergeq.merge_task then correctly refuses as "nothing to commit" (allow_empty is False for
+                    # a committing role), opening a spurious fix card for a task that actually succeeded. So the
+                    # merge is accepted as it stands, the re-verification is recorded as skipped this pass
+                    # (never silently treated as green), and the completion path below runs exactly as it would
+                    # with no postcheck at all.
                     events.record(conn, "sandbox_infrastructure_error", {
                         "task_key": key, "commit": outcome.squash_commit, "gate": "gate3-postmerge",
                         "error": _clean(str(exc), 300),

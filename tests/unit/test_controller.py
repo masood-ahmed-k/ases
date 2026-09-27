@@ -944,6 +944,33 @@ def test_merge_queue_pre_merge_check_branch_for_merge_infrastructure_failure_hol
     assert fix_cards == []
 
 
+def test_merge_queue_pre_merge_check_branch_for_merge_checkout_failure_holds_the_merge(tmp_path, monkeypatch):
+    """Finding 0 (round 12): a gates.GateCheckoutError gets the exact same treatment as
+    sandbox.SandboxInfrastructureError at this same call site -- see the test just above."""
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
+    merge_task_calls = []
+    monkeypatch.setattr(mergeq, "merge_task", lambda *a, **kw: merge_task_calls.append(1) or _CONFLICT)
+
+    def boom(*a, **kw):
+        raise gates_mod.GateCheckoutError("could not create gate worktree: fatal: '...\\wt' already exists")
+
+    monkeypatch.setattr(review_mod, "check_branch_for_merge", boom)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    assert merge_task_calls == []  # never reached: nothing was built and nothing needs undoing
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1 and rows[0] == {
+        "task_key": "T1", "card_id": pair.work_card_id, "gate": "gate1",
+        "error": "could not create gate worktree: fatal: '...\\wt' already exists",
+    }
+    assert _refusals(conn, "merge_failed") == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []
+
+
 def test_merge_queue_gate3_candidate_infrastructure_failure_holds_the_merge(tmp_path, monkeypatch):
     repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
     plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
@@ -961,6 +988,33 @@ def test_merge_queue_gate3_candidate_infrastructure_failure_holds_the_merge(tmp_
     assert len(rows) == 1 and rows[0] == {
         "task_key": "T1", "card_id": pair.merge_card_id, "gate": "gate3",
         "error": "the sandbox is enabled but image x is not present locally",
+    }
+    assert _refusals(conn, "merge_failed") == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []
+    # the integration branch itself was never touched
+    assert _git_ok("rev-parse", "integration", cwd=repo).stdout.strip() == before
+
+
+def test_merge_queue_gate3_candidate_checkout_failure_holds_the_merge(tmp_path, monkeypatch):
+    """Finding 0 (round 12): a gates.GateCheckoutError gets the exact same treatment as
+    sandbox.SandboxInfrastructureError at this same call site -- see the test just above."""
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
+    before = _git_ok("rev-parse", "integration", cwd=repo).stdout.strip()
+
+    def boom(*a, **kw):
+        raise gates_mod.GateCheckoutError("could not create gate worktree: fatal: '...\\wt' already exists")
+
+    monkeypatch.setattr(mergeq, "merge_task", boom)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == []
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1 and rows[0] == {
+        "task_key": "T1", "card_id": pair.merge_card_id, "gate": "gate3",
+        "error": "could not create gate worktree: fatal: '...\\wt' already exists",
     }
     assert _refusals(conn, "merge_failed") == []
     fix_cards = [c for c in created if "fix" in c["title"]]
@@ -997,6 +1051,45 @@ def test_merge_queue_post_merge_infrastructure_failure_still_completes_the_merge
     assert merged == ["T1"]
     assert completed == [pair.merge_card_id]
     assert reverts == []
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1
+    assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate3-postmerge"
+    assert _refusals(conn, "post_merge_reverted") == []
+    fix_cards = [c for c in created if "fix" in c["title"]]
+    assert fix_cards == []
+
+
+def test_merge_queue_post_merge_checkout_failure_still_completes_the_merge_and_never_reverts(
+    tmp_path, monkeypatch,
+):
+    """Finding 0 (round 12), the "above all" case the work order names explicitly: the post-merge re-run must
+    NEVER revert a landed merge because its throwaway re-check checkout could not be created. Before this fix,
+    gates.run_gate's checkout failure returned GateResult(passed=False, ...) instead of raising, so this exact
+    scenario fell through the except sandbox_mod.SandboxInfrastructureError guard at controller.py's post-merge
+    site, reached `if postcheck is not None and not postcheck.passed`, and called mergeq.revert_merge on an
+    already-landed, correct merge (r12_audit_findings.md, finding 0). Mirrors
+    test_merge_queue_post_merge_infrastructure_failure_still_completes_the_merge above, with
+    gates.GateCheckoutError in place of sandbox.SandboxInfrastructureError."""
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo)
+    completed = []
+    monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: completed.append(cid))
+    reverts = []
+    monkeypatch.setattr(mergeq, "revert_merge", lambda *a, **kw: reverts.append(1))
+    real_run_gate = gates_mod.run_gate
+
+    def boom_on_postmerge_only(repo_arg, sha, gate_name, commands, **kwargs):
+        if gate_name == "gate3-postmerge":
+            raise gates_mod.GateCheckoutError("could not create gate worktree: fatal: '...\\wt' already exists")
+        return real_run_gate(repo_arg, sha, gate_name, commands, **kwargs)
+
+    monkeypatch.setattr(gates_mod, "run_gate", boom_on_postmerge_only)
+
+    merged = controller.process_merge_queue("b", repo, plan, project, conn=conn)
+
+    assert merged == ["T1"]
+    assert completed == [pair.merge_card_id]
+    assert reverts == []  # the "above all" requirement: never reverted
     rows = _refusals(conn, "sandbox_infrastructure_error")
     assert len(rows) == 1
     assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate3-postmerge"
@@ -1494,6 +1587,30 @@ def test_review_lane_an_infrastructure_failure_is_recorded_and_the_card_is_held_
     assert len(rows) == 1
     assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate1"
     assert "docker CLI not found" in rows[0]["error"]
+    assert _refusals(conn, "gate1_recheck_failed") == []  # never treated as a red gate
+
+
+def test_review_lane_a_checkout_failure_is_recorded_and_the_card_is_held_not_sent_back(tmp_path, monkeypatch):
+    """Finding 0 (round 12): a gates.GateCheckoutError gets the exact same treatment as
+    sandbox.SandboxInfrastructureError at this same call site -- see the test just above."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+
+    def boom(*args, **kwargs):
+        raise gates_mod.GateCheckoutError("could not create gate worktree: fatal: '...\\wt' already exists")
+
+    monkeypatch.setattr(review_mod, "gate_before_review", boom)
+
+    sent_back = controller.process_review_lane("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert sent_back == []
+    rows = _refusals(conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1
+    assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate1"
+    assert "already exists" in rows[0]["error"]
     assert _refusals(conn, "gate1_recheck_failed") == []  # never treated as a red gate
 
 

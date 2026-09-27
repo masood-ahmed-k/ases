@@ -77,6 +77,7 @@ from typing import Any, NamedTuple
 import yaml
 
 from . import events as events_mod
+from . import procenv as procenv_mod
 
 WORKSPACE = "/workspace"
 _DOCKER = "docker"
@@ -1042,10 +1043,14 @@ def default_runner(
     so nothing can wait for input. Killing a timed-out docker CLI does not stop its container (see
     remove_container_command).
 
-    `env` is the environment the command starts with; None (the default, and what every `runner(argv, timeout)`
-    call gets) inherits the parent's whole environment, as before. The docker probes here rely on that: the key
-    visibility test must see a credential that a mis-built `docker run` would forward, so this helper never
-    scrubs on its own. A caller that starts hermes passes hermes.scrubbed_environ() (ASES-CFG-05)."""
+    `env` is the environment the command starts with; None (the default) inherits the parent's whole
+    environment, as before. The docker probes here rely on being ABLE to do that: the key visibility test must
+    see a credential that a mis-built `docker run` would forward, so this helper never scrubs on its own, and
+    must stay callable with env=None for that reason (docker_available/image_present's own default `runner`
+    parameter is this function, unchanged, for a caller such as doctor.py's sandbox checks that wants the real
+    environment). A caller that starts hermes passes hermes.scrubbed_environ() (ASES-CFG-05); round 12's
+    sandbox_command_runner (finding 1) passes its own env via `_gate_docker_runner` below, its default
+    `process_runner`, rather than calling this with env=None the way it used to."""
     argv = list(argv)
     try:
         return subprocess.run(
@@ -1058,6 +1063,37 @@ def default_runner(
         return subprocess.CompletedProcess(argv, RC_NOT_FOUND, "", f"command not found: {_short(argv[0])}")
     except OSError as exc:
         return subprocess.CompletedProcess(argv, RC_ERROR, "", f"could not run {_short(argv[0])}: {_short(exc)}")
+
+
+# Round 12 (finding 1): none of these match procenv's credential-shaped pattern (key, token, secret, passw,
+# credential, auth, cookie, session), so procenv.scrubbed_environ() alone leaves them untouched -- an operator
+# override of any of them would otherwise silently redirect the gate path's docker CLI calls to a different
+# daemon/context than the mount and resource checks in this module were built for.
+_DOCKER_CONTEXT_ENV_NAMES = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH")
+
+
+def _gate_docker_env() -> dict[str, str]:
+    """The environment the gate path's own docker-launching subprocesses start with (round 12, finding 1,
+    ASES-CFG-04/ASES-CFG-05): procenv.scrubbed_environ() (credential-shaped names dropped, everything else --
+    PATH, SYSTEMROOT, the profile and temp directories -- kept) with _DOCKER_CONTEXT_ENV_NAMES also dropped."""
+    env = dict(procenv_mod.scrubbed_environ())
+    for name in _DOCKER_CONTEXT_ENV_NAMES:
+        env.pop(name, None)
+    return env
+
+
+def _gate_docker_runner(argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess:
+    """Round 12 (finding 1, ASES-CFG-04/ASES-CFG-05): sandbox_command_runner's default `process_runner`,
+    replacing a bare `default_runner` (which passes env=None, inheriting the controller's WHOLE environment --
+    every credential-shaped variable and any DOCKER_HOST/DOCKER_CONTEXT/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH
+    override -- into the docker CLI process that drives every one of the controller's own sandboxed gate runs,
+    the ONE gap this module's docstring's list of scrubbed callers never actually closed). Same pattern as
+    profiles.py's `_hermes_runner`: wrap `default_runner` with an explicit, scrubbed environment instead of
+    changing `default_runner` itself, which key_visibility_test and exfiltration_probe still call directly with
+    env=None on purpose (see default_runner's own docstring) -- their whole point is to see what a real,
+    unscrubbed environment would leak through a mis-built `docker run`, and scrubbing default_runner globally
+    would have blinded exactly the probes meant to catch that class of bug."""
+    return default_runner(argv, timeout, env=_gate_docker_env())
 
 
 class _Result(NamedTuple):
@@ -1103,7 +1139,7 @@ def image_present(image: str, runner: Callable = default_runner) -> bool:
 
 
 def sandbox_command_runner(
-    policy: SandboxPolicy, *, network: bool = False, process_runner: Callable = default_runner,
+    policy: SandboxPolicy, *, network: bool = False, process_runner: Callable = _gate_docker_runner,
     home: object = None,
 ) -> Callable[[pathlib.Path, list[str], int], tuple[bool, str]]:
     """Round 9 (ASES-QG-04, ASES-SEC-02, ASES-SEC-03, ASES-SEC-05, ASES-SEC-06, ASES-SEC-07): build the `runner`
@@ -1118,9 +1154,17 @@ def sandbox_command_runner(
     default) unless the caller (gates.resolve_runner) resolved an explicit, Gate-0-approved exception for this
     one gate call. Every command of every call gets only the worktree mounted (plus a mask over each sensitive
     file inside it, since a gate command runs committed, model-authored code and docker_run_argv's own docstring
-    says callers like this one MUST mask), no inherited environment and no --env-file (ASES-SEC-06), the policy's
-    CPU/memory/PID limits, and the host user where the platform has one (host_user_spec; None on native Windows,
-    where the container then runs as the image's own user, same as docker_run_argv's own default).
+    says callers like this one MUST mask), no inherited environment and no --env-file (ASES-SEC-06, the
+    CONTAINER's own environment -- docker_run_argv never forwards one), the policy's CPU/memory/PID limits, and
+    the host user where the platform has one (host_user_spec; None on native Windows, where the container then
+    runs as the image's own user, same as docker_run_argv's own default).
+
+    `process_runner` (round 12, finding 1) defaults to `_gate_docker_runner`, not a bare `default_runner`: the
+    docker CLI process itself (docker info/image inspect/run -- distinct from the container's own environment
+    the paragraph above covers) used to inherit the controller's WHOLE environment (env=None), including any
+    credential-shaped variable and any DOCKER_HOST/DOCKER_CONTEXT/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH override
+    that happened to be set. `_gate_docker_runner` scrubs both (see its own docstring). A test that wants the
+    old, unscrubbed default_runner passes its own `process_runner`, exactly as every test here already does.
 
     Before running anything, this checks docker_available() and, when the policy names an image, image_present():
     either missing raises SandboxInfrastructureError instead of attempting a `docker run` that would fail with an

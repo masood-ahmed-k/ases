@@ -93,8 +93,9 @@ def gate_before_review(
     `project_config`/`task` (round 9, ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07) reach
     gates.resolve_runner through check_branch/_run_gate1, so the Gate 1 re-check runs in the sandbox when the
     project has it enabled, with `task`'s own network exception if it carries one. Both are optional and None by
-    default (today's behaviour, the host runner). sandbox.SandboxInfrastructureError from the gate call is NOT
-    caught here: it is an infrastructure failure, never a red Gate 1, and the caller (controller.py's
+    default (today's behaviour, the host runner). sandbox.SandboxInfrastructureError, or (round 12, finding 0) a
+    gates.GateCheckoutError -- this branch's own checkout could not even be created -- from the gate call is NOT
+    caught here: either is an infrastructure failure, never a red Gate 1, and the caller (controller.py's
     process_review_lane) decides what to do about it.
 
     `project` (events.py package, round 9) is optional because this function's own signature has no plan to read
@@ -192,8 +193,9 @@ def check_branch_for_merge(
     `project_config`/`task` (round 9, ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07): passed straight
     through to _run_gate1's gates.resolve_runner call when Gate 1 actually runs here (the "otherwise" case
     above), so this task's own network exception, if it carries one, reaches its Gate 1 re-run just as it does
-    the Gate 1 review-lane check. sandbox.SandboxInfrastructureError is NOT caught here: the caller
-    (controller.py's merge loop) decides what an infrastructure failure means for the merge."""
+    the Gate 1 review-lane check. sandbox.SandboxInfrastructureError, or (round 12, finding 0) a
+    gates.GateCheckoutError, is NOT caught here: the caller (controller.py's merge loop) decides what an
+    infrastructure failure means for the merge."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope

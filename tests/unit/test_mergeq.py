@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ases import db, gates, guards, hermes, intents, mergeq, reconcile
+from ases import db, events, gates, guards, hermes, intents, mergeq, reconcile
 
 
 def _git(*args, cwd):
@@ -116,6 +116,45 @@ def test_candidate_worktree_cleaned_up_after_merge(repo):
     # contains that word, which false-positives a naive substring check on the primary repo line).
     lines = [ln for ln in result.stdout.strip().splitlines() if ln.strip()]
     assert len(lines) == 1, f"expected only the primary checkout, got:\n{result.stdout}"
+
+
+def test_merge_task_records_an_event_when_the_candidate_directory_cannot_be_removed(repo, tmp_path, monkeypatch):
+    """Finding 11 (round 12): merge_task's finally block used to discard shutil.rmtree's outcome completely
+    (ignore_errors=True, and the git worktree-remove exit code was never even captured), so a Windows file lock
+    on the throwaway candidate directory left it on disk with nothing anywhere saying so. Simulated
+    deterministically here (a mocked rmtree that leaves the directory in place -- the same observable end state
+    a real lock produces), matching test_gates.py's own counterpart for run_gate.
+
+    `shutil` is one module object shared by every importer, so patching `mergeq.shutil.rmtree` also reaches
+    gates.run_gate's own cleanup for its nested Gate 3 checkout (merge_task runs Gate 3 inside the candidate
+    directory, which is itself a git repo as far as gates.run_gate is concerned): both leaks are real and both
+    get cleaned up for real at the end, but only the "ases-merge-" one is this test's own concern."""
+    _make_work_branch(repo, "swarm/leak", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+    real_rmtree = mergeq.shutil.rmtree
+    seen_paths = []
+
+    def fake_rmtree(path, ignore_errors=False):
+        seen_paths.append(pathlib.Path(path))
+
+    monkeypatch.setattr(mergeq.shutil, "rmtree", fake_rmtree)
+
+    try:
+        outcome = mergeq.merge_task(
+            repo, "integration", "swarm/leak", "T-leak", ["echo ok"], conn=conn, project="p1",
+        )
+
+        assert outcome.merged is True
+        merge_paths = [p for p in seen_paths if "ases-merge-" in p.name]
+        assert len(merge_paths) == 1
+        rows = [
+            json.loads(e["payload"]) for e in events.recent(conn, limit=50) if e["kind"] == "merge_worktree_leak"
+        ]
+        assert len(rows) == 1
+        assert rows[0] == {"task_key": "T-leak", "path": str(merge_paths[0]), "git_exit_code": 0}
+    finally:
+        for path in seen_paths:  # actually clean up everything the fake rmtree left behind
+            real_rmtree(path, ignore_errors=True)
 
 
 def test_merge_blocks_on_a_planted_secret(repo, tmp_path):
