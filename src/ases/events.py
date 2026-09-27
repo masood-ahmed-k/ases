@@ -68,11 +68,40 @@ def redact_text(text: str) -> str:
     return _SECRET_VALUE_PATTERN.sub("[redacted]", text)
 
 
-def record(conn: sqlite3.Connection, kind: str, payload: dict | None = None) -> None:
-    safe = _redact(payload or {})
+# The project an events row belongs to, for SQL (round 9): the schema-v7 column, falling back to the payload's own
+# "project" for a row written before the column was filled. The json_valid() guard matters: coalesce() only skips
+# json_extract when the column is non-NULL, and json_extract raises on a payload that is not valid JSON, which must
+# read as "no project known" instead. PROJECT_SCOPE_SQL is a project-scoped read's filter, with ONE ? parameter for
+# the project: it matches that project's rows and rows with no project recorded anywhere (legacy rows, and
+# genuinely global events such as credential health), never another project's rows -- the same semantics
+# gate_runs and merge_records use. Every reader uses these two, so the rule cannot drift between modules.
+PROJECT_SQL = "COALESCE(project, CASE WHEN json_valid(payload) THEN json_extract(payload, '$.project') END)"
+PROJECT_SCOPE_SQL = f"({PROJECT_SQL} IS NULL OR {PROJECT_SQL} = ?)"
+
+
+def record(conn: sqlite3.Connection, kind: str, payload: dict | None = None, *, project: str | None = None) -> None:
+    """Insert one event. `project` (schema v7's column) is keyword-only and optional: omitted (the ordinary case for
+    every call site whose payload already names its project under the "project" key), it is taken from
+    `payload["project"]`, so an existing call whose payload already carries a project needs no change at the call
+    site to fill the column. Given explicitly, it is compared with `payload.get("project")`: agreeing (or the
+    payload naming none) is fine, but the two DISAGREEING is a bug at the call site (a project was passed that is
+    not the one the payload itself describes), so this raises ValueError rather than silently preferring one --
+    silently picking the keyword would hide a stale payload, and silently picking the payload would hide a caller
+    that passed the wrong variable. A call site with no project in scope at all (a doctor/eval event, credential
+    health, which is per provider, not per project) passes neither and the column stays NULL: "no project recorded",
+    which a project-scoped reader (PROJECT_SCOPE_SQL) includes for every project, exactly like a legacy row."""
+    payload = payload or {}
+    payload_project = payload.get("project")
+    if project is None:
+        project = payload_project
+    elif payload_project is not None and payload_project != project:
+        raise ValueError(
+            f"events.record({kind!r}): project={project!r} disagrees with payload['project']={payload_project!r}"
+        )
+    safe = _redact(payload)
     conn.execute(
-        "INSERT INTO events (ts, kind, payload) VALUES (?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(timespec="seconds"), kind, json.dumps(safe, default=str)),
+        "INSERT INTO events (ts, kind, payload, project) VALUES (?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(timespec="seconds"), kind, json.dumps(safe, default=str), project),
     )
 
 

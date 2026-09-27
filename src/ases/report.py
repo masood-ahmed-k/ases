@@ -206,14 +206,22 @@ def build_report(
     Every string in the result has been through events.redact (ASES-SEC-01, ASES-OBS-02)."""
     moment = _utc(now)
     task_rows = _task_rows(conn, plan.project)
+    # events.py package, round 9 (ASES-OBS-01): this panel used to read the newest events of ANY kind with no WHERE
+    # clause at all, so a project's own report showed every other project's events sharing this database too. Now
+    # scoped to this project, NULL-tolerant (a row with no project recorded anywhere, by column or by payload, is
+    # kept rather than dropped from every report: the same "matches its own rows and legacy NULL rows, never
+    # another project's" semantics gate_runs and merge_records already use), so events written before schema v7,
+    # and kinds this round leaves genuinely unattributed (eval_run, question_asked/answered, the "no project in
+    # scope" call sites), still show up here instead of vanishing from every project's report.
+    events_where = f"WHERE {events_mod.PROJECT_SCOPE_SQL}"
     report = {
         "generated_at": _iso(moment),
         "project": _project_panel(conn, board, plan, project, task_rows, moment),
-        "budget": _budget_panel(board, conn, project, models_config, task_rows, moment),
+        "budget": _budget_panel(board, conn, project, models_config, task_rows, moment, project_name=plan.project),
         "cards": _cards_panel(board, plan, task_rows),
         "quality": _quality_panel(conn, plan),
-        "health": _health_panel(conn),
-        "events": _read_events(conn, "", (), event_limit),
+        "health": _health_panel(conn, plan.project),
+        "events": _read_events(conn, events_where, (plan.project,), event_limit),
         "models": _models_panel(conn),
     }
     return events_mod.redact(report)
@@ -318,11 +326,16 @@ def _role_of(profile: str, roles: dict) -> str | None:
     return None
 
 
-def _parked_cards(board: str, conn: sqlite3.Connection, task_rows: dict) -> tuple[list[dict], str | None]:
+def _parked_cards(
+    board: str, conn: sqlite3.Connection, task_rows: dict, project_name: str,
+) -> tuple[list[dict], str | None]:
     """(cards, error): the plan's cards Hermes lists as `scheduled`, which is how the controller parks a card it
     cannot afford (process_budget_gate), each with the reason and time of the LATEST card_parked_for_budget event
-    for its task. Only cards of this plan are kept: the board is shared with other projects. A failing list gives
-    ([], the error) so the report says it could not tell, rather than that nothing is parked."""
+    for its task. Only cards of this plan are kept: the board is shared with other projects, and so is the events
+    table, so the parked-card events are read for `project_name` only (events.PROJECT_SCOPE_SQL: this project's
+    rows and rows with no project recorded), never another project's event for a task that reuses the same key.
+    A failing list gives ([], the error) so the report says it could not tell, rather than that nothing is
+    parked."""
     owners = {}
     for key, row in task_rows.items():
         for card_id in (row["work_card_id"], row["merge_card_id"]):
@@ -333,7 +346,8 @@ def _parked_cards(board: str, conn: sqlite3.Connection, task_rows: dict) -> tupl
     except Exception as exc:  # noqa: BLE001 - deliberately broad: a Hermes that cannot answer must not sink the report
         return [], _clip(f"{type(exc).__name__}: {exc}", 200)
     latest: dict[str, dict] = {}
-    for event in _read_events(conn, "WHERE kind = ?", ("card_parked_for_budget",), _PARKED_WINDOW):
+    parked_where = f"WHERE kind = ? AND {events_mod.PROJECT_SCOPE_SQL}"
+    for event in _read_events(conn, parked_where, ("card_parked_for_budget", project_name), _PARKED_WINDOW):
         key = event["payload"].get("task_key")
         if isinstance(key, str):
             latest.setdefault(key, event)   # newest first, so the first one seen is the latest
@@ -355,7 +369,7 @@ def _parked_cards(board: str, conn: sqlite3.Connection, task_rows: dict) -> tupl
 
 def _budget_panel(
     board: str, conn: sqlite3.Connection, project: ases_config.ProjectConfig, models_config: dict,
-    task_rows: dict, now: datetime,
+    task_rows: dict, now: datetime, *, project_name: str,
 ) -> dict:
     """Section 15.2 Budget, and section 15.1's "requests per provider, model, role and UTC day, against the
     budget": for each provider in models_config the daily limit, the requests used today, what remains and the
@@ -391,7 +405,7 @@ def _budget_panel(
             "ORDER BY requests DESC, provider, model, profile", (day,),
         )
     ]
-    parked, parked_error = _parked_cards(board, conn, task_rows)
+    parked, parked_error = _parked_cards(board, conn, task_rows, project_name)
     return {
         "day": day,
         "next_reset": _iso(now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)),
@@ -539,26 +553,43 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
     # net is meant to be general (it also nets any future or ad hoc tamper-shaped kind, not only these two named
     # ones), and a quality finding is a per-event, audited listing while the health count is an aggregate for
     # operational monitoring. The two panels are allowed to show the same event for different readers.
+    #
+    # events.py package, round 9 (ASES-OBS-01): this used to have no project filter at all, so another project's
+    # merge_refused_*/tamper_*/integrity_violation finding could show up in THIS plan's quality panel. Scoped the
+    # same NULL-tolerant way as the events panel above: a definite OTHER project's row is excluded, but a row with
+    # no project recorded anywhere still shows. controller._refuse_once/_refuse_unreviewed and
+    # review.gate_before_review now pass their caller's project through (process_merge_queue's and
+    # process_review_lane's plan.project respectively), so this NULL-tolerant half only still matters for rows
+    # written before this package, or a merge_refused_*/tamper_* kind some future caller records with no project
+    # in scope at all -- without it, those legacy or genuinely projectless rows would silently disappear from
+    # every project's panel instead.
     findings = [
         {"ts": event["ts"], "kind": event["kind"],
          "task_key": event["payload"]["task_key"] if isinstance(event["payload"].get("task_key"), str) else None,
          "message": _event_message(event["payload"])}
         for event in _read_events(
             conn,
-            "WHERE kind = 'integrity_violation' OR kind GLOB 'merge_refused_*' "
-            "OR instr(lower(kind), 'tamper') > 0", (), _FINDING_LIMIT,
+            "WHERE (kind = 'integrity_violation' OR kind GLOB 'merge_refused_*' "
+            "OR instr(lower(kind), 'tamper') > 0) "
+            f"AND {events_mod.PROJECT_SCOPE_SQL}",
+            (plan.project,), _FINDING_LIMIT,
         )
     ]
     return {"gate_runs": gate_runs, "review_verdicts": verdicts, "merge_records": merges, "findings": findings}
 
 
-def _health_panel(conn: sqlite3.Connection) -> dict:
+def _health_panel(conn: sqlite3.Connection, project_name: str) -> dict:
     """Section 15.2 Health, from what the controller itself recorded (HEALTH_KINDS): for each kind the count over
     the events read, the time of the newest one and its message, and the most recent events across all kinds.
     Provider health "from real traffic" (429s, 5xx, timeouts) is not collected anywhere yet, and this panel does
-    not pretend otherwise: `note` says so."""
+    not pretend otherwise: `note` says so.
+
+    Scoped to `project_name` (events.PROJECT_SCOPE_SQL): this project's events plus those with no project recorded
+    (legacy rows, and kinds with no project in scope, such as credential health), never another project's on the
+    same database, so one project's report cannot show another's merge failures or integrity violations."""
     marks = ",".join("?" * len(HEALTH_KINDS))
-    rows = _read_events(conn, f"WHERE kind IN ({marks})", HEALTH_KINDS, _HEALTH_WINDOW)
+    health_where = f"WHERE kind IN ({marks}) AND {events_mod.PROJECT_SCOPE_SQL}"
+    rows = _read_events(conn, health_where, (*HEALTH_KINDS, project_name), _HEALTH_WINDOW)
     counts: dict[str, int] = {}
     newest: dict[str, dict] = {}
     for row in rows:

@@ -542,12 +542,21 @@ def record_critique(conn: sqlite3.Connection, plan_project: str, round_no: int, 
 def _payloads(conn: sqlite3.Connection, plan_project: str):
     """The payload of every plan_critique event of this project, newest first (by id: the timestamps only have
     second resolution). A row whose payload is not a JSON object is skipped."""
-    for row in conn.execute("SELECT payload FROM events WHERE kind = ? ORDER BY id DESC", (EVENT_KIND,)):
+    # events.py package, round 9: project, falling back to the payload for a pre-migration row, NULL-tolerant (a
+    # row with no project recorded anywhere still matches, the same semantics gate_runs/merge_records use) -- the
+    # json_valid() guard is needed because coalesce() only short-circuits past json_extract when the column itself
+    # is non-NULL, and this table's own tests seed rows whose payload is not valid JSON at all.
+    project_sql = events_mod.PROJECT_SQL
+    for row in conn.execute(
+        f"SELECT payload FROM events WHERE kind = ? "
+        f"AND ({project_sql} IS NULL OR {project_sql} = ?) ORDER BY id DESC",
+        (EVENT_KIND, plan_project),
+    ):
         try:
             payload = json.loads(row[0])
         except (ValueError, RecursionError):
             continue
-        if isinstance(payload, dict) and payload.get("project") == plan_project:
+        if isinstance(payload, dict):
             yield payload
 
 

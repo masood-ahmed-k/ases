@@ -803,6 +803,7 @@ def test_a_tamper_check_error_is_retried_next_pass_and_never_a_failure(tmp_path,
     assert "merge_failed" not in kinds(w.conn) and "fix_card_created" not in kinds(w.conn)
     (event,) = payloads(w.conn, "tamper_check_error")
     assert event["task_key"] == "T1" and event["card_id"] == w.work() and "could not diff" in event["detail"]
+    assert event["project"] == w.plan.project  # ASES-OBS-01: not a cross-project leak
 
     stub_check(monkeypatch)  # git recovers: the same task merges on the next pass
     assert controller.process_merge_queue("b", w.repo, w.plan, w.project, conn=w.conn) == ["T1"]
@@ -1960,7 +1961,9 @@ def test_one_card_that_cannot_be_unparked_does_not_stop_the_others(tmp_path, mon
 
     assert unpark(w, CAPPED_MODELS) == ["T2"]
 
-    assert "locked" in payloads(w.conn, "unpark_error")[0]["error"]
+    (error_event,) = payloads(w.conn, "unpark_error")
+    assert "locked" in error_event["error"]
+    assert error_event["project"] == w.plan.project  # ASES-OBS-01: not a cross-project leak
 
 
 def test_the_gate_and_unpark_agree_about_the_same_card(tmp_path, monkeypatch):
@@ -2645,6 +2648,10 @@ def test_a_step_that_is_not_safety_critical_cannot_stop_the_pass(tmp_path, monke
     assert [(e["step"], step in e["error"]) for e in errors] == [(step, True)]
     assert summary["warnings"] == [f"step {step} failed: RuntimeError: {step} exploded"]
     assert set(summary) == SUMMARY_KEYS and summary["stopped"] is False
+    # events.py package, round 9: every _isolated call site is inside run_pass, which already has plan.project
+    # ("p" for this rig) in scope, so pass_step_error carries it too instead of leaving the column NULL.
+    project_rows = rig.conn.execute("SELECT project FROM events WHERE kind = 'pass_step_error'").fetchall()
+    assert project_rows and all(r["project"] == "p" for r in project_rows)
     if step == "usage":                                           # the old, specific event is kept
         assert "usage exploded" in payloads(rig.conn, "usage_ingest_error")[0]["error"]
         assert summary["usage_sessions"] == 0

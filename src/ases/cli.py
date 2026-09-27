@@ -973,7 +973,10 @@ def _run_loop(args: argparse.Namespace) -> int:
             # blip, so it stops after _MAX_CONSECUTIVE_PASS_ERRORS in a row rather than looping to the bound.
             consecutive_errors += 1
             detail = f"{type(exc).__name__}: {exc}"[:500]
-            events_mod.record(conn, "pass_error", {"pass": number, "consecutive": consecutive_errors, "error": detail})
+            events_mod.record(
+                conn, "pass_error", {"pass": number, "consecutive": consecutive_errors, "error": detail},
+                project=plan.project,
+            )
             _err(f"[pass {number}] ERROR ({consecutive_errors} in a row): {detail}")
             if consecutive_errors >= _MAX_CONSECUTIVE_PASS_ERRORS:
                 _err(f"stopping after {consecutive_errors} failed passes in a row; fix the cause and re-run "

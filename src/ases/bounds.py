@@ -598,7 +598,7 @@ def mark_release_report(conn: sqlite3.Connection, project: str, path) -> None:
 def release_report_written(conn: sqlite3.Connection, project: str) -> bool:
     """ASES-CTL-01: True once mark_release_report has recorded a report for this project."""
     row = conn.execute(
-        "SELECT 1 FROM events WHERE kind = ? AND json_extract(payload, '$.project') = ? LIMIT 1",
+        f"SELECT 1 FROM events WHERE kind = ? AND {events.PROJECT_SCOPE_SQL} LIMIT 1",
         (RELEASE_REPORT_EVENT, project),
     ).fetchone()
     return row is not None

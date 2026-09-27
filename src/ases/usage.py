@@ -160,9 +160,9 @@ def _ingest_run(
         events.record(conn, "usage_ingested", {
             "session_id": session_id, "profile": profile, "provider": provider,
             "model": model, "requests": requests,
-        })
+        }, project=attribution[0])
         if mismatch is not None:
-            events.record(conn, "model_mismatch", mismatch)
+            events.record(conn, "model_mismatch", mismatch, project=attribution[0])
     return session_id
 
 

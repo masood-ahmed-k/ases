@@ -1600,6 +1600,45 @@ def test_gate_before_review_keeps_the_card_in_review_when_the_tamper_check_could
     }]
 
 
+def test_gate_before_review_passes_its_project_through_to_a_tamper_check_error_event(repo, tmp_path, monkeypatch):
+    """events.py package, round 9: gate_before_review's own tamper_check_error event must carry the same project
+    as gate1_recheck_failed, the sibling event its one caller (controller.process_review_lane) already records
+    with plan.project a few lines later -- checked against the events.project column directly, since _events()
+    above only reads the payload, which never carries "project" for this event."""
+    _branch_with_changes(repo, "swarm/E4B", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: boom"))
+    _forbid_hermes(monkeypatch)
+    _forbid_gate1(monkeypatch)
+
+    ok = review.gate_before_review(
+        "b", "t_e4b", repo, "swarm/E4B", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="E4B",
+        project="proj-a",
+    )
+
+    assert ok is True
+    row = conn.execute("SELECT project FROM events WHERE kind = 'tamper_check_error'").fetchone()
+    assert row["project"] == "proj-a"
+
+
+def test_gate_before_review_passes_its_project_through_to_a_tamper_blocked_event(repo, tmp_path, monkeypatch):
+    """Same as above, for the tamper_blocked event a real tampering finding records (as opposed to a check that
+    could not run at all)."""
+    touches, _, _ = _tamper_branch(repo, "deleted-test-file", "swarm/E4C")
+    conn = db.connect(tmp_path / "ases.db")
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda b, c, r: None)
+    _forbid_gate1(monkeypatch)
+
+    ok = review.gate_before_review(
+        "b", "t_e4c", repo, "swarm/E4C", "integration", ["echo gate-ok"], touches, conn=conn, task_key="E4C",
+        project="proj-b",
+    )
+
+    assert ok is False
+    row = conn.execute("SELECT project FROM events WHERE kind = 'tamper_blocked'").fetchone()
+    assert row["project"] == "proj-b"
+
+
 def test_the_merge_check_returns_a_tamper_check_error_as_it_is_and_no_green_record_excuses_it(repo, tmp_path, monkeypatch):
     _branch_with_changes(repo, "swarm/E5", {"src/a.py": "x=1\n"})
     conn = db.connect(tmp_path / "ases.db")

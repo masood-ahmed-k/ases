@@ -439,7 +439,7 @@ def test_ingest_leaves_nothing_behind_when_a_write_fails_part_way(conn, tmp_path
     _fake_exports(monkeypatch, {"S1": _export("S1", CODER_MODEL, 12)})
     real_record = events.record
 
-    def locked(_conn, kind, payload=None):
+    def locked(_conn, kind, payload=None, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(events, "record", locked)
@@ -785,10 +785,10 @@ def test_a_failing_mismatch_write_rolls_the_whole_session_back_and_it_is_retried
     _fake_exports(monkeypatch, {"S1": _export("S1", "vendor/model-a:free", 3)})
     real_record = events.record
 
-    def flaky(_conn, kind, payload=None):
+    def flaky(_conn, kind, payload=None, **kwargs):
         if kind == "model_mismatch":
             raise sqlite3.OperationalError("database is locked")
-        return real_record(_conn, kind, payload)
+        return real_record(_conn, kind, payload, **kwargs)
 
     monkeypatch.setattr(events, "record", flaky)
     with pytest.raises(sqlite3.OperationalError):

@@ -81,6 +81,9 @@ def _bootstrap_event(conn, kind: str, repo: pathlib.Path, integration_branch: st
     _ingest_outgoing_usage uses for models_config)."""
     if conn is None:
         return
+    # No project in scope here (events.py package, round 9): ensure_repo_bootstrapped runs from cmd_plan before a
+    # plan or a plan_tasks row exists for this repo, and neither it nor this helper is given the ASES project name,
+    # only the repo path -- left NULL rather than threading a new parameter through a git-bootstrap helper.
     events.record(conn, kind, {"repo": str(repo), "integration_branch": integration_branch, **extra})
 
 
@@ -338,7 +341,10 @@ def create_cards_from_plan(
                 (plan.project, key, work["id"], merge["id"], task.role,
                  json.dumps(list(task.touches)), task.gate_profile, task.estimated_requests, fix_cards_seed),
             )
-            events.record(conn, "cards_created", {"task_key": key, "work": work["id"], "merge": merge["id"]})
+            events.record(
+                conn, "cards_created", {"task_key": key, "work": work["id"], "merge": merge["id"]},
+                project=plan.project,
+            )
 
     return list(pairs.values())
 
@@ -478,21 +484,27 @@ def _handoff_commit(work_card: dict) -> str | None:
 def _refuse_once(conn, kind: str, work_card: dict, payload: dict) -> None:
     """Record a merge refusal ONCE per work card and kind. Once, not on every poll: a pass repeats every few
     seconds and would otherwise add an identical event each time for as long as the card sits there."""
+    # Hermes work card ids are globally unique, so kind + card_id alone (no project) is already an unambiguous
+    # dedup key: another project's card can never collide here.
     seen = conn.execute(
         "SELECT 1 FROM events WHERE kind = ? AND json_extract(payload, '$.card_id') = ? LIMIT 1",
         (kind, work_card["id"]),
     ).fetchone()
     if seen is None:
+        # events.py package, round 9: this helper takes no project parameter of its own -- it forwards whatever
+        # payload dict its caller built straight to events.record, and every one of its callers has plan.project
+        # in scope at its own call site and puts it under payload["project"], so the column still ends up filled.
         events.record(conn, kind, {"card_id": work_card["id"], **payload})
 
 
 def _refuse_unreviewed(
-    conn, task_key: str, work_card: dict, completed_by: str | None, reviewer_profile: str,
+    conn, task_key: str, work_card: dict, completed_by: str | None, reviewer_profile: str, *, project: str,
 ) -> None:
     """Record, once per work card, that the merge queue refused it because the reviewer profile did not
     complete it."""
     _refuse_once(conn, "merge_refused_unreviewed", work_card, {
         "task_key": task_key, "completed_by": completed_by, "needs_completion_by": reviewer_profile,
+        "project": project,
     })
 
 
@@ -636,7 +648,9 @@ def process_budget_gate(
         if not ok:
             hermes_mod.kanban_schedule(board, card["id"], reason)
             parked.append(task.key)
-            events.record(conn, "card_parked_for_budget", {"task_key": task.key, "reason": reason})
+            events.record(
+                conn, "card_parked_for_budget", {"task_key": task.key, "reason": reason}, project=plan.project,
+            )
     return parked
 
 
@@ -742,7 +756,7 @@ def process_review_lane(
             ok = review_mod.gate_before_review(
                 board, card["id"], repo, branch, plan.integration_branch, gate_cmds, list(task.touches),
                 conn=conn, task_key=task_key, allow_gate_config_changes=task.allow_gate_config_changes,
-                project_config=project, task=task,
+                project_config=project, task=task, project=plan.project,
             )
         except sandbox_mod.SandboxInfrastructureError as exc:
             _record_once(conn, "sandbox_infrastructure_error", {
@@ -751,7 +765,7 @@ def process_review_lane(
             continue
         if not ok:
             sent_back.append(task_key)
-            events.record(conn, "gate1_recheck_failed", {"task_key": task_key})
+            events.record(conn, "gate1_recheck_failed", {"task_key": task_key}, project=plan.project)
     return sent_back
 
 
@@ -774,7 +788,9 @@ def _handle_merge_failure(
             f"another fix card. Last failure: {detail[:500]}\nHow should this be resolved?",
             conn=conn,
         )
-        events.record(conn, "fix_card_budget_exhausted", {"task_key": key, "asked": asked})
+        events.record(
+            conn, "fix_card_budget_exhausted", {"task_key": key, "asked": asked}, project=plan.project,
+        )
         return
 
     assignee = policy.resolve_assignee(task.role, project.roles)
@@ -802,7 +818,9 @@ def _handle_merge_failure(
         "WHERE project = ? AND task_key = ?",
         (fix_card["id"], plan.project, key),
     )
-    events.record(conn, "fix_card_created", {"task_key": key, "fix_card_id": fix_card["id"]})
+    events.record(
+        conn, "fix_card_created", {"task_key": key, "fix_card_id": fix_card["id"]}, project=plan.project,
+    )
 
 
 def process_merge_queue(
@@ -924,7 +942,7 @@ def process_merge_queue(
         completed_run = _completing_run(work_card)
         completed_by = completed_run.get("profile") if completed_run else None
         if completed_by != reviewer_profile:
-            _refuse_unreviewed(conn, key, work_card, completed_by, reviewer_profile)
+            _refuse_unreviewed(conn, key, work_card, completed_by, reviewer_profile, project=plan.project)
             if unreviewed is not None:
                 unreviewed.append(key)
             continue
@@ -945,6 +963,7 @@ def process_merge_queue(
             if not verdict.valid:
                 _refuse_once(conn, "merge_refused_invalid_verdict", work_card, {
                     "task_key": key, "outcome": verdict.outcome, "problems": list(verdict.problems)[:10],
+                    "project": plan.project,
                 })
                 if unreviewed is not None:
                     unreviewed.append(key)
@@ -966,7 +985,7 @@ def process_merge_queue(
                 hermes_mod.kanban_reopen_review(board, work_card["id"], reason=reason)
                 events.record(conn, "reviewer_completed_with_changes_requested", {
                     "task_key": key, "card_id": work_card["id"], "outcome": verdict.outcome,
-                })
+                }, project=plan.project)
                 continue
             # ASES-GIT-03, ASES-GIT-13, ASES-REV-05, ASES-QG-01: scope, then the controller's OWN green Gate 1
             # record for this exact head. A red or stale result takes the ordinary failure path (fix card).
@@ -991,7 +1010,8 @@ def process_merge_queue(
                 # once per card and message: a pass repeats every few seconds and a broken git would say the same
                 # thing each time.
                 _record_once(conn, "tamper_check_error", {
-                    "task_key": key, "card_id": work_card["id"], "detail": _clean(check.detail, 300),
+                    "project": plan.project, "task_key": key, "card_id": work_card["id"],
+                    "detail": _clean(check.detail, 300),
                 }, match=("card_id", "detail"))
                 continue
             if not check.ok:
@@ -1001,6 +1021,7 @@ def process_merge_queue(
             elif not review_mod.verdict_matches_head(verdict, check.head):
                 _refuse_once(conn, "merge_refused_verdict_commit_mismatch", work_card, {
                     "task_key": key, "reviewed_commit": verdict.commit, "branch_head": check.head,
+                    "project": plan.project,
                 })
                 if unreviewed is not None:
                     unreviewed.append(key)
@@ -1042,7 +1063,10 @@ def process_merge_queue(
             # ASES-REC-06: the kill switch (or a reached bound) stopped the merge at one of its checkpoints. Nothing
             # was merged and nothing is wrong with the branch, so it is not a failure: no merge_failed event, no fix
             # card, no budget. The rest of the queue waits too, since the same flag stops every later task.
-            events.record(conn, "merge_stopped", {"task_key": key, "detail": _clean(outcome.detail, 300)})
+            events.record(
+                conn, "merge_stopped", {"task_key": key, "detail": _clean(outcome.detail, 300)},
+                project=plan.project,
+            )
             break
 
         if outcome.merged and outcome.squash_commit is None:
@@ -1056,7 +1080,7 @@ def process_merge_queue(
                     metadata={"squash_commit": None, "no_op": True},
                 )
             merged.append(key)
-            events.record(conn, "merged", {"task_key": key, "sha": None, "no_op": True})
+            events.record(conn, "merged", {"task_key": key, "sha": None, "no_op": True}, project=plan.project)
             continue
         if outcome.merged:
             # ASES-GIT-05 (section 8.1): re-check Gate 3 on the NEW integration HEAD before trusting the merge.
@@ -1101,7 +1125,7 @@ def process_merge_queue(
                 post_detail = _clean(postcheck.detail, 500)
                 events.record(conn, "post_merge_reverted", {
                     "task_key": key, "commit": outcome.squash_commit, "detail": post_detail,
-                })
+                }, project=plan.project)
                 revert = mergeq.revert_merge(repo, outcome.squash_commit, conn=conn, task_key=key, project=plan.project)
                 if not revert.ok:
                     # The integration branch is now in an unknown state (still broken, or mid-conflict if even
@@ -1114,14 +1138,16 @@ def process_merge_queue(
                     )
                     events.record(conn, "integrity_violation", {
                         "problems": [problem], "head": outcome.squash_commit, "branch": plan.integration_branch,
-                    })
+                    }, project=plan.project)
                     if integrity is not None:
                         integrity.append(problem)
                     break
                 # The revert landed a new commit on the primary checkout itself: that, not the reverted merge, is
                 # the HEAD the integrity guard must now expect (the same reasoning as the green case below).
                 guards_mod.set_expected_head(conn, plan.project, revert.commit_sha)
-                events.record(conn, "merge_failed", {"task_key": key, "detail": post_detail})
+                events.record(
+                    conn, "merge_failed", {"task_key": key, "detail": post_detail}, project=plan.project,
+                )
                 _handle_merge_failure(
                     board, plan, project, conn=conn, key=key, row=row, work_card=work_card, task=task,
                     reviewer_profile=reviewer_profile, models_config=models_config, detail=post_detail,
@@ -1141,7 +1167,9 @@ def process_merge_queue(
                     metadata={"squash_commit": outcome.squash_commit},
                 )
             merged.append(key)
-            events.record(conn, "merged", {"task_key": key, "sha": outcome.squash_commit})
+            events.record(
+                conn, "merged", {"task_key": key, "sha": outcome.squash_commit}, project=plan.project,
+            )
             continue
         elif outcome.integration_moved:
             # Only the fast-forward was refused, and mergeq verified in git that the integration branch
@@ -1152,14 +1180,16 @@ def process_merge_queue(
             # Keyed on integration_moved, NOT on gate3_result == "pass": git also refuses a fast-forward
             # with the tip unmoved (dirty or wrong-branch primary checkout, index.lock), and treating that
             # as a race retried it silently on every poll instead of letting it surface below.
-            events.record(conn, "merge_race_retrying", {"task_key": key, "detail": outcome.detail[:500]})
+            events.record(
+                conn, "merge_race_retrying", {"task_key": key, "detail": outcome.detail[:500]}, project=plan.project,
+            )
             continue
 
         # Command output can carry a secret (a gate prints its environment, git echoes a remote URL), and this text goes
         # into an event, a question and a card body: redacted once here, BEFORE it is cut, so a secret is never left
         # half-visible at a truncation point (ASES-SEC-01).
         detail = events.redact_text(outcome.detail or "")
-        events.record(conn, "merge_failed", {"task_key": key, "detail": detail[:500]})
+        events.record(conn, "merge_failed", {"task_key": key, "detail": detail[:500]}, project=plan.project)
         _handle_merge_failure(
             board, plan, project, conn=conn, key=key, row=row, work_card=work_card, task=task,
             reviewer_profile=reviewer_profile, models_config=models_config, detail=detail,
@@ -1246,6 +1276,9 @@ def _record_once(conn, kind: str, payload: dict, *, match: tuple[str, ...]) -> b
     ).fetchone()
     if seen is not None:
         return False
+    # No project parameter here either: every caller's payload carries "project" (not always one of the match
+    # fields above, since a card_id is already globally unique on its own), so events.record's own
+    # payload["project"] fallback fills the column with no change needed at this line.
     events.record(conn, kind, payload)
     return True
 
@@ -1284,7 +1317,7 @@ def _pause_reason(conn, project_name: str) -> str | None:
     """Why a paused project is paused: the reason of the newest `project_paused` event (pause_and_report records it).
     bounds.set_status keeps a reason only for a `stopped` project, so this is where a paused one's is kept."""
     row = conn.execute(
-        "SELECT payload FROM events WHERE kind = 'project_paused' AND json_extract(payload, '$.project') = ? "
+        f"SELECT payload FROM events WHERE kind = 'project_paused' AND {events.PROJECT_SCOPE_SQL} "
         "ORDER BY id DESC LIMIT 1", (project_name,),
     ).fetchone()
     reason = _event_payload(row["payload"]).get("reason") if row else None
@@ -1334,7 +1367,9 @@ def _ingest_outgoing_usage(board, card_id, project, models_config, plan, task_ke
             board, card_id, project, models_config, conn=conn, plan_project=plan.project, task_key=task_key,
         )
     except Exception as exc:  # noqa: BLE001 - see above
-        events.record(conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]})
+        events.record(
+            conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]}, project=plan.project,
+        )
 
 
 # --- recovery: failed runs, fresh attempts, re-plans and spent lineage budgets -----------------------------------
@@ -1432,7 +1467,7 @@ def _pending_decisions(conn, plan: plan_mod.Plan, *, skip=frozenset()) -> list:
         )
     }
     rows = conn.execute(
-        "SELECT payload FROM events WHERE kind = 'recovery_decision' AND json_extract(payload, '$.project') = ? "
+        f"SELECT payload FROM events WHERE kind = 'recovery_decision' AND {events.PROJECT_SCOPE_SQL} "
         "AND json_extract(payload, '$.action') IN (?, ?, ?) ORDER BY id", (plan.project, *_CONTROLLER_ACTIONS),
     ).fetchall()
     pending = []
@@ -1451,7 +1486,7 @@ def _pending_decisions(conn, plan: plan_mod.Plan, *, skip=frozenset()) -> list:
             else (("retry_card_created", "retry_card_skipped"), "old_card")
         )
         done = conn.execute(
-            f"SELECT 1 FROM events WHERE kind IN (?, ?) AND json_extract(payload, '$.project') = ? "
+            f"SELECT 1 FROM events WHERE kind IN (?, ?) AND {events.PROJECT_SCOPE_SQL} "
             f"AND json_extract(payload, '$.{field}') = ? AND json_extract(payload, '$.run_id') IS ? LIMIT 1",
             (*markers, plan.project, card_id, run_id),
         ).fetchone()
@@ -1506,7 +1541,7 @@ def _retry_count(conn, project: str, task_key: str) -> int:
     """How many replacement cards `retry_card_created` events say were made for this task."""
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM events WHERE kind = 'retry_card_created' "
-        "AND json_extract(payload, '$.project') = ? AND json_extract(payload, '$.task_key') = ?",
+        f"AND {events.PROJECT_SCOPE_SQL} AND json_extract(payload, '$.task_key') = ?",
         (project, task_key),
     ).fetchone()
     return int(row["n"])
@@ -1522,7 +1557,7 @@ def _next_retry_number(conn, project: str, task_key: str) -> int:
     before it was dropped, and the next decision must not adopt that stray card through its idempotency key."""
     skipped = conn.execute(
         "SELECT COUNT(*) AS n FROM events WHERE kind = 'retry_card_skipped' "
-        "AND json_extract(payload, '$.project') = ? AND json_extract(payload, '$.task_key') = ?",
+        f"AND {events.PROJECT_SCOPE_SQL} AND json_extract(payload, '$.task_key') = ?",
         (project, task_key),
     ).fetchone()
     return _retry_count(conn, project, task_key) + int(skipped["n"]) + 1
@@ -1761,7 +1796,7 @@ def _escalate_spent_budgets(board: str, plan: plan_mod.Plan, project: ases_confi
             continue
         seen = conn.execute(
             "SELECT 1 FROM events WHERE kind IN ('replan_requested', 'lineage_escalated') "
-            "AND json_extract(payload, '$.project') = ? AND json_extract(payload, '$.task_key') = ? "
+            f"AND {events.PROJECT_SCOPE_SQL} AND json_extract(payload, '$.task_key') = ? "
             "AND json_extract(payload, '$.review_rounds') = ? LIMIT 1",
             (plan.project, task.key, lineage.review_rounds),
         ).fetchone()
@@ -1863,11 +1898,14 @@ def process_unpark(
             hermes_mod.kanban_unblock(board, card["id"], reason="budget available again")
         except Exception as exc:  # noqa: BLE001 - one card must never stop the others
             _record_once(conn, "unpark_error", {
-                "task_key": task.key, "card_id": card["id"], "error": _clean(f"{type(exc).__name__}: {exc}"),
+                "project": plan.project, "task_key": task.key, "card_id": card["id"],
+                "error": _clean(f"{type(exc).__name__}: {exc}"),
             }, match=("card_id", "error"))
             continue
         unparked.append(task.key)
-        events.record(conn, "card_unparked", {"task_key": task.key, "card_id": card["id"]})
+        events.record(
+            conn, "card_unparked", {"task_key": task.key, "card_id": card["id"]}, project=plan.project,
+        )
     return unparked
 
 
@@ -1944,15 +1982,21 @@ def pause_and_report(
         directory = _report_directory(project, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     except Exception as exc:  # noqa: BLE001 - see the docstring
         directory = None
-        events.record(conn, "pause_report_error", {"error": _clean(f"{type(exc).__name__}: {exc}")})
+        events.record(
+            conn, "pause_report_error", {"error": _clean(f"{type(exc).__name__}: {exc}")}, project=plan.project,
+        )
     try:
         hermes_mod.pause(why)
     except Exception as exc:  # noqa: BLE001 - see the docstring
-        events.record(conn, "pause_error", {"error": _clean(f"{type(exc).__name__}: {exc}")})
+        events.record(
+            conn, "pause_error", {"error": _clean(f"{type(exc).__name__}: {exc}")}, project=plan.project,
+        )
     try:
         bounds_mod.set_status(conn, plan.project, "paused", why)
     except Exception as exc:  # noqa: BLE001 - see the docstring
-        events.record(conn, "pause_state_error", {"error": _clean(f"{type(exc).__name__}: {exc}")})
+        events.record(
+            conn, "pause_state_error", {"error": _clean(f"{type(exc).__name__}: {exc}")}, project=plan.project,
+        )
     try:
         events.record(conn, "project_paused", {
             "project": plan.project, "reason": why, "report_dir": str(directory) if directory else "",
@@ -1963,7 +2007,9 @@ def pause_and_report(
         try:
             report_mod.write_report(report_mod.build_report(board, plan, project, models_config, conn), directory)
         except Exception as exc:  # noqa: BLE001 - see the docstring
-            events.record(conn, "pause_report_error", {"error": _clean(f"{type(exc).__name__}: {exc}")})
+            events.record(
+                conn, "pause_report_error", {"error": _clean(f"{type(exc).__name__}: {exc}")}, project=plan.project,
+            )
     return str(directory) if directory else ""
 
 
@@ -1981,7 +2027,9 @@ def process_provision(board: str, plan: plan_mod.Plan, *, conn) -> list[str]:
     try:
         leases_mod.sweep_finished(board, conn, plan, live_statuses=_LEASE_LIVE_STATUSES)
     except Exception as exc:  # noqa: BLE001 - a lease that is not swept now is swept next pass
-        events.record(conn, "lease_sweep_error", {"error": _clean(f"{type(exc).__name__}: {exc}")})
+        events.record(
+            conn, "lease_sweep_error", {"error": _clean(f"{type(exc).__name__}: {exc}")}, project=plan.project,
+        )
     return list(provisioned)
 
 
@@ -2055,7 +2103,7 @@ def process_finalize(
 # --- the pass -------------------------------------------------------------------------------------------------------
 
 
-def _isolated(conn, summary: dict, step: str, fn, default):
+def _isolated(conn, summary: dict, step: str, fn, default, project: str | None = None):
     """Run one step of the pass that is NOT safety-critical, and turn an exception into a `pass_step_error` event naming
     the step plus a warning line in the summary, then carry on with `default`: a stale ledger, a failed lease or a
     final gate that cannot run must not stop the merge queue. KeyboardInterrupt and SystemExit are not caught."""
@@ -2063,7 +2111,9 @@ def _isolated(conn, summary: dict, step: str, fn, default):
         return fn()
     except Exception as exc:  # noqa: BLE001 - deliberately broad: see the docstring
         text = _clean(f"{type(exc).__name__}: {exc}")
-        events.record(conn, "pass_step_error", {"step": step, "error": text})
+        # events.py package, round 9: every call site is inside run_pass, which already has plan.project in
+        # scope, so it is threaded straight through here instead of left NULL.
+        events.record(conn, "pass_step_error", {"step": step, "error": text}, project=project)
         summary["warnings"].append(f"step {step} failed: {text}")
         return default
 
@@ -2121,12 +2171,16 @@ def run_pass(
     )
     if not guard.ok:
         problems = list(guard.problems)[:20]
-        events.record(conn, "integrity_violation", {"problems": problems, "head": guard.head, "branch": guard.branch})
+        events.record(
+            conn, "integrity_violation", {"problems": problems, "head": guard.head, "branch": guard.branch},
+            project=plan.project,
+        )
         summary["integrity"] = problems
         return summary
 
     summary["warnings"].extend(_isolated(
         conn, summary, "idle_worktrees", lambda: process_idle_worktrees(board, repo, plan, conn=conn), [],
+        plan.project,
     ))
 
     # Real usage into the ledger first (ASES-CAP-03), as the blueprint's loop does: the budget gate below is
@@ -2136,17 +2190,21 @@ def run_pass(
         try:
             return usage_mod.ingest_run_usage(board, plan, project, models_config, conn=conn)
         except Exception as exc:  # noqa: BLE001 - recorded under its own name, then by _isolated as a step error
-            events.record(conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]})
+            events.record(
+                conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]}, project=plan.project,
+            )
             raise
 
-    summary["usage_sessions"] = len(_isolated(conn, summary, "usage", ingest, []))
+    summary["usage_sessions"] = len(_isolated(conn, summary, "usage", ingest, [], plan.project))
     summary["recovery"] = _isolated(
         conn, summary, "recovery",
         lambda: process_recovery(board, repo, plan, project, models_config, conn=conn, now=now), [],
+        plan.project,
     )
     stopped, why = _isolated(
         conn, summary, "bounds",
         lambda: process_bounds(board, repo, plan, project, models_config, conn=conn, now=now), (False, None),
+        plan.project,
     )
     if stopped:
         summary["stopped"] = True
@@ -2159,11 +2217,13 @@ def run_pass(
     summary["unparked"] = _isolated(
         conn, summary, "unpark",
         lambda: process_unpark(board, plan, models_config, conn=conn, budgets=project.budgets, project=project), [],
+        plan.project,
     )
     summary["sent_back"] = process_review_lane(board, repo, plan, project, conn=conn)
     summary["dispatch"] = hermes_mod.kanban_dispatch(board)
     summary["provisioned"] = _isolated(
         conn, summary, "provision", lambda: process_provision(board, plan, conn=conn), [],
+        plan.project,
     )
     summary["merged"] = process_merge_queue(
         board, repo, plan, project, conn=conn, unreviewed=summary["unreviewed"], models_config=models_config,
@@ -2177,6 +2237,7 @@ def run_pass(
     final = _isolated(
         conn, summary, "finalize",
         lambda: process_finalize(board, repo, plan, project, models_config, conn=conn, now=now), None,
+        plan.project,
     )
 
     summary["final"] = final

@@ -1413,6 +1413,96 @@ def test_event_payloads_are_redacted_where_they_are_read(conn, tmp_path, monkeyp
                        "nested": {"token": "[redacted]"}}
 
 
+# --- Two projects sharing a database (events.py package, round 9; ASES-OBS-01) --------------------------------
+
+OTHER_PLAN = plan_mod.parse_and_validate({
+    "project": "p2",
+    "integration_branch": "integration",
+    "gate_profiles": {"trivial": ["echo ok"]},
+    "tasks": [_task("T1", "scaffold", "coder", [], ["a.py"])],
+}, known_roles=set(ROLES), max_cards=40)
+
+
+def test_the_events_panel_is_per_project_not_per_database(conn, tmp_path, monkeypatch):
+    """BEFORE this package, build_report's "events" panel had no project filter at all: p1's report showed p2's
+    events too (see the round 9 before/after proof in the builder's report). Covers both a row attributed through
+    the new project column (events.record(..., project=...)) and a legacy-shaped row attributed only through its
+    payload, the way every row written before schema v7 is."""
+    _fake_hermes(monkeypatch, {})
+    events.record(conn, "final_gate_recorded", {"gate": "gate4", "result": "pass"}, project="p1")
+    events.record(conn, "final_gate_recorded", {"gate": "gate4", "result": "pass"}, project="p2")
+    _event(conn, "2026-09-19T10:00:00+00:00", "legacy_kind", {"project": "p1", "detail": "pre-v7 row, p1"})
+    _event(conn, "2026-09-19T10:00:01+00:00", "legacy_kind", {"project": "p2", "detail": "pre-v7 row, p2"})
+    _event(conn, "2026-09-19T10:00:02+00:00", "unattributed_kind", {"detail": "no project anywhere"})
+
+    p1_events = _build(conn, tmp_path)["events"]
+    p2_events = report.build_report(
+        "b", OTHER_PLAN, _project(tmp_path, name="p2"), MODELS_CONFIG, conn, now=NOW,
+    )["events"]
+    p1_details = {e["payload"].get("detail") for e in p1_events}
+    p2_details = {e["payload"].get("detail") for e in p2_events}
+
+    assert sum(1 for e in p1_events if e["kind"] == "final_gate_recorded") == 1   # p1's own, via the column
+    assert sum(1 for e in p2_events if e["kind"] == "final_gate_recorded") == 1   # p2's own, via the column
+    assert "pre-v7 row, p1" in p1_details and "pre-v7 row, p1" not in p2_details  # legacy row, payload-only
+    assert "pre-v7 row, p2" in p2_details and "pre-v7 row, p2" not in p1_details  # p1 never sees p2's legacy row
+    assert "no project anywhere" in p1_details and "no project anywhere" in p2_details  # kept for every project
+
+
+def test_the_quality_panel_findings_are_per_project_not_per_database(conn, tmp_path, monkeypatch):
+    """The same leak, for _quality_panel's findings query (merge_refused_*/tamper_*/integrity_violation)."""
+    _fake_hermes(monkeypatch, {})
+    events.record(conn, "integrity_violation", {"problems": ["p1 problem"]}, project="p1")
+    events.record(conn, "integrity_violation", {"problems": ["p2 problem"]}, project="p2")
+
+    p1_findings = _build(conn, tmp_path)["quality"]["findings"]
+    p2_findings = report.build_report(
+        "b", OTHER_PLAN, _project(tmp_path, name="p2"), MODELS_CONFIG, conn, now=NOW,
+    )["quality"]["findings"]
+
+    assert any("p1 problem" in f["message"] for f in p1_findings)
+    assert not any("p2 problem" in f["message"] for f in p1_findings)
+    assert any("p2 problem" in f["message"] for f in p2_findings)
+    assert not any("p1 problem" in f["message"] for f in p2_findings)
+
+
+def test_the_health_panel_counts_only_this_projects_events_and_unattributed_ones(conn, tmp_path, monkeypatch):
+    """Round 9 (architect, after EVENTSPROJ left it as a known gap): _health_panel used to count HEALTH_KINDS
+    across the whole database, so p1's report showed p2's merge failures. Now p1 sees its own, the unattributed
+    one, and never p2's."""
+    _fake_hermes(monkeypatch, {})
+    events.record(conn, "merge_failed", {"task_key": "T1", "detail": "p1 failure"}, project="p1")
+    events.record(conn, "merge_failed", {"task_key": "T1", "detail": "p2 failure"}, project="p2")
+    events.record(conn, "merge_failed", {"task_key": "T9", "detail": "no project anywhere"})
+
+    p1 = report._health_panel(conn, "p1")
+    p2 = report._health_panel(conn, "p2")
+
+    count = lambda panel: next(k["count"] for k in panel["kinds"] if k["kind"] == "merge_failed")  # noqa: E731
+    assert count(p1) == 2 and count(p2) == 2
+    p1_messages = " ".join(r["message"] or "" for r in p1["recent"])
+    assert "p1 failure" in p1_messages and "no project anywhere" in p1_messages
+    assert "p2 failure" not in p1_messages
+
+
+def test_a_parked_cards_reason_comes_from_its_own_projects_event_not_another_project_reusing_the_key(
+    conn, tmp_path, monkeypatch,
+):
+    """Round 9 (architect, after EVENTSPROJ left it as a known gap): two projects reuse task key T1; p2's parking
+    event is the NEWER one, which the old query (kind only) picked for p1's parked card."""
+    _fake_hermes(monkeypatch, {"w1": {"id": "w1", "status": "scheduled", "title": "p1's T1"}})
+    _event(conn, "2026-09-19T10:00:00+00:00", "card_parked_for_budget", {"project": "p1", "task_key": "T1",
+                                                                        "reason": "p1 reason"})
+    _event(conn, "2026-09-19T11:00:00+00:00", "card_parked_for_budget", {"project": "p2", "task_key": "T1",
+                                                                        "reason": "p2 reason"})
+    task_rows = {"T1": {"work_card_id": "w1", "merge_card_id": None}}
+
+    parked, error = report._parked_cards("b", conn, task_rows, "p1")
+
+    assert error is None
+    assert [(p["task_key"], p["reason"]) for p in parked] == [("T1", "p1 reason")]
+
+
 # --- Models ---------------------------------------------------------------------------------------------------
 
 

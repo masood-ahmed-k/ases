@@ -717,6 +717,8 @@ def _audit(conn: sqlite3.Connection | None, record: RunRecord, warnings: list[st
     if conn is None:
         return
     try:
+        # No project here: a one-shot evaluation run is not tied to any ASES project (events.py package, round 9's
+        # own example of a genuinely cross-project event).
         events.record(conn, "eval_run", {
             "run_id": record.run_id, "task": record.task_id, "candidate": record.candidate,
             "requests": record.requests, "success": record.score.success,

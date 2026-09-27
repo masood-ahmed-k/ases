@@ -942,13 +942,16 @@ def _bounds_reached(board: str, plan, project, models_config, conn, moment: date
 
 
 def _count_events(conn: sqlite3.Connection, kind: str, project: str | None = None) -> int:
-    """How many events of `kind`, and of `project` when one is given (only payloads that carry a project field can
-    be scoped: recovery_decision does, question_answered and reconcile_repair do not, so those count the database)."""
+    """How many events of `kind`, and of `project` when one is given (only a kind whose payload (or, since schema
+    v7/events.py round 9, its project column) carries a project can be scoped: recovery_decision and
+    reconcile_repair do, question_answered does not (questions.answer_question is "not scoped to a plan"), so that
+    one counts the whole database)."""
     if project is None:
         row = conn.execute("SELECT COUNT(*) AS n FROM events WHERE kind = ?", (kind,)).fetchone()
     else:
         row = conn.execute(
-            "SELECT COUNT(*) AS n FROM events WHERE kind = ? AND json_extract(payload, '$.project') = ?",
+            "SELECT COUNT(*) AS n FROM events WHERE kind = ? "
+            f"AND {events.PROJECT_SCOPE_SQL}",
             (kind, project),
         ).fetchone()
     return int(row["n"])
@@ -994,7 +997,7 @@ def release_summary(
         },
         "replans": state["replans"] if state is not None else 0,
         "recovery_decisions": _count_events(conn, "recovery_decision", plan.project),
-        "reconcile_repairs": _count_events(conn, "reconcile_repair"),
+        "reconcile_repairs": _count_events(conn, "reconcile_repair", plan.project),
         "notes": notes,
     }
     return events.redact(summary)
@@ -1222,7 +1225,7 @@ def _report_directory(project, repo, moment: datetime, plan) -> pathlib.Path:
 def _last_report_path(conn: sqlite3.Connection, project: str) -> pathlib.Path | None:
     row = conn.execute(
         "SELECT json_extract(payload, '$.path') AS path FROM events WHERE kind = ? "
-        "AND json_extract(payload, '$.project') = ? ORDER BY id DESC LIMIT 1",
+        f"AND {events.PROJECT_SCOPE_SQL} ORDER BY id DESC LIMIT 1",
         (bounds.RELEASE_REPORT_EVENT, project),
     ).fetchone()
     return pathlib.Path(row["path"]) if row is not None and row["path"] else None

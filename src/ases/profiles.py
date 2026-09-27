@@ -1404,6 +1404,8 @@ def apply_init(
         credential_names_copied=tuple(applier.copied), skipped=tuple(skipped),
     )
     if conn is not None:
+        # No project: apply_init changes the user's real Hermes profiles directly (hermes_home), and is not given
+        # an ASES project name (it is called before a project's own DB rows necessarily exist, at `swarm init`).
         events_mod.record(conn, "profiles_apply", {
             "applied": [change.line() for change in applied], "failed": [change.line() for change in failed],
             "skipped": len(skipped), "backups": len(result.backups),

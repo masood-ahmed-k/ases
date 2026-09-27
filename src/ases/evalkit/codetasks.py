@@ -527,6 +527,11 @@ def score_swarm_project(
     requests = int(conn.execute(
         "SELECT COALESCE(SUM(requests), 0) FROM usage_ingested WHERE project = ?", (project,)).fetchone()[0])
     interventions = 0
+    # question_answered carries no project (questions.answer_question is "not scoped to a plan"; events.py package,
+    # round 9), so this is already correctly scoped the only way it can be: read every row, then keep only the
+    # ones whose own task_key is one of THIS project's (`keys`, from plan_tasks, above). A COALESCE(project, ...)
+    # filter would be wrong here, not merely unhelpful: every question_answered row's project column and payload
+    # are NULL, so it would silently drop every intervention instead of counting them.
     for row in conn.execute("SELECT payload FROM events WHERE kind = 'question_answered'"):
         try:
             payload = json.loads(row["payload"])

@@ -407,6 +407,7 @@ def ask_user(
         hermes_mod.kanban_comment(board, card_id, f"{ASK_PREFIX} {clean}", author=author)
         how = ASKED_COMMENTED
     if conn is not None:
+        # No project: ask_user takes a Hermes card, not a plan, so no project name is in scope here.
         events.record(conn, "question_asked", {
             "card_id": card_id, "via": how, "status": status, "chars": len(clean), "question": clean[:300],
         })
@@ -537,7 +538,7 @@ def list_questions(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Connection)
         except hermes_mod.HermesCommandError as exc:
             events.record(conn, "question_read_failed", {
                 "card_id": card_id, "error": f"{type(exc).__name__}: {exc}"[:300],
-            })
+            }, project=plan.project)
             continue
         status = card.get("status", lane)
         if status not in _QUESTION_STATUSES:
@@ -659,6 +660,7 @@ def answer_question(
             "its own) or by re-planning the task."
         )
     hermes_mod.kanban_unblock(board, card_id, reason="answered by " + author)
+    # No project: answer_question is "not scoped to a plan" (see the docstring above), so no project is available.
     events.record(conn, "question_answered", {"card_id": card_id, "task_key": task_key, "chars": len(text)})
     return question
 

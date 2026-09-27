@@ -990,6 +990,8 @@ def retention_events(conn: sqlite3.Connection, days: int, *, apply: bool = False
         count = conn.execute("SELECT COUNT(*) FROM events WHERE datetime(ts) < datetime(?)", (cutoff,)).fetchone()[0]
         if apply and count:
             conn.execute("DELETE FROM events WHERE datetime(ts) < datetime(?)", (cutoff,))
+            # No project: retention is global by design (it prunes every project's old rows in one pass), so the
+            # event that records the prune is about the whole database, not any one project.
             events_mod.record(conn, "events_pruned", {"days": days, "rows": count})
         return int(count)
     except Exception:  # noqa: BLE001
