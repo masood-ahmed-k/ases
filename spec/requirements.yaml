@@ -266,9 +266,15 @@ requirements:
   section: '5.2'
   verified_by: '22.1'
   status: covered
-  note: 'Pinned in config/models.yaml 2026-09-18: glm-5.3-thinking:free (Lead, requires reasoning_effort=low
-    + verify-don''t-guess system prompt addition) and cohere/north-mini-code:free (Reviewer, different
-    family/provider). qwen3.8-27b:free kept unpinned as a documented fallback. See docs/phase2-evaluation-report.md.'
+  note: 'ROUND 10 register hygiene (2026-09-27, zero quota): The models this note names are no longer the pinned
+    ones. glm-5.3-thinking:free was retired with UnoRouter on 2026-09-19. config/models.yaml pins today, one
+    explicit model ID per role, no router: Lead xkiro qwen/qwen3.8-max:free, coder xkiro
+    qwen/qwen3-coder-plus:free, Reviewer openrouter cohere/north-mini-code:free (a different provider and
+    family from the Lead). No Debugger role is active yet, so nothing is pinned for it. The requirement itself
+    still holds as written, so the status stays covered. Earlier note: Pinned in config/models.yaml
+    2026-09-18: glm-5.3-thinking:free (Lead, requires reasoning_effort=low + verify-don''t-guess system prompt
+    addition) and cohere/north-mini-code:free (Reviewer, different family/provider). qwen3.8-27b:free kept
+    unpinned as a documented fallback. See docs/phase2-evaluation-report.md.'
 - id: ASES-MOD-04
   requirement: A smoke test through the real Hermes path precedes first use of a model
   section: '5.2'
