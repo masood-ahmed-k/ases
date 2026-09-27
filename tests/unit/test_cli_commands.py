@@ -2921,6 +2921,31 @@ def test_doctor_exits_1_and_says_not_healthy_when_a_row_fails(world, monkeypatch
     assert out.rstrip().endswith("NOT HEALTHY -- see FAIL lines above")
 
 
+def test_doctor_passes_the_repo_to_the_checks_only_when_given(world, monkeypatch, capsys):
+    """Round 10: `swarm doctor --repo` hands the repository to doctor.run, so the base-commit check's
+    prerequisite (core.logAllRefUpdates) is checked there; plain `swarm doctor` passes no repo at all."""
+    seen = []
+
+    def run(project, models_config, conn, **kwargs):
+        seen.append(kwargs)
+        return doctor.DoctorReport((doctor.DoctorCheck("python_version", "pass", "ok"),))
+
+    monkeypatch.setattr(cli.ases_doctor, "run", run)
+
+    assert cli.main(["doctor"]) == 0
+    assert cli.main(["doctor", "--repo", str(world.repo)]) == 0
+
+    assert seen == [{}, {"repo": world.repo.resolve()}]
+
+
+def test_doctor_with_a_repo_reports_the_real_log_all_ref_updates_row(world, capsys):
+    """End to end on a real throwaway repository: with --repo the row is no longer "pending"."""
+    subprocess.run(["git", "init", "-q", str(world.repo)], check=True, capture_output=True)
+    rows = doctor._check_log_all_ref_updates(world.repo)
+
+    assert rows.status in ("pass", "warn") and rows.status != "pending"
+
+
 def test_models_lists_the_registry(world, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_load_models_config", lambda: {
         "providers": {}, "models": [{"provider": "xkiro", "model": "coder-model", "context_length": 65536,

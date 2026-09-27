@@ -240,13 +240,17 @@ def serialization_lines(plan) -> list[str]:
 
 
 @_command
-def cmd_doctor(_args: argparse.Namespace) -> int:
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """`--repo` (optional, round 10) names the project repository, so the base-commit check's prerequisite
+    (core.logAllRefUpdates, ASES-GIT-01/GIT-16) is checked there; without it that row reports "pending"."""
     project = _load_project()
     models_config = _load_models_config()
     conn = _open_conn(project)
     models_mod.sync_from_config(conn, models_config)
 
-    report = ases_doctor.run(project, models_config, conn)
+    repo = getattr(args, "repo", None)
+    extra = {"repo": pathlib.Path(repo).resolve()} if repo else {}
+    report = ases_doctor.run(project, models_config, conn, **extra)
     for check in report.checks:
         ids = f" ({', '.join(check.requirement_ids)})" if check.requirement_ids else ""
         _out(f"{_GLYPH[check.status]} {check.name}: {check.detail}{ids}")
@@ -1623,9 +1627,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="swarm", description="ASES: AI Software Engineering Swarm")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("doctor", help="Check the ASES + Hermes environment (acceptance test 22.1)").set_defaults(
-        func=cmd_doctor
-    )
+    p_doctor = sub.add_parser("doctor", help="Check the ASES + Hermes environment (acceptance test 22.1)")
+    p_doctor.add_argument("--repo", help="The project repository, for the checks that read it (optional)")
+    p_doctor.set_defaults(func=cmd_doctor)
     sub.add_parser("models", help="List the model registry and its declared capabilities").set_defaults(
         func=cmd_models
     )
