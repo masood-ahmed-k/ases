@@ -612,3 +612,88 @@ def test_explicit_depends_on_the_scaffold_task_is_what_actually_orders_parallel_
     assert order.index("scaffold") < order.index("T1")
     assert order.index("scaffold") < order.index("T2")
     assert p.serialization_links == ()  # from the explicit depends_on, not from a touches overlap
+
+
+# ---------------------------------------------------------------------------------------------
+# ASES-SEC-05, ASES-SEC-07 (round 9): a task-scoped network exception. A reason is required whenever the
+# exception is granted, and plan.sandbox_network_exceptions folds it into the gate_profiles pin.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_sandbox_network_defaults_to_false_and_empty_reason():
+    p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
+    assert all(t.sandbox_network is False and t.sandbox_network_reason == "" for t in p.tasks)
+
+
+def test_sandbox_network_true_with_a_reason_is_accepted():
+    raw = _raw_plan({**_raw_task("T1", ["a.py"]),
+                      "sandbox_network": True, "sandbox_network_reason": "installs a package during setup"})
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.task("T1").sandbox_network is True
+    assert p.task("T1").sandbox_network_reason == "installs a package during setup"
+
+
+def test_sandbox_network_true_without_a_reason_is_rejected():
+    raw = _raw_plan({**_raw_task("T1", ["a.py"]), "sandbox_network": True})
+    with pytest.raises(plan_mod.PlanError, match="sandbox_network_reason is empty"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_sandbox_network_true_with_a_blank_reason_is_rejected():
+    raw = _raw_plan({**_raw_task("T1", ["a.py"]), "sandbox_network": True, "sandbox_network_reason": "   "})
+    with pytest.raises(plan_mod.PlanError, match="sandbox_network_reason is empty"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_sandbox_network_must_be_a_bool():
+    raw = _raw_plan({**_raw_task("T1", ["a.py"]), "sandbox_network": "yes"})
+    with pytest.raises(plan_mod.PlanError, match="sandbox_network must be true or false"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_sandbox_network_reason_must_be_a_string():
+    raw = _raw_plan({**_raw_task("T1", ["a.py"]), "sandbox_network": True, "sandbox_network_reason": 5})
+    with pytest.raises(plan_mod.PlanError, match="sandbox_network_reason must be a string"):
+        plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+
+def test_sandbox_network_false_needs_no_reason():
+    """A reason is only required alongside the exception itself: a task that never asks for network access
+    (the default) is not forced to explain why it does not need one."""
+    raw = _raw_plan(_raw_task("T1", ["a.py"]))  # neither key given
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+    assert p.task("T1").sandbox_network is False
+
+
+def test_existing_plan_with_no_sandbox_network_field_parses_unchanged():
+    p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
+    assert all(t.sandbox_network is False and t.sandbox_network_reason == "" for t in p.tasks)
+
+
+def test_sandbox_network_exceptions_lists_only_tasks_that_carry_one():
+    raw = _raw_plan(
+        {**_raw_task("T1", ["a.py"]), "sandbox_network": True, "sandbox_network_reason": "needs pypi"},
+        _raw_task("T2", ["b.py"], depends_on=["T1"]),
+    )
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+    assert plan_mod.sandbox_network_exceptions(p) == {"T1": [True, "needs pypi"]}
+
+
+def test_sandbox_network_exceptions_empty_when_no_task_has_one():
+    p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
+    assert plan_mod.sandbox_network_exceptions(p) == {}
+
+
+def test_serialize_overlapping_tasks_preserves_the_sandbox_network_fields():
+    """dataclasses.replace inside serialize_overlapping_tasks must not drop a field it does not itself set."""
+    t1 = dataclasses.replace(_task("T1", ["a.py"]), sandbox_network=True, sandbox_network_reason="needs pypi")
+    t2 = _task("T2", ["a.py"])  # touches overlap with T1, so Gate 0 serializes them
+
+    tasks, links = plan_mod.serialize_overlapping_tasks([t1, t2])
+
+    by_key = {t.key: t for t in tasks}
+    assert by_key["T1"].sandbox_network is True
+    assert by_key["T1"].sandbox_network_reason == "needs pypi"
+    assert by_key["T2"].sandbox_network is False
+    assert links  # confirms the overlap was actually serialized, so this is not a vacuous check

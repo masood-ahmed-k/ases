@@ -798,6 +798,25 @@ def test_gate4_runs_the_plan_commands_through_run_gate_and_their_failure_fails_t
     assert [row["result"] for row in _final_rows(conn, "gate4")] == ["fail"]
 
 
+def test_gate4_threads_self_contained_checkout_to_run_gate(conn):
+    """Round 9 (ASES-QG-04, ASES-SEC-03): reaches run_gate exactly like `runner` does."""
+    fake = FakeRunGate()
+    plan = _plan(profiles={"g": ["echo ok"], "gate4": ["pip-audit"]})
+
+    _run4(conn, plan, "a" * 40, run_gate=fake, self_contained_checkout=True)
+
+    assert fake.calls[0]["self_contained_checkout"] is True
+
+
+def test_gate4_self_contained_checkout_defaults_to_false(conn):
+    fake = FakeRunGate()
+    plan = _plan(profiles={"g": ["echo ok"], "gate4": ["pip-audit"]})
+
+    _run4(conn, plan, "a" * 40, run_gate=fake)
+
+    assert fake.calls[0]["self_contained_checkout"] is False
+
+
 def test_gate4_passes_when_the_scan_is_clean_and_the_commands_pass(conn):
     plan = _plan(profiles={"g": ["echo ok"], "gate4": ["pip-audit"]})
     outcome = _run4(conn, plan, "a" * 40, run_gate=FakeRunGate(detail="no known vulnerabilities"))
@@ -1049,6 +1068,25 @@ def test_gate5_runs_the_plan_profile(conn):
     assert call["conn"] is None
     assert "GET /health 200" in outcome.detail
     assert [row["result"] for row in _final_rows(conn, "gate5")] == ["pass"]
+
+
+def test_gate5_threads_self_contained_checkout_to_run_gate(conn):
+    """Round 9 (ASES-QG-04, ASES-SEC-03): reaches run_gate exactly like `runner` does."""
+    fake = FakeRunGate()
+    plan = _plan(profiles={"g": ["pytest -q"], "gate5": ["python app.py --probe /health"]})
+
+    _run5(conn, plan, run_gate=fake, self_contained_checkout=True)
+
+    assert fake.calls[0]["self_contained_checkout"] is True
+
+
+def test_gate5_self_contained_checkout_defaults_to_false(conn):
+    fake = FakeRunGate()
+    plan = _plan(profiles={"g": ["pytest -q"], "gate5": ["python app.py --probe /health"]})
+
+    _run5(conn, plan, run_gate=fake)
+
+    assert fake.calls[0]["self_contained_checkout"] is False
 
 
 def test_gate5_fallback_is_every_distinct_task_command_in_first_seen_order(conn):

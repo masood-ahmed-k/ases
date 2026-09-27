@@ -16,7 +16,9 @@ def wired(tmp_path, monkeypatch):
     """cmd_run with everything outside the loop stubbed, so only the loop's own behaviour is under test."""
     db_file = tmp_path / "ases.db"
     project = types.SimpleNamespace(board="b", roles={"coder": "coder-1", "reviewer": "reviewer"}, budgets={})
-    plan = types.SimpleNamespace(project="p", gate_profiles={}, integration_branch="integration", serialization_links=())
+    plan = types.SimpleNamespace(
+        project="p", gate_profiles={}, integration_branch="integration", serialization_links=(), tasks=(),
+    )
     monkeypatch.setattr(cli, "_load_project", lambda: project)
     monkeypatch.setattr(cli.ases_config, "db_path", lambda p: db_file)
     monkeypatch.setattr(cli.plan_mod, "load_plan_file", lambda *a, **kw: plan)

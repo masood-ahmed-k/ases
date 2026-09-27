@@ -650,7 +650,7 @@ def _apply_allowlist(findings: list, allow_paths) -> list:
 
 def run_gate4(
     repo, plan, conn, head: str, *, runner=None, scan=None, run_gate=None, timeout_per_command: int = 300,
-    allow_paths=(),
+    allow_paths=(), self_contained_checkout: bool = False,
 ) -> GateOutcome:
     """Gate 4, security, on the integration HEAD `head` (table 24; ASES-TSK-04, ASES-QG-01, ASES-QG-04, ASES-SEC-01).
 
@@ -672,7 +672,11 @@ def run_gate4(
     tests/ or docs/. An allowlisted finding is never silently invisible, it is still in the returned outcome's
     findings and in the detail, renamed to its ALLOWLIST_PREFIX kind (see _apply_allowlist and severity()), so
     the release report shows exactly what was excused. Defaults to `()`: a caller that does not pass it sees
-    exactly today's behaviour."""
+    exactly today's behaviour.
+
+    `self_contained_checkout` (round 9, ASES-QG-04, ASES-SEC-03) reaches `run_gate` exactly like `runner` does:
+    False by default (today's behaviour), True only when the caller's `runner` is a sandbox one (see
+    gates.resolve_runner, whose GateRunner keeps the two together)."""
     scan = scan or scan_tree
     run_gate = run_gate or gates.run_gate
     findings = _apply_allowlist(_run_scan(scan, repo, head), allow_paths)
@@ -698,6 +702,7 @@ def run_gate4(
         result = run_gate(
             repo, head, GATE4, commands, conn=None, task_key=FINAL_TASK_KEY,
             timeout_per_command=timeout_per_command, runner=runner,
+            self_contained_checkout=self_contained_checkout,
         )
         passed = bool(result.passed)
         parts += [f"the plan's gate4 commands: {'pass' if passed else 'fail'}", str(result.detail)]
@@ -710,6 +715,7 @@ def run_gate4(
 
 def run_gate5(
     repo, plan, conn, head: str, *, runner=None, run_gate=None, timeout_per_command: int = 300,
+    self_contained_checkout: bool = False,
 ) -> GateOutcome:
     """Gate 5, smoke, on the integration HEAD `head` (table 24: "Start the app, hit the health endpoint, run a
     representative user flow"; ASES-TSK-04, ASES-QG-01, ASES-QG-04).
@@ -721,7 +727,10 @@ def run_gate5(
     on the integration HEAD". The `gate4` profile is not part of the fallback (see _every_task_command). A plan
     with nothing to run FAILS the gate with a clear message: nothing to run is not a pass. The commands run through
     `run_gate` (default gates.run_gate) so `runner`, the sandbox hook, applies. ONE row is recorded through
-    bounds.record_final_gate; an exception from `run_gate` propagates and records nothing."""
+    bounds.record_final_gate; an exception from `run_gate` propagates and records nothing.
+
+    `self_contained_checkout` (round 9, ASES-QG-04, ASES-SEC-03): see run_gate4's own docstring -- reaches
+    `run_gate` the same way."""
     run_gate = run_gate or gates.run_gate
     notes: list[str] = []
     commands = _profile_commands(plan, GATE5)
@@ -739,6 +748,7 @@ def run_gate5(
     result = run_gate(
         repo, head, GATE5, commands, conn=None, task_key=FINAL_TASK_KEY,
         timeout_per_command=timeout_per_command, runner=runner,
+        self_contained_checkout=self_contained_checkout,
     )
     passed = bool(result.passed)
     parts += [f"the commands: {'pass' if passed else 'fail'}", str(result.detail)]

@@ -746,7 +746,9 @@ def cmd_approve(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         _err(f"swarm approve REFUSED: {exc}")
         return 1
-    controller_mod.pin_gate_profiles(conn, plan.project, plan.gate_profiles)
+    controller_mod.pin_gate_profiles(
+        conn, plan.project, plan.gate_profiles, plan_mod.sandbox_network_exceptions(plan),
+    )
     _out(f"Gate P: published approved plan at {publish_sha}")
     if skipped:
         events_mod.record(conn, "critic_skipped", {
@@ -930,7 +932,9 @@ def _run_loop(args: argparse.Namespace) -> int:
     repo = pathlib.Path(args.repo).resolve()
     plan = _load_plan(repo, project)
     try:
-        controller_mod.verify_gate_pin(conn, plan.project, plan.gate_profiles)
+        controller_mod.verify_gate_pin(
+            conn, plan.project, plan.gate_profiles, plan_mod.sandbox_network_exceptions(plan),
+        )
     except controller_mod.GateConfigTamperedError as exc:
         _err(f"swarm run REFUSED (ASES-QG-02): {exc}")
         return 1

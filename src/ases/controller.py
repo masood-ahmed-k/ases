@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import importlib
 import json
 import pathlib
@@ -45,6 +46,7 @@ from . import questions as questions_mod
 from . import recovery as recovery_mod
 from . import report as report_mod
 from . import review as review_mod
+from . import sandbox as sandbox_mod
 from . import usage as usage_mod
 
 
@@ -544,15 +546,21 @@ class GateConfigTamperedError(RuntimeError):
     pass
 
 
-def pin_gate_profiles(conn, project: str, gate_profiles: dict) -> str:
+def pin_gate_profiles(
+    conn, project: str, gate_profiles: dict, sandbox_network_exceptions: dict | None = None,
+) -> str:
     """ASES-QG-02: pin this project's approved gate profiles by content hash at `swarm approve` time,
     so `swarm run` can refuse to trust a diff that quietly changed gate configuration, CI scripts, or
     test-runner settings. Called only after publish_plan succeeds (see cmd_approve) -- a plan refused
     earlier by a data-policy or budget gate must never reach this and get pinned.
 
     Re-approving (a fresh `swarm approve`) intentionally moves the pin to whatever is approved now --
-    that's the sanctioned way to change gate configuration, not a bypass of it."""
-    digest = gates_mod.hash_gate_profiles(gate_profiles)
+    that's the sanctioned way to change gate configuration, not a bypass of it.
+
+    `sandbox_network_exceptions` (round 9, ASES-SEC-05, ASES-SEC-07: plan.sandbox_network_exceptions) is folded
+    into the same hash, so a task's network exception is pinned exactly like a gate command and re-approval is
+    required to change either. Left at the default None (today's call shape), the pin is unaffected."""
+    digest = gates_mod.hash_gate_profiles(gate_profiles, sandbox_network_exceptions)
     conn.execute(
         "INSERT INTO gate_pins (project, gate_profiles_hash, pinned_at) VALUES (?, ?, datetime('now')) "
         "ON CONFLICT(project) DO UPDATE SET gate_profiles_hash=excluded.gate_profiles_hash, "
@@ -562,24 +570,30 @@ def pin_gate_profiles(conn, project: str, gate_profiles: dict) -> str:
     return digest
 
 
-def verify_gate_pin(conn, project: str, gate_profiles: dict) -> None:
+def verify_gate_pin(
+    conn, project: str, gate_profiles: dict, sandbox_network_exceptions: dict | None = None,
+) -> None:
     """ASES-QG-02: refuse to proceed if the plan's gate profiles no longer match what was pinned at
     this project's last `swarm approve`. No pin row means this project has never been through the
     pinning path yet -- nothing to verify against, so this is a silent no-op rather than a false
-    positive on a first-ever approve."""
+    positive on a first-ever approve.
+
+    `sandbox_network_exceptions`: see pin_gate_profiles. Passing the plan's current
+    plan.sandbox_network_exceptions here is what makes a task's network flag flipped after approval, without a
+    fresh `swarm approve`, raise GateConfigTamperedError exactly like an edited gate command would."""
     row = conn.execute(
         "SELECT gate_profiles_hash FROM gate_pins WHERE project = ?",
         (project,),
     ).fetchone()
     if row is None:
         return
-    current = gates_mod.hash_gate_profiles(gate_profiles)
+    current = gates_mod.hash_gate_profiles(gate_profiles, sandbox_network_exceptions)
     if row["gate_profiles_hash"] != current:
         raise GateConfigTamperedError(
             f"gate configuration for project {project!r} no longer matches the pin recorded at the "
-            f"last `swarm approve` (ASES-QG-02): gate commands, CI scripts, or test-runner settings "
-            f"changed without an explicit approved plan task allowing it. Re-run `swarm approve` if "
-            f"this change is intentional."
+            f"last `swarm approve` (ASES-QG-02): gate commands, CI scripts, test-runner settings, or a "
+            f"task's sandbox network exception changed without an explicit approved plan task allowing "
+            f"it. Re-run `swarm approve` if this change is intentional."
         )
 
 
@@ -694,7 +708,8 @@ def _affordable_now(
 
 
 def process_review_lane(
-    board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn,
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig | None = None,
+    *, conn,
 ) -> list[str]:
     """One pass: for every work card currently in 'review', re-run Gate 1 (ASES-REV-05). Returns the
     task keys that were sent back this pass.
@@ -703,7 +718,14 @@ def process_review_lane(
     different project sharing this board must not be matched against this run's plan by task key alone.
 
     A fix card counts as its task's work card here once `process_merge_queue` has repointed
-    plan_tasks.work_card_id at it, so its diff is policed like any other card's."""
+    plan_tasks.work_card_id at it, so its diff is policed like any other card's.
+
+    `project` (round 9, ASES-QG-04, ASES-SEC-03; optional and None by default, so an older caller keeps working
+    unchanged with the host runner) is handed to gates.resolve_runner through review.gate_before_review, along
+    with the task itself for its own network exception (ASES-SEC-05, ASES-SEC-07). A gate call that cannot even
+    start (sandbox.SandboxInfrastructureError: Docker down, the pinned image missing) is not a red gate: it is
+    recorded once per card as a `sandbox_infrastructure_error` event and the card is left exactly where it is,
+    to be re-checked next pass, never sent back and never silently run on the host instead."""
     sent_back = []
     for card in hermes_mod.kanban_list(board, status="review"):
         row = conn.execute(
@@ -716,10 +738,17 @@ def process_review_lane(
         task = plan.task(task_key)
         gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
         branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
-        ok = review_mod.gate_before_review(
-            board, card["id"], repo, branch, plan.integration_branch, gate_cmds, list(task.touches),
-            conn=conn, task_key=task_key, allow_gate_config_changes=task.allow_gate_config_changes,
-        )
+        try:
+            ok = review_mod.gate_before_review(
+                board, card["id"], repo, branch, plan.integration_branch, gate_cmds, list(task.touches),
+                conn=conn, task_key=task_key, allow_gate_config_changes=task.allow_gate_config_changes,
+                project_config=project, task=task,
+            )
+        except sandbox_mod.SandboxInfrastructureError as exc:
+            _record_once(conn, "sandbox_infrastructure_error", {
+                "task_key": task_key, "card_id": card["id"], "gate": "gate1", "error": _clean(str(exc), 300),
+            }, match=("task_key", "gate"))
+            continue
         if not ok:
             sent_back.append(task_key)
             events.record(conn, "gate1_recheck_failed", {"task_key": task_key})
@@ -941,11 +970,21 @@ def process_merge_queue(
                 continue
             # ASES-GIT-03, ASES-GIT-13, ASES-REV-05, ASES-QG-01: scope, then the controller's OWN green Gate 1
             # record for this exact head. A red or stale result takes the ordinary failure path (fix card).
-            check = review_mod.check_branch_for_merge(
-                repo, branch, plan.integration_branch, gate_cmds, list(task.touches), conn=conn, task_key=key,
-                require_binding=True, reviewed_commit=verdict.commit or _handoff_commit(work_card),
-                allow_gate_config_changes=task.allow_gate_config_changes,
-            )
+            try:
+                check = review_mod.check_branch_for_merge(
+                    repo, branch, plan.integration_branch, gate_cmds, list(task.touches), conn=conn, task_key=key,
+                    require_binding=True, reviewed_commit=verdict.commit or _handoff_commit(work_card),
+                    allow_gate_config_changes=task.allow_gate_config_changes,
+                    project_config=project, task=task,
+                )
+            except sandbox_mod.SandboxInfrastructureError as exc:
+                # Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox is enabled but this task's Gate 1 re-check could
+                # not even start (Docker down, the pinned image missing). Not a red gate and not a scope
+                # violation: recorded once per card and retried next pass, exactly like a tamper_check_error.
+                _record_once(conn, "sandbox_infrastructure_error", {
+                    "task_key": key, "card_id": work_card["id"], "gate": "gate1", "error": _clean(str(exc), 300),
+                }, match=("task_key", "gate"))
+                continue
             if not check.ok and check.kind == "tamper_check_error":
                 # git could not answer the tamper question, so nothing is known about the diff: not a failure of the
                 # branch (no fix card, no fix budget), and not a pass either. The task is retried next pass. Recorded
@@ -982,11 +1021,22 @@ def process_merge_queue(
         # Only a role in _COMMITTING_ROLES (coder, tester) is expected to commit. Any other role (a reviewer)
         # legitimately leaves an empty diff, which merge_task then records as a no-op rather than failing on
         # "nothing to commit".
-        outcome = pre_merge_outcome or mergeq.merge_task(
-            repo, plan.integration_branch, branch, key, gate_cmds, conn=conn,
-            commit_message=commit_message, allow_empty=(task.role not in _COMMITTING_ROLES),
-            expected_head=expected_head, project=plan.project, should_stop=should_stop,
-        )
+        try:
+            outcome = pre_merge_outcome or mergeq.merge_task(
+                repo, plan.integration_branch, branch, key, gate_cmds, conn=conn,
+                commit_message=commit_message, allow_empty=(task.role not in _COMMITTING_ROLES),
+                expected_head=expected_head, project=plan.project, should_stop=should_stop,
+                project_config=project, task=task,
+            )
+        except sandbox_mod.SandboxInfrastructureError as exc:
+            # Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox is enabled but this task's Gate 3 candidate could
+            # not even start (Docker down, the pinned image missing). Not a red gate: nothing was built and
+            # nothing was merged, so there is nothing to revert either. Recorded once per card and retried next
+            # pass, the same shape as the Gate 1 case above -- never fall back to the host silently.
+            _record_once(conn, "sandbox_infrastructure_error", {
+                "task_key": key, "card_id": row["merge_card_id"], "gate": "gate3", "error": _clean(str(exc), 300),
+            }, match=("task_key", "gate"))
+            continue
 
         if getattr(outcome, "stopped", False):
             # ASES-REC-06: the kill switch (or a reached bound) stopped the merge at one of its checkpoints. Nothing
@@ -1015,10 +1065,37 @@ def process_merge_queue(
             # with the pre-merge Gate 3 above: this catches a project-level regression another task's merge
             # introduced on the shared tip between this candidate's build and this fast-forward, on a file this
             # task's own touches never named.
-            postcheck = gates_mod.run_gate(
-                repo, outcome.squash_commit, "gate3-postmerge", gate_cmds, conn=conn, task_key=key,
-                project=plan.project,
-            ) if task.role in _COMMITTING_ROLES else None
+            #
+            # No task-scoped network exception here (round 9, ASES-SEC-05, ASES-SEC-07): resolve_runner is
+            # called with no task, so this re-check always runs with --network none, even for a task whose Gate
+            # 1 and Gate 3 candidate carried an exception. Only that task's OWN candidate build gets network.
+            postcheck = None
+            if task.role in _COMMITTING_ROLES:
+                # The sandbox kwargs are added ONLY when the sandbox is actually enabled (round 9), exactly like
+                # mergeq.merge_task's own Gate 3 call: a `run_gate` test stand-in with a fixed signature keeps
+                # working unchanged for every test that does not turn the sandbox on.
+                choice = gates_mod.resolve_runner(project)
+                sandbox_kwargs = (
+                    {"runner": choice.runner, "self_contained_checkout": True} if choice.self_contained else {}
+                )
+                try:
+                    postcheck = gates_mod.run_gate(
+                        repo, outcome.squash_commit, "gate3-postmerge", gate_cmds, conn=conn, task_key=key,
+                        project=plan.project, **sandbox_kwargs,
+                    )
+                except sandbox_mod.SandboxInfrastructureError as exc:
+                    # The fast-forward already landed on the integration branch: an infra failure here is NOT a
+                    # red gate, so it must not trigger a revert (the reasoning below), and it must not leave the
+                    # merge card open either -- a repeat pass would re-run merge_task on a work branch whose
+                    # content the integration tip already has, which mergeq.merge_task then correctly refuses as
+                    # "nothing to commit" (allow_empty is False for a committing role), opening a spurious fix
+                    # card for a task that actually succeeded. So the merge is accepted as it stands, the
+                    # re-verification is recorded as skipped this pass (never silently treated as green), and the
+                    # completion path below runs exactly as it would with no postcheck at all.
+                    events.record(conn, "sandbox_infrastructure_error", {
+                        "task_key": key, "commit": outcome.squash_commit, "gate": "gate3-postmerge",
+                        "error": _clean(str(exc), 300),
+                    })
 
             if postcheck is not None and not postcheck.passed:
                 post_detail = _clean(postcheck.detail, 500)
@@ -1948,7 +2025,25 @@ def process_finalize(
     if _halted(conn, plan.project)[0] or not all_merge_cards_done(board, plan, conn=conn):
         return None
     finalgates = _finalgates()
-    outcome = finalgates.finalize(board, repo, plan, project, models_config, conn, now=now)
+    # Round 9 (ASES-QG-04, ASES-SEC-03): Gates 4 and 5 get no task, so they never carry a task's own network
+    # exception through (ASES-SEC-05, ASES-SEC-07: "Gates 4/5 and every other task stay --network none").
+    # `self_contained_checkout` is bound onto run_gate4/run_gate5 themselves via functools.partial, not passed
+    # through finalize()'s own gate_kwargs, so a test's run4/run5 stand-in (a fixed signature, no **kwargs) is
+    # never handed a keyword it does not know about. The sandbox kwargs (runner/run4/run5) are added to this call
+    # ONLY when the sandbox is actually enabled, for the same reason: a finalize() stand-in (or the real one, with
+    # its own defaults) sees exactly today's call shape otherwise. An infrastructure failure (Docker down, the
+    # pinned image missing) is already handled by finalgates._run_final_gate, which turns any exception from
+    # run4/run5 into status "error" with a final_gate_error event and no gate row written: not a red gate, and
+    # nothing here needs to catch it again.
+    choice = gates_mod.resolve_runner(project)
+    sandbox_kwargs = {}
+    if choice.self_contained:
+        sandbox_kwargs["runner"] = choice.runner
+        sandbox_kwargs["run4"] = functools.partial(finalgates.run_gate4, self_contained_checkout=True)
+        sandbox_kwargs["run5"] = functools.partial(finalgates.run_gate5, self_contained_checkout=True)
+    outcome = finalgates.finalize(
+        board, repo, plan, project, models_config, conn, now=now, **sandbox_kwargs,
+    )
     events.record(conn, "finalize_result", {
         "project": plan.project, "status": outcome.status, "reason": _clean(getattr(outcome, "reason", ""), 300),
     })
@@ -2065,7 +2160,7 @@ def run_pass(
         conn, summary, "unpark",
         lambda: process_unpark(board, plan, models_config, conn=conn, budgets=project.budgets, project=project), [],
     )
-    summary["sent_back"] = process_review_lane(board, repo, plan, conn=conn)
+    summary["sent_back"] = process_review_lane(board, repo, plan, project, conn=conn)
     summary["dispatch"] = hermes_mod.kanban_dispatch(board)
     summary["provisioned"] = _isolated(
         conn, summary, "provision", lambda: process_provision(board, plan, conn=conn), [],

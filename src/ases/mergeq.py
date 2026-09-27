@@ -161,7 +161,7 @@ def merge_task(
     repo: pathlib.Path, integration_branch: str, work_branch: str, task_key: str,
     gate3_commands: list[str], *, conn=None, commit_message: str | None = None, allow_empty: bool = False,
     expected_head: str | None = None, project: str | None = None,
-    should_stop: Callable[[], bool] | None = None,
+    should_stop: Callable[[], bool] | None = None, project_config=None, task=None,
 ) -> MergeOutcome:
     """ASES-GIT-04: squash candidate on integration HEAD -> Gate 3 -> fast-forward -> done.
     A merge conflict or a red Gate 3 leaves the integration branch untouched and returns merged=False;
@@ -191,6 +191,14 @@ def merge_task(
     work branch (review.check_branch_for_merge), and a commit pushed after that must not ride in unchecked. With
     it given, the branch must still be at exactly that commit, else the merge is refused (nothing is built);
     and the squash is taken from that SHA itself, not from the branch name, so there is no window at all.
+
+    `project_config`/`task` (round 9, ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07): reach
+    gates.resolve_runner for the Gate 3 candidate run only (never the fast-forward, which runs no commands).
+    `project_config` is an ases.config.ProjectConfig (or a duck-typed stand-in, see resolve_runner); `task` is
+    this task's own ases.plan.PlanTask, so its sandbox_network exception, if it carries one, applies to this one
+    candidate run. Both default to None: today's behaviour, the host runner. A
+    sandbox.SandboxInfrastructureError from the Gate 3 run is NOT caught here -- nothing has been built or
+    merged yet at that point, so there is nothing to undo -- and propagates to the caller.
 
     ASES-REC-06 (`should_stop`): "stop the merge queue between steps". A zero-argument callable, polled before the
     candidate is built, before Gate 3 and before the fast-forward, in that order. When it says True the
@@ -256,8 +264,16 @@ def merge_task(
 
             if _stop_requested(should_stop, conn, task_key, STEP_GATE3):
                 return _stopped(STEP_GATE3)
+            # The sandbox kwargs are added to the call ONLY when the sandbox is actually enabled (round 9): a
+            # `run_gate` stand-in written before this round (a fixed signature, no **kwargs) keeps working
+            # unchanged for every test that does not turn the sandbox on, exactly like `allow_paths` elsewhere.
+            choice = gates_mod.resolve_runner(project_config, task)
+            sandbox_kwargs = (
+                {"runner": choice.runner, "self_contained_checkout": True} if choice.self_contained else {}
+            )
             gate_result = gates_mod.run_gate(
                 candidate, candidate_sha, "gate3", gate3_commands, conn=conn, task_key=task_key, project=project,
+                **sandbox_kwargs,
             )
             # The last checkpoint comes BEFORE the merge_records row is written, so a stop here leaves the row
             # exactly as it was. A red gate never reaches the fast-forward, so it has nothing left to stop.

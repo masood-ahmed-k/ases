@@ -5,7 +5,7 @@ worker who can only write inside a repository (the shared .git/hooks, .git/confi
 must not be able to make a controller git call run their code, hide content from a scanner, or read a
 credential-shaped variable out of the controller's own environment.
 
-The completeness scan (test_no_bare_git_subprocess_call_bypasses_gitexec_outside_fakes_and_gates) is the
+The completeness scan (test_no_bare_git_subprocess_call_bypasses_gitexec_outside_fakes) is the
 project's proof that no OTHER git call site in src/ases regressed back to a bare `["git", ...]` argv; it is
 written in the spirit of test_fakes.py's public-function/fake signature check.
 """
@@ -45,13 +45,13 @@ def bare_git_call_sites(root: pathlib.Path) -> list[str]:
     """"path:line" (relative to `root`) of every subprocess call under it whose argv starts with the literal
     string "git", rather than something derived from gitexec.GIT (a starred `*gitexec.GIT`/`*_GIT`, a name, an
     attribute). Skips `<root>/fakes/` (test doubles standing in for a real Hermes or a real worker, never the
-    controller) and `<root>/gates.py` (round 8 already scrubs its own environment; package GATESANDBOX is
-    switching its git calls to gitexec on its own branch; the architect merges it). A literal "git" is exactly
-    what an unrouted call looks like -- see gitexec.py's module docstring for why that matters."""
+    controller). gates.py was excluded while package GATESANDBOX rewrote its checkout on another branch; since
+    the merge its one git helper runs through gitexec too, so it is scanned like every other module. A literal
+    "git" is exactly what an unrouted call looks like -- see gitexec.py's module docstring for why that matters."""
     hits = []
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
-        if rel.parts[0] == "fakes" or rel == pathlib.Path("gates.py"):
+        if rel.parts[0] == "fakes":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -62,7 +62,7 @@ def bare_git_call_sites(root: pathlib.Path) -> list[str]:
     return hits
 
 
-def test_no_bare_git_subprocess_call_bypasses_gitexec_outside_fakes_and_gates():
+def test_no_bare_git_subprocess_call_bypasses_gitexec_outside_fakes():
     hits = bare_git_call_sites(_SRC_ROOT)
     assert hits == [], f"subprocess call(s) start a literal 'git' argv, bypassing gitexec.GIT: {hits}"
 
@@ -77,13 +77,13 @@ def test_the_scanner_itself_catches_a_planted_bare_git_call(tmp_path):
     assert bare_git_call_sites(tmp_path) == ["planted.py:5"]
 
 
-def test_the_scanner_ignores_fakes_and_gates_even_with_a_bare_call(tmp_path):
+def test_the_scanner_ignores_fakes_but_not_gates(tmp_path):
     (tmp_path / "gates.py").write_text("import subprocess\nsubprocess.run([\"git\", \"status\"])\n", encoding="utf-8")
     fakes = tmp_path / "fakes"
     fakes.mkdir()
     (fakes / "board.py").write_text("import subprocess\nsubprocess.run([\"git\", \"status\"])\n", encoding="utf-8")
 
-    assert bare_git_call_sites(tmp_path) == []
+    assert bare_git_call_sites(tmp_path) == ["gates.py:2"]
 
 
 def test_a_call_routed_through_gitexec_is_not_flagged(tmp_path):

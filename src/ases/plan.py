@@ -7,6 +7,12 @@ that retry policy lives in cli.py, not here; this module only validates.
 
 A plan that passes is then serialized (ASES-GIT-08): two tasks whose touches overlap and that have no
 dependency path between them get one added, so they never run, and conflict, in parallel.
+
+Round 9 (ASES-SEC-05, ASES-SEC-07): a task may also declare sandbox_network, an explicit exception to the
+sandbox's default-deny network for its own Gate 1 and Gate 3 candidate runs (gates.resolve_runner reads it),
+with sandbox_network_reason required whenever it is true. sandbox_network_exceptions() below is what
+controller.pin_gate_profiles / verify_gate_pin fold into the gate_profiles pin, so flipping the flag after
+approval is caught the same way an edited gate command is.
 """
 from __future__ import annotations
 
@@ -33,6 +39,13 @@ class PlanTask:
     # test-runner configuration with a touches glob broad enough to cover it (see _gate_config_violation).
     # Optional and False by default, so a plan written before this field existed parses unchanged.
     allow_gate_config_changes: bool = False
+    # ASES-SEC-05, ASES-SEC-07 (round 9): an explicit, task-scoped exception to the sandbox's default-deny
+    # network (gates.resolve_runner grants network ONLY to this task's own Gate 1 and Gate 3 candidate runs
+    # when this is true). sandbox_network_reason must be non-empty whenever this is true (see
+    # parse_and_validate); both are optional and default to false/"" so a plan written before this field
+    # existed parses unchanged.
+    sandbox_network: bool = False
+    sandbox_network_reason: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,6 +150,27 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
             )
             allow_gate_config = False
 
+        # ASES-SEC-05, ASES-SEC-07 (round 9): the task-scoped network exception. A reason is required whenever
+        # the exception is granted, mirroring table 34's "gates the agent cannot edit" reasoning: a network
+        # exception is a plan-author decision published and reviewed at Gate P, so it must say why, not just
+        # that it exists.
+        sandbox_network = rt.get("sandbox_network", False)
+        if not isinstance(sandbox_network, bool):
+            errors.append(f"{where} ({key}): sandbox_network must be true or false, got {sandbox_network!r}")
+            sandbox_network = False
+
+        sandbox_network_reason = rt.get("sandbox_network_reason", "")
+        if not isinstance(sandbox_network_reason, str):
+            errors.append(
+                f"{where} ({key}): sandbox_network_reason must be a string, got {sandbox_network_reason!r}"
+            )
+            sandbox_network_reason = ""
+        elif sandbox_network and not sandbox_network_reason.strip():
+            errors.append(
+                f"{where} ({key}): sandbox_network is true but sandbox_network_reason is empty; a network "
+                "exception must say why the task's gate run needs it (ASES-SEC-05, ASES-SEC-07)"
+            )
+
         touches = rt.get("touches")
         if not isinstance(touches, list):
             errors.append(f"{where} ({key}): touches must be an array, possibly empty (ASES-TSK-03)")
@@ -177,6 +211,7 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
                 acceptance=tuple(acceptance) if isinstance(acceptance, list) else (),
                 gate_profile=gate_profile or "", estimated_requests=estimated_requests,
                 allow_gate_config_changes=bool(allow_gate_config),
+                sandbox_network=bool(sandbox_network), sandbox_network_reason=sandbox_network_reason,
             ))
 
     # Dangling dependencies and cycles, checked over whatever tasks parsed even if some rows had errors --
@@ -334,6 +369,16 @@ def serialize_overlapping_tasks(
             ))
     serialized = tuple(dataclasses.replace(t, depends_on=tuple(deps[t.key])) for t in tasks)
     return serialized, tuple(links)
+
+
+def sandbox_network_exceptions(plan: Plan) -> dict[str, list]:
+    """ASES-SEC-05, ASES-SEC-07 (round 9): {task_key: [True, reason]} for every task that carries an explicit,
+    Gate-0-validated network exception. Meant to be folded into gates.hash_gate_profiles by
+    controller.pin_gate_profiles / verify_gate_pin, so flipping a task's sandbox_network after approval --
+    without a fresh `swarm approve` -- is caught the same way an edited gate command is. A task with no
+    exception (the default) is left out entirely, so a plan that sets none hashes exactly as it did before this
+    field existed."""
+    return {t.key: [True, t.sandbox_network_reason] for t in plan.tasks if t.sandbox_network}
 
 
 def load_plan_file(path: str | pathlib.Path, *, known_roles: set[str], max_cards: int) -> Plan:
