@@ -3280,6 +3280,26 @@ def test_run_refuses_when_a_tasks_sandbox_network_exception_changed_after_approv
     assert "REFUSED (ASES-QG-02)" in err
 
 
+def test_run_refuses_when_a_tasks_allow_gate_config_changes_marker_changed_after_approval(world, monkeypatch, capsys):
+    """ASES-QG-02 (round 10, GATEPIN): round 9's CIPIN made a task's allow_gate_config_changes marker the only
+    thing that lets a diff change gate/CI/test-runner configuration, but never pinned the marker itself, so a
+    plan.json edited after approval to set it went unnoticed. GATEPIN folds the marker into the same pin
+    plan.pinned_task_fields / gates.hash_gate_profiles already cover for a task's network exception, so
+    `swarm run`'s pre-flight now refuses this exactly like an edited gate command, modeled on
+    test_run_refuses_when_a_tasks_sandbox_network_exception_changed_after_approval above."""
+    passes = _real_startup(world, monkeypatch)  # pinned with PLAN_RAW: no task sets the marker
+    plan_file = world.repo / "docs" / "ases" / "plan.json"
+    raw = json.loads(plan_file.read_text(encoding="utf-8"))
+    raw["tasks"][0]["allow_gate_config_changes"] = True
+    plan_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert cli.main(_run_argv(world)) == 1
+
+    assert passes == []
+    out, err = _console(capsys)
+    assert "REFUSED (ASES-QG-02)" in err
+
+
 def test_run_startup_with_the_real_guard_pin_bounds_and_reconcile(world, monkeypatch, capsys):
     passes = _real_startup(world, monkeypatch)
 

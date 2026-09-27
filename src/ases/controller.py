@@ -559,7 +559,7 @@ class GateConfigTamperedError(RuntimeError):
 
 
 def pin_gate_profiles(
-    conn, project: str, gate_profiles: dict, sandbox_network_exceptions: dict | None = None,
+    conn, project: str, gate_profiles: dict, pinned_task_fields: dict | None = None,
 ) -> str:
     """ASES-QG-02: pin this project's approved gate profiles by content hash at `swarm approve` time,
     so `swarm run` can refuse to trust a diff that quietly changed gate configuration, CI scripts, or
@@ -569,10 +569,11 @@ def pin_gate_profiles(
     Re-approving (a fresh `swarm approve`) intentionally moves the pin to whatever is approved now --
     that's the sanctioned way to change gate configuration, not a bypass of it.
 
-    `sandbox_network_exceptions` (round 9, ASES-SEC-05, ASES-SEC-07: plan.sandbox_network_exceptions) is folded
-    into the same hash, so a task's network exception is pinned exactly like a gate command and re-approval is
-    required to change either. Left at the default None (today's call shape), the pin is unaffected."""
-    digest = gates_mod.hash_gate_profiles(gate_profiles, sandbox_network_exceptions)
+    `pinned_task_fields` (round 9, ASES-SEC-05/-07; round 10, ASES-QG-02, GATEPIN: plan.pinned_task_fields) is
+    folded into the same hash, so a task's network exception and its allow_gate_config_changes marker are
+    pinned exactly like a gate command, and re-approval is required to change any of them. Left at the
+    default None, the pin is unaffected."""
+    digest = gates_mod.hash_gate_profiles(gate_profiles, pinned_task_fields)
     conn.execute(
         "INSERT INTO gate_pins (project, gate_profiles_hash, pinned_at) VALUES (?, ?, datetime('now')) "
         "ON CONFLICT(project) DO UPDATE SET gate_profiles_hash=excluded.gate_profiles_hash, "
@@ -583,29 +584,32 @@ def pin_gate_profiles(
 
 
 def verify_gate_pin(
-    conn, project: str, gate_profiles: dict, sandbox_network_exceptions: dict | None = None,
+    conn, project: str, gate_profiles: dict, pinned_task_fields: dict | None = None,
 ) -> None:
     """ASES-QG-02: refuse to proceed if the plan's gate profiles no longer match what was pinned at
     this project's last `swarm approve`. No pin row means this project has never been through the
     pinning path yet -- nothing to verify against, so this is a silent no-op rather than a false
     positive on a first-ever approve.
 
-    `sandbox_network_exceptions`: see pin_gate_profiles. Passing the plan's current
-    plan.sandbox_network_exceptions here is what makes a task's network flag flipped after approval, without a
-    fresh `swarm approve`, raise GateConfigTamperedError exactly like an edited gate command would."""
+    `pinned_task_fields`: see pin_gate_profiles. Passing the plan's current plan.pinned_task_fields here is
+    what makes a task's network exception, or its allow_gate_config_changes marker, flipped after approval
+    without a fresh `swarm approve`, raise GateConfigTamperedError exactly like an edited gate command would
+    (round 10, GATEPIN: this is what pins the marker itself, closing the gap where a plan.json edited after
+    approval to set it went unnoticed)."""
     row = conn.execute(
         "SELECT gate_profiles_hash FROM gate_pins WHERE project = ?",
         (project,),
     ).fetchone()
     if row is None:
         return
-    current = gates_mod.hash_gate_profiles(gate_profiles, sandbox_network_exceptions)
+    current = gates_mod.hash_gate_profiles(gate_profiles, pinned_task_fields)
     if row["gate_profiles_hash"] != current:
         raise GateConfigTamperedError(
             f"gate configuration for project {project!r} no longer matches the pin recorded at the "
-            f"last `swarm approve` (ASES-QG-02): gate commands, CI scripts, test-runner settings, or a "
-            f"task's sandbox network exception changed without an explicit approved plan task allowing "
-            f"it. Re-run `swarm approve` if this change is intentional."
+            f"last `swarm approve` (ASES-QG-02): gate commands, CI scripts, test-runner settings, a "
+            f"task's sandbox network exception, or a task's allow_gate_config_changes marker changed "
+            f"without an explicit approved plan task allowing it. Re-run `swarm approve` if this change "
+            f"is intentional."
         )
 
 

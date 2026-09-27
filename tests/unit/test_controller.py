@@ -1603,7 +1603,12 @@ def test_verify_gate_pin_scoped_per_project(tmp_path):
     controller.verify_gate_pin(conn, "b", {"default": ["a completely different command"]})  # must not raise
 
 
-# --- round 9 (ASES-SEC-05/-07): sandbox_network_exceptions is pinned alongside the gate profiles ----------------
+# --- round 9 (ASES-SEC-05/-07) and round 10 (ASES-QG-02, GATEPIN): plan.pinned_task_fields (a task's network
+# exception and its allow_gate_config_changes marker) is pinned alongside the gate profiles. pin_gate_profiles /
+# verify_gate_pin only hash whatever mapping they are given -- they do not know or care which per-task field is
+# inside it -- so the round 9 tests below, written against the raw {"T1": [True, reason]} shape, still exercise
+# the same change-detection logic unchanged; the shape plan.pinned_task_fields() actually produces is
+# test_plan.py's concern. ------------------------------------------------------------------------------------
 
 
 def test_pin_and_verify_with_no_network_exceptions_behaves_exactly_as_before(tmp_path):
@@ -1648,6 +1653,52 @@ def test_pin_and_verify_with_the_same_network_exception_passes(tmp_path):
     exceptions = {"T1": [True, "installs a package"]}
     controller.pin_gate_profiles(conn, "t3", profiles, exceptions)
     controller.verify_gate_pin(conn, "t3", dict(profiles), dict(exceptions))  # must not raise
+
+
+# --- round 10 (ASES-QG-02, GATEPIN): the allow_gate_config_changes marker folds into the same pin -----------------
+
+
+def test_verify_gate_pin_raises_when_the_allow_gate_config_changes_marker_is_added_after_approval(tmp_path):
+    """The exact gap the round 10 work order describes: round 9's CIPIN made the marker the only thing that lets
+    a diff change gate/CI/test-runner configuration, but never pinned the marker itself, so a plan.json edited
+    after approval to set it went unnoticed. This is GATEPIN closing that gap."""
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles)  # approved with the marker unset on every task
+
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(conn, "t3", profiles, {"T1": {"allow_gate_config_changes": True}})
+
+
+def test_verify_gate_pin_raises_when_the_allow_gate_config_changes_marker_is_removed_after_approval(tmp_path):
+    """Flipped back off after approval is still a change from what Gate P saw, same as a network exception."""
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles, {"T1": {"allow_gate_config_changes": True}})
+
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(conn, "t3", profiles, {})
+
+
+def test_pin_and_verify_with_the_same_allow_gate_config_changes_marker_passes(tmp_path):
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    fields = {"T1": {"allow_gate_config_changes": True}}
+    controller.pin_gate_profiles(conn, "t3", profiles, fields)
+    controller.verify_gate_pin(conn, "t3", dict(profiles), dict(fields))  # must not raise
+
+
+def test_verify_gate_pin_raises_when_a_task_gains_a_second_pinned_field_the_first_already_had_one(tmp_path):
+    """A task pinned with only a network exception, then given the marker too without a fresh approval, must
+    still be caught -- adding a SECOND pinned field is exactly as much a change as adding the first one."""
+    conn = db.connect(tmp_path / "ases.db")
+    profiles = {"default": ["pytest -q"]}
+    controller.pin_gate_profiles(conn, "t3", profiles, {"T1": {"sandbox_network": [True, "needs pypi"]}})
+
+    with pytest.raises(controller.GateConfigTamperedError):
+        controller.verify_gate_pin(
+            conn, "t3", profiles, {"T1": {"sandbox_network": [True, "needs pypi"], "allow_gate_config_changes": True}},
+        )
 
 
 # ---------------------------------------------------------------------------------------------

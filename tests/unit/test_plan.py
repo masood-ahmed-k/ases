@@ -616,7 +616,8 @@ def test_explicit_depends_on_the_scaffold_task_is_what_actually_orders_parallel_
 
 # ---------------------------------------------------------------------------------------------
 # ASES-SEC-05, ASES-SEC-07 (round 9): a task-scoped network exception. A reason is required whenever the
-# exception is granted, and plan.sandbox_network_exceptions folds it into the gate_profiles pin.
+# exception is granted, and plan.pinned_task_fields folds it into the gate_profiles pin (round 10, GATEPIN:
+# alongside allow_gate_config_changes -- see the pinned_task_fields tests further down).
 # ---------------------------------------------------------------------------------------------
 
 
@@ -670,19 +671,55 @@ def test_existing_plan_with_no_sandbox_network_field_parses_unchanged():
     assert all(t.sandbox_network is False and t.sandbox_network_reason == "" for t in p.tasks)
 
 
-def test_sandbox_network_exceptions_lists_only_tasks_that_carry_one():
+def test_pinned_task_fields_lists_only_tasks_that_carry_a_network_exception():
     raw = _raw_plan(
         {**_raw_task("T1", ["a.py"]), "sandbox_network": True, "sandbox_network_reason": "needs pypi"},
         _raw_task("T2", ["b.py"], depends_on=["T1"]),
     )
     p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
 
-    assert plan_mod.sandbox_network_exceptions(p) == {"T1": [True, "needs pypi"]}
+    assert plan_mod.pinned_task_fields(p) == {"T1": {"sandbox_network": [True, "needs pypi"]}}
 
 
-def test_sandbox_network_exceptions_empty_when_no_task_has_one():
+def test_pinned_task_fields_empty_when_no_task_sets_either_field():
     p = plan_mod.parse_and_validate(VALID, known_roles=ROLES, max_cards=40)
-    assert plan_mod.sandbox_network_exceptions(p) == {}
+    assert plan_mod.pinned_task_fields(p) == {}
+
+
+# --- round 10 (ASES-QG-02, GATEPIN): allow_gate_config_changes folds into the same pinned_task_fields mapping -----
+
+
+def test_pinned_task_fields_lists_a_task_that_carries_only_the_allow_gate_config_changes_marker():
+    raw = _raw_plan(
+        {**_raw_task("T1", ["a.py"]), "allow_gate_config_changes": True},
+        _raw_task("T2", ["b.py"], depends_on=["T1"]),
+    )
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+    assert plan_mod.pinned_task_fields(p) == {"T1": {"allow_gate_config_changes": True}}
+
+
+def test_pinned_task_fields_lists_a_task_that_carries_both_fields():
+    raw = _raw_plan({
+        **_raw_task("T1", ["a.py"]), "allow_gate_config_changes": True,
+        "sandbox_network": True, "sandbox_network_reason": "needs pypi",
+    })
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+    assert plan_mod.pinned_task_fields(p) == {
+        "T1": {"sandbox_network": [True, "needs pypi"], "allow_gate_config_changes": True},
+    }
+
+
+def test_pinned_task_fields_a_plan_that_sets_neither_field_anywhere_is_empty_even_with_many_tasks():
+    """The round 10 work order's own requirement: a plan that sets NEITHER field, on any task, must fold into
+    gates.hash_gate_profiles exactly as before this function existed, so every pin recorded before this round
+    stays valid. An empty mapping, not one full of empty per-task entries, is what makes that byte-identical
+    (see gates.hash_gate_profiles: a falsy pinned_task_fields hashes gate_profiles alone)."""
+    raw = _raw_plan(_raw_task("T1", ["a.py"]), _raw_task("T2", ["b.py"], depends_on=["T1"]))
+    p = plan_mod.parse_and_validate(raw, known_roles=ROLES, max_cards=40)
+
+    assert plan_mod.pinned_task_fields(p) == {}
 
 
 def test_serialize_overlapping_tasks_preserves_the_sandbox_network_fields():

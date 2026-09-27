@@ -331,7 +331,7 @@ def detect_tamper(diff_text: str) -> list[str]:
 
 
 def hash_gate_profiles(
-    gate_profiles: dict[str, list[str]], sandbox_network_exceptions: dict | None = None,
+    gate_profiles: dict[str, list[str]], pinned_task_fields: dict | None = None,
 ) -> str:
     """ASES-QG-02: a stable content hash of a plan's gate profiles, pinned in controller config (see
     controller.pin_gate_profiles / verify_gate_pin) so a later diff that quietly edits gate
@@ -342,15 +342,17 @@ def hash_gate_profiles(
     comparison would be, since any textual change to what a profile actually does should force
     re-approval.
 
-    `sandbox_network_exceptions` (round 9, ASES-SEC-05, ASES-SEC-07): the plan's task-scoped network exceptions
-    (see plan.sandbox_network_exceptions), folded into the same pin so flipping one after approval -- without a
-    fresh `swarm approve` -- is caught exactly like an edited gate command, instead of quietly granting network
-    access to a sandboxed gate run that Gate P never saw. Left at the default None, or given an empty mapping,
-    the hash is EXACTLY what it was before this parameter existed: every project with no network exception --
-    which is every project pinned before this round -- keeps validating against its existing pin unchanged."""
+    `pinned_task_fields` (round 9, ASES-SEC-05/-07; round 10, ASES-QG-02, GATEPIN): the plan's per-task pinned
+    fields (see plan.pinned_task_fields -- today a task's sandbox_network exception and its
+    allow_gate_config_changes marker), folded into the same pin so flipping any of them after approval --
+    without a fresh `swarm approve` -- is caught exactly like an edited gate command, instead of quietly
+    granting network access to a sandboxed gate run, or letting a diff touch gate/CI/test-runner configuration,
+    that Gate P never saw. Left at the default None, or given an empty mapping, the hash is EXACTLY what it
+    was before this parameter existed: every project where no task sets either field -- which is every
+    project pinned before round 9 -- keeps validating against its existing pin unchanged."""
     payload = (
-        {"gate_profiles": gate_profiles, "sandbox_network_exceptions": sandbox_network_exceptions}
-        if sandbox_network_exceptions else gate_profiles
+        {"gate_profiles": gate_profiles, "pinned_task_fields": pinned_task_fields}
+        if pinned_task_fields else gate_profiles
     )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
