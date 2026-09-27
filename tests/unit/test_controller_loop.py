@@ -2404,6 +2404,47 @@ def test_process_card_base_checks_blocks_a_card_planted_from_a_commit_ases_never
     assert not payloads(w.conn, "card_base_verified")
 
 
+def test_process_card_base_checks_skips_a_card_whose_branch_does_not_exist_yet(tmp_path, monkeypatch):
+    """Finding 3 (round 12, RUNSTART, ASES-GIT-01/GIT-16): Hermes's own claim_task commits status='running' before
+    its LATER `git worktree add -b` subprocess actually creates the branch and its reflog. A controller pass that
+    lands in that window must not yank an otherwise-legitimate card into `blocked` over a branch that simply does
+    not exist YET; it must be skipped, unrecorded, so the very next pass rechecks it. The merge queue's own
+    `_check_base` stays the backstop that keeps a genuinely bad base from ever landing."""
+    repo = git_repo(tmp_path, with_branch=False)  # swarm/T1-coder has not been created at all yet
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    w.board.cards[w.work("T1")].update(status="running", branch_name="swarm/T1-coder")
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+
+    assert problems == []
+    assert w.board.cards[w.work("T1")]["status"] == "running"  # not yanked into blocked over a timing artifact
+    assert not any(kind.startswith("card_base_") for kind in kinds(w.conn))
+
+    # Hermes's worktree-add subprocess catches up: the branch now exists, cut from the adopted head.
+    git("branch", "swarm/T1-coder", "integration", cwd=repo)
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+    assert problems == []
+    (payload,) = payloads(w.conn, "card_base_verified")
+    assert payload["branch"] == "swarm/T1-coder"
+
+
+def test_process_card_base_checks_still_blocks_a_branch_that_exists_with_a_bad_base(tmp_path, monkeypatch):
+    """The other half of finding 3: a branch that DOES exist but was cut from a commit ASES never wrote is still
+    blocked immediately, exactly as before -- only "no ref at all yet" gets the grace, never a branch whose
+    provenance is demonstrably wrong."""
+    repo = git_repo(tmp_path, with_branch=False)
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    _plant_branch(repo, "swarm/T1-coder")
+    w.board.cards[w.work("T1")].update(status="running", branch_name="swarm/T1-coder")
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+
+    assert len(problems) == 1 and "ASES-GIT-01" in problems[0]
+    assert w.board.cards[w.work("T1")]["status"] == "blocked"
+
+
 def test_process_card_base_checks_only_looks_at_this_plans_own_running_cards(tmp_path, monkeypatch):
     repo = git_repo(tmp_path)
     w = make_world(tmp_path, monkeypatch)

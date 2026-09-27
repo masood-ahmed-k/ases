@@ -3762,6 +3762,78 @@ def test_run_startup_reconciles_for_real_and_blocks_on_an_open_create_cards_inte
     assert cli.main([*_run_argv(world), "--ignore-reconcile"]) == 0  # the operator's explicit override
 
 
+def test_run_startup_does_not_start_the_wall_clock_when_reconcile_refuses(world, monkeypatch, capsys):
+    """Finding 8 (round 12, RUNSTART, ASES-REC-04/ASES-CTL-01): bounds.start_project (which stamps started_at and
+    flips the project to 'running') must not run until reconcile-on-start has had its say. Before this fix,
+    _refuse_unless_startable started the wall clock BEFORE reconcile could refuse, so an operator fixing a blocked
+    reconcile burned real wall-clock budget on a run that dispatched nothing at all."""
+    passes = _real_startup(world, monkeypatch)
+    world.conn.execute("INSERT INTO intents (project, kind, key, started_at) VALUES ('t3', 'create_cards', 't3', "
+                       "datetime('now'))")
+
+    assert cli.main(_run_argv(world)) == 5
+
+    assert passes == []
+    assert bounds.get_state(world.conn, "t3") is None  # reconcile refused before start_project ever ran
+
+    world.conn.execute("DELETE FROM intents WHERE project = 't3'")
+    assert cli.main(_run_argv(world)) == 0  # once reconcile is happy, the clock starts normally
+    assert bounds.get_state(world.conn, "t3")["status"] == "running"
+
+
+def test_run_startup_refuses_a_restart_whose_head_moved_since_the_last_adopted_one(world, monkeypatch, capsys):
+    """Finding 2 (round 12, RUNSTART, ASES-GIT-12): swarm run's own docstring promises Ctrl-C plus a re-run is a
+    supported way to continue. Between two runs, a HEAD moved by something other than ASES (a stray write into
+    the primary checkout -- guards.py's own module docstring names exactly this threat) must refuse the restart
+    the same way a mid-run divergence already does, not be silently laundered into the base-check allow-list by
+    an unconditional adopt_current_head."""
+    passes = _real_startup(world, monkeypatch)
+    assert cli.main(_run_argv(world)) == 0
+    first_head = guards.expected_head(world.conn, "t3")
+    assert first_head == _git(world.repo, "rev-parse", "HEAD")
+
+    _git(world.repo, "commit", "-q", "--allow-empty", "-m", "a commit ASES never wrote")
+    rogue_head = _git(world.repo, "rev-parse", "HEAD")
+    assert rogue_head != first_head
+
+    assert cli.main(_run_argv(world)) == 3
+
+    assert passes == [1]  # only the first run's pass; the restart never dispatched anything
+    out, err = _console(capsys)
+    assert "REFUSED (ASES-GIT-12)" in err and "HEAD moved" in err
+    assert guards.expected_head(world.conn, "t3") == first_head  # the rogue head was never adopted
+    assert rogue_head not in guards.written_heads(world.conn, "t3")
+
+
+def test_run_startup_allow_head_move_overrides_loudly_and_adopts_the_new_head(world, monkeypatch, capsys):
+    """The operator's explicit override (finding 2's suggested fix): a real, intentional HEAD move can still be
+    adopted, but only on request, and loudly."""
+    passes = _real_startup(world, monkeypatch)
+    assert cli.main(_run_argv(world)) == 0
+
+    _git(world.repo, "commit", "-q", "--allow-empty", "-m", "an intentional operator commit")
+    rogue_head = _git(world.repo, "rev-parse", "HEAD")
+
+    assert cli.main([*_run_argv(world), "--allow-head-move"]) == 0
+
+    assert passes == [1, 1]
+    err = _console(capsys)[1]
+    assert "--allow-head-move" in err
+    assert guards.expected_head(world.conn, "t3") == rogue_head
+    assert rogue_head in guards.written_heads(world.conn, "t3")
+
+
+def test_run_startup_first_ever_run_is_unaffected_by_the_head_move_check(world, monkeypatch, capsys):
+    """A first-ever run has no expected head recorded yet: check_primary_checkout already treats None as "skip the
+    comparison", and that must stay true without --allow-head-move."""
+    passes = _real_startup(world, monkeypatch)
+
+    assert guards.expected_head(world.conn, "t3") is None
+    assert cli.main(_run_argv(world)) == 0
+    assert passes == [1]
+    assert "REFUSED (ASES-GIT-12)" not in _console(capsys)[1]
+
+
 # ---------------------------------------------------------------------------------------------
 # A cmd_* function called directly with a hand-built Namespace that has only the required attributes
 # ---------------------------------------------------------------------------------------------
