@@ -234,6 +234,9 @@ is a real, if imperfect, proxy for "the same account under two provider names", 
 `key_pooling` row) without ever failing the run over it -- one provider used by several profiles is normal and is not
 what this flags.
 
+**Adding a provider.** `docs/provider-onboarding.md` is the checklist (ASES-CAP-06): discovery, smoke test, data-policy
+check, evaluation, each tied to the real command or field that supports it, plus a copy-paste `config/models.yaml` stub.
+
 ## 8. The request ledger and parking
 
 Every agent tool call costs one request against some provider's daily quota. ASES counts them itself so it can refuse to
