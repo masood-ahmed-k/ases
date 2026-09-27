@@ -41,6 +41,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -54,6 +55,26 @@ from . import gitexec as gitexec_mod
 from . import procenv as procenv_mod
 from . import sandbox as sandbox_mod
 from . import tamper as tamper_mod
+
+_IS_WINDOWS = os.name == "nt"
+
+
+class GateCheckoutError(Exception):
+    """Round 12 (finding 0, ASES-QG-01, blueprint p346 "An infrastructure failure says nothing about the model
+    or the task"): run_gate's own checkout step (git worktree add in host mode, git clone/checkout in sandbox
+    mode) failed for a reason that has nothing to do with the commit or the gate commands -- disk full, a stale
+    leftover directory, an AV lock, a git worktree-limit collision. This used to become a plain
+    GateResult(passed=False, ...), indistinguishable from a real failing gate, which let mergeq.py spend real
+    fix-card budget on a phantom failure and let controller.py's post-merge Gate 3 re-check revert an
+    already-landed, correct merge purely because its throwaway re-check checkout could not be created.
+
+    Raised instead, alongside sandbox.SandboxInfrastructureError (which covers the sandbox runner's own
+    infrastructure failures, never the checkout step -- see its own docstring), by every one of the same call
+    sites review.py's two Gate 1 paths, mergeq.py's Gate 3 candidate and controller.py's post-merge re-run
+    already catch SandboxInfrastructureError at, so a checkout failure gets the exact same "not a red gate,
+    retry next pass, never a silent revert" treatment. Kept as its own class, not a reuse of
+    SandboxInfrastructureError, because that exception's docstring scopes it specifically to the runner
+    sandbox_command_runner hands to gates.run_gate, never the checkout gates.py itself performs."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,7 +129,31 @@ def resolve_runner(project_config, task=None) -> GateRunner:
     return GateRunner(sandbox_mod.sandbox_command_runner(policy, network=network), True)
 
 
-def _run_commands(cwd: pathlib.Path, commands: list[str], timeout: int) -> tuple[bool, str]:
+def _kill_process_tree(pid: int) -> None:
+    """Stop `pid` and everything it started, best effort, never raises. Round 12 (finding 10): `_run_commands`
+    runs each command with shell=True, so on Windows `pid` is only the cmd.exe wrapper's own process id --
+    Popen.kill()/terminate() (TerminateProcess) ends that wrapper but never touches a grandchild that inherited
+    the same stdout/stderr pipe handles, so `taskkill /PID <pid> /T /F` ends the whole tree instead. On POSIX,
+    `_run_commands` starts the command in its own session (start_new_session=True), which makes its process
+    group id equal to its own pid, so os.killpg ends the command and everything it started. This mirrors
+    evals.py's own `_kill_process_tree` (the same hazard, fixed there first); kept as gates.py's own copy
+    rather than an import because evals.py is outside this package's file ownership (round 12, GATEINFRA)."""
+    try:
+        if _IS_WINDOWS:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
+        else:
+            import signal
+
+            os.killpg(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _run_commands(
+    cwd: pathlib.Path, commands: list[str], timeout: int, *,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    kill_tree: Callable[[int], None] = _kill_process_tree,
+) -> tuple[bool, str]:
     """Runs `commands` on the host, in order, stopping at the first non-zero exit: the default `runner` for
     run_gate, used whenever no sandbox runner is given.
 
@@ -120,21 +165,41 @@ def _run_commands(cwd: pathlib.Path, commands: list[str], timeout: int) -> tuple
     Windows programs still start. This is the HOST runner only: a sandbox runner (sandbox.py) never inherits the
     host environment at all, and a gateway-dispatched worker's own shell is out of scope, since ASES never spawns
     one. No pass-through allowlist: a command that needs a credential-shaped variable fails here, loudly, and that
-    failure is recorded like any other red gate (see the module docstring)."""
+    failure is recorded like any other red gate (see the module docstring).
+
+    Round 12 (finding 10): `timeout` used to be `subprocess.run(..., timeout=timeout)`, which does not bound
+    wall-clock on real Windows for a shell=True command -- on TimeoutExpired, subprocess.run kills only the
+    cmd.exe wrapper it holds a handle to, then drains its pipes with a SECOND, UNTIMED communicate() that blocks
+    until the real command (a grandchild that inherited the same pipe handles) exits on its own, however long
+    that takes, even though the text returned already says "[TIMEOUT after Ns]". Popen plus
+    communicate(timeout=timeout) plus, on TimeoutExpired, killing the WHOLE process tree (`kill_tree`) BEFORE
+    draining again fixes this: the real command is dead before the second communicate() call, so that call
+    returns quickly with whatever partial output it already had buffered. `popen`/`kill_tree` are injectable
+    (test-only; every production call keeps the real subprocess.Popen and _kill_process_tree) so a test can
+    prove the branch without a real hung process, alongside the real-process test that proves the fix on real
+    Windows."""
     env = procenv_mod.scrubbed_environ()
     lines = []
+    popen_kwargs: dict = {} if _IS_WINDOWS else {"start_new_session": True}
     for cmd in commands:
+        proc = popen(
+            cmd, shell=True, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", env=env, **popen_kwargs,
+        )
         try:
-            result = subprocess.run(
-                cmd, shell=True, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
-                encoding="utf-8", errors="replace", env=env,
-            )
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            lines.append(f"$ {cmd}\n[TIMEOUT after {timeout}s]")
+            kill_tree(proc.pid)
+            try:
+                out, err = proc.communicate(timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                out, err = "", ""
+            lines.append(f"$ {cmd}\n{(out or '')}{(err or '')}".rstrip())
+            lines.append(f"[TIMEOUT after {timeout}s]")
             return False, "\n".join(lines)
-        lines.append(f"$ {cmd}\n{result.stdout}{result.stderr}".rstrip())
-        if result.returncode != 0:
-            lines.append(f"[exit {result.returncode}]")
+        lines.append(f"$ {cmd}\n{out}{err}".rstrip())
+        if proc.returncode != 0:
+            lines.append(f"[exit {proc.returncode}]")
             return False, "\n".join(lines)
     return True, "\n".join(lines)
 
@@ -162,8 +227,11 @@ def _worktree_checkout(
     return _git(["worktree", "add", "--detach", str(target), commit_sha], cwd=repo_path, timeout=60)
 
 
-def _worktree_teardown(repo_path: pathlib.Path, target: pathlib.Path) -> None:
-    _git(["worktree", "remove", "--force", str(target)], cwd=repo_path, timeout=60)
+def _worktree_teardown(repo_path: pathlib.Path, target: pathlib.Path) -> subprocess.CompletedProcess:
+    """Round 12 (finding 11): returns the CompletedProcess (it used to be discarded) so run_gate's finally block
+    can tell a real removal failure (a Windows file lock: a hung gate-command child, or another process, still
+    has `target` open) from an ordinary success, instead of treating every teardown as having worked."""
+    return _git(["worktree", "remove", "--force", str(target)], cwd=repo_path, timeout=60)
 
 
 def _self_contained_checkout(
@@ -197,6 +265,31 @@ def _self_contained_teardown(repo_path: pathlib.Path, target: pathlib.Path) -> N
     """A clone registers nothing in repo_path/.git/worktrees, so there is nothing to unregister: run_gate's own
     shutil.rmtree(tmp_root) removes the directory. Kept as its own function, matching _worktree_teardown, so
     run_gate never has to know which mode tore itself down."""
+
+
+def _report_worktree_leak_if_any(
+    conn, tmp_root: pathlib.Path, teardown_result: object, *, task_key: str, gate: str, project: str | None,
+) -> None:
+    """Round 12 (finding 11): run_gate's finally block used to discard the teardown outcome completely -- the
+    git worktree-remove exit code was never checked, and shutil.rmtree ran with ignore_errors=True -- so a
+    Windows file lock (a hung gate-command child that still has the throwaway worktree as its cwd, or any other
+    process with an open handle inside it) left `tmp_root` on disk with nothing anywhere saying so. The round 12
+    audit's own reproduction found that `git worktree remove --force` can deregister the worktree even when it
+    fails to delete the directory itself, so list_worktrees/check_idle_worktrees (both built on `git worktree
+    list`) can never rediscover it afterward: this is the one place that still has the path. `tmp_root.exists()`
+    after shutil.rmtree is the reliable signal (a non-zero git exit code alone is also expected, and benign,
+    whenever the checkout itself never succeeded, such as GateCheckoutError above); the git exit code is
+    recorded too, for the leak's own diagnosis. Best effort and never raises, so a broken events table can never
+    mask whatever exception this finally block's own try body is already propagating."""
+    if conn is None or not tmp_root.exists():
+        return
+    try:
+        events_mod.record(conn, "gate_worktree_leak", {
+            "task_key": task_key, "gate": gate, "path": str(tmp_root),
+            "git_exit_code": getattr(teardown_result, "returncode", None),
+        }, project=project)
+    except Exception:  # noqa: BLE001 - best effort, see the docstring above
+        pass
 
 
 def run_gate(
@@ -240,6 +333,13 @@ def run_gate(
     in GateResult.detail. Command output is the likeliest place for a secret (a failing test that prints its
     environment, a tool that echoes a token), and every consumer copies GateResult.detail somewhere else: a card
     comment, a fix-card body, a merge outcome. Redacting at the source means no consumer can forget to.
+
+    Round 12 (finding 0, ASES-QG-01): a checkout that fails (`add.returncode != 0`) raises GateCheckoutError
+    instead of returning GateResult(passed=False, ...) -- exactly like a runner that raises (the paragraph
+    above): the checkout is still torn down below, no gate_runs row is written, and the caller decides what an
+    infrastructure failure means. It is never a red gate. ASES-SEC-01 still applies to this path (git can echo
+    the bad commit argument itself back in its error): the message is redacted before the exception is raised,
+    same as GateResult.detail below, so no consumer of GateCheckoutError needs to remember to redact it itself.
     """
     run_commands = runner if runner is not None else _run_commands
     checkout = _self_contained_checkout if self_contained_checkout else _worktree_checkout
@@ -250,12 +350,16 @@ def run_gate(
     try:
         add = checkout(repo_path, commit_sha, worktree)
         if add.returncode != 0:
-            passed, output = False, f"could not create gate {kind}: {add.stdout}{add.stderr}"
-        else:
-            passed, output = run_commands(worktree, commands, timeout_per_command)
+            raise GateCheckoutError(
+                events_mod.redact_text(f"could not create gate {kind}: {add.stdout}{add.stderr}")
+            )
+        passed, output = run_commands(worktree, commands, timeout_per_command)
     finally:
-        teardown(repo_path, worktree)
+        teardown_result = teardown(repo_path, worktree)
         shutil.rmtree(tmp_root, ignore_errors=True)
+        _report_worktree_leak_if_any(
+            conn, tmp_root, teardown_result, task_key=task_key, gate=gate_name, project=project,
+        )
 
     # A runner is expected to hand back text; anything else is passed through untouched rather than crashing a
     # gate that already ran.

@@ -2541,6 +2541,93 @@ def test_sandbox_command_runner_infrastructure_error_never_a_silent_pass_or_host
         run(worktree, ["echo hi"], 60)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Finding 1 (round 12, ASES-CFG-04/ASES-CFG-05): the gate path's own docker-launching subprocesses must not
+# inherit the controller's whole environment (a credential-shaped variable, or a DOCKER_HOST/DOCKER_CONTEXT/
+# DOCKER_TLS_VERIFY/DOCKER_CERT_PATH override that would silently redirect the sandbox to a different daemon).
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_gate_docker_env_drops_credentials_and_docker_context_overrides_but_keeps_everything_else(monkeypatch):
+    monkeypatch.setenv("HERMES_PROVIDER_API_KEY", "sk-super-secret-value-12345")
+    monkeypatch.setenv("DOCKER_HOST", "tcp://unexpected-remote-daemon.example:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "some-other-context")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_CERT_PATH", "C:/some/certs")
+    monkeypatch.setenv("ASES_GATE_DOCKER_ENV_PROBE", "kept")
+
+    env = sandbox._gate_docker_env()
+
+    for dropped in ("HERMES_PROVIDER_API_KEY", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY",
+                    "DOCKER_CERT_PATH"):
+        assert dropped not in env
+    assert env.get("ASES_GATE_DOCKER_ENV_PROBE") == "kept"
+    assert env.get("PATH") == os.environ.get("PATH")  # not just emptied: an ordinary, non-credential var survives
+
+
+def test_gate_docker_runner_calls_default_runner_with_the_scrubbed_env(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-shouldnotbevisible0123456789")
+    seen = {}
+
+    def fake_default_runner(argv, timeout, *, env=None):
+        seen.update(argv=list(argv), timeout=timeout, env=env)
+        return result(0, "ok")
+
+    monkeypatch.setattr(sandbox, "default_runner", fake_default_runner)
+
+    out = sandbox._gate_docker_runner(["docker", "info"], 20)
+
+    assert out.stdout == "ok"
+    assert seen["argv"] == ["docker", "info"] and seen["timeout"] == 20
+    assert "OPENROUTER_API_KEY" not in seen["env"]
+
+
+def test_sandbox_command_runner_default_process_runner_scrubs_credentials_and_docker_context_overrides(
+    monkeypatch, worktree,
+):
+    """Finding 1's own reproduction method (r12_audit_findings.md): plant a credential-shaped variable and a
+    DOCKER_HOST override in the parent process, call the real sandbox_command_runner with NO process_runner
+    override -- exactly gates.resolve_runner's own production call shape -- and check what env the docker CLI
+    process (docker_available, image_present and the actual `docker run`) actually received. Before this fix
+    every one of the three saw env=None (subprocess.run's "inherit everything"), including the planted values."""
+    monkeypatch.setattr(sandbox, "host_user_spec", lambda: None)
+    monkeypatch.setenv("HERMES_PROVIDER_API_KEY", "sk-super-secret-value-12345")
+    monkeypatch.setenv("DOCKER_HOST", "tcp://unexpected-remote-daemon.example:2375")
+    seen_envs = []
+
+    def fake_default_runner(argv, timeout, *, env=None):
+        seen_envs.append(env)
+        sub = argv[1]
+        if sub == "info":
+            return result(0, "27.0.1\n")
+        if sub == "image":
+            return result(0, "sha256:abc\n")
+        return result(0, "ran")
+
+    monkeypatch.setattr(sandbox, "default_runner", fake_default_runner)
+
+    run = sandbox.sandbox_command_runner(POLICY)  # no process_runner override: the real production default
+    passed, _ = run(worktree, ["echo hi"], 60)
+
+    assert passed is True
+    assert len(seen_envs) == 3  # docker info, docker image inspect, docker run
+    for env in seen_envs:
+        assert env is not None, "the default process runner must not inherit the parent's whole environment"
+        assert "HERMES_PROVIDER_API_KEY" not in env
+        assert "DOCKER_HOST" not in env
+
+
+def test_default_runner_itself_is_unchanged_and_still_inherits_when_no_env_is_given():
+    """The fix wraps sandbox_command_runner's default `process_runner`; it must not touch default_runner itself,
+    which key_visibility_test and exfiltration_probe still call directly with env=None on purpose (see
+    default_runner's own docstring): their whole point is to see what a real, unscrubbed environment would leak
+    through a mis-built `docker run`."""
+    import inspect
+
+    params = inspect.signature(sandbox.default_runner).parameters
+    assert params["env"].default is None
+
+
 def test_the_sandbox_files_contain_neither_the_em_dash_nor_the_section_sign():
     """The owner's standing rule for code, comments, docstrings, tests and strings."""
     banned = (chr(0x2014), chr(0xA7))
