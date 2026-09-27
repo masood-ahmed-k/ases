@@ -525,8 +525,13 @@ def _key(path):
 
 
 def _snapshot_rows(conn, project="proj"):
+    """Confirmed baselines only: a worktree's grace and pending markers are separate rows, keyed by the worktree's
+    own key plus a NUL suffix, and are not part of what a caller normally means by "the stored snapshot"."""
     cur = conn.execute("SELECT path, head, status_hash FROM worktree_snapshots WHERE project = ?", (project,))
-    return {row["path"]: (row["head"], row["status_hash"]) for row in cur.fetchall()}
+    return {
+        row["path"]: (row["head"], row["status_hash"])
+        for row in cur.fetchall() if not row["path"].endswith(("\x00grace", "\x00pending"))
+    }
 
 
 def _listed(repo, name):
@@ -904,7 +909,101 @@ def test_a_running_cards_worktree_is_skipped_and_its_baseline_is_dropped_until_i
     assert _idle(conn, repo) == []  # the card stopped: the first idle look is the new baseline, nothing is reported
     assert list(_snapshot_rows(conn)) == [_key(wt)]
     _commit_new_file(wt, "later.txt")  # a change after that is caught again
-    assert len(_idle(conn, repo)) == 1
+    assert _idle(conn, repo) == []  # this fresh, just-vacated baseline still carries its one grace pass
+    assert len(_idle(conn, repo)) == 1  # never explained: confirmed on the pass after that
+
+
+# --- the re-dispatch race: a worktree just vacated by a running card earns one grace pass -------------------------
+
+def test_a_worktree_no_card_has_ever_left_gets_no_grace_and_is_reported_on_its_very_first_divergence(conn, repo):
+    """The baseline for a worktree check_idle_worktrees has never seen owned carries no grace pass, so it is
+    judged exactly as before this round: immediately, on the very first pass that finds it changed."""
+    wt = _worktree(repo, "t1")
+    _idle(conn, repo)  # a genuinely first sight: wt was never in running_paths before this
+    old = _head(wt)
+    new = _commit_new_file(wt)
+
+    assert _idle(conn, repo) == [_changed(repo, "t1", f"HEAD {old[:12]}..{new[:12]}")]
+
+
+def test_a_worktree_that_becomes_owned_again_explains_a_change_seen_right_after_it_was_vacated(conn, repo):
+    """ASES-GIT-12's own documented false positive (the register's ROUND 6 note on ASES-GIT-12; r9_wp_small.md's
+    IDLEWT): "a card re-dispatched into its worktree between two polls" can leave the worktree looking idle and
+    changed for exactly one pass, before the board catches up and shows it running again. The pass right after a
+    running card leaves its worktree spends that worktree's one grace pass on its first divergence rather than
+    reporting it, so if the worktree is owned again by the next pass, the change is explained, never reported."""
+    wt = _worktree(repo, "t1")
+    _idle(conn, repo)
+    _commit_new_file(wt, "own-work.txt")
+    assert _idle(conn, repo, running=[str(wt)]) == []  # the card runs and commits
+    assert _idle(conn, repo) == []  # vacated: a fresh baseline, one grace pass earned
+    _commit_new_file(wt, "re-dispatched.txt")  # a re-dispatch starts writing before the board reflects it
+
+    assert _idle(conn, repo) == []  # looks idle for this one pass: held back, not blamed
+    assert _idle(conn, repo, running=[str(wt)]) == []  # the board now shows it running again: explained
+    assert _idle(conn, repo) == []  # vacated once more, from a clean baseline: still nothing to report
+    assert _snapshot_rows(conn)[_key(wt)][0] == _head(wt)
+
+
+def test_a_post_vacate_change_that_is_never_explained_is_still_reported(conn, repo):
+    """The grace pass only delays a genuine, unexplained change by one pass: it never lets one through for good."""
+    wt = _worktree(repo, "t1")
+    _idle(conn, repo)
+    _commit_new_file(wt, "own-work.txt")
+    assert _idle(conn, repo, running=[str(wt)]) == []
+    assert _idle(conn, repo) == []  # vacated: a fresh baseline, one grace pass earned
+    old = _head(wt)
+    new = _commit_new_file(wt, "intruder.txt")  # nobody re-dispatches: this is never explained
+
+    assert _idle(conn, repo) == []  # held back for its one grace pass
+    assert _idle(conn, repo) == [_changed(repo, "t1", f"HEAD {old[:12]}..{new[:12]}")]  # confirmed the pass after
+
+
+def test_a_change_that_keeps_moving_between_two_idle_looks_is_still_confirmed(conn, repo):
+    """Confirming a held-back change does not require the worktree to have settled: only that it is still idle
+    and still different from the ORIGINAL baseline on the pass after it was first noticed."""
+    wt = _worktree(repo, "t1")
+    _idle(conn, repo)
+    _commit_new_file(wt, "own-work.txt")
+    assert _idle(conn, repo, running=[str(wt)]) == []
+    assert _idle(conn, repo) == []  # vacated: a fresh baseline, one grace pass earned
+    old = _head(wt)
+    _write(wt, "first.txt")
+
+    assert _idle(conn, repo) == []  # held back
+    new = _commit_new_file(wt, "second.txt")  # the worktree keeps changing before the next pass
+
+    assert _idle(conn, repo) == [_changed(repo, "t1", f"HEAD {old[:12]}..{new[:12]}")]
+
+
+def test_a_change_that_fully_reverts_before_the_next_pass_is_never_reported(conn, repo):
+    wt = _worktree(repo, "t1")
+    _idle(conn, repo)
+    _commit_new_file(wt, "own-work.txt")
+    assert _idle(conn, repo, running=[str(wt)]) == []
+    assert _idle(conn, repo) == []  # vacated: a fresh baseline, one grace pass earned
+    _write(wt, "stray.txt")
+
+    assert _idle(conn, repo) == []  # held back
+    (wt / "stray.txt").unlink()  # removed again before the next pass: back to the confirmed baseline exactly
+
+    assert _idle(conn, repo) == []
+    assert _idle(conn, repo) == []  # and the held-back sighting does not linger either
+
+
+def test_the_grace_pass_expires_after_one_full_quiet_pass(conn, repo):
+    """A worktree that proves quiet for one whole pass after being vacated is judged immediately from then on,
+    the same as a worktree no card has ever left: the grace pass is not renewed pass after pass."""
+    wt = _worktree(repo, "t1")
+    _idle(conn, repo)
+    _commit_new_file(wt, "own-work.txt")
+    assert _idle(conn, repo, running=[str(wt)]) == []  # a grace pass is earned for the next time it is idle
+    assert _idle(conn, repo) == []  # vacated: fresh baseline, grace pass still unspent
+    assert _idle(conn, repo) == []  # a full quiet pass: the grace pass is spent, unused
+    old = _head(wt)
+    new = _commit_new_file(wt, "later.txt")
+
+    assert _idle(conn, repo) == [_changed(repo, "t1", f"HEAD {old[:12]}..{new[:12]}")]  # reported immediately
 
 
 def test_a_running_worktree_is_skipped_even_when_it_has_no_baseline_yet(conn, repo):

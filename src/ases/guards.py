@@ -13,7 +13,9 @@ The same reasoning covers the OTHER worktrees (the second half of ASES-GIT-12): 
 may change its worktree, so a HEAD or a status that moved in a worktree NO running card owns was changed by
 something else, for example a worker handed the absolute path of another card's worktree. check_idle_worktrees
 compares each such worktree with the snapshot kept in the worktree_snapshots table and reports a change once;
-snapshot_worktree, refresh_snapshots and list_worktrees are its parts.
+snapshot_worktree, refresh_snapshots and list_worktrees are its parts. A worktree a running card only just left
+earns one grace pass before its first divergence is reported, to rule out the specific race a re-dispatch can
+cause between two polls (see check_idle_worktrees for the detail and its limits).
 
 This module only reports: what a violation does (halt the run, raise a security event) is the controller's
 decision. The checks never raise and are read-only: every git call runs with --no-optional-locks, so it cannot
@@ -370,12 +372,61 @@ def _store_snapshot(conn: sqlite3.Connection, project: str, key: str, head: str,
     )
 
 
+def _delete_snapshot(conn: sqlite3.Connection, project: str, key: str) -> None:
+    conn.execute("DELETE FROM worktree_snapshots WHERE project = ? AND path = ?", (project, key))
+
+
+def _has_snapshot(conn: sqlite3.Connection, project: str, key: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM worktree_snapshots WHERE project = ? AND path = ?", (project, key),
+    ).fetchone() is not None
+
+
+# check_idle_worktrees keeps two markers per worktree alongside its confirmed baseline row, each a second row in
+# the SAME table keyed by the worktree's own key plus a NUL suffix (a NUL can never appear in a real filesystem
+# path, so it can never collide with one, and no schema change is needed). Their content is never read, only
+# their presence: _GRACE_SUFFIX means "the next divergence against this baseline gets one held-back pass rather
+# than being reported straight away", earned the moment a running card leaves the worktree and spent (deleted)
+# either by that pass or by the baseline surviving one full quiet pass unspent. _PENDING_SUFFIX means "a
+# divergence was already held back once and is now confirmed the next time this worktree is still idle and still
+# different", whatever it changed to meanwhile.
+_GRACE_SUFFIX = "\x00grace"
+_PENDING_SUFFIX = "\x00pending"
+
+
+def _grace_key(key: str) -> str:
+    return key + _GRACE_SUFFIX
+
+
+def _pending_key(key: str) -> str:
+    return key + _PENDING_SUFFIX
+
+
+def _owner_key(stored: str) -> str:
+    """The real worktree key a stored row (confirmed, grace or pending) belongs to."""
+    for suffix in (_GRACE_SUFFIX, _PENDING_SUFFIX):
+        if stored.endswith(suffix):
+            return stored[: -len(suffix)]
+    return stored
+
+
+def _describe_change(row: tuple[str, str], head: str, status_hash: str) -> str:
+    """'HEAD a..b', 'status changed', or both joined with '; ', for whichever of head and status_hash moved from
+    the confirmed row (row[0], row[1]) to the current pair. Both are shortened to 12 characters."""
+    changes = []
+    if row[0] != head:
+        changes.append(f"HEAD {row[0][:12]}..{head[:12]}")
+    if row[1] != status_hash:
+        changes.append("status changed")
+    return "; ".join(changes)
+
+
 def check_idle_worktrees(
     conn: sqlite3.Connection, project: str, repo: pathlib.Path, running_paths: Iterable[str | os.PathLike],
     *, ignore_prefixes: tuple[str, ...] = (),
 ) -> list[str]:
     """ASES-GIT-12, other worktrees: "Any change outside the worker's own worktree fails the card and raises a
-    security event". Reports what changed in a worktree no running card owns, once.
+    security event" (blueprint p185). Reports what changed in a worktree no running card owns, once.
 
     running_paths is the set of worktree paths of the cards running now (Hermes spells them however it likes:
     separators and, on Windows, case are normalised before comparing). For every other worktree of the
@@ -383,13 +434,40 @@ def check_idle_worktrees(
     worktree_snapshots:
 
       - no row yet is a first sight: the snapshot is recorded and nothing is reported;
-      - a moved HEAD, or a changed status hash, is ONE problem for that worktree ("worktree <path> changed while
-        no card was running in it: HEAD a..b" and/or "status changed", a and b shortened to 12 characters), and
-        the new snapshot is stored so the same change is reported once, not on every pass from now on;
       - a worktree of a running card is skipped, its own worker may change it, and its row is deleted: the
-        baseline is taken again the first time the worktree is seen idle (the snapshot after the card stops);
-      - a worktree that has disappeared, or that git marks prunable because its directory is gone, has its row
-        dropped and is not a problem.
+        baseline is taken again the first time the worktree is seen idle (the snapshot after the card stops).
+        That worktree also earns ONE grace pass, spent on whichever comes first: the new baseline surviving one
+        full pass unchanged, or the baseline's own first divergence;
+      - a moved HEAD, or a changed status hash, against a baseline with no grace pass left is ONE problem for
+        that worktree ("worktree <path> changed while no card was running in it: HEAD a..b" and/or "status
+        changed", a and b shortened to 12 characters), reported on this very pass, and the new snapshot is
+        stored so the same change is reported once, not on every pass from now on. A worktree no running card
+        has ever left (never seen in running_paths through this function) never carries a grace pass, so it is
+        judged exactly this way from its very first divergence;
+      - the SAME kind of divergence against a baseline that still carries its grace pass is held back instead,
+        for exactly one more pass: if the worktree is owned again by then, the grace pass explains the change
+        and nothing is ever reported; if it is still idle, the pass reports it there, using the ORIGINAL
+        baseline against whatever the worktree's state is by then, whether or not that is the same state the
+        held-back pass saw;
+      - a worktree that has disappeared, or that git marks prunable because its directory is gone, has its row,
+        and any grace or pending marker, dropped and is not a problem.
+
+    Why a grace pass at all: the register's own note on this function ("a card re-dispatched into its worktree
+    between two polls") names a real race. running_paths is a snapshot the caller takes once per pass; a poll
+    can land in the moment between a re-dispatched worker starting to write to a worktree it was just handed back
+    and the board reflecting that worker as running again, and without a grace pass that poll blames an intruder
+    for the re-dispatch's own, legitimate, first write. The grace pass is spent the moment it is used, whether it
+    explains a change or not, so it protects only that one specific moment, never a worktree that has been idle
+    and quiet for a while and then genuinely changes.
+
+    What a grace pass does NOT do: the register names a second false positive for this function, "a reviewer
+    legitimately works in a card's worktree while the card is in review", and that one is still wide open. A
+    card in review is not a card running_paths ever names (the controller builds running_paths from
+    hermes_mod.kanban_list(board, status="running")), so this function has no signal at all, grace pass or
+    not, to tell a reviewer's legitimate edit from an intruder's. Attributing a still-unexplained change to
+    "the" one running card, and failing it, would misfire on exactly that reviewer case, so every problem this
+    function returns stays a report for the controller to turn into a WARNING, as it does today, never a FAIL,
+    until something gives this function visibility into review-in-progress worktrees too.
 
     Deviations from the blueprint text, on purpose and the same as check_primary_checkout: this runs once per
     polling pass, not around each spawn (Hermes, not ASES, spawns workers), and it reports rather than fails a
@@ -408,7 +486,10 @@ def check_idle_worktrees(
     baselined: set[str] = set()
     for key, worktree in _other_worktrees(worktrees, repo):
         if key in running:
-            conn.execute("DELETE FROM worktree_snapshots WHERE project = ? AND path = ?", (project, key))
+            baselined.add(key)  # accounted for: only its confirmed and pending rows are cleared, not its new grace
+            _delete_snapshot(conn, project, key)
+            _delete_snapshot(conn, project, _pending_key(key))
+            _store_snapshot(conn, project, _grace_key(key), "", "")  # one grace pass for the next time it is idle
             continue
         if worktree.prunable or not worktree.path.is_dir():
             continue
@@ -421,19 +502,29 @@ def check_idle_worktrees(
         row = conn.execute(
             "SELECT head, status_hash FROM worktree_snapshots WHERE project = ? AND path = ?", (project, key),
         ).fetchone()
-        if row is not None and (row[0], row[1]) == (head, status_hash):
+        if row is None:
+            _store_snapshot(conn, project, key, head, status_hash)  # first sight; a grace pass, if any, is untouched
             continue
-        if row is not None:
-            changes = []
-            if row[0] != head:
-                changes.append(f"HEAD {row[0][:12]}..{head[:12]}")
-            if row[1] != status_hash:
-                changes.append("status changed")
-            problems.append(f"worktree {shown} changed while no card was running in it: {'; '.join(changes)}")
+        if (row[0], row[1]) == (head, status_hash):
+            _delete_snapshot(conn, project, _grace_key(key))  # survived one full quiet pass: the grace pass is spent
+            _delete_snapshot(conn, project, _pending_key(key))
+            continue
+        if _has_snapshot(conn, project, _pending_key(key)):  # held back once already: confirm it now, unconditionally
+            problems.append(f"worktree {shown} changed while no card was running in it: "
+                             f"{_describe_change(row, head, status_hash)}")
+            _store_snapshot(conn, project, key, head, status_hash)
+            _delete_snapshot(conn, project, _pending_key(key))
+            continue
+        if _has_snapshot(conn, project, _grace_key(key)):  # first divergence against a graced baseline: hold it back
+            _delete_snapshot(conn, project, _grace_key(key))  # the grace pass is spent either way, one-shot
+            _store_snapshot(conn, project, _pending_key(key), head, status_hash)
+            continue
+        problems.append(f"worktree {shown} changed while no card was running in it: "
+                         f"{_describe_change(row, head, status_hash)}")
         _store_snapshot(conn, project, key, head, status_hash)
     for (stored,) in conn.execute("SELECT path FROM worktree_snapshots WHERE project = ?", (project,)).fetchall():
-        if stored not in baselined:
-            conn.execute("DELETE FROM worktree_snapshots WHERE project = ? AND path = ?", (project, stored))
+        if _owner_key(stored) not in baselined:
+            _delete_snapshot(conn, project, stored)
     return problems
 
 
