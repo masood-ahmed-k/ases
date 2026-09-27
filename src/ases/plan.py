@@ -10,9 +10,12 @@ dependency path between them get one added, so they never run, and conflict, in 
 
 Round 9 (ASES-SEC-05, ASES-SEC-07): a task may also declare sandbox_network, an explicit exception to the
 sandbox's default-deny network for its own Gate 1 and Gate 3 candidate runs (gates.resolve_runner reads it),
-with sandbox_network_reason required whenever it is true. sandbox_network_exceptions() below is what
-controller.pin_gate_profiles / verify_gate_pin fold into the gate_profiles pin, so flipping the flag after
-approval is caught the same way an edited gate command is.
+with sandbox_network_reason required whenever it is true.
+
+Round 10 (ASES-QG-02, GATEPIN): pinned_task_fields() below is the one place that decides which per-task
+fields controller.pin_gate_profiles / verify_gate_pin fold into the gate_profiles pin -- today sandbox_network
+and allow_gate_config_changes, both -- so flipping either one after approval is caught the same way an edited
+gate command is. It replaces the round 9 sandbox_network_exceptions() function of the same shape.
 """
 from __future__ import annotations
 
@@ -37,7 +40,9 @@ class PlanTask:
     estimated_requests: int
     # ASES-QG-02 (section 14.3): true only when this task is deliberately allowed to touch gate, CI or
     # test-runner configuration with a touches glob broad enough to cover it (see _gate_config_violation).
-    # Optional and False by default, so a plan written before this field existed parses unchanged.
+    # Optional and False by default, so a plan written before this field existed parses unchanged. Round 10
+    # (GATEPIN): pinned at swarm approve time by pinned_task_fields() below, exactly like sandbox_network, so
+    # flipping it in plan.json after approval no longer goes unnoticed.
     allow_gate_config_changes: bool = False
     # ASES-SEC-05, ASES-SEC-07 (round 9): an explicit, task-scoped exception to the sandbox's default-deny
     # network (gates.resolve_runner grants network ONLY to this task's own Gate 1 and Gate 3 candidate runs
@@ -371,14 +376,35 @@ def serialize_overlapping_tasks(
     return serialized, tuple(links)
 
 
-def sandbox_network_exceptions(plan: Plan) -> dict[str, list]:
-    """ASES-SEC-05, ASES-SEC-07 (round 9): {task_key: [True, reason]} for every task that carries an explicit,
-    Gate-0-validated network exception. Meant to be folded into gates.hash_gate_profiles by
-    controller.pin_gate_profiles / verify_gate_pin, so flipping a task's sandbox_network after approval --
-    without a fresh `swarm approve` -- is caught the same way an edited gate command is. A task with no
-    exception (the default) is left out entirely, so a plan that sets none hashes exactly as it did before this
-    field existed."""
-    return {t.key: [True, t.sandbox_network_reason] for t in plan.tasks if t.sandbox_network}
+def pinned_task_fields(plan: Plan) -> dict[str, dict]:
+    """ASES-QG-02, ASES-SEC-05, ASES-SEC-07 (round 10, GATEPIN): {task_key: {field: value, ...}} for every task
+    that carries at least one of the per-task fields that must be pinned at swarm approve time alongside the
+    gate profiles, because each one lets a task do something Gate 1 would otherwise refuse, or grants it
+    something the sandbox otherwise denies -- so flipping any of them after approval, without a fresh
+    `swarm approve`, must be caught exactly like an edited gate command. Meant to be folded into
+    gates.hash_gate_profiles by controller.pin_gate_profiles / verify_gate_pin.
+
+    Today's fields:
+      sandbox_network            [True, reason] (round 9, ASES-SEC-05/-07), when the task carries the
+                                  sandbox's default-deny network exception.
+      allow_gate_config_changes  True (round 9 CIPIN, round 10 GATEPIN), when the task is allowed to touch
+                                  gate, CI or test-runner configuration.
+
+    One generalised mapping rather than a second parallel argument for each new pinned field: a future field
+    is added the same way, here only. A task with NEITHER field set is left out of the mapping entirely, and a
+    plan where no task sets either hashes EXACTLY as it did before this function (and allow_gate_config_changes
+    pinning) existed -- see gates.hash_gate_profiles and its test coverage -- so every pin recorded before round
+    10, for a plan that never used either field, stays valid unchanged."""
+    fields_by_task: dict[str, dict] = {}
+    for t in plan.tasks:
+        fields: dict = {}
+        if t.sandbox_network:
+            fields["sandbox_network"] = [True, t.sandbox_network_reason]
+        if t.allow_gate_config_changes:
+            fields["allow_gate_config_changes"] = True
+        if fields:
+            fields_by_task[t.key] = fields
+    return fields_by_task
 
 
 def load_plan_file(path: str | pathlib.Path, *, known_roles: set[str], max_cards: int) -> Plan:

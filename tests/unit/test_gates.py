@@ -841,10 +841,10 @@ def test_run_gate_self_contained_checkout_false_is_still_todays_worktree_message
     assert "could not create gate worktree" in result.detail
 
 
-# --- hash_gate_profiles with sandbox_network_exceptions (round 9, ASES-SEC-05/07) --------------------------------
+# --- hash_gate_profiles with pinned_task_fields (round 9 ASES-SEC-05/07; round 10 ASES-QG-02, GATEPIN) ------------
 
 
-def test_hash_gate_profiles_with_no_exceptions_matches_the_hash_before_this_parameter_existed():
+def test_hash_gate_profiles_with_no_pinned_fields_matches_the_hash_before_this_parameter_existed():
     profiles = {"default": ["pytest -q"]}
     assert gates.hash_gate_profiles(profiles) == gates.hash_gate_profiles(profiles, None) \
         == gates.hash_gate_profiles(profiles, {})
@@ -853,10 +853,47 @@ def test_hash_gate_profiles_with_no_exceptions_matches_the_hash_before_this_para
 def test_hash_gate_profiles_changes_when_a_network_exception_is_added_or_edited():
     profiles = {"default": ["pytest -q"]}
     plain = gates.hash_gate_profiles(profiles)
-    with_exception = gates.hash_gate_profiles(profiles, {"T1": [True, "installs a package"]})
-    different_reason = gates.hash_gate_profiles(profiles, {"T1": [True, "a different reason"]})
+    with_exception = gates.hash_gate_profiles(profiles, {"T1": {"sandbox_network": [True, "installs a package"]}})
+    different_reason = gates.hash_gate_profiles(profiles, {"T1": {"sandbox_network": [True, "a different reason"]}})
 
     assert plain != with_exception != different_reason
     assert len({plain, with_exception, different_reason}) == 3
     # deterministic and order-independent, same as the base hash
-    assert gates.hash_gate_profiles(profiles, {"T1": [True, "installs a package"]}) == with_exception
+    assert gates.hash_gate_profiles(
+        profiles, {"T1": {"sandbox_network": [True, "installs a package"]}}) == with_exception
+
+
+def test_hash_gate_profiles_changes_when_the_allow_gate_config_changes_marker_is_added():
+    """ASES-QG-02 (round 10, GATEPIN): the marker folds into the same pin the network exception does, by the
+    same pinned_task_fields mapping -- gates.py itself does not know or care which per-task field it is."""
+    profiles = {"default": ["pytest -q"]}
+    plain = gates.hash_gate_profiles(profiles)
+    with_marker = gates.hash_gate_profiles(profiles, {"T1": {"allow_gate_config_changes": True}})
+
+    assert plain != with_marker
+    # deterministic
+    assert gates.hash_gate_profiles(profiles, {"T1": {"allow_gate_config_changes": True}}) == with_marker
+
+
+def test_hash_gate_profiles_a_task_with_both_pinned_fields_differs_from_either_alone():
+    """A task can carry both a network exception and the gate-config marker at once; the hash must tell that
+    state apart from having only one of the two, so flipping either one alone is still caught."""
+    profiles = {"default": ["pytest -q"]}
+    network_only = gates.hash_gate_profiles(profiles, {"T1": {"sandbox_network": [True, "needs pypi"]}})
+    marker_only = gates.hash_gate_profiles(profiles, {"T1": {"allow_gate_config_changes": True}})
+    both = gates.hash_gate_profiles(
+        profiles, {"T1": {"sandbox_network": [True, "needs pypi"], "allow_gate_config_changes": True}})
+
+    assert len({network_only, marker_only, both}) == 3
+
+
+def test_hash_gate_profiles_pinned_task_fields_key_order_does_not_matter():
+    """sort_keys=True (see the docstring) applies to the whole payload, not just gate_profiles: a task's own
+    field order, and the order tasks appear in the mapping, must not change the hash either."""
+    profiles = {"default": ["pytest -q"]}
+    t1_fields_forward = {"sandbox_network": [True, "needs pypi"], "allow_gate_config_changes": True}
+    t1_fields_reversed = {"allow_gate_config_changes": True, "sandbox_network": [True, "needs pypi"]}
+    t2_fields = {"allow_gate_config_changes": True}
+    a = gates.hash_gate_profiles(profiles, {"T1": t1_fields_forward, "T2": t2_fields})
+    b = gates.hash_gate_profiles(profiles, {"T2": t2_fields, "T1": t1_fields_reversed})
+    assert a == b
