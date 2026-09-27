@@ -1202,6 +1202,26 @@ Merging found real conflicts only where CIPIN, GATESANDBOX and EVENTSPROJ each a
 sites; all three were kept. Register after round 9: 48 covered, 39 in_progress, 13 partial, 3 not_applicable, 0
 not_covered. Suite: 5,668 passed, 2 skipped, 0 failed.
 
+## Round 10: the base-commit check, and what round 9 surfaced (2026-09-27)
+
+Same method as round 9 (one Sonnet builder per package in its own worktree, an independent Sonnet review with a nemotron
+second opinion, fix rounds, Haiku live verification, the architect merging one branch at a time), zero quota. Four
+packages. BASECHECK built the check blueprint p169 requires ("Phase 3 MUST verify the actual base commit before a worker
+starts"): Hermes's Kanban dispatcher always cuts a card's worktree from the board repository's local HEAD and never reads
+`worktree_sync`, so `guards.check_card_base` reads each work branch's creation commit from its reflog and requires it to be
+an integration head ASES itself wrote or adopted (a new `integrity_heads` history, schema v9, so a card dispatched before a
+later merge still passes). Hermes starts the worker, not ASES, so "before it starts" becomes: checked on the first pass that
+sees it running and blocked for the user if wrong or unverifiable, and refused by the merge queue whatever happens, so a
+wrong base can never land. Its nemotron review caught a real bug before merge: git translates reflog messages under a
+non-English locale, so the check now forces `LC_ALL=C`. GATEPIN pinned the `allow_gate_config_changes` marker alongside the
+network exception and added the 22.12 acceptance test for `gate_config_changed`. BUDGETFIX made 10 percent the one
+daily-reserve default and found that a paused project's clock running on was correct, not a bug. CALLERS gave the smoke test
+a command (refused without `--spend-quota`, fake-tested only) and printed the residual risks in `swarm init` and
+`swarm doctor`. The architect wired `swarm doctor --repo` so the base check's prerequisite is actually checked. Branch names
+were deliberately left alone (see Known gaps). The owner decided the same day that commits are authored by the owner alone,
+with no co-author lines, and that the reviewer's write access is accepted until the sandbox closes it. Register after round
+10: 50 covered, 40 in_progress, 10 partial, 3 not_applicable, 0 not_covered. Suite: 5,757 passed, 2 skipped, 0 failed.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and
@@ -1246,7 +1266,9 @@ not_covered. Suite: 5,668 passed, 2 skipped, 0 failed.
   freshly fetched REMOTE tip that actually differs from local HEAD (the case the requirement guards
   against) has still never been exercised for real. Round 9 (2026-09-27): the second half of blueprint
   p169, "Phase 3 MUST verify the actual base commit before a worker starts", is not built anywhere in
-  `src/ases`; ASES-GIT-01 was set back to `partial` for it.
+  `src/ases`; ASES-GIT-01 was set back to `partial` for it. Round 10 (2026-09-27): built
+  (`guards.check_card_base`, detection every pass plus a merge-queue refusal; see the round 10 section), so
+  GIT-01 is covered again and GIT-16 is `in_progress`: the check has not yet run against a real dispatch.
 - **Gaps the first real run exposed** (details in "The first real end-to-end run"), updated 2026-09-27
   against the current code: the reviewer profile still has `write_file` and `patch` (Hermes toolsets are
   per group, no per-tool deny; `ASES-ROL-05`, `partial`, unchanged). Partly true: the reviewer itself still
@@ -1309,12 +1331,15 @@ not_covered. Suite: 5,668 passed, 2 skipped, 0 failed.
   design: filter and merge drivers have worker-chosen names no single flag disables (they run, but see no
   credential), and a worker's own shell on the local backend runs as the operator's user; only the Docker
   sandbox closes that.
-- **Found in round 9, not fixed yet** (2026-09-27): CIPIN's `allow_gate_config_changes` marker is a plan task
-  field that is not folded into the gate-profile pin (the new network exception is), so a plan.json edited after
-  approval to set it is not caught by the pin (ASES-QG-02); `bounds`' `daily_reserve_percent` default reads 10
-  in one place and 0 in another; `report._wall_clock` keeps running for a paused project; work-card branch
-  names (`swarm/{key}-{role}`) are not project-scoped, so two projects reusing a task key would collide on the
-  branch itself; `profiles.residual_risks()` and `models.record_smoke_test` have no production caller.
+- ~~**Found in round 9, not fixed yet**: the unpinned `allow_gate_config_changes` marker; the `daily_reserve_percent`
+  default read as 10 in one place and 0 in another; a paused project's wall clock; project-scoped branch names;
+  `profiles.residual_risks()` and `models.record_smoke_test` with no caller.~~ -- resolved in round 10
+  (2026-09-27): the marker is pinned (GATEPIN); one reserve default of 10 (BUDGETFIX); the paused clock was NOT a
+  bug (the bound itself keeps counting and `swarm resume --extend-minutes` handles a passed deadline; the real
+  mismatch was the report freezing a STOPPED project's clock, now fixed); the residual risks are shown and the smoke
+  test has a command (CALLERS). Branch names were deliberately left as they are: the blueprint assigns them to
+  Hermes as `swarm/<plan-key>-<slug>`, and each project has its own repository (its own `workspace_root`), so two
+  projects can only collide on a branch by sharing a repository, which ASES does not support.
 - **ASES-CFG-05 (`partial`)**: a Hermes-gateway-dispatched worker is spawned by Hermes's own gateway, a process
   ASES never touches, so no ASES-side scrub reaches it (ASES-ARC-01). If a provider key leaks there, it was
   exported into the shell that started the gateway, which blueprint p213 forbids.

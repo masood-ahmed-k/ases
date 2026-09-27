@@ -113,3 +113,11 @@ git worktree under `C:\Users\masoo\ases-wt\` and branch `r9/<package>`; Tier 2 l
 | `r9_wp_mergepk.md` | MERGEPK: `merge_records` keyed by project and task, schema v8 (ASES-ARC-03, GIT-05) | done, independently verified |
 | `r9_wp_small.md` | CIPIN (ASES-QG-02), IDLEWT (GIT-12), PAUSEREASON (CTL-01), DOCTOR (VER-01, p213), CAPDOC (CAP-06) | done, independently verified |
 | `r9_wp_eventsproj.md` | EVENTSPROJ: events carry their project (ASES-ARC-03, OBS-01) | done, independently verified; two report panels scoped by the architect |
+
+## Round 10 (2026-09-27): the base-commit check, and what round 9 surfaced
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r10_rules.md` | shared rules: Write/Edit only (a heredoc eats backslashes), no `/tmp` for Windows Python, use `gitexec` and `events.PROJECT_SCOPE_SQL` | in use |
+| `r10_wp_basecheck.md` | BASECHECK: a work card's base commit is verified, detection plus merge refusal (ASES-GIT-01, GIT-16) | done, independently verified; `swarm doctor --repo` wired by the architect |
+| `r10_wp_small.md` | GATEPIN (ASES-QG-02), BUDGETFIX (CAP-03, CTL-01), CALLERS (MOD-04, ROL-05) | done, independently verified |

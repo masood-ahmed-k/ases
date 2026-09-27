@@ -195,13 +195,17 @@ requirements:
   section: '4.2'
   verified_by: 22.1, 22.6
   status: partial
-  note: 'doctor.reviewer_diversity fails closed if lead and reviewer share a provider; real check confirmed
-    unorouter vs openrouter on 2026-09-18, and confirms xkiro vs openrouter today (2026-09-19, after lead
-    moved off unorouter entirely per an explicit user decision -- see docs/architecture.md). Downgraded from
-    covered after the first real review: the reviewer has no command tool (its terminal call failed with
-    "Tool terminal does not exist"), but its tool list includes write_file and patch, because Hermes toolsets
-    are per group (file is reads and writes together) and this version has no per-tool deny. So "no
-    product-file write" is not enforced by profile configuration; a read-only sandbox mount (Phase 5) is.'
+  note: 'ROUND 10 (2026-09-27, zero quota): Owner decision (2026-09-27): the reviewer keeping the combined file
+    toolset is accepted as a documented residual risk until the Docker sandbox''s read-only mount closes it;
+    no interim guard. CALLERS made the risk visible: profiles.residual_risks() is printed by swarm init and
+    shown as INFO rows by swarm doctor. Earlier note: doctor.reviewer_diversity fails closed if lead and
+    reviewer share a provider; real check confirmed unorouter vs openrouter on 2026-09-18, and confirms xkiro
+    vs openrouter today (2026-09-19, after lead moved off unorouter entirely per an explicit user decision --
+    see docs/architecture.md). Downgraded from covered after the first real review: the reviewer has no
+    command tool (its terminal call failed with "Tool terminal does not exist"), but its tool list includes
+    write_file and patch, because Hermes toolsets are per group (file is reads and writes together) and this
+    version has no per-tool deny. So "no product-file write" is not enforced by profile configuration; a
+    read-only sandbox mount (Phase 5) is.'
 - id: ASES-ROL-06
   requirement: Least-privilege toolsets per role
   section: '4.2'
@@ -280,9 +284,14 @@ requirements:
   section: '5.2'
   verified_by: '22.1'
   status: covered
-  note: 'Real smoke tests run 2026-09-18: glm-5.3-thinking:free FAILED (tool_call_count=0, x2), qwen3.8-27b:free
-    and cohere/north-mini-code:free PASSED. See docs/phase2-evaluation-report.md. Awaiting user acceptance
-    before config/models.yaml is updated.'
+  note: 'ROUND 10 (2026-09-27, zero quota): CALLERS: the smoke test now has a command instead of a hand-run recipe:
+    swarm models runs one tiny tool-calling task with a structured result through the real Hermes path and
+    records pass/fail, detail and latency with models.record_smoke_test. It refuses to run without
+    --spend-quota, reuses the evaluation harness''s one-shot call and scrubbed environment, and is tested only
+    against fakes; it has not been run for real yet. Earlier note: Real smoke tests run 2026-09-18:
+    glm-5.3-thinking:free FAILED (tool_call_count=0, x2), qwen3.8-27b:free and cohere/north-mini-code:free
+    PASSED. See docs/phase2-evaluation-report.md. Awaiting user acceptance before config/models.yaml is
+    updated.'
 - id: ASES-MOD-05
   requirement: Provider health is passive; no timer-based probing
   section: '5.2'
@@ -307,24 +316,29 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: partial
-  note: 'ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real
-    bug fixed this round: create_cards_from_plan used to forget a task''s fix or retry card (or, for a retry
-    card specifically, create a genuine DUPLICATE work card) if the ASES database was deleted and card
-    creation re-run a third time, since both of its ''does a fix/retry card already exist'' signals lived only
-    in that database. It now asks the BOARD directly (the merge card''s own parent lineage, disambiguated by
-    each candidate''s created_at, never by id or list order, since real Hermes card ids are RANDOM and only
-    the fake board''s happen to be sequential -- a subtlety the builder''s report documents precisely, worth
-    reading before anyone builds similar board-native recovery logic). Acceptance-tested for both the fix-card
-    and retry-card case. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.9):
-    a card over the daily budget is parked (scheduled, budget: reason), an independent affordable task
-    proceeds normally, several idle passes show exactly one card_parked_for_budget event with no thrashing and
-    the fake provider never started, the report shows the reset time, no purchase language appears anywhere,
-    and after the simulated UTC-midnight reset the card unparks and completes with the other task''s state
-    intact. Left partial: the review-reserve half and the daily-reset arithmetic against a REAL
-    Hermes/provider are still unverified, and ledger.py has no injectable clock (tests must monkeypatch
-    ledger._today directly). Earlier note: Three layers, all unit-tested: cmd_approve checks the whole plan''s
-    budget at Gate P; controller.process_budget_gate re-checks every ready card on every pass and parks it
-    with hermes kanban schedule when the budget is gone; and, since 2026-09-19, the ledger sees REAL usage:
+  note: 'ROUND 10 (2026-09-27, zero quota): BUDGETFIX: the daily reserve now has one default,
+    ledger.DEFAULT_DAILY_RESERVE_PERCENT = 10 (blueprint section 9.3: ''the limit in section 5.3 minus a 10
+    percent reserve''), used by bounds, policy, report and ledger.can_afford; policy and the report used to
+    fall back to 0 when a project''s budgets omitted the key, so the budget gate, the Gate P estimate and the
+    report could disagree. An explicit 0 still means 0. Earlier note: ROUND 7 wave 1 (2026-09-22, zero quota,
+    one real Hermes call authorized only for kanban_specify): A real bug fixed this round:
+    create_cards_from_plan used to forget a task''s fix or retry card (or, for a retry card specifically,
+    create a genuine DUPLICATE work card) if the ASES database was deleted and card creation re-run a third
+    time, since both of its ''does a fix/retry card already exist'' signals lived only in that database. It
+    now asks the BOARD directly (the merge card''s own parent lineage, disambiguated by each candidate''s
+    created_at, never by id or list order, since real Hermes card ids are RANDOM and only the fake board''s
+    happen to be sequential -- a subtlety the builder''s report documents precisely, worth reading before
+    anyone builds similar board-native recovery logic). Acceptance-tested for both the fix-card and retry-card
+    case. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.9): a card over the
+    daily budget is parked (scheduled, budget: reason), an independent affordable task proceeds normally,
+    several idle passes show exactly one card_parked_for_budget event with no thrashing and the fake provider
+    never started, the report shows the reset time, no purchase language appears anywhere, and after the
+    simulated UTC-midnight reset the card unparks and completes with the other task''s state intact. Left
+    partial: the review-reserve half and the daily-reset arithmetic against a REAL Hermes/provider are still
+    unverified, and ledger.py has no injectable clock (tests must monkeypatch ledger._today directly). Earlier
+    note: Three layers, all unit-tested: cmd_approve checks the whole plan''s budget at Gate P;
+    controller.process_budget_gate re-checks every ready card on every pass and parks it with hermes kanban
+    schedule when the budget is gone; and, since 2026-09-19, the ledger sees REAL usage:
     usage.ingest_run_usage runs first in every pass and counts each finished worker session once (Hermes
     session export, api_call_count, idempotent through the usage_ingested table, attributed to the plan task
     so lineage requests can be summed), and the outgoing card of a fix-card repoint is ingested just before
@@ -399,17 +413,28 @@ requirements:
   requirement: One worktree per work card, branched from the exact integration HEAD
   section: '8'
   verified_by: 22.2, 22.5
-  status: partial
-  note: 'ROUND 9 architect correction (2026-09-27, zero quota): status set back from covered to partial. The
-    register hygiene pass above is right that the real Hermes-created worktree was exercised on 2026-09-19,
-    but blueprint p169 tags this row together with ASES-GIT-16 on the sentence ''Phase 3 MUST verify the
-    actual base commit before a worker starts'', and round 9''s T2B package confirmed no such verification
-    exists in src/ases: the base was observed once, never checked by the controller. Partial until a
-    base-commit check exists (listed as a new, separate work item). Earlier note: ROUND 9 register hygiene
-    (2026-09-27, zero quota): Stale claim corrected -- the real Hermes-created worktree HAS been exercised.
-    ASES-GIT-16''s own note records it precisely: ''Observed on the real 2026-09-19 run: the work-card
-    worktree Hermes created on dispatch was cut at the exact integration tip both times (232e12e for G1,
-    676628f for G2 after G1 merged)'', matching docs/architecture.md''s run log (''Its worktree was cut at
+  status: covered
+  note: 'ROUND 10 (2026-09-27, zero quota): BASECHECK built the check blueprint p169''s last sentence asks for:
+    guards.check_card_base reads a work branch''s creation commit from its reflog (git forced to the C locale
+    so the message is never translated) and requires it to be an integration head ASES itself wrote or
+    adopted, kept in a new integrity_heads history table (schema v9, backfilled), so a card dispatched before
+    a later merge still passes. It runs twice: every pass checks each running card once and blocks a wrong or
+    unverifiable base through the question path, and the merge queue refuses such a branch outright, so a
+    wrong base can never land even if detection missed it. ''Before a worker starts'' is enforced as ''on the
+    first pass that sees it running, and never mergeable'', because Hermes, not ASES, starts the worker. swarm
+    doctor --repo checks core.logAllRefUpdates, which the check needs. Acceptance-tested on the fake board
+    (tests/acceptance/test_r10_basecheck.py); never run against a real dispatch. With the base now verified by
+    the controller, and one-worktree-per-card observed on the real 2026-09-19 run, this row is covered.
+    Earlier note: ROUND 9 architect correction (2026-09-27, zero quota): status set back from covered to
+    partial. The register hygiene pass above is right that the real Hermes-created worktree was exercised on
+    2026-09-19, but blueprint p169 tags this row together with ASES-GIT-16 on the sentence ''Phase 3 MUST
+    verify the actual base commit before a worker starts'', and round 9''s T2B package confirmed no such
+    verification exists in src/ases: the base was observed once, never checked by the controller. Partial
+    until a base-commit check exists (listed as a new, separate work item). Earlier note: ROUND 9 register
+    hygiene (2026-09-27, zero quota): Stale claim corrected -- the real Hermes-created worktree HAS been
+    exercised. ASES-GIT-16''s own note records it precisely: ''Observed on the real 2026-09-19 run: the
+    work-card worktree Hermes created on dispatch was cut at the exact integration tip both times (232e12e for
+    G1, 676628f for G2 after G1 merged)'', matching docs/architecture.md''s run log (''Its worktree was cut at
     232e12e, exactly the integration tip''). That is real proof of this row''s own requirement (one worktree
     per work card, branched from the exact integration HEAD) for two real cards, on top of the existing
     mergeq/gates unit tests against a real git repo and the 22.5 parallel acceptance test (three simultaneous
@@ -643,24 +668,29 @@ requirements:
   section: '9.3'
   verified_by: 22.6, 22.9, 22.14
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): PAUSEREASON closed the remaining known gap: bounds.set_status stores a
-    pause reason in project_state.stop_reason exactly as a stop already did (no migration), and swarm status,
-    swarm report, swarm run''s refusal and swarm resume show it. Both documented gaps are now closed; back to
-    in_progress, since the finalize path has still never run for a real project. Found alongside, not fixed:
-    daily_reserve_percent defaults to 10 in one place and 0 in another; report._wall_clock keeps running for a
-    paused project. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota): One of the two ''Known
-    gap'' items this note lists is fixed. Gate 4''s no-allowlist gap is closed: ASES-TSK-04''s own note (ROUND
-    6, 2026-09-22) records plan.gate4_allowlist landing (matched by tamper.py''s glob semantics, findings
-    demoted to advisory), and a read-only run against ASES''s own repository shows Gate 4 passing (60
-    findings, all excused by allow_paths). The other known gap (`bounds.set_status(paused)` drops the reason,
-    kept only in a project_paused event) has no fix on record anywhere in the register or the code checked
-    this round; it remains open. ''Finished means every merge card done plus Gates 4/5 green'' is otherwise
-    still ''not run for real'' exactly as this note originally said: no real project has reached the finalize
-    path since it was built. Status moved from in_progress to partial: the mechanism is built, wired,
-    unit-tested, and one of its two documented gaps is closed; the other documented gap and the lack of a real
-    end-to-end run keep this short of covered. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
-    bounds.py is evaluated every pass: a breached project bound pauses the project with a report; finished now
-    means every merge card done, Gates 4 and 5 green on the integration HEAD and the release report written
+  note: 'ROUND 10 (2026-09-27, zero quota): BUDGETFIX checked the wall-clock bound: bounds'' own arithmetic runs
+    live whatever the status, and swarm resume --extend-minutes already handles a deadline that has passed, so
+    a paused project''s clock that keeps running in the report is correct (round 9 listed it as a possible
+    bug; it is not). The real mismatch was the other way: the report froze a STOPPED project''s clock; now
+    only a finished project''s clock freezes. Earlier note: ROUND 9 (2026-09-27, zero quota): PAUSEREASON
+    closed the remaining known gap: bounds.set_status stores a pause reason in project_state.stop_reason
+    exactly as a stop already did (no migration), and swarm status, swarm report, swarm run''s refusal and
+    swarm resume show it. Both documented gaps are now closed; back to in_progress, since the finalize path
+    has still never run for a real project. Found alongside, not fixed: daily_reserve_percent defaults to 10
+    in one place and 0 in another; report._wall_clock keeps running for a paused project. Earlier note: ROUND
+    9 register hygiene (2026-09-27, zero quota): One of the two ''Known gap'' items this note lists is fixed.
+    Gate 4''s no-allowlist gap is closed: ASES-TSK-04''s own note (ROUND 6, 2026-09-22) records
+    plan.gate4_allowlist landing (matched by tamper.py''s glob semantics, findings demoted to advisory), and a
+    read-only run against ASES''s own repository shows Gate 4 passing (60 findings, all excused by
+    allow_paths). The other known gap (`bounds.set_status(paused)` drops the reason, kept only in a
+    project_paused event) has no fix on record anywhere in the register or the code checked this round; it
+    remains open. ''Finished means every merge card done plus Gates 4/5 green'' is otherwise still ''not run
+    for real'' exactly as this note originally said: no real project has reached the finalize path since it
+    was built. Status moved from in_progress to partial: the mechanism is built, wired, unit-tested, and one
+    of its two documented gaps is closed; the other documented gap and the lack of a real end-to-end run keep
+    this short of covered. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): bounds.py is
+    evaluated every pass: a breached project bound pauses the project with a report; finished now means every
+    merge card done, Gates 4 and 5 green on the integration HEAD and the release report written
     (finalgates.finalize, called by controller.process_finalize). Known gap: `bounds.set_status(paused)` drops
     the reason (kept in a project_paused event), and Gate 4 fails on any repository with sample keys in tests
     or docs (no allowlist).'
@@ -890,33 +920,39 @@ requirements:
   requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
   section: '14.3'
   verified_by: '22.12'
-  status: partial
-  note: 'ROUND 9 (2026-09-27, zero quota): CIPIN: tamper''s gate_config_changed finding now treats only the plan
-    task''s explicit allow_gate_config_changes marker as ''an explicit plan task that allows it'', never the
-    path merely being in touches, and both Gate 1 paths (the review lane and the merge-time re-check) pass the
-    marker through; Gate 0 was tightened to match, so a literal touches entry on a gate-config path now needs
-    the marker too (reversing round 6''s literal exemption, on purpose, so Gate 0 never approves a plan Gate 1
-    would always reject). Both sentences of p277 now have a mechanism. Still partial: the marker is a plan
-    task field that is NOT folded into the gate-profile pin (the round 9 network exception is), so a plan.json
-    edited after approval to set it is not caught by the pin; and 22.12 does not yet exercise
-    gate_config_changed end to end. Earlier note: ROUND 6 (2026-09-22, zero quota): Gate 0 now rejects a task
-    whose touches is a WILDCARD glob broad enough to cover gate/CI configuration, unless the task explicitly
-    sets allow_gate_config_changes: true (a narrow, literal touches entry needs no marker). This closes the
-    hole two independent round 6 builders (TV building it, AC-E reproducing it live) confirmed: because
-    review.check_branch runs the scope check BEFORE the tamper check, anything that reaches tamper.py is
-    already inside touches and hence exempt, so gate_config_changed and assertion_weakened findings can never
-    fire through this wiring on their own. The register''s existing partial note (hashing/pinning a fixed
-    CI-file list) is a different, still-open half; this round''s fix is plan-time touches-breadth,
-    complementary, not a substitute. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The pin
-    check of the gate profiles exists; the diff side is the tamper module''s gate_config_changed finding,
-    which cannot fire through the review wiring today (see ASES-QG-03), so a change to gate configuration is
-    stopped by the scope check alone. Earlier note: gates.hash_gate_profiles() +
-    controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a plan''s gate_profiles are content-hashed
-    and pinned per-project at swarm approve time (only after every earlier REFUSED path -- data-policy, budget
-    -- has passed, so a refused plan is never pinned), and swarm run refuses with "REFUSED (ASES-QG-02)" if
-    the hash no longer matches, telling the user to re-approve. Re-running swarm approve deliberately moves
-    the pin -- that IS "an explicit plan task that allows it." Unit-tested (9 new tests: hash
-    stability/sensitivity, no-op-when-unpinned, pin/ verify round trip, re-approve moves the pin,
+  status: covered
+  note: 'ROUND 10 (2026-09-27, zero quota): GATEPIN folded each task''s allow_gate_config_changes marker into the
+    gate-profile pin (one per-task pinned-fields mapping with the sandbox_network exception; a plan setting
+    neither hashes exactly as before), wired through swarm approve and swarm run''s pre-flight, with a test
+    that a marker flipped after approval is refused. A new acceptance test drives gate_config_changed through
+    Gate 0 and Gate 1 at zero quota, the 22.12 gap named below. Both sentences of p277 now have a mechanism
+    and a passing test. Hashing the CONTENT of CI files, named in an older note as another half, is not in
+    p277''s text and is not built. Earlier note: ROUND 9 (2026-09-27, zero quota): CIPIN: tamper''s
+    gate_config_changed finding now treats only the plan task''s explicit allow_gate_config_changes marker as
+    ''an explicit plan task that allows it'', never the path merely being in touches, and both Gate 1 paths
+    (the review lane and the merge-time re-check) pass the marker through; Gate 0 was tightened to match, so a
+    literal touches entry on a gate-config path now needs the marker too (reversing round 6''s literal
+    exemption, on purpose, so Gate 0 never approves a plan Gate 1 would always reject). Both sentences of p277
+    now have a mechanism. Still partial: the marker is a plan task field that is NOT folded into the
+    gate-profile pin (the round 9 network exception is), so a plan.json edited after approval to set it is not
+    caught by the pin; and 22.12 does not yet exercise gate_config_changed end to end. Earlier note: ROUND 6
+    (2026-09-22, zero quota): Gate 0 now rejects a task whose touches is a WILDCARD glob broad enough to cover
+    gate/CI configuration, unless the task explicitly sets allow_gate_config_changes: true (a narrow, literal
+    touches entry needs no marker). This closes the hole two independent round 6 builders (TV building it,
+    AC-E reproducing it live) confirmed: because review.check_branch runs the scope check BEFORE the tamper
+    check, anything that reaches tamper.py is already inside touches and hence exempt, so gate_config_changed
+    and assertion_weakened findings can never fire through this wiring on their own. The register''s existing
+    partial note (hashing/pinning a fixed CI-file list) is a different, still-open half; this round''s fix is
+    plan-time touches-breadth, complementary, not a substitute. Earlier note: BUILT AND WIRED, NOT RUN FOR
+    REAL (2026-09-22): The pin check of the gate profiles exists; the diff side is the tamper module''s
+    gate_config_changed finding, which cannot fire through the review wiring today (see ASES-QG-03), so a
+    change to gate configuration is stopped by the scope check alone. Earlier note: gates.hash_gate_profiles()
+    + controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a plan''s gate_profiles are
+    content-hashed and pinned per-project at swarm approve time (only after every earlier REFUSED path --
+    data-policy, budget -- has passed, so a refused plan is never pinned), and swarm run refuses with "REFUSED
+    (ASES-QG-02)" if the hash no longer matches, telling the user to re-approve. Re-running swarm approve
+    deliberately moves the pin -- that IS "an explicit plan task that allows it." Unit-tested (9 new tests:
+    hash stability/sensitivity, no-op-when-unpinned, pin/ verify round trip, re-approve moves the pin,
     cross-project isolation). Left at partial, not covered: the blueprint''s text also covers "CI scripts or
     test runner settings" beyond gate_profiles itself -- hashing a fixed list of config files (CI workflow,
     pytest/tox config) is a natural follow-up but needs its own decision about which files count, deliberately
@@ -1415,19 +1451,31 @@ requirements:
     manual creation is used
   section: '8'
   verified_by: 22.2, 22.5
-  status: partial
-  note: 'ROUND 9 T2B (2026-09-27, zero quota): Read against the installed Hermes 0.21.3 source (read only).
-    worktree_sync is already pinned: profiles._config_rows sets worktree_sync: false on every ASES-managed
-    profile (built in round 5, citing this row), and profiles._check_profile reports a live profile that has
-    it on; T2B made swarm doctor tag that drift row with ASES-GIT-16 itself (doctor._extract_requirement_ids),
-    so a drifted value names this requirement. Still partial for two reasons, both honest: the remote-tip case
-    this row guards against has never been exercised (the real test repo has no remote), and the second half
-    of p169, ''Phase 3 MUST verify the actual base commit before a worker starts'', is not built anywhere
-    (listed as a new, separate work item; ASES-GIT-01 is set back to partial for the same reason). Earlier
-    note: Observed on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at
-    the exact integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and
-    merge worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote,
-    so Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
+  status: in_progress
+  note: 'ROUND 10 (2026-09-27, zero quota): BASECHECK built the check blueprint p169''s last sentence asks for:
+    guards.check_card_base reads a work branch''s creation commit from its reflog (git forced to the C locale
+    so the message is never translated) and requires it to be an integration head ASES itself wrote or
+    adopted, kept in a new integrity_heads history table (schema v9, backfilled), so a card dispatched before
+    a later merge still passes. It runs twice: every pass checks each running card once and blocks a wrong or
+    unverifiable base through the question path, and the merge queue refuses such a branch outright, so a
+    wrong base can never land even if detection missed it. ''Before a worker starts'' is enforced as ''on the
+    first pass that sees it running, and never mergeable'', because Hermes, not ASES, starts the worker. swarm
+    doctor --repo checks core.logAllRefUpdates, which the check needs. Acceptance-tested on the fake board
+    (tests/acceptance/test_r10_basecheck.py); never run against a real dispatch. worktree_sync is pinned false
+    (round 5) and, per the Hermes 0.21.3 source, the Kanban dispatcher never syncs from a remote at all; the
+    remaining gap is only that the check has not run against a real dispatch. Earlier note: ROUND 9 T2B
+    (2026-09-27, zero quota): Read against the installed Hermes 0.21.3 source (read only). worktree_sync is
+    already pinned: profiles._config_rows sets worktree_sync: false on every ASES-managed profile (built in
+    round 5, citing this row), and profiles._check_profile reports a live profile that has it on; T2B made
+    swarm doctor tag that drift row with ASES-GIT-16 itself (doctor._extract_requirement_ids), so a drifted
+    value names this requirement. Still partial for two reasons, both honest: the remote-tip case this row
+    guards against has never been exercised (the real test repo has no remote), and the second half of p169,
+    ''Phase 3 MUST verify the actual base commit before a worker starts'', is not built anywhere (listed as a
+    new, separate work item; ASES-GIT-01 is set back to partial for the same reason). Earlier note: Observed
+    on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at the exact
+    integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and merge
+    worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote, so
+    Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
     guards against) was never exercised, and whether worktree_sync must be turned off explicitly is
     unverified.'
 - id: ASES-CFG-05
