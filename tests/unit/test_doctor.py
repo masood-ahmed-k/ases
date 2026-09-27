@@ -127,6 +127,90 @@ def test_model_context_check_warns_when_undeclared(tmp_path, monkeypatch):
     assert "ASES-MOD-02" in by_name["context_length[unorouter/glm-5.3-thinking:free]"].requirement_ids
 
 
+def _context_report(tmp_path, monkeypatch, models_config):
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, models_config)
+    report = doctor.run(project, models_config, conn)
+    return report, {c.name: c for c in report.checks}
+
+
+def test_model_context_check_fails_a_pinned_model_rejected_as_unknown_on_a_custom_endpoint(tmp_path, monkeypatch):
+    """ASES-MOD-02, acceptance 22.4: a PINNED model on a custom OpenAI-compatible endpoint (config/models.yaml
+    providers.<name>.type: openai_compatible) with no declared context_length is exactly what
+    models.classify_model_context rejects as unknown. Since it is pinned, cli._first_model_rejection would
+    itself refuse it at swarm approve/run pre-flight -- so swarm doctor must FAIL here, not merely warn: the
+    row should honestly say the run cannot start, the same row name (context_length[...]) as before."""
+    models_config = {
+        "providers": {"xkiro": {"type": "openai_compatible", "data_policy": "unknown"}},
+        "models": [
+            {"provider": "xkiro", "model": "some/undeclared-model", "context_length": None,
+             "tool_calling": True, "role_class": "lead", "pinned": True},
+        ],
+    }
+    report, by_name = _context_report(tmp_path, monkeypatch, models_config)
+    row = by_name["context_length[xkiro/some/undeclared-model]"]
+    assert row.status == "fail"
+    assert "rejected unknown" in row.detail
+    assert "ASES-MOD-02" in row.requirement_ids
+    assert report.ok is False
+
+
+def test_model_context_check_fails_a_pinned_model_with_a_declared_too_small_context(tmp_path, monkeypatch):
+    """Acceptance 22.4 step 1 ("Register a model declared at 16K: the controller must reject it before any
+    card starts") reflected in swarm doctor: an explicit, too-small declared context_length on a PINNED model
+    is a FAIL regardless of provider type (models.classify_model_context never excuses this one on type)."""
+    models_config = {
+        "providers": {"openrouter": {"type": "openrouter", "data_policy": "some_free_endpoints_train"}},
+        "models": [
+            {"provider": "openrouter", "model": "too-small-model", "context_length": 16_000,
+             "tool_calling": True, "role_class": "reviewer", "pinned": True},
+        ],
+    }
+    report, by_name = _context_report(tmp_path, monkeypatch, models_config)
+    row = by_name["context_length[openrouter/too-small-model]"]
+    assert row.status == "fail"
+    assert "rejected too small" in row.detail
+    assert report.ok is False
+
+
+def test_model_context_check_warns_not_fails_an_unpinned_candidate_rejected_as_unknown(tmp_path, monkeypatch):
+    """The same rejected-as-unknown model, UNPINNED (a candidate, never actually resolved for a role today):
+    the work order is explicit that "an unpinned candidate stays a WARN" -- it does not block anything from
+    starting today, so FAILing it here would be a false alarm swarm doctor must not raise."""
+    models_config = {
+        "providers": {"xkiro": {"type": "openai_compatible", "data_policy": "unknown"}},
+        "models": [
+            {"provider": "xkiro", "model": "some/undeclared-candidate", "context_length": None,
+             "tool_calling": True, "role_class": "coder_candidate", "pinned": False},
+        ],
+    }
+    report, by_name = _context_report(tmp_path, monkeypatch, models_config)
+    row = by_name["context_length[xkiro/some/undeclared-candidate]"]
+    assert row.status == "warn"
+
+
+def test_model_context_check_passes_undeclared_context_on_a_native_hermes_provider(tmp_path, monkeypatch):
+    """A native Hermes provider (type openrouter or hermes_provider, or no type declared) with no declared
+    context_length is ACCEPTED by models.classify_model_context (see its docstring: Hermes's own knowledge or
+    probing, not the custom-endpoint gap the blueprint's 'rejected as unknown' text is about) -- so it is
+    never a FAIL, pinned or not, even though the context is still undeclared. It stays a WARN, same as before
+    this round, because the number itself is still worth confirming (ASES-MOD-02's own comment in
+    config/models.yaml: "swarm doctor WARNs on every such row until a smoke test or an explicit number here
+    confirms the Hermes floor")."""
+    models_config = {
+        "providers": {"opencode_free": {"type": "hermes_provider", "provider_id": "opencode-free"}},
+        "models": [
+            {"provider": "opencode_free", "model": "some/native-model", "context_length": None,
+             "tool_calling": True, "role_class": "lead", "pinned": True},
+        ],
+    }
+    _, by_name = _context_report(tmp_path, monkeypatch, models_config)
+    row = by_name["context_length[opencode_free/some/native-model]"]
+    assert row.status == "warn"  # never a FAIL: classify_model_context accepts this model
+
+
 def _make_profile(home: object, name: str, provider: str, model: str) -> None:
     import pathlib
     d = pathlib.Path(str(home)) / "profiles" / name

@@ -1258,6 +1258,25 @@ def test_approve_refuses_a_plan_that_has_no_critic_pass_and_creates_nothing(worl
     assert f"plan hash {world.plan_hash()[:12]}" in err and "swarm critique" in err
 
 
+def test_approve_refuses_a_plan_whose_pinned_model_the_controller_rejects_and_creates_nothing(
+    world, monkeypatch, capsys,
+):
+    """ASES-MOD-02, acceptance 22.4: "the controller must reject it before any card starts". This is checked
+    before the critic-pass lookup (no _record_pass needed here), the same way a data-policy violation is: the
+    coder role's pinned model is declared at 16K, well under the 64K floor, and no card may be created."""
+    calls = _approve_world(world, monkeypatch)
+    rejected_config = copy.deepcopy(MODELS_CONFIG)
+    rejected_config["models"][0]["context_length"] = 16_000  # the coder role's pinned model
+    monkeypatch.setattr(cli, "_load_models_config", lambda: rejected_config)
+
+    assert cli.main(_approve_argv(world, "--yes")) == 1
+
+    assert calls == []
+    err = _console(capsys)[1]
+    assert "Gate P REFUSED (ASES-MOD-02)" in err
+    assert "coder-model" in err and "rejected too small" in err and "16000" in err
+
+
 def test_approve_with_a_critic_pass_and_yes_publishes_pins_and_creates_the_cards(world, monkeypatch, capsys):
     calls = _approve_world(world, monkeypatch)
     _record_pass(world)
@@ -3272,6 +3291,26 @@ def test_a_plan_role_with_no_pinned_model_adds_nothing_to_the_estimate(world, mo
 
     assert [line.split(":")[0] for line in estimate.budget_lines] == ["  budget[xkiro]"]  # the reviewer task has none
     assert estimate.policy_violation is None and estimate.unaffordable == ()
+
+
+def test_estimate_lines_stops_at_the_first_rejected_model_before_any_budget_line(world, monkeypatch):
+    """ASES-MOD-02, acceptance 22.4: _estimate_lines checks _first_model_rejection before it computes any
+    budget or calendar line at all (mirroring how a data-policy violation already short-circuits it), since
+    "the controller must reject it before any card starts" -- there is nothing to budget for a plan whose
+    pinned model is refused."""
+    plan = cli.plan_mod.load_plan_file(world.plan_file, known_roles=set(ROLES), max_cards=40)
+    rejected_config = copy.deepcopy(MODELS_CONFIG)
+    rejected_config["providers"]["openrouter"]["type"] = "openai_compatible"
+    rejected_config["models"][1]["context_length"] = None  # the reviewer role's pinned model, now undeclared
+
+    estimate = cli._estimate_lines(plan, world.project, rejected_config, world.conn)
+
+    assert estimate.model_rejected is not None
+    assert "reviewer" in estimate.model_rejected and "review-model" in estimate.model_rejected
+    assert "rejected unknown" in estimate.model_rejected
+    assert estimate.budget_lines == () and estimate.calendar_lines == () and estimate.policy_violation is None
+    assert f"Gate P would REFUSE this plan (context length, ASES-MOD-02): {estimate.model_rejected}" in \
+        estimate.text()
 
 
 def test_the_calendar_line_says_when_a_provider_declares_no_rate_limit(world, monkeypatch):
