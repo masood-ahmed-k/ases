@@ -1170,6 +1170,38 @@ with the full environment in repositories a local-backend worker can write `.git
 became round 9's GITHARDEN package. An architect re-run also fixed a pre-existing test fragility (`test_gate_worktree_cleaned_up`
 searched `git worktree list` for the text "wt", so any temp path containing "wt" failed it). Suite: 5,533 passed, 2 skipped, 0 failed.
 
+## Round 9: Tier 2 register honesty, then the Tier 1 gaps in parallel worktrees (2026-09-27)
+
+The user asked for "tier 2 first, then tier 1 items", with many agents at once. Zero quota throughout. Every package was
+built by a Sonnet agent in its own git worktree (`C:\Users\masoo\ases-wt\<package>`, its own pytest `--basetemp`, no
+`git stash` anywhere, since the stash is shared by every worktree), reviewed by a second Sonnet agent with a nemotron second
+opinion (the MCP tools still return 403; `tools/nemo.py` run with the nemotron server's own venv works), given a fix round
+when the review found something, and live-verified by Haiku last. The architect reviewed each diff and merged the branches
+one at a time, Tier 2 first.
+
+Tier 2. A register-hygiene pass re-checked every partial and in_progress row against the code: ARC-02, ARC-03, ARC-04,
+GIT-07, CFG-01 and TST-01 moved to covered on evidence, CTL-01 and TST-02 to partial with the exact gap named, and stale
+notes (MOD-02, REV-01, REV-03) corrected; the architect set GIT-01 back to partial, because blueprint p169's "Phase 3 MUST
+verify the actual base commit before a worker starts" is not built. `worktree_sync: false` turned out to have been pinned
+since round 5; `swarm doctor` now names ASES-GIT-16 on a drifted value.
+
+Tier 1, nine packages. GITHARDEN: `src/ases/gitexec.py` is the one way the controller runs git (repository hooks and
+`core.fsmonitor` disabled, the credential scrub, `--no-ext-diff --no-textconv` on every diff whose text matters), closing
+what round 8's sweep proved, including a textconv driver that could hide a secret from the Gate 3 scan. GATESANDBOX: every
+gate caller goes through `gates.resolve_runner`, so gates can run in the Docker sandbox with a self-contained checkout and a
+task-scoped, Gate-0-validated, pinned network exception (the architect wired `cli.py` to pass that exception into the pin,
+the gap its builder reported); off by default until Docker runs for real. MERGEPK: `merge_records` keyed by
+`(project, task_key)`, schema v8. EVENTSPROJ: events carry their project; every reader scopes through one definition,
+`events.PROJECT_SCOPE_SQL` (the architect replaced twelve inline copies with it and scoped the two report panels the
+builder had left open, the health panel having shown other projects' merge failures). CIPIN: a gate/CI config change
+needs the plan task's explicit `allow_gate_config_changes` marker, and Gate 0 was tightened to match (reversing round 6's
+literal-touches exemption). IDLEWT: the idle-worktree false positive fixed, still a warning. PAUSEREASON: a paused
+project keeps its reason. DOCTOR: source URLs and an exported-provider-key warning. CAPDOC: `docs/provider-onboarding.md`.
+
+Merging found real conflicts only where CIPIN, GATESANDBOX and EVENTSPROJ each added a parameter to the same Gate 1 call
+sites; all three were kept. Register after round 9: 48 covered, 39 in_progress, 13 partial, 3 not_applicable, 0
+not_covered. Suite: 5,668 passed, 2 skipped, 0 failed.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and
@@ -1212,7 +1244,9 @@ searched `git worktree list` for the text "wt", so any temp path containing "wt"
   live profile with it left on as a problem. What the register (`ASES-GIT-16`, still `partial`) correctly
   says remains open: this test repo still has no remote, so Hermes's default of syncing a worktree from a
   freshly fetched REMOTE tip that actually differs from local HEAD (the case the requirement guards
-  against) has still never been exercised for real.
+  against) has still never been exercised for real. Round 9 (2026-09-27): the second half of blueprint
+  p169, "Phase 3 MUST verify the actual base commit before a worker starts", is not built anywhere in
+  `src/ases`; ASES-GIT-01 was set back to `partial` for it.
 - **Gaps the first real run exposed** (details in "The first real end-to-end run"), updated 2026-09-27
   against the current code: the reviewer profile still has `write_file` and `patch` (Hermes toolsets are
   per group, no per-tool deny; `ASES-ROL-05`, `partial`, unchanged). Partly true: the reviewer itself still
@@ -1229,16 +1263,25 @@ searched `git worktree list` for the text "wt", so any temp path containing "wt"
   for the primary checkout -- `guards.check_primary_checkout` (`src/ases/guards.py:117`) runs at the start
   of every controller pass and at run start, and halts the run on a violation, acceptance-proven 2026-09-22
   (`ASES-GIT-12`, `partial`). Still genuinely open: the other-worktree half
-  (`guards.check_idle_worktrees`, `src/ases/guards.py:373`) only WARNs and has a documented false-positive
-  gap, and neither half inspects anything outside a git worktree's own tracked state, so the bullet's own
+  (`guards.check_idle_worktrees`, `src/ases/guards.py:373`) only WARNs (round 9's IDLEWT fixed its documented
+  re-dispatch false positive but kept it a warning, because a reviewer editing during review still looks the
+  same to it), and neither half inspects anything outside a git worktree's own tracked state, so the bullet's own
   example -- `pip install` into Hermes's own venv -- would still go undetected today; only the Docker
   sandbox (`ASES-SEC-03`, `in_progress`, see below) would close that.
 - Credentials, as of 2026-09-19: `lead` and `coder-1` are on xKiro (own key each), `reviewer` is on
   OpenRouter, and UnoRouter is removed entirely (an explicit decision). The first complete real end-to-end
   run (acceptance test 22.2's shape: two tasks, both merge cards done) finished on 2026-09-19 and is
   written up in "The first real end-to-end run" above, including what it did NOT exercise.
-- Partly true, updated 2026-09-27 (was: "Gate 1/3 run directly on the host, not inside Docker, Phase 5
-  requirement, not built"): `gates.run_gate` (`src/ases/gates.py:58`) has since grown an injectable
+- Updated again after round 9 (2026-09-27): GATESANDBOX wired every gate caller (Gate 1 in both review paths,
+  Gate 3, the post-merge re-run, Gates 4/5) through `gates.resolve_runner`, so gates CAN run in the Docker
+  sandbox, with a self-contained checkout and task-scoped network. The switch (`sandbox: enabled` in
+  `config/swarm.yaml`) stays off by default because Docker has never run for real on this machine, so every
+  gate still runs on the host in practice, now with round 8's scrubbed environment and round 9's hardened git.
+  One accepted limitation: with the sandbox on, a post-merge Gate 3 re-run that cannot start (Docker down)
+  keeps the merge and records a `sandbox_infrastructure_error` event rather than reverting. The text below is
+  the pre-round-9 state, kept for the record. Partly true, updated 2026-09-27 (was: "Gate 1/3 run directly on
+  the host, not inside Docker, Phase 5 requirement, not built"): `gates.run_gate` (`src/ases/gates.py:58`) has
+  since grown an injectable
   `runner` parameter (`ASES-QG-04`, `ASES-SEC-03`) that a sandboxed runner could plug into, and
   `finalgates.run_gate4`/`run_gate5` (`src/ases/finalgates.py:648`, `:708`) already forward it. But no real call
   site actually supplies one: `review.py`'s Gate 1 re-check (`src/ases/review.py:382`), `mergeq.py`'s
@@ -1258,14 +1301,20 @@ searched `git worktree list` for the text "wt", so any temp path containing "wt"
   `tests/acceptance/test_22_14_plan_rejection.py`. The register's note "Plan critique (the critic role in Gate
   P) is not built" predates it and is stale (round 9's register hygiene package corrects it). What is still
   open is the live half: the critic has never run against a real plan with a real reviewer model.
-- **The controller's other git calls** (round 8 sweep, 2026-09-27; ASES-CFG-04, ASES-CFG-05, ASES-SEC-01):
-  outside `gates.py`, every git subprocess the controller starts (merge queue, guards, reconcile, hardening,
-  integrity, controller) runs with the operator's full environment in a repository whose shared `.git/config`
-  and `.git/hooks` a local-backend worker can write, so a planted hook or `core.fsmonitor` script runs with the
-  controller's credentials (proven empirically), and the merge queue's Gate 3 secret-scan diff has no
-  `--no-ext-diff --no-textconv`. Round 9's GITHARDEN package is the fix. Residual even after it: filter and
-  merge drivers have worker-chosen names no single flag disables (the environment scrub caps them), and a
-  worker's own shell on the local backend runs as the operator's user; only the Docker sandbox closes that.
+- ~~**The controller's other git calls** (round 8 sweep): every controller git subprocess ran with the full
+  environment in a repository a local-backend worker can write hooks and config into, and the Gate 3
+  secret-scan diff had no `--no-ext-diff --no-textconv`.~~ -- fixed in round 9 (GITHARDEN, 2026-09-27): every
+  controller git call goes through `src/ases/gitexec.py` (hooks and `core.fsmonitor` disabled, the credential
+  scrub, `DIFF_SAFETY` on diff text), and a completeness test fails on any new bare git call. Residual, by
+  design: filter and merge drivers have worker-chosen names no single flag disables (they run, but see no
+  credential), and a worker's own shell on the local backend runs as the operator's user; only the Docker
+  sandbox closes that.
+- **Found in round 9, not fixed yet** (2026-09-27): CIPIN's `allow_gate_config_changes` marker is a plan task
+  field that is not folded into the gate-profile pin (the new network exception is), so a plan.json edited after
+  approval to set it is not caught by the pin (ASES-QG-02); `bounds`' `daily_reserve_percent` default reads 10
+  in one place and 0 in another; `report._wall_clock` keeps running for a paused project; work-card branch
+  names (`swarm/{key}-{role}`) are not project-scoped, so two projects reusing a task key would collide on the
+  branch itself; `profiles.residual_risks()` and `models.record_smoke_test` have no production caller.
 - **ASES-CFG-05 (`partial`)**: a Hermes-gateway-dispatched worker is spawned by Hermes's own gateway, a process
   ASES never touches, so no ASES-side scrub reaches it (ASES-ARC-01). If a provider key leaks there, it was
   exported into the shell that started the gateway, which blueprint p213 forbids.

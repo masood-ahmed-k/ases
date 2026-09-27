@@ -98,3 +98,18 @@ later". One workflow, zero quota.
 | `r8_wp_housekeeping.md` | HK-PATH: the drift check's blueprint path and an `ASES_BLUEPRINT_DOCX` override (ASES-DOC-02); HK-GAPS: the "Known gaps" list re-checked against the code | done, independently verified |
 | `r8_wp_gateenv.md` | GATEENV: gate commands and the gate checkout run with a credential-scrubbed environment (ASES-CFG-04/05) | done, independently reviewed and live-verified |
 | (no separate work order; a read-only sweep dispatched alongside GATEENV) | the controller's other git calls: hooks, fsmonitor, textconv in worker-writable repositories | done; became round 9's GITHARDEN |
+
+## Round 9 (2026-09-27): Tier 2, then every Tier 1 item, many agents at once
+
+The user asked for "tier 2 first, then tier 1 items - dispatch multiple agents to do the work faster". Each package had its own
+git worktree under `C:\Users\masoo\ases-wt\` and branch `r9/<package>`; Tier 2 landed first.
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r9_rules.md` | shared rules: one worktree and one pytest `--basetemp` per package, no `git stash` at all, imports from the worktree | in use |
+| `r9_wp_tier2.md` | T2A: register notes re-checked against the code (ASES-DOC-01/02); T2B: `worktree_sync` (ASES-GIT-16) | done, independently verified |
+| `r9_wp_githarden.md` | GITHARDEN: `gitexec.py`, one hardened way the controller runs git (ASES-CFG-04, SEC-01, SEC-04) | done, independently verified |
+| `r9_wp_gatesandbox.md` | GATESANDBOX: gates in the Docker sandbox, task-scoped network (ASES-QG-04, SEC-03, SEC-05, SEC-07) | done, independently verified; pin wiring finished by the architect |
+| `r9_wp_mergepk.md` | MERGEPK: `merge_records` keyed by project and task, schema v8 (ASES-ARC-03, GIT-05) | done, independently verified |
+| `r9_wp_small.md` | CIPIN (ASES-QG-02), IDLEWT (GIT-12), PAUSEREASON (CTL-01), DOCTOR (VER-01, p213), CAPDOC (CAP-06) | done, independently verified |
+| `r9_wp_eventsproj.md` | EVENTSPROJ: events carry their project (ASES-ARC-03, OBS-01) | done, independently verified; two report panels scoped by the architect |

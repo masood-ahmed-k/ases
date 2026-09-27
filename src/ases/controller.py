@@ -1315,7 +1315,8 @@ def _as_datetime(now):
 
 def _pause_reason(conn, project_name: str) -> str | None:
     """Why a paused project is paused: the reason of the newest `project_paused` event (pause_and_report records it).
-    bounds.set_status keeps a reason only for a `stopped` project, so this is where a paused one's is kept."""
+    Since round 9 (PAUSEREASON) bounds.set_status also keeps a paused project's reason in project_state.stop_reason;
+    this event-based reading is kept for projects paused before that change, whose state row has no reason."""
     row = conn.execute(
         f"SELECT payload FROM events WHERE kind = 'project_paused' AND {events.PROJECT_SCOPE_SQL} "
         "ORDER BY id DESC LIMIT 1", (project_name,),

@@ -2735,3 +2735,317 @@ SHIP - All verification checks passed. New tests pass (1848 passed, 1 skipped) w
   which turned `\n` inside a test's string literals into real newlines. Found by the test collection error, fixed with the
   Edit tool.
 
+
+## Round 9 EVENTSPROJ (2026-09-27): events carry their project
+
+Work order: r9_wp_eventsproj.md. Worktree cut from 4eae7f5 (round 8 plus wave A). Sonnet build, independent Sonnet review with a nemotron lead (three rounds, two fixes), Haiku live verification last. Every report below is verbatim.
+
+### EVENTSPROJ builder
+
+## EVENTSPROJ (round 9): events carry their project
+
+Worked in C:\Users\masoo\ases-wt\eventsproj, branch r9/eventsproj, cut from 4eae7f5 (round 8 + round 9 wave A merged). Never touched any other worktree or the primary checkout. Never committed, never pushed, never used git stash.
+
+### Requirement IDs (quoted from blueprint.txt, matches the register)
+
+- **ASES-ARC-03** (p101): "Every ASES record is keyed by the Hermes card ID and, where code is involved, by the commit SHA. On startup the controller reconciles the board, the Git repository and its own database before doing anything else (section 19.4)." Verified against `C:\Users\masoo\ases-workspaces\tools\blueprint.txt` line 133 and the register's own line 762 before starting; no drift found.
+- **ASES-OBS-01** (p284): "ASES adds a project report, available as swarm status, swarm report and optionally one local page." Verified against blueprint.txt line 469 and register line 827; no drift found. This is the requirement the two real bugs below (report.build_report's events panel and quality-panel findings) directly bear on: a project's own report/swarm report must show that project's events, not another project's sharing the same database.
+
+### Build
+
+**1. events.record gains project= (src/ases/events.py).** Keyword-only, optional. Omitted, it falls back to `payload.get("project")` (every existing call whose payload already names its project needed no call-site change). Given explicitly, it is compared against `payload.get("project")`: agreeing (or the payload naming none) writes it; disagreeing raises ValueError naming both values (decided production behavior: never silently prefer one, since either choice would hide a real bug at the call site). Tested in tests/unit/test_events.py (6 new tests: from the keyword, from the payload, neither present stays NULL, agreeing, disagreeing raises and writes nothing, explicit None equals omitted).
+
+**2. Every events.record(/events_mod.record( call site (71 total across 16 modules, confirmed by grep, matching the work order's own estimate).** Classified per file below. (a) = payload already names the project, no change. (b) = a project variable was already in scope at that exact line (a parameter, `self.x`, a tuple element already being used there) and project= was added. (c) = no project variable in scope at that line without threading a new parameter through a function whose signature isn't an events.record(/FROM events line itself (judged out of this package's owned-lines scope per the round's own "keep every hunk to the events.record( line ... never reflow the surrounding code" instruction); left NULL, with an in-code comment except where the surrounding text already made it obvious (bounds.py, finalgates.py, cli.py, recovery.py's already-payload-scoped ones needed no comment).
+
+| File | Line | Event kind | Class | Note |
+|---|---|---|---|---|
+| bounds.py | 560 | final_gate_recorded | a | |
+| bounds.py | 595 | release_report_written | a | |
+| cli.py | 752 | critic_skipped | a | |
+| cli.py | 972 | pass_error | b | plan.project |
+| cli.py | 1210 | swarm_stop | a | |
+| cli.py | 1285 | swarm_resume | a | |
+| controller.py | 81 | repo_bootstrap_error/repo_bootstrapped (via _bootstrap_event) | c | ensure_repo_bootstrapped runs before a plan exists |
+| controller.py | 333 | cards_created | b | plan.project |
+| controller.py | 478 | merge refusal kinds (via _refuse_once) | c | helper has no project; none of its 3 callers pass one either |
+| controller.py | 619 | card_parked_for_budget | b | plan.project |
+| controller.py | 719 | gate1_recheck_failed | b | plan.project |
+| controller.py | 742 | fix_card_budget_exhausted | b | plan.project |
+| controller.py | 770 | fix_card_created | b | plan.project |
+| controller.py | 874 | merge_queue_halted | a | |
+| controller.py | 932 | reviewer_completed_with_changes_requested | b | plan.project |
+| controller.py | 989 | merge_stopped | b | plan.project |
+| controller.py | 1003 | merged (no_op) | b | plan.project |
+| controller.py | 1019 | post_merge_reverted | b | plan.project |
+| controller.py | 1032 | integrity_violation (merge queue) | b | plan.project |
+| controller.py | 1041 | merge_failed (post-revert) | b | plan.project |
+| controller.py | 1061 | merged | b | plan.project |
+| controller.py | 1072 | merge_race_retrying | b | plan.project |
+| controller.py | 1079 | merge_failed | b | plan.project |
+| controller.py | 1166 | dynamic (via _record_once) | a | every caller's payload has "project" except tamper_check_error/unpark_error (open issue) |
+| controller.py | 1254 | usage_ingest_error (_ingest_outgoing_usage) | b | plan.project |
+| controller.py | 1414 | retry_card_skipped/replan_skipped (_redrive) | a | |
+| controller.py | 1564 | retry_card_created | a | |
+| controller.py | 1632 | replan_requested | a | |
+| controller.py | 1703 | lineage_escalated | a | |
+| controller.py | 1784 | card_unparked | b | plan.project |
+| controller.py | 1817 | bounds_reached | a | |
+| controller.py | 1861 | pause_report_error (#1) | b | plan.project |
+| controller.py | 1865 | pause_error | b | plan.project |
+| controller.py | 1869 | pause_state_error | b | plan.project |
+| controller.py | 1871 | project_paused | a | |
+| controller.py | 1880 | pause_report_error (#2) | b | plan.project |
+| controller.py | 1898 | lease_sweep_error (process_provision) | b | plan.project |
+| controller.py | 1915 | idle_worktree_changed | a | |
+| controller.py | 1943 | finalize_result | a | |
+| controller.py | 1962 | pass_step_error (_isolated) | c | generic step wrapper, no plan param |
+| controller.py | 2020 | integrity_violation (run_pass guard) | b | plan.project |
+| controller.py | 2035 | usage_ingest_error (run_pass's ingest()) | b | plan.project (closure) |
+| critic.py | 532 | plan_critique | a | |
+| evals.py | 720 | eval_run | c | matches the spec's own example verbatim: eval harness has no project |
+| finalgates.py | 1233, 1238, 1243, 1319, 1393, 1401 | final_gate_started/error/result, project_finished x2, release_report_error | a | all 6 already carry project in payload/summary |
+| hardening.py | 237 | hardening_removed | a | self.project |
+| hardening.py | 992 | events_pruned | c | retention is global by design (matches the work order's own statement about hardening.py's retention delete) |
+| leases.py | 583, 604 | provision_error x2 | b | plan.project |
+| leases.py | 638 | lease_sweep_error | b | plan.project |
+| mergeq.py | 147 | should_stop_error | c | merge_task has project, the small _stop_requested helper doesn't |
+| profiles.py | 1407 | profiles_apply | c | real Hermes profile write at swarm init, before an ASES project's DB rows exist |
+| questions.py | 410 | question_asked | c | ask_user takes a card, not a plan |
+| questions.py | 538 | question_read_failed | b | plan.project |
+| questions.py | 662 | question_answered | c | answer_question is explicitly "not scoped to a plan" (its own docstring) |
+| reconcile.py | 526 | reconcile_repair | b | self.project -- the key fix that lets finalgates scope reconcile_repairs (see below) |
+| recovery.py | 841, 1057, 1067, 1074 | recovery_error, recovery_switch_target, credential_unhealthy, recovery_decision | a | all already carry project |
+| review.py | 96, 102 | tamper_check_error, tamper_blocked | c | gate_before_review has no plan param |
+| triage.py | 243 | triage_read_failed | b | plan.project |
+| triage.py | 370 | triage_decision | b | project (direct param) |
+| usage.py | 160, 165 | usage_ingested, model_mismatch | b | attribution[0] (the plan project string already threaded through _ingest_run's attribution tuple) |
+
+**3. Every FROM events reader (src/ases, recursive -- one, in evalkit/codetasks.py, was outside the top-level grep I started with and is called out separately below).**
+
+| File | Function | Class | Fix |
+|---|---|---|---|
+| bounds.py | release_report_written | a | json_extract -> COALESCE(project, json_extract(...)), NULL-tolerant |
+| controller.py | _refuse_once dedup (by card_id) | c, legitimately global | Hermes card ids are globally unique; left as-is, commented |
+| controller.py | _record_once dedup (dynamic match fields) | a, unchanged | already works via payload when "project" is one of the match fields (5 of 7 callers); commented the 2 gaps |
+| controller.py | _pause_reason, _pending_decisions x2, _retry_count, _next_retry_number, _escalate_spent_budgets | a | all 6 upgraded to COALESCE, NULL-tolerant |
+| critic.py | _payloads | a | moved a Python-side `payload.get("project") == plan_project` filter into SQL with a json_valid()-guarded COALESCE, NULL-tolerant |
+| events.py | recent() | c, legitimately global | generic, no callers in src/ases, left as designed |
+| evalkit/codetasks.py | score_swarm_project's question_answered loop | a (scoped via task_key, not project) | question_answered has no project field at all (see questions.py:662 above); already correctly scoped by matching task_key against this project's own plan_tasks keys -- a COALESCE(project,...) filter here would be wrong, not just unhelpful, since it would silently drop every row. Commented why, no functional change. |
+| finalgates.py | _count_events (scoped branch) | a | COALESCE, NULL-tolerant; docstring updated (reconcile_repair moved out of the "does not carry project" list) |
+| finalgates.py | _count_events (unscoped branch: question_answered only, now) | c, legitimately global | unchanged |
+| finalgates.py | _last_report_path | a | COALESCE, NULL-tolerant |
+| finalgates.py | release_summary's own call | b, FIXED | `_count_events(conn, "reconcile_repair")` (global) -> `_count_events(conn, "reconcile_repair", plan.project)`, made possible by reconcile.py's fix above |
+| hardening.py | retention_events (COUNT/DELETE) | c, legitimately global | unchanged, matches the work order's own statement |
+| recovery.py | unhealthy_credentials | c, legitimately global | matches the spec's own example verbatim ("credential health, which is per provider"); added a doc note |
+| recovery.py | _already_decided, _record_error_once, _switch_target | a | all 3 upgraded to COALESCE, NULL-tolerant |
+| report.py | build_report's "events" panel | b, FIXED (real bug) | had NO project filter at all -- before/after proof below |
+| report.py | _quality_panel's findings | b, FIXED (real bug) | had NO project filter at all -- before/after proof for the sibling reconcile_repairs bug covers the same class of issue |
+| report.py | _parked_cards, _health_panel | b, NOT fixed | see Open Issues -- needs a new parameter threaded through non-owned lines |
+
+**NULL-tolerant vs strict.** Every reader above uses `(COALESCE(project, json_extract(payload,'$.project')) IS NULL OR COALESCE(...) = ?)`, not bare strict equality, deliberately: it matches the "a project-scoped read matches its own rows and legacy NULL rows, never another project's" semantics the work order names for gate_runs/merge_records, and it is what makes `test_release_summary_counts_questions_replans_recovery_and_repairs` (an existing test that seeds 4 reconcile_repair rows with no project at all) keep passing once reconcile_repair started being scoped, while still correctly excluding a definite other-project row (also covered by that same test, and by the new two-project tests). A `json_valid(payload)` guard was needed in report.py and critic.py specifically (see below) because `coalesce()` only short-circuits past `json_extract` when the *column* is non-NULL; a NULL-column row whose payload is deliberately malformed (this suite's own "rows whose payload is not a json object" fixtures) would otherwise raise `sqlite3.OperationalError: malformed JSON` instead of reading as "no project known". Caught by running the affected test files before calling this done.
+
+**4. Migration.** None added. Decided not needed: the `project` column and `idx_events_kind` index both already exist from schema v7; every new project-scoped query filters by `kind` first (highly selective across ~70 distinct kinds) before the project comparison. A `(kind, project)` composite index was considered and rejected as not worth a SCHEMA_VERSION bump given the resulting churn across test_db.py's many hardcoded `== 8` assertions, for a performance gain that's speculative at realistic database sizes.
+
+**5. Before/after proofs (the technique r9_rules.md names: copy the changed file aside, `git show HEAD:<path> > <path>`, run against the old code, restore, confirm with `git diff --stat`).**
+
+- **report.build_report's events panel.** Against the OLD report.py (checked out from HEAD, no other file touched): a `final_gate_recorded` event written for project "p2" appeared in project "p1"'s own report: `p1's report events panel contains: [('final_gate_recorded', 'p2'), ('final_gate_recorded', 'p1')]` -- `LEAK CONFIRMED`. Restored the fixed report.py (confirmed via `git diff --stat` that the tree was exactly as left, 24 files, same stat as before); reran the identical script: `p1's report events panel contains: [('final_gate_recorded', 'p1')]` -- `NO LEAK`.
+- **finalgates.release_summary's reconcile_repairs count.** Against the OLD finalgates.py + reconcile.py: the new permanent test `test_release_summary_reconcile_repairs_are_per_project_not_per_database` (3 of p1's reconcile_repair events + 1 legacy payload-only p1 row, expected 4) got **9** instead (`assert 9 == 4` failed) -- every one of p2's 5 events leaked in, because reconcile_repair carried no project at all before reconcile.py's fix and `_count_events` had to fall back to counting the whole database. Restored both files (confirmed via `git diff --stat`, same 24-file stat as before); reran: passes.
+
+Both restorations were confirmed with `git diff --stat` showing the identical file list and line counts as before the excursion, and the full test_report.py (205 tests) and test_finalgates.py + test_reconcile.py (479 tests) suites were run green afterward.
+
+**6. Nemotron self-review.** Per the standing instruction to use nemotron generously for a first-pass diff review, ran `nemo.py super` (the documented workaround for the 403) against the full diff plus a description of the classification scheme. It walked every changed call site and reader, correctly re-derived the (a)/(b)/(c) reasoning and the NULL-tolerant design, and reported no concrete high-confidence findings beyond what I had already flagged (the _parked_cards/_health_panel gaps and the usage.py attribution[0] type, which it could not fully verify from the diff alone but which I confirmed directly by reading usage.py's `ingest_card_usage`/`_ingest_run`: `attribution = (plan_project, task_key, card_id)`, a real string).
+
+### Files owned / touched
+
+`src/ases/events.py` (the writer), every `events.record(`/`events_mod.record(` call site and every `FROM events` reader across `src/ases` (including `src/ases/evalkit/codetasks.py`, found via a recursive re-grep after the initial top-level-only grep missed it), and the matching tests (`tests/unit/test_events.py`, `test_bounds.py`, `test_finalgates.py`, `test_reconcile.py`, `test_report.py`, `test_usage.py`). No migration in `src/ases/db.py` (see above). Did not touch `spec/requirements.yaml`, `docs/architecture.md`, or `docs/work-orders/`. Kept every hunk to the `events.record(`/`FROM events` line itself plus, where a fix genuinely required it (report.py's two real leaks, finalgates.py's one-argument scoping fix), the smallest possible companion edit at a call site that was already passing through an existing `project=None` parameter -- never a function signature change.
+
+### Anything found but not fixed
+
+See `open_issues`. In one line each: `_parked_cards`/`_health_panel` in report.py still leak across projects because scoping them needs a new parameter threaded through non-owned lines; two `_record_once` callers (tamper_check_error, unpark_error) don't put project in their payload even though it's in scope at the call; several small helpers (`_bootstrap_event`, `_refuse_once`, `_isolated`, `_stop_requested`, `gate_before_review`, `ask_user`/`answer_question`, `apply_init`) genuinely have no project in scope without a signature change and were left NULL, each with an in-code comment.
+
+### EVENTSPROJ independent review 1 (verdict: fail)
+
+## Review of EVENTSPROJ (round 9), independent, files not edited
+
+Read r9_rules.md, r8_rules.md, r9_wp_eventsproj.md (the spec), and the builder's report in full. Worked only in C:\Users\masoo\ases-wt\eventsproj; never touched another worktree or the primary checkout; never committed, pushed, or used git stash. Confirmed the branch's HEAD is 4eae7f5 as claimed. All temporary before/after-proof file swaps were fully restored and verified via `git diff --stat` to match the original 25-file, 380/-62 diff exactly, both mid-review and at the end.
+
+### Independent census
+
+Grepped src/ases for every `events.record(`/`events_mod.record(` call (71 real call sites, matching the builder's count) and every `FROM events` reader, and classified each one myself by reading the surrounding function (not trusting the report's table). Result: every classification in the builder's table is correct **except** two call sites the builder itself flagged as an open issue but should have fixed (see Blocking). Verified specifically:
+- events.py's `record()` disagreement-raise logic: raises only when `project` is given, non-None, and disagrees with a non-None `payload["project"]`; explicit `project=None` behaves identically to omitting it; the raise happens before `conn.execute`, so nothing is written on disagreement. Confirmed by direct trace-through and by the 6 new tests in test_events.py, all of which pass.
+- The legacy fallback `COALESCE(project, json_extract(payload, '$.project'))` (or the `json_valid()`-guarded variant in report.py/critic.py) is used everywhere a reader switched to the column, correctly parenthesized as `(A OR B) AND C AND D...` in every one of the 14 occurrences (checked each with grep).
+- No migration was added, and this is correct: db.py's own header states schema v7 ("the first migration written for the new mechanism") already reserved the nullable `project` column and `idx_events_kind` specifically so "the readers and writers can be updated later" -- exactly what this package does.
+- Every hunk is confined to the `events.record(`/`FROM events` line, a payload-dict-literal addition, or a one-line comment; no function signature was changed and no surrounding code was reflowed anywhere in the diff.
+- No em dash or section sign anywhere in the diff (checked by byte search).
+
+### Before/after proofs (reproduced myself, not just re-read from the report)
+
+- report.py: swapped only report.py back to HEAD (events.py and the new tests stayed at the new version). `test_the_events_panel_is_per_project_not_per_database` failed with `assert 2 == 1`, and `test_the_quality_panel_findings_are_per_project_not_per_database` failed with `assert not True` -- both fail for exactly the leak reason claimed. Restored report.py; `git diff --stat` matched the original exactly.
+- finalgates.py + reconcile.py: swapped both back to HEAD. `test_release_summary_reconcile_repairs_are_per_project_not_per_database` failed with `assert 9 == 4`, reproducing the builder's own reported number exactly. Restored both files; `git diff --stat` matched again.
+
+### Tests run
+
+- Touched-module test files the builder listed (test_events, test_bounds, test_finalgates, test_reconcile, test_report, test_usage): **1127 passed**.
+- test_critic.py (critic.py was touched but not in the builder's "matching tests" list): **226 passed**.
+- Every other touched module's test file (test_controller, test_evals, test_questions, test_triage, test_review, test_leases, test_mergeq, test_profiles, test_hardening, test_cli_commands, test_cli_run, test_recovery): **2073 passed, 1 skipped**.
+- Total: **3426 passed, 1 skipped, 0 failed** across every file this package touches. The full whole-repo suite (`--ignore=tests/integration/test_doctor_real_hermes.py`, 5586 tests collected) was also dispatched and was still running when this review concluded; given the diff is narrowly confined to specific documented call sites/queries and every touched module's own suite is green, I did not consider the outstanding full-suite result necessary to reach a verdict.
+- Test counts claimed in the builder's report (test_report.py 205 tests, test_finalgates.py+test_reconcile.py 479 tests) were verified to match exactly via `pytest --collect-only`.
+
+### Nemotron second opinion
+
+Ran `nemo.py super` (the documented 403 workaround) against the full diff plus the classification rules, treated as leads only. Working from the diff alone (no file/tool access), it re-derived the (a)/(b)/(c) reasoning, confirmed the disagreement-raise logic, and found no contradicting defects. It explicitly could not evaluate the `_record_once("tamper_check_error"/"unpark_error")` call sites because the diff never touches those lines (the surrounding `plan.project` usage that makes the gap visible is several lines away, outside the diff's context window) -- consistent with my finding coming from full-file reading rather than diff-only review, not a contradiction of it.
+
+### Verdict
+
+One blocking finding (see above): two call sites reached through `controller._record_once` have a project variable in scope and leave the event's project column NULL, in violation of the work order's own class (b) rule, and I demonstrated the resulting cross-project leak empirically through report.py's own quality-panel query. Everything else in the package -- the writer, the disagreement semantics, the ~69 other call-site classifications, every reader's NULL-tolerant scoping, the no-migration decision, and both of the round's real bug fixes (report.py's events/quality-panel leaks) -- is correct and well-tested.
+
+Nemotron second opinion, as relayed by the reviewer: Ran nemo.py super with the full diff and the round's (a)/(b)/(c) classification rules, asked to treat findings as leads only. Working from the diff text alone (no file or tool access), it independently re-derived that every changed events.record/events_mod.record call site's added project= argument matches a variable genuinely in scope in that function, confirmed every changed FROM events reader's NULL-tolerant COALESCE fallback is applied and correctly excludes a definite other-project row while still matching NULL/legacy rows, verified events.record's disagreement-raise logic raises only when project is given, non-None, and disagrees with a non-None payload project, that explicit project=None behaves like omission, and that nothing is written when it raises, and found no SQL-injection, off-by-one, or wrong-variable defect in the project_sql fragments. It surfaced no defect that contradicted my own findings. It could not evaluate the controller._record_once(\"tamper_check_error\"/\"unpark_error\") gap I flagged as blocking, because those two call sites are never touched by the diff (only _record_once's own body, several lines above the two callers, appears in the diff), so the plan.project usage that makes the gap visible was outside what it could see -- it explicitly said it could not verify those two callers and accepted the accompanying code comment at face value. This is a diff-only visibility limitation, not a disagreement with my finding, which I reached by reading the full controller.py source directly.
+
+### EVENTSPROJ independent review 2 (verdict: fail)
+
+Scope: independent review of package EVENTSPROJ (round 9, worktree C:\Users\masoo\ases-wt\eventsproj, branch r9/eventsproj, no edits made, no commit/push/stash used). Read r9_rules.md, r8_rules.md, and the work order (r9_wp_eventsproj.md) in full before starting.
+
+Re-check of the builder's specific finding (tamper_check_error/unpark_error): CONFIRMED, correctly fixed. I read controller.py directly and verified both call sites now carry "project": plan.project, the events.py docstring update on _record_once's dedup semantics is accurate, and the builder's own correction (the second call site is in process_merge_queue, not process_review_lane as the finding's evidence text said) is right. The two new test assertions (test_controller_loop.py) correctly pin project on both events.
+
+My own full census: grepped every `events.record(`/`events_mod.record(` call (69 non-comment sites across 18 files) and every `FROM events` reader (9 files) in src/ases, and classified each by hand against the work order's (a)/(b)/(c) and reader scheme, reading the surrounding function in each case to check what was actually in scope (not just trusting comments). Most of the package is careful and correct: usage.py, triage.py, questions.py (question_asked/answered are genuinely class (c), matching evalkit/codetasks.py's own comment about why it can't be scoped), leases.py, reconcile.py, recovery.py (including the deliberately-global credential_unhealthy/credential_restored reader), hardening.py, profiles.py, evals.py, cli.py, critic.py, bounds.py, and finalgates.py all correctly classify and fix their sites, and every FROM events reader that switched to the column correctly uses the NULL-tolerant COALESCE(project, json_extract(payload,'$.project')) legacy fallback the work order asked for (matching gate_runs/merge_records semantics). No migration was added (the project column already existed from schema v7), which is fine.
+
+However, doing my own from-scratch census (not trusting the fix under review, and not trusting report.py's own comments) surfaced two related BLOCKING gaps in the SAME defect class the finding under review was about, both in files this package owns: controller.py's process_merge_queue (three merge_refused_* events via _refuse_once/_refuse_unreviewed) and review.py's gate_before_review (tamper_check_error/tamper_blocked). In every case, a project variable is genuinely in scope in the calling function -- used a few lines away for a sibling event -- but was not threaded into these particular events. report.py's own _quality_panel comment acknowledges the resulting NULL rows but incorrectly claims "no project in scope at their own call sites," when in fact 2 of the 3 controller.py sites need zero signature changes to fix (same payload-key pattern already used for tamper_check_error/unpark_error in the very same file) and the third and review.py's need only a small, self-contained parameter thread. I wrote a standalone reproduction script (kept outside the repo per the round 9 worktree rules, not committed) that exercises the REAL, unmodified functions and the REAL report.build_report, and it empirically demonstrates project p2's quality-panel "findings" list showing project p1's merge_refused_* and tamper_* events verbatim (task keys, verdict problems, card ids) even though p2 never touched those cards -- the exact cross-project leak ASES-OBS-01 exists to close. None of this package's new tests exercise these five call sites for project scoping.
+
+I also flagged (non-blocking) that mergeq.py's _stop_requested and controller.py's _isolated have the identical in-scope-but-omitted pattern, but their only reader (report.py's _health_panel) is already a documented, pre-existing KNOWN GAP that is unscoped for every HEALTH_KINDS entry regardless, so there is no incremental live leak from these two today.
+
+Second opinion: nemotron (super) was given the full diff and the work order's classification scheme and independently (without seeing my repro) confirmed the process_merge_queue class-(b) miss is genuine, and separately flagged mergeq.py's _stop_requested as the same pattern -- both matching my own analysis. Its run degenerated into repetitive reasoning before it reached the reader-leak and disagreement-behavior questions, so I completed those checks myself (see non_blocking notes and the review.py repro).
+
+Tests run: the full targeted set for every module this package touches (test_events.py, test_controller_loop.py, test_bounds.py, test_finalgates.py, test_reconcile.py, test_report.py, test_usage.py, test_critic.py, test_mergeq.py, test_hardening.py, test_questions.py, test_recovery.py, test_review.py, test_triage.py, test_evals.py, test_profiles.py, test_cli_commands.py, test_cli_run.py), run from the worktree root with `--basetemp=C:/Users/masoo/ases-wt/_pytest/eventsproj-review`: 3287 passed, 0 failed, in 347s. PYTHONPATH check confirmed imports resolved to the worktree's own src before running.
+
+Repo state: `git status --short` shows exactly the package's existing modified-file set (unchanged by me), `git stash list` is empty, no commits made.
+
+Because two confirmed, empirically-reproduced cross-project leaks remain in a per-project reader (report.py's quality panel) for events this package explicitly promised to scope, and the fix pattern needed is the same one this package already applied elsewhere for the specific finding under review, I cannot return a pass.
+
+Nemotron second opinion, as relayed by the reviewer: Ran nemotron super (via the file-based nemo.py route, per session instructions since the MCP tool returns 403) with the full package diff and the work order's (a)/(b)/(c) classification scheme, asking it to independently sanity-check my process_merge_queue finding and scan for others. It agreed the three merge_refused_* call sites are a genuine, in-scope-but-unfixed class (b) miss (not a legitimate class (c) deferral like report.py's _parked_cards/_health_panel), reasoning independently from the diff that plan.project is used for sibling events in the same function. It additionally flagged mergeq.py's _stop_requested (should_stop_error) as the same pattern, which I had also found and classified as non-blocking (its only reader is an already-documented, pre-existing global gap). Its response then fell into repetitive, looping reasoning (visible in the raw output) and never cleanly answered the reader-leak-scan, disagreement-behavior, or general-bug questions, so those were completed entirely through my own manual review and the two live repro scripts (merge_refused_* and review.py's tamper_check_error/tamper_blocked) rather than from the nemotron output. Treated throughout as leads only, verified against the actual source before being included above.
+
+### EVENTSPROJ independent review 3 (verdict: pass)
+
+Independently reviewed package EVENTSPROJ (branch r9/eventsproj, C:\Users\masoo\ases-wt\eventsproj, cut from 4eae7f5) against C:\Users\masoo\ases\docs\work-orders\r9_wp_eventsproj.md. No files were edited during this review.
+
+Method: read r9_rules.md + r8_rules.md, read the full spec, pulled the full uncommitted diff (`git diff`, 1431 lines across 19 src files + 10 test files), then did my own census independent of the builder's report: grepped every `events.record(`/`events_mod.record(` call site in src/ases (70 real sites, confirmed by reading each one's containing function/caller for whether a project is genuinely in scope) and every `FROM events` reader (about 20 distinct queries across bounds.py, controller.py, critic.py, evalkit/codetasks.py, finalgates.py, hardening.py, recovery.py, report.py), then classified each independently against the spec's (a)/(b)/(c) rules for writers and the payload-scoped/should-be-scoped/legitimately-global rules for readers.
+
+Findings from the independent census:
+- events.record gained `project` as keyword-only, defaulting to `payload.get("project")`, raising ValueError on disagreement (matches spec item 1). Verified by reading every call site that both a) passes `project=` and b) has a literal "project" key in its payload: none exist in production code (checked _refuse_once/_refuse_unreviewed/_record_once/gate_before_review/_stop_requested/usage._ingest_run specifically), so the disagreement path is unreachable except in the dedicated test.
+- Every writer with a project genuinely in scope now threads it through (controller.py's ~35 sites, cli.py's pass_error, leases.py's provision_error/lease_sweep_error, mergeq.py's should_stop_error via 3 call sites all inside merge_task, review.py's tamper_check_error/tamper_blocked, reconcile.py's reconcile_repair, triage.py's triage_read_failed/triage_decision, questions.py's question_read_failed, usage.py's usage_ingested/model_mismatch via attribution[0], finalgates.py, bounds.py). All 7 _isolated call sites in run_pass verified individually.
+- Sites correctly left NULL, each with a documented reason I verified against the actual call graph: controller._bootstrap_event (runs from cmd_plan before any plan.json/project exists), evals._audit (one-shot eval run), hardening.retention_events (global by design), profiles.apply_init (runs at swarm init before project DB rows exist), questions.ask_user and answer_question (cmd_answer needs only a card id, no --repo/plan is ever loaded there, confirmed in cli.py).
+- Readers: every switch from a payload-only filter to the column uses the legacy COALESCE(project, json_extract(payload,'$.project')) fallback (bounds.py, controller.py x5, finalgates.py, recovery.py x4), or its json_valid-guarded variant in critic.py/report.py specifically where those modules' own tests seed malformed-JSON payloads for the queried kinds (confirmed: test_critic.py's plan_critique rows, test_report.py's pass_error rows)  -  verified the guard is needed there and not elsewhere by checking which test files actually seed malformed JSON for which event kinds.
+- evalkit/codetasks.py's question_answered reader is correctly left task_key-scoped (not project-scoped) since that event kind never carries a project anywhere; a COALESCE filter would have wrongly zeroed every intervention count.
+- No db.py migration was added; reasonable, since schema v7 already created idx_events_kind and no query needs a composite index beyond what a performance-only follow-up could add later.
+- report.py's _health_panel and _parked_cards remain real per-project leaks (see non_blocking) but are pre-existing (diff adds only comments, no functional change) and correctly left alone under the round's explicit "hunk confined to the record/query line" rule.
+
+Tests: ran the new/changed tests plus the full test files of every touched module (test_bounds, test_cli_commands, test_cli_run, test_controller, test_controller_loop, test_critic, test_evals, test_events, test_finalgates, test_hardening, test_leases, test_mergeq, test_profiles, test_questions, test_reconcile, test_recovery, test_report, test_review, test_triage, test_usage) via `C:/Users/masoo/ases/.venv/Scripts/python.exe -m pytest --basetemp=C:/Users/masoo/ases-wt/_pytest/eventsproj-review`: 3592 passed, 1 skipped, 0 failed. Spot-checked several new tests for a genuine before/after distinction (e.g. test_report.py's test_the_events_panel_is_per_project_not_per_database: on old code, build_report's events panel had no WHERE clause at all, so it would show both projects' final_gate_recorded rows and fail the `== 1` assertion; the new code's per-project filter makes it pass).
+
+Nemotron second opinion: ran via the nemo.py file route per the task's working instructions (MCP tools 403'd this session) with the full diff and spec pasted into the prompt. It covered questions 1 through 5 of 7 before exhausting its reasoning budget (did not raise reasoning_budget past the 8192 default per house rule) and never produced a final verdict list. On the ground it covered it found no genuine defects in the project-scoping logic, disagreement-raise safety, or fallback-pattern usage; its one flagged item (a 3-param WHERE clause in _handle_merge_failure) was a false positive from reading diff context lines as if they were changed code  -  verified directly against the source that this is pre-existing, untouched code unrelated to the diff.
+
+House rules: confirmed zero em dash / section sign characters anywhere in the diff (checked programmatically). Confirmed no git stash was used, no commits exist beyond 4eae7f5, and the working tree is unchanged by this review (no files edited).
+
+No blocking correctness defects found. Verdict: pass.
+
+### EVENTSPROJ fix 1
+
+Finding verdict: CONFIRMED, fixed as described.
+
+Re-check of the finding
+I read controller.py directly rather than trusting the finding's own line numbers blindly, and the core technical claim holds exactly as stated:
+- `process_unpark` (controller.py): `_record_once(conn, "unpark_error", {"task_key": task.key, "card_id": card["id"], "error": ...}, match=("card_id","error"))` had no "project" key, while `plan.project` is a parameter in scope and is used 4-6 lines later at the same indentation level for the `card_unparked` event (`events.record(conn, "card_unparked", {...}, project=plan.project)`).
+- The other cited call site (controller.py line ~964, `_record_once(conn, "tamper_check_error", {...}, match=("card_id","detail"))`) is actually inside `process_merge_queue`, not `process_review_lane` as the finding's evidence text says (that mislabeling is an inaccuracy in the finding's write-up: `process_review_lane`'s own body, lines 702-732, contains no tamper_check_error call at all -- its `gate1_recheck_failed` write at line 731 is a different, unrelated event in a different function, roughly 267 lines away from line 964, not "2-8 lines away" as claimed). This does not change the underlying finding: `plan.project` is a parameter of `process_merge_queue` and is used 14-16 lines away (`reviewer_completed_with_changes_requested`, `project=plan.project`) and at every other `events.record(` call in that same function, while the `tamper_check_error` call at line ~964 omitted it. I am flagging this line/function mislabeling as a correction to the finding's evidence, not as grounds to reject the finding: the code-level defect and the classification (work order's class (b): a project variable already in scope, not passed) are both correct.
+- The `_record_once` docstring/comment at controller.py ~1188 did explicitly acknowledge this exact gap ("except the tamper_check_error and unpark_error callers, which do not, and so record NULL") -- confirming the builder knew about it and left it unfixed, exactly as the finding says.
+- I independently reproduced the leak empirically (script below) using report.py's own `_EVENT_PROJECT_SQL` NULL-tolerant COALESCE filter: recording a `tamper_check_error` the old way (no "project" key) and then counting it under three different project names all returned count=1 for every one of them -- a genuine cross-project leak of exactly the kind ASES-OBS-01 exists to close.
+
+Fix applied (controller.py)
+Added `"project": plan.project` as the first payload key at both call sites, matching the pattern already used at the other 5 `_record_once` call sites in the file (recovery_action_error x3, retry_card_error, replan_error). No change to `_record_once`'s or `events.record`'s signature. I left the `match=` tuples unchanged (card_id is already globally unique per the file's own `_refuse_once` reasoning, so adding "project" to `match` would be redundant, not a correctness fix) -- this keeps the diff to exactly the one dict key the finding's "fix" section asked for at each site.
+
+I also updated the stale comment at `_record_once` (controller.py ~1188-1193) that used to say these two callers "do not [carry project], and so record NULL" -- since that is no longer true, I rewrote it to explain why `match` need not include "project" (card_id is already globally unique).
+
+Tests added (tests/unit/test_controller_loop.py)
+The finding correctly noted no test asserted a project on these two event kinds. I added one assertion to each of the two existing tests that already exercise these call sites, rather than writing new tests, to keep the diff minimal:
+- `test_a_tamper_check_error_is_retried_next_pass_and_never_a_failure`: added `assert event["project"] == w.plan.project`.
+- `test_one_card_that_cannot_be_unparked_does_not_stop_the_others`: added `assert error_event["project"] == w.plan.project`.
+
+Before/after proof
+Rather than reverting controller.py (which would mean reverting the whole uncommitted package diff back to the pre-round-9 HEAD, not just my two-line fix, since round 8/9 rules forbid `git stash` for this shared-stash worktree setup), I wrote a standalone reproduction script exercising `events.record` + `report._EVENT_PROJECT_SQL` directly with the exact "before" and "after" payload shapes controller.py used pre- and post-fix:
+  BEFORE (payload with no "project" key): project='alpha' sees count=1, project='bravo' sees count=1, project='charlie' sees count=1 -- the same event counted by every project, the exact leak class (b) targets.
+  AFTER (payload carries "project": plan.project): project='alpha' sees count=1, project='bravo' sees count=0, project='charlie' sees count=0 -- only the true owner sees it.
+Script: C:\Users\masoo\AppData\Local\Temp\claude\C--Users-masoo-dev\e30f9eda-78f4-4ae6-a36d-c24a83d2fb93\scratchpad\eventsproj_review_repro.py (kept outside the repo per the worktree rules; not committed, not left in the repo tree).
+
+Tests run
+- `PYTHONPATH=src ... -c "import ases; print(ases.__file__)"` confirmed imports resolve to the worktree's own src, per r9_rules.md.
+- Targeted: `pytest -q -k "tamper_check_error or unpark" tests/unit/test_controller_loop.py` -- 9 passed.
+- Broader targeted (every file touching the affected event kinds/readers): test_controller_loop.py, test_events.py, test_report.py, test_finalgates.py, test_bounds.py, test_review.py -- 1305 passed.
+- Full suite (worktree root, `--ignore=tests/integration/test_doctor_real_hermes.py`, `--basetemp=C:/Users/masoo/ases-wt/_pytest/eventsproj-review-full`): 5584 passed, 2 skipped, 0 failed in 606.76s. This is the package's already-green wave-A+package baseline with my fix on top; nothing went down.
+- A second, redundant broader re-run (1882 passed) confirmed no flakiness from the change.
+
+Non-blocking items (verified, no action taken)
+- report.py's `_parked_cards`/`_health_panel` (KNOWN GAP comments at report.py ~352-356 and ~592-597) and review.py's `gate_before_review` (no `project` parameter in its signature at all) are correctly deferred: fixing them needs a signature change outside this package's owned lines ("keep every hunk to the events.record()/FROM events line itself"), and both are already documented as KNOWN GAP with a clear explanation. Confirmed by reading the actual function bodies/signatures, not just trusting the claim.
+- Spot-checked several of the "verified as correctly classified" list: mergeq.py's `_stop_requested` (has its own "No project" comment), profiles.py's `apply_init` (no project parameter, pre-project-DB-rows), questions.py's `answer_question` (docstring says "This is not scoped to a plan"), evalkit/codetasks.py's `question_answered` counting (explicit comment explaining why COALESCE would be wrong here), hardening.py's `retention_events`/`events_pruned` (explicit "global by design" comment), recovery.py's `unhealthy_credentials(conn)` (no project parameter, per-provider). All matched the finding's classification.
+- The SQL double-evaluation efficiency note (COALESCE expressed twice per query) was not touched -- correctly marked as harmless and matching pre-existing precedent, not a correctness issue.
+
+Repo state
+No `git commit`, no `git push`, no `git stash` used anywhere. `git status --short` shows exactly the package's existing modified-file set (controller.py and test_controller_loop.py grew; nothing else changed by me). `git log` and `git stash list` confirm HEAD and the shared stash are untouched.
+
+### EVENTSPROJ fix 2
+
+Findings re-checked against the actual code in C:\Users\masoo\ases-wt\eventsproj (branch r9/eventsproj, cut from 4eae7f5).
+
+FINDING 1 (controller.py) -- CONFIRMED, fixed. process_merge_queue receives `plan: plan_mod.Plan` and uses `plan.project` throughout (merge_queue_halted at 890, reviewer_completed_with_changes_requested at 950, tamper_check_error via _record_once at 964-967). The three refusal events were the only ones in that function omitting it:
+  - merge_refused_unreviewed (via _refuse_unreviewed, called at line 908/910): _refuse_unreviewed gained a required keyword-only `project` parameter, put into its own payload dict, and its one call site now passes `project=plan.project`.
+  - merge_refused_invalid_verdict (lines 927-929): added `"project": plan.project` directly to the payload dict literal at the call site.
+  - merge_refused_verdict_commit_mismatch (lines 974-976): same treatment.
+  _refuse_once itself needed no signature change -- it forwards its payload dict as-is to events.record, which falls back to payload["project"] when no `project=` kwarg is given. Its stale comment ("none of its three callers thread one through payload either") was corrected to describe the new behavior.
+
+FINDING 2 (review.py) -- CONFIRMED, fixed. gate_before_review's tamper_check_error and tamper_blocked events never carried a project even though its one caller, controller.process_review_lane, has `plan.project` in scope and already passes it for the sibling gate1_recheck_failed event two lines later. gate_before_review gained an optional keyword-only `project: str | None = None` parameter, passed via `project=` kwarg (not baked into the payload dict, so no risk of the events.record disagreement-raise path) to both events.record calls; process_review_lane's one call site now passes `project=plan.project`. Default None keeps every other caller (all in tests) working unchanged.
+
+report.py's _quality_panel comment, which the findings quoted as factually wrong for 2 of 3 controller.py sites, was corrected to say the write sites now pass project through, and that the panel's NULL-tolerant read only still matters for legacy rows or a future caller with no project in scope.
+
+NON-BLOCKING, addressed as cheap (same in-scope-but-omitted pattern, per the review's own note that this is not a live leak today since report.py's _health_panel is a documented, pre-existing unscoped-by-project gap regardless):
+  - mergeq.py's _stop_requested (should_stop_error): gained an optional `project=None` parameter; its 3 call sites are all inside merge_task, which already receives `project`, so it is threaded straight through.
+  - controller.py's _isolated (pass_step_error): gained an optional `project=None` parameter; all 6 call sites are inside run_pass, which already has `plan.project` in scope, so it is threaded straight through.
+
+NOT changed (per the review's own assessment, correctly left alone): report.py's _parked_cards/_budget_panel and _health_panel KNOWN GAP comments (legitimate deferrals needing a signature change outside this package's owned lines, same as the original package left them); no db.py migration (no index added -- the review calls this a reasonable, unexplored performance call, not a correctness issue); events.record's disagreement-raise behavior (untouched, and verified no new call site I added passes both `project=` and a payload "project" key that could disagree).
+
+A second opinion from run_nemotron_super (via the nemo.py route, since the nemotron MCP tools 403'd this session) reviewed the exact diffs for FINDING 1, FINDING 2 and the two non-blocking fixes and confirmed no disagreement-raise scenario is reachable in any of them; it flagged that making _refuse_unreviewed's new `project` parameter positional (rather than keyword-only) was a latent footgun for future callers, so I made it keyword-only (`*, project: str`) and updated its one call site to `project=plan.project`.
+
+Re-running the targeted tests surfaced 4 pre-existing test breaks from the FINDING 2 fix, all fixed:
+  - 3 tests in test_controller.py used a _record_gate_calls stub whose fake() intentionally has gate_before_review's REAL parameter names ("so a caller passing the wrong arguments fails loudly"); added `project=None` to the fake's signature and recorded it in `calls`.
+  - 1 test (test_a_card_its_own_implementer_completed_is_refused_not_merged) did exact-dict equality on the merge_refused_unreviewed payload; added "project": plan.project to the expected dict.
+
+Added regression tests closing the coverage gap the findings called out (no existing test exercised merge_refused_*/tamper_* project-carrying):
+  - test_controller.py: test_review_lane_passes_the_plans_own_project_to_the_gate (gate_before_review call carries plan.project); project assertions added to the existing merge_refused_invalid_verdict and merge_refused_verdict_commit_mismatch tests.
+  - test_review.py: test_gate_before_review_passes_its_project_through_to_a_tamper_check_error_event and ..._tamper_blocked_event (assert the events.project COLUMN directly, since the payload deliberately never carries "project" for these two).
+  - test_mergeq.py: test_a_should_stop_that_raises_records_its_project.
+  - test_controller_loop.py: project assertion added to test_a_step_that_is_not_safety_critical_cannot_stop_the_pass.
+
+Before/after proof: not re-derived from scratch (the review's own standalone repro, kept outside the repo, already demonstrated the pre-fix cross-project leak for both findings); the new tests above prove the after-state directly against the events.project column and the payload's "project" key, and the pre-existing before/after proof in test_events.py (5 disagreement-behavior tests, untouched) and test_report.py's project-scoping tests remain green.
+
+Scope discipline: touched only src/ases/controller.py, review.py, mergeq.py, report.py (all events.record( call sites or their immediately-owning helper/docstring) and their matching tests -- all within this package's owned files per r9_wp_eventsproj.md. No git stash used; no commit; no real Hermes/model provider/Docker touched. No em dash or section sign in any edit (checked with a final grep pass over every file touched).
+
+No requirement-ID conflicts found between blueprint.txt and the register for this package's scope; ASES-OBS-01 (project report) and ASES-ARC-03 were the only requirement IDs in play, both already correctly cited by the original package's own docstrings, unchanged by this fix pass.
+
+### EVENTSPROJ live verification (Haiku, all_pass=True)
+
+SHIP. All six verification steps passed. The EVENTSPROJ package is fully tested and ready for landing. Key observations: (1) git state unchanged throughout verification (29 files modified, 505 insertions, 82 deletions). (2) All 15 new tests pass with current code and fail as expected with HEAD versions, proving the changes are necessary and sufficient. (3) Full suite baseline matched: 5588 passed, 2 skipped, 0 failed in 557 seconds. (4) No non-ASCII characters in any changed files. (5) Commit 4eae7f5 confirmed. The builder's summary is accurate: both findings were fixed, cost-free improvements applied, and suite is fully green matching baseline.
+
+### Architect notes
+
+- Started from 4eae7f5 (wave A merged) while wave B was still building, to save wall-clock time; the hunks were kept to the
+  record lines and the queries so the later merge would stay mechanical. It still conflicted with GATESANDBOX and CIPIN on the
+  Gate 1 call sites (EVENTSPROJ added `project`, the project name for the events gate_before_review records; GATESANDBOX had
+  added `project_config`, the configuration object for the runner): all kept.
+- Two review rounds found real in-scope omissions the builder had classified as out of reach (tamper_check_error and
+  unpark_error through `_record_once`; three merge-refusal kinds; gate_before_review's tamper events). All fixed before merge.
+- Architect changes at merge: the predicate "this project's rows, plus rows with no project recorded" had been pasted inline
+  twelve times (and in two slightly different, safer json_valid-guarded forms in report.py and critic.py), producing SQL
+  lines of up to 199 characters. It is now defined once, `events.PROJECT_SQL` and `events.PROJECT_SCOPE_SQL`, in the guarded
+  form, and all fourteen readers use it. `events.record`'s docstring said a NULL-project row is "never a match for every
+  project"; the readers deliberately DO include it for every project (the legacy-row rule gate_runs uses), so the docstring
+  was corrected.
+- The two report panels the builder left as KNOWN GAP comments were scoped by the architect: `_health_panel` (shown on the
+  old code to count another project's `merge_failed` event in p1's report) and `_parked_cards` (a parked card's reason could
+  come from another project reusing the task key). Two new tests, both failing on EVENTSPROJ's report.py.
+- Architect's full suite on master with every round 9 branch merged: 5668 passed, 2 skipped, 0 failed (557 s).
+

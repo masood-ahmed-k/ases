@@ -75,19 +75,26 @@ requirements:
   section: '3.2'
   verified_by: 22.7, 22.15
   status: covered
-  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): Stale claim corrected -- reconcile-on-start is built,
-    wired in and proven, not ''not built yet''. src/ases/reconcile.py implements reconcile() (section 19.4),
-    called at the start of every `swarm run` (cli.py''s _reconcile_on_start, exit code 5 on an unrepaired
-    blocked finding) and before `swarm resume`; it is unit-tested and acceptance-proven at all three named
-    crash points (22.7; see ASES-REC-03/REC-04) and was real-verified against the live board after the
-    2026-09-19 run (reconcile.check found no findings). ASES-REC-04''s own row already corrected this exact
-    drift back in ROUND 6 (''The register''s prior note calling reconcile-on-start not built yet had drifted
-    from the source; corrected here'') but that fix was never propagated to this row. Note that ASES-REC-04
-    itself stays in_progress because a real bug in its role-hardcoding was found and fixed as recently as
-    round 7 wave 2 (2026-09-23); check that row for the current fine-grained state of the repair logic. The
-    keyed-by-card-and-commit-SHA half of this requirement was already correctly reported as done. Earlier
-    note: gate_runs/merge_records keyed by task_key+commit_sha exist; reconcile-on-start (crash recovery) not
-    built yet.'
+  note: 'ROUND 9 (2026-09-27, zero quota): MERGEPK made merge_records project-scoped (schema v8, key (project,
+    task_key)), so two projects reusing a task key in one database no longer share a merge record. EVENTSPROJ:
+    events.record writes the events.project column (from a keyword argument or the payload''s own project; a
+    disagreement raises), every record call site and every FROM events reader was classified, and
+    project-scoped readers use one definition, events.PROJECT_SCOPE_SQL (this project''s rows plus rows with
+    no project recorded, never another project''s), including the report''s events, quality and health panels
+    and the parked-card reasons, each with a two-project test that fails on the old code. Genuinely global
+    events (credential health, doctor, eval) stay NULL by design. Earlier note: ROUND 9 register hygiene
+    (2026-09-27, zero quota): Stale claim corrected -- reconcile-on-start is built, wired in and proven, not
+    ''not built yet''. src/ases/reconcile.py implements reconcile() (section 19.4), called at the start of
+    every `swarm run` (cli.py''s _reconcile_on_start, exit code 5 on an unrepaired blocked finding) and before
+    `swarm resume`; it is unit-tested and acceptance-proven at all three named crash points (22.7; see
+    ASES-REC-03/REC-04) and was real-verified against the live board after the 2026-09-19 run (reconcile.check
+    found no findings). ASES-REC-04''s own row already corrected this exact drift back in ROUND 6 (''The
+    register''s prior note calling reconcile-on-start not built yet had drifted from the source; corrected
+    here'') but that fix was never propagated to this row. Note that ASES-REC-04 itself stays in_progress
+    because a real bug in its role-hardcoding was found and fixed as recently as round 7 wave 2 (2026-09-23);
+    check that row for the current fine-grained state of the repair logic. The keyed-by-card-and-commit-SHA
+    half of this requirement was already correctly reported as done. Earlier note: gate_runs/merge_records
+    keyed by task_key+commit_sha exist; reconcile-on-start (crash recovery) not built yet.'
 - id: ASES-ARC-04
   requirement: One Hermes wrapper module, JSON or REST over text parsing, pinned Hermes version, no updates
     during a project
@@ -343,20 +350,23 @@ requirements:
   section: '5.4'
   verified_by: Inspection
   status: in_progress
-  note: 'The blueprint''s real text (section 5.4) is a 4-step process -- discovery, smoke test,
-    data-policy check, evaluation -- plus an explicit warning not to assume extra keys on one account
-    add quota. The data-policy-check step is generic and already covered by policy.check_data_class
-    (ASES-PRV-01/02/03, wired into cmd_approve); the smoke-test step is covered by models.py''s
-    record_smoke_test, already exercised for real (xkiro/qwen/qwen3.8-max:free shows smoke=pass). Real
-    discovery + evaluation happened for real 2026-09-19: xKiro was added and evaluated as a genuine
+  note: 'ROUND 9 (2026-09-27, zero quota): CAPDOC: docs/provider-onboarding.md is the repeatable artifact this note
+    said was missing: the four steps as a checklist, each naming the ASES command, config field or check
+    behind it, the same-account-keys warning, and a commented models.yaml stub, linked from
+    docs/operations.md. Point (a) below stands: the quota warning can only be checked against a provider''s
+    own account endpoint, live. Earlier note: The blueprint''s real text (section 5.4) is a 4-step process --
+    discovery, smoke test, data-policy check, evaluation -- plus an explicit warning not to assume extra keys
+    on one account add quota. The data-policy-check step is generic and already covered by
+    policy.check_data_class (ASES-PRV-01/02/03, wired into cmd_approve); the smoke-test step is covered by
+    models.py''s record_smoke_test, already exercised for real (xkiro/qwen/qwen3.8-max:free shows smoke=pass).
+    Real discovery + evaluation happened for real 2026-09-19: xKiro was added and evaluated as a genuine
     second, independently-accounted provider, and UnoRouter was run for real, found unreliable (an
-    undocumented daily token cap, an output-tokens-per-minute cap, a refused dangerous gate command,
-    recurring transient failures) and dropped entirely -- see docs/architecture.md''s dated D2/D3
-    sections. Left at in_progress rather than covered because (a) the "don''t assume extra keys share a
-    quota" warning has no code check anywhere and can only be verified by a live call to a provider''s
-    own account/key-info endpoint, and (b) there''s no repeatable artifact (checklist/template) that
-    would make discovery+evaluation hold for the *next* provider addition -- only a one-time real
-    instance exists so far.'
+    undocumented daily token cap, an output-tokens-per-minute cap, a refused dangerous gate command, recurring
+    transient failures) and dropped entirely -- see docs/architecture.md''s dated D2/D3 sections. Left at
+    in_progress rather than covered because (a) the "don''t assume extra keys share a quota" warning has no
+    code check anywhere and can only be verified by a live call to a provider''s own account/key-info
+    endpoint, and (b) there''s no repeatable artifact (checklist/template) that would make
+    discovery+evaluation hold for the *next* provider addition -- only a one-time real instance exists so far.'
 - id: ASES-TSK-01
   requirement: Each plan task becomes a work card and a merge card
   section: '7'
@@ -442,8 +452,14 @@ requirements:
   section: '8.1'
   verified_by: '22.8'
   status: partial
-  note: 'ROUND 6 (2026-09-22, zero quota): The post-merge revert trigger is now wired: after every real coder
-    merge, Gate 3 re-runs on the new integration HEAD (gate3-postmerge); green proceeds as before;
+  note: 'ROUND 9 (2026-09-27, zero quota): MERGEPK fixed the merge_records collision this note named as a separate
+    open risk: schema v8 rebuilds the table with PRIMARY KEY (project, task_key), backfills legacy rows from
+    plan_tasks only where exactly one project owns the key, and every reader and writer scopes by project with
+    gate_runs'' legacy-row semantics; a two-project acceptance test
+    (tests/acceptance/test_r9_mergepk_two_projects.py) fails on the old schema. Still partial for the reason
+    below: a real post-merge failure triggering an actual revert has never been exercised in a real run.
+    Earlier note: ROUND 6 (2026-09-22, zero quota): The post-merge revert trigger is now wired: after every
+    real coder merge, Gate 3 re-runs on the new integration HEAD (gate3-postmerge); green proceeds as before;
     red-and-revert-succeeds takes the ordinary fix-card path; red-and-revert-also-fails halts the run
     (integrity_violation). mergeq.revert_merge itself is fixed to only mark reverted=1 on a real git success
     and to run `git revert --abort` on a conflicted revert rather than leaving the primary checkout
@@ -557,9 +573,14 @@ requirements:
   section: '8.4'
   verified_by: 22.5, 22.11
   status: partial
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven for the primary-checkout half (22.11): a worker that
-    writes outside its own worktree trips check_primary_checkout end to end, records integrity_violation,
-    halts the run, and the integration branch never moves again. The other-worktree half
+  note: 'ROUND 9 (2026-09-27, zero quota): IDLEWT fixed the documented false positive (a card re-dispatched into
+    its worktree between two polls) with a one-shot grace pass earned only by a worktree a running card just
+    vacated; reproduced first in a test against the old code. Still a WARNING, not a card failure, on purpose:
+    a reviewer editing during review is still indistinguishable from this function''s inputs (running_paths
+    names only ''running'' cards), and a full dispatch-and-finish cycle entirely between two polls is still
+    invisible. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven for the primary-checkout half
+    (22.11): a worker that writes outside its own worktree trips check_primary_checkout end to end, records
+    integrity_violation, halts the run, and the integration branch never moves again. The other-worktree half
     (check_idle_worktrees) stays partial with its documented false-positive gap unchanged this round. Earlier
     note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): guards.check_idle_worktrees runs every pass and
     reports changes in worktrees no running card owns as WARNINGS (an idle_worktree_changed event), never a
@@ -615,20 +636,25 @@ requirements:
   requirement: Finished is defined, and the global bounds in section 9.3 are enforced
   section: '9.3'
   verified_by: 22.6, 22.9, 22.14
-  status: partial
-  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): One of the two ''Known gap'' items this note lists is
-    fixed. Gate 4''s no-allowlist gap is closed: ASES-TSK-04''s own note (ROUND 6, 2026-09-22) records
-    plan.gate4_allowlist landing (matched by tamper.py''s glob semantics, findings demoted to advisory), and a
-    read-only run against ASES''s own repository shows Gate 4 passing (60 findings, all excused by
-    allow_paths). The other known gap (`bounds.set_status(paused)` drops the reason, kept only in a
-    project_paused event) has no fix on record anywhere in the register or the code checked this round; it
-    remains open. ''Finished means every merge card done plus Gates 4/5 green'' is otherwise still ''not run
-    for real'' exactly as this note originally said: no real project has reached the finalize path since it
-    was built. Status moved from in_progress to partial: the mechanism is built, wired, unit-tested, and one
-    of its two documented gaps is closed; the other documented gap and the lack of a real end-to-end run keep
-    this short of covered. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): bounds.py is
-    evaluated every pass: a breached project bound pauses the project with a report; finished now means every
-    merge card done, Gates 4 and 5 green on the integration HEAD and the release report written
+  status: in_progress
+  note: 'ROUND 9 (2026-09-27, zero quota): PAUSEREASON closed the remaining known gap: bounds.set_status stores a
+    pause reason in project_state.stop_reason exactly as a stop already did (no migration), and swarm status,
+    swarm report, swarm run''s refusal and swarm resume show it. Both documented gaps are now closed; back to
+    in_progress, since the finalize path has still never run for a real project. Found alongside, not fixed:
+    daily_reserve_percent defaults to 10 in one place and 0 in another; report._wall_clock keeps running for a
+    paused project. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota): One of the two ''Known
+    gap'' items this note lists is fixed. Gate 4''s no-allowlist gap is closed: ASES-TSK-04''s own note (ROUND
+    6, 2026-09-22) records plan.gate4_allowlist landing (matched by tamper.py''s glob semantics, findings
+    demoted to advisory), and a read-only run against ASES''s own repository shows Gate 4 passing (60
+    findings, all excused by allow_paths). The other known gap (`bounds.set_status(paused)` drops the reason,
+    kept only in a project_paused event) has no fix on record anywhere in the register or the code checked
+    this round; it remains open. ''Finished means every merge card done plus Gates 4/5 green'' is otherwise
+    still ''not run for real'' exactly as this note originally said: no real project has reached the finalize
+    path since it was built. Status moved from in_progress to partial: the mechanism is built, wired,
+    unit-tested, and one of its two documented gaps is closed; the other documented gap and the lack of a real
+    end-to-end run keep this short of covered. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
+    bounds.py is evaluated every pass: a breached project bound pauses the project with a report; finished now
+    means every merge card done, Gates 4 and 5 green on the integration HEAD and the release report written
     (finalgates.finalize, called by controller.process_finalize). Known gap: `bounds.set_status(paused)` drops
     the reason (kept in a project_paused event), and Gate 4 fails on any repository with sample keys in tests
     or docs (no allowlist).'
@@ -675,10 +701,16 @@ requirements:
   section: '10.2'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: the profile check rejects any forwarded
-    credential-shaped variable and key_visibility_test looks for planted secrets in `env` output from a
-    container ASES starts (never run for real). It cannot see inside Hermes-managed worker containers, and the
-    real profiles still use the local backend.'
+  note: 'ROUND 9 (2026-09-27, zero quota): DOCTOR: swarm doctor WARNs when a provider key_env named in
+    config/models.yaml is set in the controller''s own environment (blueprint p213), naming the variable,
+    never the value, and lists other credential-shaped names as INFO. GITHARDEN: every controller git call now
+    runs with gitexec.git_env() (the credential scrub) and with repository hooks and core.fsmonitor disabled,
+    so a planted hook or fsmonitor script in a worker-writable repository no longer runs with the
+    controller''s credentials (proven before/after). The worker-terminal half below is unchanged: it needs the
+    Docker sandbox, never run for real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
+    sandbox.py: the profile check rejects any forwarded credential-shaped variable and key_visibility_test
+    looks for planted secrets in `env` output from a container ASES starts (never run for real). It cannot see
+    inside Hermes-managed worker containers, and the real profiles still use the local backend.'
 - id: ASES-RTE-01
   requirement: No hidden fallback; the provider and model actually used are recorded
   section: '11.2'
@@ -853,54 +885,72 @@ requirements:
   section: '14.3'
   verified_by: '22.12'
   status: partial
-  note: 'ROUND 6 (2026-09-22, zero quota): Gate 0 now rejects a task whose touches is a WILDCARD glob broad enough
-    to cover gate/CI configuration, unless the task explicitly sets allow_gate_config_changes: true (a narrow,
-    literal touches entry needs no marker). This closes the hole two independent round 6 builders (TV building
-    it, AC-E reproducing it live) confirmed: because review.check_branch runs the scope check BEFORE the
-    tamper check, anything that reaches tamper.py is already inside touches and hence exempt, so
-    gate_config_changed and assertion_weakened findings can never fire through this wiring on their own. The
-    register''s existing partial note (hashing/pinning a fixed CI-file list) is a different, still-open half;
-    this round''s fix is plan-time touches-breadth, complementary, not a substitute. Earlier note: BUILT AND
-    WIRED, NOT RUN FOR REAL (2026-09-22): The pin check of the gate profiles exists; the diff side is the
-    tamper module''s gate_config_changed finding, which cannot fire through the review wiring today (see
-    ASES-QG-03), so a change to gate configuration is stopped by the scope check alone. Earlier note:
-    gates.hash_gate_profiles() + controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a plan''s
-    gate_profiles are content-hashed and pinned per-project at swarm approve time (only after every earlier
-    REFUSED path -- data-policy, budget -- has passed, so a refused plan is never pinned), and swarm run
-    refuses with "REFUSED (ASES-QG-02)" if the hash no longer matches, telling the user to re-approve.
-    Re-running swarm approve deliberately moves the pin -- that IS "an explicit plan task that allows it."
-    Unit-tested (9 new tests: hash stability/sensitivity, no-op-when-unpinned, pin/ verify round trip,
-    re-approve moves the pin, cross-project isolation). Left at partial, not covered: the blueprint''s text
-    also covers "CI scripts or test runner settings" beyond gate_profiles itself -- hashing a fixed list of
-    config files (CI workflow, pytest/tox config) is a natural follow-up but needs its own decision about
-    which files count, deliberately not bundled into this change.'
+  note: 'ROUND 9 (2026-09-27, zero quota): CIPIN: tamper''s gate_config_changed finding now treats only the plan
+    task''s explicit allow_gate_config_changes marker as ''an explicit plan task that allows it'', never the
+    path merely being in touches, and both Gate 1 paths (the review lane and the merge-time re-check) pass the
+    marker through; Gate 0 was tightened to match, so a literal touches entry on a gate-config path now needs
+    the marker too (reversing round 6''s literal exemption, on purpose, so Gate 0 never approves a plan Gate 1
+    would always reject). Both sentences of p277 now have a mechanism. Still partial: the marker is a plan
+    task field that is NOT folded into the gate-profile pin (the round 9 network exception is), so a plan.json
+    edited after approval to set it is not caught by the pin; and 22.12 does not yet exercise
+    gate_config_changed end to end. Earlier note: ROUND 6 (2026-09-22, zero quota): Gate 0 now rejects a task
+    whose touches is a WILDCARD glob broad enough to cover gate/CI configuration, unless the task explicitly
+    sets allow_gate_config_changes: true (a narrow, literal touches entry needs no marker). This closes the
+    hole two independent round 6 builders (TV building it, AC-E reproducing it live) confirmed: because
+    review.check_branch runs the scope check BEFORE the tamper check, anything that reaches tamper.py is
+    already inside touches and hence exempt, so gate_config_changed and assertion_weakened findings can never
+    fire through this wiring on their own. The register''s existing partial note (hashing/pinning a fixed
+    CI-file list) is a different, still-open half; this round''s fix is plan-time touches-breadth,
+    complementary, not a substitute. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): The pin
+    check of the gate profiles exists; the diff side is the tamper module''s gate_config_changed finding,
+    which cannot fire through the review wiring today (see ASES-QG-03), so a change to gate configuration is
+    stopped by the scope check alone. Earlier note: gates.hash_gate_profiles() +
+    controller.pin_gate_profiles()/verify_gate_pin() (2026-09-19): a plan''s gate_profiles are content-hashed
+    and pinned per-project at swarm approve time (only after every earlier REFUSED path -- data-policy, budget
+    -- has passed, so a refused plan is never pinned), and swarm run refuses with "REFUSED (ASES-QG-02)" if
+    the hash no longer matches, telling the user to re-approve. Re-running swarm approve deliberately moves
+    the pin -- that IS "an explicit plan task that allows it." Unit-tested (9 new tests: hash
+    stability/sensitivity, no-op-when-unpinned, pin/ verify round trip, re-approve moves the pin,
+    cross-project isolation). Left at partial, not covered: the blueprint''s text also covers "CI scripts or
+    test runner settings" beyond gate_profiles itself -- hashing a fixed list of config files (CI workflow,
+    pytest/tox config) is a natural follow-up but needs its own decision about which files count, deliberately
+    not bundled into this change.'
 - id: ASES-QG-03
   requirement: The tamper check fails deleted or skipped tests, unconditional passes and weakened assertions
   section: '14.3'
   verified_by: '22.12'
   status: in_progress
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven for three of its five blueprint attempts (22.12:
-    deleted test, skip marker, || true all correctly fail Gate 1 with the right finding kind, through the real
-    review lane). The other two land through different, already-covered mechanisms and are documented
-    precisely rather than forced to match the blueprint''s literal prose: the out-of-scope attempt is caught
-    by the SCOPE check, not the tamper check (same ASES-QG-02 gap, now closed at plan time); the
-    untracked-file attempt is caught because Gate 1 genuinely reruns in a clean checkout and the underlying
-    test is still failing for real, not by any missing-file detection. Independently confirmed twice this
-    round (TV building the fix, AC-E reproducing the gap live) that gate_config_changed/assertion_weakened
-    cannot fire through the review wiring without ASES-QG-02''s new plan-time check. Earlier note: BUILT AND
-    WIRED, NOT RUN FOR REAL (2026-09-22): tamper.check_range runs in the review lane and in the merge-time
-    check (deleted or skipped tests, unconditional passes, weakened assertions, gate configuration, generated
-    artifacts, secrets, large files). KNOWN GAP: through this wiring the gate-configuration and
-    assertion-weakening findings can never fire, because the scope check runs first and a path that reaches
-    the tamper check is already inside the task''s touches (a wildcard touches glob silently allows config
-    edits); plan-time validation of touches is needed.'
+  note: 'ROUND 9 (2026-09-27, zero quota): CIPIN removed the reason this note gives for gate_config_changed never
+    firing through the review wiring: the exemption is now the plan task''s own marker, not the touches the
+    scope check already enforced, so a gate/CI config change inside a task''s touches but without the marker
+    fails Gate 1 (unit-tested in test_review.py and test_tamper.py). Earlier note: ROUND 6 (2026-09-22, zero
+    quota): Acceptance-proven for three of its five blueprint attempts (22.12: deleted test, skip marker, ||
+    true all correctly fail Gate 1 with the right finding kind, through the real review lane). The other two
+    land through different, already-covered mechanisms and are documented precisely rather than forced to
+    match the blueprint''s literal prose: the out-of-scope attempt is caught by the SCOPE check, not the
+    tamper check (same ASES-QG-02 gap, now closed at plan time); the untracked-file attempt is caught because
+    Gate 1 genuinely reruns in a clean checkout and the underlying test is still failing for real, not by any
+    missing-file detection. Independently confirmed twice this round (TV building the fix, AC-E reproducing
+    the gap live) that gate_config_changed/assertion_weakened cannot fire through the review wiring without
+    ASES-QG-02''s new plan-time check. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
+    tamper.check_range runs in the review lane and in the merge-time check (deleted or skipped tests,
+    unconditional passes, weakened assertions, gate configuration, generated artifacts, secrets, large files).
+    KNOWN GAP: through this wiring the gate-configuration and assertion-weakening findings can never fire,
+    because the scope check runs first and a path that reaches the tamper check is already inside the task''s
+    touches (a wildcard touches glob silently allows config edits); plan-time validation of touches is needed.'
 - id: ASES-QG-04
   requirement: Gates run in a clean checkout of the exact commit inside the sandbox
   section: '14.3'
   verified_by: '22.12'
   status: covered
-  note: gates.run_gate always checks out a throwaway worktree at the exact commit SHA, never the worker's
-    live directory. Docker-level sandboxing is still Phase 5 (noted as a gap in gates.py's docstring).
+  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX: gates can now run inside the Docker sandbox.
+    gates.resolve_runner picks host or sandbox for every gate caller (Gate 1 in both review paths, Gate 3, the
+    post-merge re-run, Gates 4/5); sandbox runs use a self-contained checkout (clone --no-hardlinks, detached
+    at the SHA, no pointer back into the host repository). The switch stays off by default because Docker has
+    never run for real on this machine; with it off, gates run on the host in a clean checkout exactly as
+    before, with round 8''s scrubbed environment. Earlier note: gates.run_gate always checks out a throwaway
+    worktree at the exact commit SHA, never the worker''s live directory. Docker-level sandboxing is still
+    Phase 5 (noted as a gap in gates.py''s docstring).'
 - id: ASES-QG-05
   requirement: Acceptance tests come from the contract and should precede the implementation
   section: '14.3'
@@ -1175,18 +1225,23 @@ requirements:
   section: '21.1'
   verified_by: '22.10'
   status: covered
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.10): a planted secret-shaped value in a
-    committed file, and a second key in the controller''s own test-process environment, were both scanned for
-    across every event payload, gate_runs.detail, review_verdicts.metadata, every card body/comment/run, and
-    both report renderings after a full scenario run -- absent everywhere. A whole file named like a secret
-    (id_rsa) is caught too, as generated_artifact rather than secret_added (that distinction is now
-    documented: secret_added is a value on an added line, generated_artifact is a whole flagged file, and
-    gates.scan_for_secrets, which WOULD call a whole file secret_added, is only reached from Gate 3/mergeq,
-    never the review lane). The Docker/sandbox half of 22.10 (env inside a worker terminal, reading .env from
-    inside the sandbox) is still unverified: Docker never runs in this suite. Earlier note:
-    gates.scan_for_secrets (reuses events.py''s redaction patterns) runs inside mergeq.merge_task on the full
-    diff before Gate 3 -- a planted secret blocks the merge and never reaches the integration branch.
-    Unit-tested end to end (test_merge_blocks_on_a_planted_secret) and at the pattern level.'
+  note: 'ROUND 9 (2026-09-27, zero quota): GITHARDEN: the merge queue''s Gate 3 secret-scan diff now passes
+    --no-ext-diff --no-textconv (gitexec.DIFF_SAFETY), as tamper.py''s diff already did; before this, a
+    worker-defined textconv driver could show the scanner sanitised text while the committed blob carried a
+    secret (proven by test_a_planted_textconv_driver_does_not_hide_a_secret_from_the_gate_3_scan, which fails
+    on the old code). Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.10): a
+    planted secret-shaped value in a committed file, and a second key in the controller''s own test-process
+    environment, were both scanned for across every event payload, gate_runs.detail, review_verdicts.metadata,
+    every card body/comment/run, and both report renderings after a full scenario run -- absent everywhere. A
+    whole file named like a secret (id_rsa) is caught too, as generated_artifact rather than secret_added
+    (that distinction is now documented: secret_added is a value on an added line, generated_artifact is a
+    whole flagged file, and gates.scan_for_secrets, which WOULD call a whole file secret_added, is only
+    reached from Gate 3/mergeq, never the review lane). The Docker/sandbox half of 22.10 (env inside a worker
+    terminal, reading .env from inside the sandbox) is still unverified: Docker never runs in this suite.
+    Earlier note: gates.scan_for_secrets (reuses events.py''s redaction patterns) runs inside
+    mergeq.merge_task on the full diff before Gate 3 -- a planted secret blocks the merge and never reaches
+    the integration branch. Unit-tested end to end (test_merge_blocks_on_a_planted_secret) and at the pattern
+    level.'
 - id: ASES-SEC-02
   requirement: Sensitive paths are denied through the sandbox mount list
   section: '21.1'
@@ -1200,32 +1255,44 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py plus `swarm init --sandbox` (dry run by
-    default) can put the Docker terminal block into a worker profile; the controller''s own gate runs do not
-    use docker_run_argv yet and Docker was never started. Real Hermes 0.21.3 facts: an explicit terminal.cwd
-    of /workspace defeats the worktree mount (omitted), docker_persist_across_processes must be false,
-    docker_run_as_host_user does nothing on native Windows, a git worktree''s .git file points outside the
-    mount so git fails inside a worktree-only sandbox (a design decision is open). No profile has a terminal
-    block yet.'
+  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX wired the controller''s own gate runs to the sandbox (this
+    note''s ''the controller''s own gate runs do not use docker_run_argv yet'' is no longer true), opt-in and
+    off by default; Docker or the image missing is an infrastructure failure (an event, the card held), never
+    a red gate and never a silent host run. Worker containers are still configured per Hermes profile and
+    Docker has never run for real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py
+    plus `swarm init --sandbox` (dry run by default) can put the Docker terminal block into a worker profile;
+    the controller''s own gate runs do not use docker_run_argv yet and Docker was never started. Real Hermes
+    0.21.3 facts: an explicit terminal.cwd of /workspace defeats the worktree mount (omitted),
+    docker_persist_across_processes must be false, docker_run_as_host_user does nothing on native Windows, a
+    git worktree''s .git file points outside the mount so git fails inside a worktree-only sandbox (a design
+    decision is open). No profile has a terminal block yet.'
 - id: ASES-SEC-04
   requirement: Content that agents read is treated as data, never as instructions
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed via 22.11''s negative case: injection text
-    planted in two seeded files and never acted on causes no violation and a normal merge, alongside the
-    positive case above proving a violation IS caught. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL
-    (2026-09-22): Every role prompt ends with the data-not-instructions sentence and the prompts are checked
-    against Hermes''s own injection patterns in a test. No injection test (22.11) has run.'
+  note: 'ROUND 9 (2026-09-27, zero quota): GITHARDEN: controller._branch_diff, whose text is embedded in a retry
+    card body, now passes --no-ext-diff --no-textconv, so the diff a later worker reads is git''s own output,
+    never a worker-planted driver''s. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed
+    via 22.11''s negative case: injection text planted in two seeded files and never acted on causes no
+    violation and a normal merge, alongside the positive case above proving a violation IS caught. Earlier
+    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Every role prompt ends with the
+    data-not-instructions sentence and the prompts are checked against Hermes''s own injection patterns in a
+    test. No injection test (22.11) has run.'
 - id: ASES-SEC-05
   requirement: Sandbox network access is disabled by default and only enabled through explicit task-scoped
     exceptions
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: docker_run_argv defaults to --network none and
-    the profile check refuses docker_network true unless the policy allows it. Task-scoped exceptions are not
-    modelled in the plan schema.'
+  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX: task-scoped exceptions are now modelled in the plan schema
+    (sandbox_network plus a required sandbox_network_reason), validated in Gate 0, visible at Gate P, folded
+    into the gate-profile pin (and passed by swarm approve and swarm run''s pre-flight, so a flipped flag is
+    refused), and applied only to that task''s own Gate 1 and Gate 3 candidate runs. Worker containers cannot
+    be task-scoped this way: Hermes configures them per profile, not per card. Earlier note: BUILT AND WIRED,
+    NOT RUN FOR REAL (2026-09-22): sandbox.py: docker_run_argv defaults to --network none and the profile
+    check refuses docker_network true unless the policy allows it. Task-scoped exceptions are not modelled in
+    the plan schema.'
 - id: ASES-SEC-06
   requirement: Provider keys stay outside the sandbox; the egress proxy is optional and user-approved
   section: '21.3'
@@ -1363,11 +1430,14 @@ requirements:
   section: 10, 17.4
   verified_by: '22.10'
   status: partial
-  note: 'ROUND 8 (2026-09-27, zero quota): The deferred gates.py gap is closed. gates._run_commands (the host gate
-    runner) and run_gate''s own git worktree add/remove now start every subprocess with
-    procenv.scrubbed_environ(), so model-authored code under Gate 1/3/4/5 and a post-checkout hook planted in
-    the shared .git/hooks cannot read a provider key from the controller''s shell; proven before/after (the
-    old code printed KEYSEEN and the hook recorded the key), plus a new acceptance test
+  note: 'ROUND 9 (2026-09-27, zero quota): GITHARDEN closed the sibling exposure round 8''s sweep proved (the
+    controller''s other git calls: hooks, core.fsmonitor, textconv, all with the full environment). The one
+    structural gap below remains: a Hermes-gateway-dispatched worker is spawned by Hermes, which ASES cannot
+    scrub. Earlier note: ROUND 8 (2026-09-27, zero quota): The deferred gates.py gap is closed.
+    gates._run_commands (the host gate runner) and run_gate''s own git worktree add/remove now start every
+    subprocess with procenv.scrubbed_environ(), so model-authored code under Gate 1/3/4/5 and a post-checkout
+    hook planted in the shared .git/hooks cannot read a provider key from the controller''s shell; proven
+    before/after (the old code printed KEYSEEN and the hook recorded the key), plus a new acceptance test
     tests/acceptance/test_22_10_gate_env.py through a real controller pass. procenv exempts
     GIT_AUTHOR_NAME/EMAIL/DATE by exact name (they match the pattern only on ''auth''); SSH_AUTH_SOCK and
     XAUTHORITY stay stripped (capability-bearing). No pass-through allowlist (a gate that needs a credential
@@ -1440,7 +1510,9 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: default-deny network in docker_run_argv and in
+  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX: sandboxed gate runs default to --network none; the only
+    exception is a task''s own Gate-0-validated, pinned sandbox_network flag (see ASES-SEC-05). Earlier note:
+    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: default-deny network in docker_run_argv and in
     the profile terminal block check; exfiltration_probe proves it from inside a container (never run for
     real).'
 - id: ASES-PRV-04
@@ -1464,5 +1536,9 @@ requirements:
   section: 5.3, Appendix E
   verified_by: '22.1'
   status: in_progress
-  note: config/models.yaml records verified_on per provider and doctor displays it; the source URLs from
-    Appendix E are not yet echoed into the doctor report itself
+  note: 'ROUND 9 (2026-09-27, zero quota): DOCTOR: config/models.yaml carries a source field and swarm doctor
+    displays value, source URL and checked date, WARNing where a source is missing. Sources were taken only
+    from blueprint Appendix E or the file''s own comments, never invented: today only openrouter has one
+    (Appendix E [S12]); xkiro and opencode_free WARN until someone records where their numbers came from.
+    Earlier note: config/models.yaml records verified_on per provider and doctor displays it; the source URLs
+    from Appendix E are not yet echoed into the doctor report itself'
