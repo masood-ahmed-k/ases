@@ -677,15 +677,21 @@ def render_status(report: dict) -> str:
     its bounds, a line per provider ("openrouter 37/50 used"), the parked cards, the cards by status with the
     open questions ("3 done, 1 running, 1 blocked (1 question)") and the merge queue, the last gate result, and
     the last 5 health events. ASCII only: anything non-ASCII from a card title or event text is backslash-escaped
-    (a Windows console crashes on it), and every value is redacted first (ASES-SEC-01)."""
+    (a Windows console crashes on it), and every value is redacted first (ASES-SEC-01).
+
+    A `stopped` or `paused` project's recorded reason (project_state.stop_reason, ASES-CTL-01) is appended to the
+    status word in parentheses when one is recorded, clipped like any other free-text field."""
     report = events_mod.redact(report)
     project, budget, cards = report["project"], report["budget"], report["cards"]
     quality, health = report["quality"], report["health"]
+    status_word = f"status {project['status'] or 'not recorded'}"
+    if project["stop_reason"]:
+        status_word += f" ({_clip(str(project['stop_reason']), _STATUS_LINE_CHARS)})"
     lines = [
         f"ASES status, generated {report['generated_at']} (UTC)",
         f"Project: {project['name']} (plan {project['plan_project']}), board {project['board']}, "
         f"branch {project['integration_branch']}, data class {project['data_class']}, "
-        f"status {project['status'] or 'not recorded'}",
+        f"{status_word}",
         "Bounds: " + ", ".join(
             _bound_text(bound) for bound in project["bounds"]
             if bound["name"] in _PROJECT_BOUNDS or (bound["used"] or 0) > 0

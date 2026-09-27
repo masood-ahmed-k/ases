@@ -791,7 +791,8 @@ def _refuse_unless_startable(conn, plan) -> int | None:
     gate) is a decision for the operator, who lifts it with `swarm resume`."""
     state = bounds_mod.get_state(conn, plan.project)
     if state is not None and state["status"] == "paused":
-        _err(f"swarm run REFUSED: project {plan.project} is paused (a bound was reached or a final gate failed). "
+        why = state.get("stop_reason") or "a bound was reached or a final gate failed"
+        _err(f"swarm run REFUSED: project {plan.project} is paused ({why}). "
              f"swarm status shows why; swarm resume [--extend-minutes N] lifts the pause.")
         return 4
     try:
@@ -869,8 +870,8 @@ def _print_pass_details(number: int, summary: dict) -> None:
 
 
 def _halt_reason(conn, plan, summary: dict) -> str:
-    """Why the project is halted: the pass's own reason, else the stop reason kept in project_state (only a `stopped`
-    project has one: bounds.set_status keeps no reason for a pause), else the state itself."""
+    """Why the project is halted: the pass's own reason, else the stop/pause reason kept in project_state
+    (bounds.set_status records one for both `stopped` and `paused`), else the state itself."""
     reason = summary.get("stop_reason")
     state = bounds_mod.get_state(conn, plan.project) or {}
     if not reason:
@@ -1265,8 +1266,9 @@ def _resume_one(args: argparse.Namespace, project, conn, target: _Target) -> int
         return 1
     state = bounds_mod.get_state(conn, target.project)
     if state is not None and state["status"] == "paused":
+        why = state.get("stop_reason")
         bounds_mod.set_status(conn, target.project, "running")
-        _out(f"project {target.project}: was paused, now running")
+        _out(f"project {target.project}: was paused, now running" + (f" (reason: {why})" if why else ""))
     state = bounds_mod.get_state(conn, target.project) or {}
     if state.get("status") == "finished":
         _out(f"project {target.project}: is finished, so only Hermes dispatch was resumed; there is nothing to run")

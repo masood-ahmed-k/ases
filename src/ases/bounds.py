@@ -284,12 +284,17 @@ def set_status(
     `status` must be one of planning, running, paused, stopped, finished, else ValueError and nothing is written.
     Creates the row when the project has none.
 
-    `reason` is stored as stop_reason only for `stopped`, the status the report needs an explanation for
-    (Table 17: a reached bound "stops, not finishes"). Any other status clears it, so a project that runs again
-    never shows the reason of an old stop. started_at, the deadline and the re-plan count are not touched."""
+    `reason` is stored as stop_reason for `stopped` AND `paused`, the two statuses ASES-CTL-01 leaves a project in
+    when it is not finished (Table 17: a reached bound "stops, not finishes"; pause_and_report uses `paused` for
+    the same case with running work left alone) and that the report needs an explanation for. Any other status
+    (planning, running, finished) clears it, so a project that runs again never shows the reason of an old stop or
+    pause. started_at, the deadline and the re-plan count are not touched.
+
+    Before this fix, a paused project's reason was dropped here and kept only in a `project_paused` event
+    (controller.pause_and_report / controller._pause_reason); this is the fix for that known gap."""
     if status not in STATUSES:
         raise ValueError(f"project status must be one of {', '.join(STATUSES)}, got {ascii(status)}")
-    stop_reason = None if (status != "stopped" or reason is None) else str(reason)
+    stop_reason = str(reason) if (status in ("stopped", "paused") and reason is not None) else None
     conn.execute(
         "INSERT INTO project_state (project, replans, status, stop_reason, updated_at) VALUES (?, 0, ?, ?, ?) "
         "ON CONFLICT(project) DO UPDATE SET status = excluded.status, stop_reason = excluded.stop_reason, "
