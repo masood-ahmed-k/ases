@@ -2,8 +2,10 @@
 # the providers' own pages and the installed Hermes source on 17-18 September 2026. They change --
 # re-verify before trusting them for real capacity planning, and update verified_on when you do.
 #
-# context_length: null means undeclared/unverified (ASES-MOD-02). swarm doctor WARNs on every such row
-# until a smoke test or an explicit number here confirms the Hermes floor of 65536 tokens.
+# context_length: null means undeclared/unverified (ASES-MOD-02). The floor is Hermes's own 64,000 tokens
+# (models.MINIMUM_CONTEXT_LENGTH). Since round 11, a PINNED model below it, or undeclared on a custom
+# openai_compatible provider, is rejected before any card starts (swarm approve and swarm run refuse; swarm
+# doctor shows FAIL); an unpinned candidate only WARNs.
 #
 # ASES-PRV-04 (section 21.2): "private/confidential projects require an EXPLICITLY VERIFIED provider data
 # policy" -- a data_policy string alone is not enough for those two data classes. Two OPTIONAL fields, same
