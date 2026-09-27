@@ -545,13 +545,16 @@ def revert_merge(
     that cleanup succeeded; `ok` is False either way; a caller that must tell "cleanly refused" from "still
     dirty" apart checks `aborted` too, matching the halt path controller.process_merge_queue wires this round.
 
-    The `reverted` write is NULL-tolerant by project (the same scoping run_gate and last_gate_result use):
-    with a real project it matches that project's own row OR a legacy row with no project recorded, never a
-    DIFFERENT project's row that happens to share this task_key (schema v8, round 9: merge_records' primary key
-    is now (project, task_key), so that row genuinely exists as its own, separate record rather than the SAME
-    physical row a same-task_key upsert used to share). With no project given (the old call shape) the write is
-    now scoped to `project IS NULL` rather than left completely unscoped: an unscoped `WHERE task_key = ?` would
-    mark EVERY project's row for this task_key reverted, not just the one row this caller actually means."""
+    The `reverted` write is scoped by EXACT project match (round 12, finding 4): with a real project it matches
+    ONLY that project's own row, never a DIFFERENT project's row that happens to share this task_key -- and,
+    since schema v8, never a legacy `project IS NULL` row either, even though such a row can coexist for the same
+    task_key (db.py's v8 migration deliberately leaves an ambiguous task_key's row at project=NULL rather than
+    guess). The old NULL-tolerant `(project IS NULL OR project = ?)` predicate matched BOTH rows at once and
+    silently flipped `reverted=1` on the unrelated legacy row too (round 12 audit finding 4, high). This mirrors
+    the exact-match idiom `_fast_forward` already uses just above: a real project matches only its own row, None
+    matches only NULL. With no project given (the old call shape) the write is scoped to `project IS NULL` rather
+    than left completely unscoped: an unscoped `WHERE task_key = ?` would mark EVERY project's row for this
+    task_key reverted, not just the one row this caller actually means."""
     with _intent(conn, project, intents_mod.KIND_REVERT, task_key, f"revert {squash_commit}"):
         result = _git(["revert", "--no-edit", squash_commit], repo)
         ok = result.returncode == 0
@@ -576,7 +579,7 @@ def revert_merge(
                 )
             else:
                 conn.execute(
-                    "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND (project IS NULL OR project = ?)",
+                    "UPDATE merge_records SET reverted = 1 WHERE task_key = ? AND project = ?",
                     (task_key, project),
                 )
     return RevertOutcome(ok, commit_sha, detail, aborted=aborted)

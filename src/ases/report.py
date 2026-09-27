@@ -551,10 +551,16 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
             (plan.project, _VERDICT_LIMIT),
         )
     ]
+    # round 12 audit (same shape as finding 6, refuted specifically for this query on this SQLite build, but the
+    # absence of ORDER BY was still implementation-defined, not guaranteed): a legacy project=NULL row and this
+    # plan's own row can coexist for one task_key. ORDER BY (project IS NULL) DESC makes the dict-overwrite
+    # deterministic across SQLite versions/query plans -- the legacy row is visited first and this plan's own row
+    # (visited second) is the one left in `records` -- instead of relying on the query planner's own row order.
     records = {
         row["task_key"]: row for row in conn.execute(
             f"SELECT task_key, candidate_sha, gate3_result, squash_commit, reverted, completed_at "
-            f"FROM merge_records WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?)",
+            f"FROM merge_records WHERE task_key IN ({marks}) AND (project IS NULL OR project = ?) "
+            f"ORDER BY (project IS NULL) DESC",
             (*scope, plan.project),
         )
     }

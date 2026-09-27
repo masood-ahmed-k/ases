@@ -122,6 +122,29 @@ def test_done_but_reverted_is_flagged(tmp_path, monkeypatch):
     assert any(f.kind == "done_but_reverted" for f in findings)
 
 
+def test_check_cards_prefers_this_projects_own_merge_record_over_a_coexisting_legacy_one(tmp_path, monkeypatch):
+    """Same OR-predicate shape as round 12 audit finding 7 (`hardening._squash_proof`), found by grepping
+    `src/ases` for every other `merge_records` statement using it (r12_wp_fixes.md's DATAFIX package): a
+    single-row read must prefer this project's own row when a legacy project=NULL row for the same task_key also
+    matches. Without an ORDER BY, `.fetchone()` on `(project IS NULL OR project = ?)` is not guaranteed to return
+    p1's own (correct, unreverted) row over an unrelated legacy row that happens to be flagged reverted."""
+    conn = db.connect(tmp_path / "ases.db")
+    _seed(conn)
+    conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES (NULL, 'T1', 'legacy', 'pass', 'legacy_squash', 1, '2020-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES ('p1', 'T1', 'abc', 'pass', 'abc', 0, datetime('now'))"
+    )
+    monkeypatch.setattr(hermes, "kanban_show", lambda b, cid: (
+        {"status": "done"} if cid == "t_merge" else {"status": "done"}
+    ))
+
+    assert reconcile.check("b", "p1", conn=conn) == []
+
+
 def test_only_checks_the_given_project(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "ases.db")
     _seed(conn, project="p1", task_key="T1")
@@ -528,10 +551,10 @@ def _task(conn, key="T1", *, project="p1", role="coder", work="t_work", merge="t
 
 
 def _record(conn, key="T1", *, candidate="abc", gate3="pass", squash=None, reverted=0,
-            completed="2026-09-19T00:00:00+00:00"):
+            completed="2026-09-19T00:00:00+00:00", project=None):
     conn.execute(
-        "INSERT INTO merge_records (task_key, candidate_sha, gate3_result, squash_commit, reverted, completed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)", (key, candidate, gate3, squash, reverted, completed),
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (project, key, candidate, gate3, squash, reverted, completed),
     )
 
 
@@ -819,6 +842,32 @@ def test_b_an_unfinished_record_is_finished_from_git_keeping_what_the_merge_queu
     assert (row["candidate_sha"], row["gate3_result"], row["squash_commit"]) == (sha, "pass", sha)
     assert row["completed_at"]
     assert [r.kind for r in report.repairs] == ["merge_record_recovered"] and report.blocked == []
+
+
+def test_b_finishing_a_landed_merge_with_a_coexisting_incomplete_legacy_row_does_not_crash(env):
+    """Round 12 audit finding 5 (medium): a legacy project=NULL row and p1's own row can BOTH be incomplete
+    (completed_at IS NULL) for the same task_key at once (schema v8's ambiguous-task-key backfill). The old
+    `_finish_record` UPDATE, scoped by `(project IS NULL OR project = ?)`, matched both rows in one statement and
+    tried to give both the same (project, task_key) primary key, raising sqlite3.IntegrityError -- caught by
+    run_task's broad except and turned into an unresolved reconcile_error, with the real repair never applied."""
+    env.task()
+    sha = _land(env.repo)
+    _record(env.conn, candidate=None, gate3=None, squash=None, completed=None, project="p1")
+    _record(env.conn, candidate="legacy-candidate", gate3=None, squash=None, completed=None, project=None)
+    env.board(_card("t_work", "done"), _card("t_merge", "done"))
+
+    report = env.go()
+
+    assert not any(f.kind == "reconcile_error" for f in report.findings)
+    p1_row = env.conn.execute(
+        "SELECT squash_commit, completed_at FROM merge_records WHERE task_key = 'T1' AND project = 'p1'"
+    ).fetchone()
+    legacy_row = env.conn.execute(
+        "SELECT squash_commit, completed_at FROM merge_records WHERE task_key = 'T1' AND project IS NULL"
+    ).fetchone()
+    assert p1_row["squash_commit"] == sha and p1_row["completed_at"]           # p1's own row was finished
+    assert legacy_row["squash_commit"] is None and legacy_row["completed_at"] is None  # the legacy row: untouched
+    assert [r.kind for r in report.repairs] == ["merge_record_recovered"]
 
 
 # -- c. merge record without a done card (the crash between the fast-forward and the card completion) --
@@ -1132,6 +1181,34 @@ def test_e_a_revert_that_is_in_git_but_was_never_recorded_is_recorded(env):
     assert _intent_row(env.conn, iid)["completed_at"]
     assert env.world.calls == []  # the merge step did not complete a card for a merge that was rolled back
     assert env.go().clean
+
+
+def test_e_reverting_one_projects_merge_does_not_flip_a_coexisting_legacy_rows_reverted_flag(env):
+    """Round 12 audit finding 4 (high), reconcile side: a legacy project=NULL row and p1's own row can coexist for
+    the same task_key (schema v8). Recording p1's git revert (`_mark_reverted`) must only flip p1's own row,
+    never the unrelated legacy one that happens to share the task_key -- the old
+    `(project IS NULL OR project = ?)` UPDATE predicate matched both at once."""
+    env.task()
+    sha = _land(env.repo)
+    _git_ok("revert", "--no-edit", sha, cwd=env.repo)
+    _record(env.conn, candidate=sha, squash=sha, reverted=0, project="p1")
+    _record(env.conn, candidate=sha, squash=sha, reverted=0, project=None,
+            completed="2020-01-01T00:00:00+00:00")
+    env.board(_card("t_work", "todo"), _card("t_merge", "blocked"))  # the fix card is on its way
+    iid = intents.begin(env.conn, "p1", intents.KIND_REVERT, "T1", f"revert {sha[:12]}")
+
+    report = env.go()
+
+    p1_row = env.conn.execute(
+        "SELECT reverted FROM merge_records WHERE task_key = 'T1' AND project = 'p1'"
+    ).fetchone()
+    legacy_row = env.conn.execute(
+        "SELECT reverted FROM merge_records WHERE task_key = 'T1' AND project IS NULL"
+    ).fetchone()
+    assert p1_row["reverted"] == 1        # p1's own revert really was recorded
+    assert legacy_row["reverted"] == 0    # the unrelated legacy row must be left exactly as it was
+    assert [r.kind for r in report.repairs] == ["revert_recorded", "intent_recovered"]
+    assert _intent_row(env.conn, iid)["completed_at"]
 
 
 def test_e_a_revert_that_was_already_recorded_just_closes_the_intent(env):

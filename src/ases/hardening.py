@@ -566,9 +566,14 @@ class _Cleaner:
         today's tip, so a later task that edits the same file does not make an old, merged branch look unmerged. If
         this holds, the branch's content is preserved in S, and deleting the branch loses only its private history."""
         ahead = _git(self.repo, ["rev-list", "--count", f"refs/heads/{self.integration}..{tip}"])[1].strip() or "?"
+        # round 12, finding 7: a legacy project=NULL row and this plan's own row can coexist for `key` (db.py's
+        # v8 migration leaves an ambiguous task_key NULL on purpose). ORDER BY (project IS NULL) ASC prefers this
+        # plan's own (non-NULL) row when both match: SQLite orders 0/false before 1/true, so a non-NULL project
+        # sorts first. A bare .fetchone() on the OR predicate gave no such guarantee (and the audit found SQLite's
+        # real query planner deterministically preferred the WRONG, legacy row here).
         row = self.conn.execute(
             "SELECT squash_commit, completed_at, reverted FROM merge_records WHERE task_key = ? "
-            "AND (project IS NULL OR project = ?)", (key, self.project),
+            "AND (project IS NULL OR project = ?) ORDER BY (project IS NULL) ASC LIMIT 1", (key, self.project),
         ).fetchone()
         if row is None or not row[1]:
             return False, f"not merged: {ahead} commit(s) not in {self.integration} and no completed merge record for task {key}"

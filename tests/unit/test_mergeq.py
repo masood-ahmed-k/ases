@@ -1116,6 +1116,12 @@ def test_revert_merge_writes_a_revert_intent_around_git_revert_and_completes_it(
     _make_work_branch(repo, "swarm/V1", "new.txt", "x\n")
     conn = db.connect(tmp_path / "ases.db")
     merged = mergeq.merge_task(repo, "integration", "swarm/V1", "V1", ["echo ok"], conn=conn)
+    # Stamped as p1's own row (not passed as merge_task's own project=, which would also open build_candidate/
+    # fast_forward intents this test does not want): since round 12 finding 4, a real project's revert is an
+    # EXACT match on its own (project, task_key) row, never a NULL-tolerant fallback onto an unrelated legacy row
+    # (see test_revert_merge_does_not_corrupt_a_coexisting_legacy_null_row_for_the_same_task_key), so the row this
+    # asserts against below must actually be p1's own to be the one revert_merge(project="p1") touches.
+    conn.execute("UPDATE merge_records SET project = 'p1' WHERE task_key = 'V1'")
     seen = {}
     real_git = mergeq._git
 
@@ -1210,16 +1216,51 @@ def test_revert_merge_with_a_mismatched_project_does_not_touch_another_projects_
     assert row["reverted"] == 0 and row["project"] == "p1"  # ...but p1's row was never touched
 
 
-def test_revert_merge_still_matches_a_legacy_null_project_row(repo, tmp_path):
-    """A row with no project (written before schema v7, or by a caller that has not been updated to pass one)
-    still counts: never orphan history."""
+def test_revert_merge_with_a_real_project_no_longer_reaches_into_a_legacy_null_project_row(repo, tmp_path):
+    """Superseded by round 12 audit finding 4 (high): this used to assert the OLD NULL-tolerant write scoping
+    ("still counts: never orphan history"), which is exactly the `(project IS NULL OR project = ?)` UPDATE
+    predicate finding 4 found silently corrupting an UNRELATED legacy row whenever one coexisted with a real
+    project's own row for the same task_key (see
+    test_revert_merge_does_not_corrupt_a_coexisting_legacy_null_row_for_the_same_task_key). The corrected,
+    exact-match idiom (mirroring `_fast_forward`'s own pattern: a real project matches only its own row, None
+    matches only NULL) means a real project's revert call no longer reaches into a legacy project=NULL row at
+    all, even when that legacy row is the only row that exists for this task_key: nothing here is p1's own row,
+    so nothing is touched."""
     _make_work_branch(repo, "swarm/S2", "new.txt", "x\n")
     conn = db.connect(tmp_path / "ases.db")
     merged = mergeq.merge_task(repo, "integration", "swarm/S2", "S2", ["echo ok"], conn=conn)  # no project
 
     result = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="S2", project="p1")
 
-    assert result.ok is True and _merge_row(conn, "S2")["reverted"] == 1
+    assert result.ok is True  # git itself still reverts the commit...
+    assert _merge_row(conn, "S2")["reverted"] == 0  # ...but there is no p1 row, so the legacy row is left alone
+
+
+def test_revert_merge_does_not_corrupt_a_coexisting_legacy_null_row_for_the_same_task_key(repo, tmp_path):
+    """Round 12 audit finding 4 (high): schema v8's PRIMARY KEY (project, task_key) lets a legacy project=NULL
+    row and a real project's row coexist for the same task_key (db.py's v8 migration leaves an ambiguous
+    task_key NULL on purpose, ASES-ARC-03). Reverting p1's own merge must never also flip reverted=1 on that
+    unrelated legacy row: the old `(project IS NULL OR project = ?)` UPDATE predicate matched both rows at
+    once."""
+    _make_work_branch(repo, "swarm/S9", "new.txt", "x\n")
+    conn = db.connect(tmp_path / "ases.db")
+    merged = mergeq.merge_task(repo, "integration", "swarm/S9", "S9", ["echo ok"], conn=conn, project="p1")
+    conn.execute(
+        "INSERT INTO merge_records (project, task_key, candidate_sha, gate3_result, squash_commit, reverted, "
+        "completed_at) VALUES (NULL, 'S9', 'legacy', 'pass', 'legacy_squash', 0, '2020-01-01T00:00:00+00:00')"
+    )
+
+    result = mergeq.revert_merge(repo, merged.squash_commit, conn=conn, task_key="S9", project="p1")
+
+    assert result.ok is True
+    p1_row = conn.execute(
+        "SELECT reverted FROM merge_records WHERE task_key = 'S9' AND project = 'p1'"
+    ).fetchone()
+    legacy_row = conn.execute(
+        "SELECT reverted FROM merge_records WHERE task_key = 'S9' AND project IS NULL"
+    ).fetchone()
+    assert p1_row["reverted"] == 1        # p1's own merge really was reverted
+    assert legacy_row["reverted"] == 0    # the unrelated legacy row must be left exactly as it was
 
 
 def test_merge_task_stamps_the_project_column_on_merge_records_and_gate_runs(repo, tmp_path):
