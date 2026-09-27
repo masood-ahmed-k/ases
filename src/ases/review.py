@@ -23,7 +23,9 @@ verified against real Hermes; every earlier test mocked the wrapper, so none cou
 
 The tamper check (tamper.py) is part of Gate 1 (round 5): both branch checks run it on the same range the touches
 check looked at, after the scope check and before Gate 1 runs, so a card that deleted or skipped a test, added an
-unconditional pass, planted a secret or a generated artifact never reaches a reviewer or the merge queue as green.
+unconditional pass, planted a secret, a generated artifact, or changed gate/CI/test-runner configuration without
+the plan task's own allow_gate_config_changes marker (ASES-QG-02) never reaches a reviewer or the merge queue as
+green.
 """
 from __future__ import annotations
 
@@ -62,10 +64,14 @@ class BranchCheck:
 def gate_before_review(
     board: str, card_id: str, repo: pathlib.Path, branch: str, integration_branch: str,
     gate1_commands: list[str], touches: list[str], *, conn, task_key: str,
+    allow_gate_config_changes: bool = False,
 ) -> bool:
     """ASES-REV-05 (Gate 1 re-check) + ASES-GIT-13 (touches-path check). Returns True if both pass
     (card stays in review for the reviewer), False if it sent the card back (a failed attempt, not a
     review round). A thin wrapper: check_branch makes the decision, this owns the send-back to Hermes.
+
+    `allow_gate_config_changes` is the plan task's own ASES-QG-02 marker (plan.PlanTask), passed straight
+    through to check_branch's tamper check.
 
     integration_branch is the plan's configured integration branch (the same value mergeq.merge_task
     and the rest of ASES already receive as a parameter); the touches check diffs `branch` against its
@@ -84,6 +90,7 @@ def gate_before_review(
     so the card stays in review for the reviewer, a tamper_check_error event is recorded, and this returns True."""
     result = check_branch(
         repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
+        allow_gate_config_changes=allow_gate_config_changes,
     )
     if result.kind == "tamper_check_error":
         events_mod.record(conn, "tamper_check_error", {
@@ -102,17 +109,20 @@ def gate_before_review(
 
 def check_branch(
     repo: pathlib.Path, branch: str, integration_branch: str, gate1_commands: list[str],
-    touches: list[str], *, conn, task_key: str,
+    touches: list[str], *, conn, task_key: str, allow_gate_config_changes: bool = False,
 ) -> BranchCheck:
     """The decision behind gate_before_review, with no Hermes call: resolve the branch head, find its
     merge-base with the integration branch, hold the diff to the card's touches, run the tamper check over the
     same range (ASES-QG-03, ASES-QG-02, ASES-GIT-07), then re-run Gate 1 on the head (which records a gate_runs
     row). Gate 1 always runs when the scope and tamper checks pass; the merge queue uses check_branch_for_merge
-    instead, which reuses a record the controller already holds."""
+    instead, which reuses a record the controller already holds.
+
+    `allow_gate_config_changes` is the plan task's own ASES-QG-02 marker: see tamper.analyze_diff for why this,
+    not `touches`, is what the tamper check treats as "an explicit plan task that allows it"."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope
-    tampered = _check_tamper(repo, base, scope.head, touches, gate1_commands)
+    tampered = _check_tamper(repo, base, scope.head, touches, gate1_commands, allow_gate_config_changes)
     if tampered is not None:
         return tampered
     return _run_gate1(repo, scope.head, gate1_commands, conn=conn, task_key=task_key)
@@ -121,7 +131,7 @@ def check_branch(
 def check_branch_for_merge(
     repo: pathlib.Path, branch: str, integration_branch: str, gate1_commands: list[str],
     touches: list[str], *, conn, task_key: str, require_binding: bool = False,
-    reviewed_commit: str | None = None,
+    reviewed_commit: str | None = None, allow_gate_config_changes: bool = False,
 ) -> BranchCheck:
     """The merge queue's own branch check (ASES-GIT-03, ASES-GIT-13, ASES-QG-01). It does not rely on the
     review lane: Hermes's own gateway dispatcher can claim a review card and start the reviewer before
@@ -155,7 +165,10 @@ def check_branch_for_merge(
     (which may predate the check, or come from a path that never ran it) does not excuse a diff that tampers. It
     reads git only, it never runs a gate. A `tamper` or `tamper_check_error` result is returned as it is and the
     caller decides: `tamper` is a failure like any other, `tamper_check_error` means nothing is known and the
-    merge must not go ahead on it (it fails closed, and is worth retrying)."""
+    merge must not go ahead on it (it fails closed, and is worth retrying).
+
+    `allow_gate_config_changes` is the plan task's own ASES-QG-02 marker, passed straight through to the
+    tamper check (see check_branch)."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope
@@ -179,7 +192,7 @@ def check_branch_for_merge(
                 head,
             )
 
-    tampered = _check_tamper(repo, base, head, touches, gate1_commands)
+    tampered = _check_tamper(repo, base, head, touches, gate1_commands, allow_gate_config_changes)
     if tampered is not None:
         return tampered
 
@@ -265,21 +278,25 @@ _GATE_FILE_EXTENSIONS = (
 
 def _check_tamper(
     repo: pathlib.Path, base: str, head: str, touches: list[str], gate1_commands: list[str],
+    allow_gate_config_changes: bool = False,
 ) -> BranchCheck | None:
     """Run the tamper check over what `head` changed since `base` (the merge-base the scope check used, so the two
     checks read the same range). None when the diff is clean. Otherwise a failed BranchCheck: kind "tamper" with the
     blocking findings as the reason text (tamper.format_findings, trimmed like Gate 1's evidence), or kind
     "tamper_check_error" when the check could not run at all.
 
-    The task's touches are the allow paths (a path a task declares is its own territory for the config and
-    assertion rules; no touches can allow a skipped or deleted test, an unconditional pass or a secret), and the
-    files its own gate commands name are the gate configuration (gate_config_paths). Any failure to run the check,
-    a TamperCheckError from git or anything unexpected, is "tamper_check_error" and never a silent pass: what is
-    unknown is not clean. The reason is ASCII and redacted (it may be shown to a person and stored as an event)."""
+    The task's touches are the allow paths (a path a task declares is its own territory for the assertion rule;
+    no touches can allow a skipped or deleted test, an unconditional pass or a secret), and the files its own
+    gate commands name are the gate configuration (gate_config_paths). `allow_gate_config_changes` is the plan
+    task's own ASES-QG-02 marker: it, not touches, is what exempts a gate/CI/test-runner config change from
+    gate_config_changed (see tamper.analyze_diff). Any failure to run the check, a TamperCheckError from git or
+    anything unexpected, is "tamper_check_error" and never a silent pass: what is unknown is not clean. The
+    reason is ASCII and redacted (it may be shown to a person and stored as an event)."""
     try:
         findings = tamper_mod.check_range(
             repo, base, head, allow_paths=touches,
             gate_config_paths=gate_config_paths(gate1_commands, repo, head),
+            allow_gate_config_changes=allow_gate_config_changes,
         )
     except Exception as exc:  # noqa: BLE001 - anything that stops the check is "nothing is known", never "clean"
         text = str(exc) if isinstance(exc, tamper_mod.TamperCheckError) else f"{type(exc).__name__}: {exc}"

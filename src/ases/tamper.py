@@ -826,9 +826,13 @@ def _weakened_assertions(fd: FileDiff, path: str, already_flagged: set) -> list[
     return findings
 
 
-def _file_findings(fd: FileDiff, allow: tuple[str, ...], config_paths: tuple[str, ...]) -> list[Finding]:
+def _file_findings(
+    fd: FileDiff, allow: tuple[str, ...], config_paths: tuple[str, ...], allow_gate_config_changes: bool = False,
+) -> list[Finding]:
     """Every finding for one file of a diff. `allow` is the task's touches and `config_paths` the paths its gate
-    profile commands name, both already normalised. See analyze_diff for the rules."""
+    profile commands name, both already normalised. `allow_gate_config_changes` is the plan task's own marker
+    (ASES-QG-02): the only thing gate_config_changed accepts as "an explicit plan task that allows it". See
+    analyze_diff for the rules."""
     path = _norm(fd.path or "")
     anonymous = path == ""
     doc = _is_doc(path)
@@ -860,14 +864,21 @@ def _file_findings(fd: FileDiff, allow: tuple[str, ...], config_paths: tuple[str
     if fd.status == "M" and not doc and not allowed:
         found.extend(_weakened_assertions(fd, path, unconditional))
 
-    if path and not allowed:
+    # ASES-QG-02: being in the task's own touches used to be read as "a plan task allows it" (`allowed`), which
+    # meant this could never fire through review.check_branch's real wiring -- the scope check (_check_scope)
+    # already refuses any diff that touches a path outside touches, so by the time a path reaches here it is
+    # always `allowed`, touches-wise, whether narrow or wide, literal or wildcarded. The only thing that now
+    # counts as "an explicit plan task that allows it" is the plan task's own allow_gate_config_changes marker,
+    # independent of `allow`/touches (round 9, CIPIN; see docs/work-orders/builder-findings.md).
+    if path:
         reason = _config_reason(path, fd)
         if reason is None and any(_glob_match(path, glob) for glob in config_paths):
             reason = "a path an approved gate profile command names"
-        if reason is not None:
+        if reason is not None and not allow_gate_config_changes:
             found.append(Finding(
                 "gate_config_changed", path,
-                f"{reason} changed ({fd.status}) and no plan task allows it (ASES-QG-02)",
+                f"{reason} changed ({fd.status}) and the plan task does not set "
+                "allow_gate_config_changes (ASES-QG-02)",
             ))
 
     if path and fd.status == "A":
@@ -881,17 +892,22 @@ def _file_findings(fd: FileDiff, allow: tuple[str, ...], config_paths: tuple[str
     return found
 
 
-def _analyze_files(files: list[FileDiff], allow: tuple[str, ...], config_paths: tuple[str, ...]) -> list[Finding]:
+def _analyze_files(
+    files: list[FileDiff], allow: tuple[str, ...], config_paths: tuple[str, ...],
+    allow_gate_config_changes: bool = False,
+) -> list[Finding]:
     findings: list[Finding] = []
     for fd in files:
         try:
-            findings.extend(_file_findings(fd, allow, config_paths))
+            findings.extend(_file_findings(fd, allow, config_paths, allow_gate_config_changes))
         except Exception:  # the contract is "never raises"; a bug here must not turn into a crash in the gate
             _log.exception("tamper analysis failed for %r", getattr(fd, "path", "?"))
     return findings
 
 
-def analyze_diff(diff_text: str, *, allow_paths=(), gate_config_paths=()) -> list[Finding]:
+def analyze_diff(
+    diff_text: str, *, allow_paths=(), gate_config_paths=(), allow_gate_config_changes=False,
+) -> list[Finding]:
     """ASES-QG-03 and ASES-QG-02 over the text of a diff. Pure, and never raises: malformed input gives an empty
     list or fewer findings.
 
@@ -904,14 +920,22 @@ def analyze_diff(diff_text: str, *, allow_paths=(), gate_config_paths=()) -> lis
     ASES-SEC-01: generated_artifact and secret_added.
 
     `allow_paths` are the globs of the task's own touches, matched exactly as the touches check matches them. A
-    changed path an allow glob covers is exempt from gate_config_changed and from assertion_weakened (it is the
-    task's own territory) and from generated_artifact only when the glob names the artifact explicitly. It is
-    never exempt from skip_marker, test_deleted, unconditional_pass, test_file_deleted or secret_added: no plan
-    task can allow a worker to skip a test. `gate_config_paths` are extra paths whose change is gate
-    configuration, typically the files an approved gate profile's commands name."""
+    changed path an allow glob covers is exempt from assertion_weakened (it is the task's own territory) and
+    from generated_artifact only when the glob names the artifact explicitly. It is never exempt from
+    skip_marker, test_deleted, unconditional_pass, test_file_deleted or secret_added: no plan task can allow a
+    worker to skip a test. `gate_config_paths` are extra paths whose change is gate configuration, typically the
+    files an approved gate profile's commands name.
+
+    `allow_gate_config_changes` is the plan task's own marker (round 9, CIPIN): it, not `allow_paths`, is what
+    exempts a path from gate_config_changed. Being named in `allow_paths` used to be read as "a plan task allows
+    it", but review.check_branch's scope check (_check_scope) already refuses any diff with a path outside
+    touches before the tamper check ever runs, so every path this function sees from that caller is already
+    `allowed` by touches, literal or wildcarded -- gate_config_changed could never fire through that wiring.
+    `allow_gate_config_changes` is a whole-task switch (it does not need the changed path to be named anywhere),
+    exactly mirroring plan.py's Gate 0 field of the same name."""
     try:
         files = parse_diff(diff_text)
-        return _analyze_files(files, _globs(allow_paths), _globs(gate_config_paths))
+        return _analyze_files(files, _globs(allow_paths), _globs(gate_config_paths), bool(allow_gate_config_changes))
     except Exception:  # pragma: no cover - parse_diff and _analyze_files already contain their own failures
         _log.exception("tamper analysis failed")
         return []
@@ -994,7 +1018,7 @@ def _large_files(repo: pathlib.Path, head: str, paths: list[str], limit: int, ti
 
 def check_range(
     repo: pathlib.Path, base: str, head: str, *, allow_paths=(), gate_config_paths=(),
-    max_file_bytes: int | None = 1_000_000, timeout: float | None = 60,
+    allow_gate_config_changes=False, max_file_bytes: int | None = 1_000_000, timeout: float | None = 60,
 ) -> list[Finding]:
     """The tamper check for a branch: analyze what `head` changed since its merge base with `base`. This is the
     diff Gate 1 has to judge (ASES-QG-02, ASES-QG-03, ASES-GIT-07, ASES-SEC-01).
@@ -1006,6 +1030,10 @@ def check_range(
     --no-renames, as the touches check does, so a rename reads as a deletion plus an addition and the removed
     path is never hidden. The patch comes with the a/ b/ prefixes and quoting forced, so a user's git config
     (diff.noprefix, diff.mnemonicPrefix, core.quotepath, an external diff driver) cannot change what is parsed.
+
+    `allow_gate_config_changes` is the task's own ASES-QG-02 marker (see analyze_diff): pass the plan task's
+    `allow_gate_config_changes` field through here, not merely `touches` in `allow_paths` -- touches alone no
+    longer exempts a gate/CI/test-runner config change from gate_config_changed.
 
     Adds large_file findings for added or modified files over `max_file_bytes` (None turns that off).
 
@@ -1023,7 +1051,7 @@ def check_range(
     statuses = _parse_name_status(names)
 
     files = _reconcile_status(parse_diff(patch.decode("utf-8", errors="replace")), statuses)
-    findings = _analyze_files(files, _globs(allow_paths), _globs(gate_config_paths))
+    findings = _analyze_files(files, _globs(allow_paths), _globs(gate_config_paths), bool(allow_gate_config_changes))
     if max_file_bytes:
         findings.extend(_large_files(repo, head, [p for s, p in statuses if s in ("A", "M")], max_file_bytes, timeout))
     return findings

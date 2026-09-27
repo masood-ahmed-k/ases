@@ -145,17 +145,19 @@ def parse_and_validate(raw: dict, *, known_roles: set[str], max_cards: int) -> P
             # creation would fail on it too, when it joins the touches into the card body).
             errors.append(f"{where} ({key}): touches entries must be path glob strings")
         elif not allow_gate_config:
-            # ASES-QG-02: a task whose touches is broad enough to also cover gate, CI or test-runner
-            # configuration silently exempts it from tamper.analyze_diff's gate_config_changed finding too
-            # (that finding's allow_paths is the task's own touches). A narrow, explicit touches on exactly
-            # one gate-config path is fine without the marker (see _gate_config_violation).
+            # ASES-QG-02: a task whose touches names or is broad enough to also cover gate, CI or test-runner
+            # configuration needs the marker, whether the touches entry is a wildcard or a literal path (round
+            # 9, CIPIN): tamper.analyze_diff no longer reads a path being in touches as "a plan task allows
+            # it" for gate_config_changed, only allow_gate_config_changes does, so a literal, single-file
+            # touches on a gate-config path is no longer exempt either (see _gate_config_violation). Without
+            # this, Gate 0 would approve a plan Gate 1 can never let through.
             for g in touches:
                 hit = _gate_config_violation(g)
                 if hit is not None:
                     errors.append(
-                        f"{where} ({key}): touches {g!r} is broad enough to also cover gate/CI configuration "
-                        f"({hit!r}); add \"allow_gate_config_changes\": true if this task is meant to change "
-                        "it, or narrow the touches (ASES-QG-02)"
+                        f"{where} ({key}): touches {g!r} names or is broad enough to cover gate/CI "
+                        f"configuration ({hit!r}); add \"allow_gate_config_changes\": true if this task is "
+                        "meant to change it, or narrow the touches (ASES-QG-02)"
                     )
 
         gate_profile = rt.get("gate_profile")
@@ -276,22 +278,15 @@ def _globs_overlap(g1: str, g2: str) -> bool:
     return (p1.startswith(p2) or p2.startswith(p1)) and (s1.endswith(s2) or s2.endswith(s1))
 
 
-def _is_literal_glob(glob: str) -> bool:
-    """No wildcard character at all: a plain path, matching nothing else. Two literal globs can only overlap
-    (see _globs_overlap) by being equal, which is exactly the "narrow, explicit" exemption ASES-QG-02 wants: a
-    task allowed to touch exactly pytest.ini and nothing else should not need the marker."""
-    return not any(c in glob for c in _WILDCARDS)
-
-
 def _gate_config_violation(touches_glob: str) -> str | None:
-    """ASES-QG-02 (section 14.3): the gate-config pattern `touches_glob` is broad enough to also reach, or None.
-    A literal touches entry never violates (see _is_literal_glob); a wildcarded one does only when it actually
-    overlaps a pattern in tamper.GATE_CONFIG_PATTERNS, using the exact same conservative glob-overlap semantics
-    serialize_overlapping_tasks already uses, so this check and the merge-time scope check never disagree about
-    what a touches glob covers."""
-    normalized = _normalize_glob(touches_glob)
-    if _is_literal_glob(normalized):
-        return None
+    """ASES-QG-02 (section 14.3): the gate-config pattern `touches_glob` names or is broad enough to also reach,
+    or None. Checked with the exact same conservative glob-overlap semantics serialize_overlapping_tasks already
+    uses (see _globs_overlap), so this check and the merge-time scope check never disagree about what a touches
+    glob covers. A literal entry (no wildcard character at all) violates too when it is exactly one of the
+    gate-config paths (two literal globs can only overlap by being equal, per _globs_overlap): round 9 (CIPIN)
+    removed the old exemption here, because tamper.analyze_diff no longer reads a path being in touches, literal
+    or wildcarded, as "a plan task allows it" for gate_config_changed -- only allow_gate_config_changes does. A
+    plan Gate 0 approved without the marker must be a plan Gate 1 can actually let through."""
     overlap = _first_overlap((touches_glob,), tamper.GATE_CONFIG_PATTERNS)
     return overlap[1] if overlap is not None else None
 

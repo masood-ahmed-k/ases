@@ -986,9 +986,13 @@ def _record_gate_calls(monkeypatch):
     passing the wrong arguments fails loudly instead of being swallowed by *args."""
     calls = []
 
-    def fake(board, card_id, repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key):
+    def fake(
+        board, card_id, repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key,
+        allow_gate_config_changes=False,
+    ):
         calls.append({"card_id": card_id, "branch": branch, "integration_branch": integration_branch,
-                      "touches": touches, "task_key": task_key})
+                      "touches": touches, "task_key": task_key,
+                      "allow_gate_config_changes": allow_gate_config_changes})
         return True
 
     monkeypatch.setattr(review_mod, "gate_before_review", fake)
@@ -1305,6 +1309,25 @@ def test_review_lane_passes_the_plans_own_integration_branch_to_the_gate(tmp_pat
     controller.process_review_lane("b", tmp_path / "repo", plan, conn=conn)
 
     assert [(c["card_id"], c["integration_branch"]) for c in gate_calls] == [(pair.work_card_id, "main-line")]
+
+
+def test_review_lane_passes_the_tasks_allow_gate_config_changes_marker_to_the_gate(tmp_path, monkeypatch):
+    """ASES-QG-02 (round 9, CIPIN): the tamper check's exemption is the plan task's own
+    allow_gate_config_changes marker, not the task's touches, so process_review_lane must forward it from
+    plan_mod.PlanTask through to review.gate_before_review -- checked here for both settings so a caller that
+    hardcoded either value, or dropped the field, is caught."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    task = plan.task("T1")
+    plan = dataclasses.replace(plan, tasks=(dataclasses.replace(task, allow_gate_config_changes=True),))
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+    gate_calls = _record_gate_calls(monkeypatch)
+
+    controller.process_review_lane("b", tmp_path / "repo", plan, conn=conn)
+
+    assert [c["allow_gate_config_changes"] for c in gate_calls] == [True]
 
 
 def test_budget_gate_now_covers_a_fix_card_too(tmp_path, monkeypatch):
@@ -2753,6 +2776,25 @@ def test_the_merge_time_check_gets_the_tasks_own_gate_commands_touches_and_branc
         "branch": "swarm/T1-coder", "integration_branch": "integration",
         "gate1_commands": ["echo ok"], "touches": ["base.txt"], "task_key": "T1"}
     assert seen[0]["require_binding"] is True  # the merge queue always asks for the approval to be bound
+    assert seen[0]["allow_gate_config_changes"] is False  # ONE_TASK_PLAN's task does not set the marker
+
+
+def test_the_merge_time_check_gets_the_tasks_allow_gate_config_changes_marker(tmp_path, monkeypatch):
+    """ASES-QG-02 (round 9, CIPIN): process_merge_queue must forward plan_mod.PlanTask.allow_gate_config_changes
+    to review.check_branch_for_merge, the merge queue's own authoritative tamper check, exactly as
+    process_review_lane forwards it to gate_before_review."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    task = plan.task("T1")
+    plan = dataclasses.replace(plan, tasks=(dataclasses.replace(task, allow_gate_config_changes=True),))
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    seen = _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "abc123def456"))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert len(seen) == 1
+    assert seen[0]["allow_gate_config_changes"] is True
 
 
 def test_merge_task_is_told_the_exact_commit_that_was_checked(tmp_path, monkeypatch):

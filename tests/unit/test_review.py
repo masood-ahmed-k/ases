@@ -395,9 +395,12 @@ def test_check_branch_trims_the_gate1_evidence_to_1500_characters(repo, tmp_path
     _branch_with_changes(repo, "swarm/C6", {"tools/noisy.py": "print('x' * 5000)\nraise SystemExit(1)\n"})
     conn = db.connect(tmp_path / "ases.db")
 
+    # The gate command names tools/noisy.py itself (gate_config_paths), and the branch adds that exact file, so
+    # this needs the ASES-QG-02 marker to get past the tamper check to Gate 1 at all -- not what this test is
+    # about (it is about the length of Gate 1's OWN evidence), so it is granted here.
     result = review.check_branch(
         repo, "swarm/C6", "integration", [f'"{sys.executable}" tools/noisy.py'], ["tools/*"],
-        conn=conn, task_key="C6",
+        conn=conn, task_key="C6", allow_gate_config_changes=True,
     )
 
     prefix = "Gate 1 failed on the controller's re-check:\n"
@@ -1410,8 +1413,11 @@ def test_the_tamper_check_reads_the_range_the_scope_check_read_and_is_given_the_
     seen = _spy_check_range(monkeypatch)
     touches = ["tools/*", "src/*"]
 
+    # tools/check.py is also what the gate command names (gate_config_paths), so ASES-QG-02 needs the marker
+    # here too; that is not what this test is about (it is about the range check_branch computes and hands on).
     result = review.check_branch(
-        repo, "swarm/G2", "integration", ["python tools/check.py", "echo gate-ok"], touches, conn=conn, task_key="G2",
+        repo, "swarm/G2", "integration", ["python tools/check.py", "echo gate-ok"], touches, conn=conn,
+        task_key="G2", allow_gate_config_changes=True,
     )
 
     assert (result.ok, result.kind) == (True, "ok"), result.detail
@@ -1421,6 +1427,7 @@ def test_the_tamper_check_reads_the_range_the_scope_check_read_and_is_given_the_
     assert base != _head(repo, "integration")
     assert kwargs["allow_paths"] == touches
     assert list(kwargs["gate_config_paths"]) == ["tools/check.py"]
+    assert kwargs["allow_gate_config_changes"] is True
 
 
 def test_the_merge_check_gives_the_tamper_check_the_same_range_touches_and_gate_files(repo, tmp_path, monkeypatch):
@@ -1431,17 +1438,24 @@ def test_the_merge_check_gives_the_tamper_check_the_same_range_touches_and_gate_
 
     result = review.check_branch_for_merge(
         repo, "swarm/G3", "integration", ["python tools/check.py"], touches, conn=conn, task_key="G3",
+        allow_gate_config_changes=True,
     )
 
     assert result.ok is True
     (base, head, kwargs), = seen
     assert head == _head(repo, "swarm/G3") and base == _git("merge-base", "integration", "swarm/G3", cwd=repo).stdout.strip()
     assert kwargs["allow_paths"] == touches and list(kwargs["gate_config_paths"]) == ["tools/check.py"]
+    assert kwargs["allow_gate_config_changes"] is True
 
 
-def test_a_gate_config_file_the_tasks_touches_name_is_allowed(repo, tmp_path):
-    """ASES-QG-02: changing test-runner configuration needs a plan task that allows it. This task's touches name
-    pytest.ini, so the change is the task's own and the tamper check lets it through."""
+def test_a_gate_config_file_the_tasks_touches_name_is_not_allowed_without_the_marker(repo, tmp_path):
+    """ASES-QG-02 (round 9, CIPIN): changing test-runner configuration needs a plan task that EXPLICITLY allows
+    it, not merely a task whose touches happen to name the file. Before this fix, naming pytest.ini literally in
+    touches was enough on its own -- the tamper check read "in touches" as "a plan task allows it", and since
+    review.check_branch's own scope check (_check_scope) never lets a diff through unless every changed path is
+    already inside touches, that reading meant gate_config_changed could never actually block anything reaching
+    this function: whatever passed the scope check was automatically read as allowed. A task could quietly
+    change pytest.ini merely by listing it in touches, marker or not."""
     _commit_on_integration(repo, {"pytest.ini": "[pytest]\naddopts = -q\n", "src/a.py": "x = 1\n"})
     _branch_with_edit(repo, "swarm/G4", {"pytest.ini": "[pytest]\naddopts = -q -x\n"})
     conn = db.connect(tmp_path / "ases.db")
@@ -1450,12 +1464,30 @@ def test_a_gate_config_file_the_tasks_touches_name_is_allowed(repo, tmp_path):
         repo, "swarm/G4", "integration", ["echo gate-ok"], ["pytest.ini"], conn=conn, task_key="G4",
     )
 
+    assert (result.ok, result.kind) == (False, "tamper")
+    assert "gate_config_changed pytest.ini" in result.detail
+    assert "allow_gate_config_changes" in result.detail
+
+
+def test_a_gate_config_file_the_tasks_touches_name_is_allowed_with_the_marker(repo, tmp_path):
+    """The other half: a plan task that DOES set allow_gate_config_changes (plan.PlanTask, threaded through
+    controller.py's task.allow_gate_config_changes) still gets its own declared change through."""
+    _commit_on_integration(repo, {"pytest.ini": "[pytest]\naddopts = -q\n", "src/a.py": "x = 1\n"})
+    _branch_with_edit(repo, "swarm/G4b", {"pytest.ini": "[pytest]\naddopts = -q -x\n"})
+    conn = db.connect(tmp_path / "ases.db")
+
+    result = review.check_branch(
+        repo, "swarm/G4b", "integration", ["echo gate-ok"], ["pytest.ini"], conn=conn, task_key="G4b",
+        allow_gate_config_changes=True,
+    )
+
     assert (result.ok, result.kind) == (True, "ok")
 
 
 def test_a_gate_config_file_the_tasks_touches_do_not_name_never_gets_past_the_scope_check(repo, tmp_path, monkeypatch):
-    """The other half of ASES-QG-02, and why it is enough: the scope check runs first, so a config change the task
-    does not name is refused as out_of_scope before the tamper check (which would report it too) is consulted."""
+    """A THIRD way ASES-QG-02 is enforced: the scope check runs first, so a config change the task does not name
+    anywhere in its touches is refused as out_of_scope before the tamper check (which would also report it, via
+    gate_config_changed) is ever consulted."""
     _commit_on_integration(repo, {"pytest.ini": "[pytest]\naddopts = -q\n", "src/a.py": "x = 1\n"})
     _branch_with_edit(repo, "swarm/G5", {"pytest.ini": "[pytest]\naddopts = -q -x\n", "src/a.py": "x = 2\n"})
     conn = db.connect(tmp_path / "ases.db")
