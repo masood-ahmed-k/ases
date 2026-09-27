@@ -540,11 +540,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
 class Estimate:
     """What the approve screen shows about cost, and what Gate P decides from it. budget_lines are the per-provider
     request lines (ASES-CAP-03), calendar_lines the pacing estimate (ASES-CAP-04), policy_violation the reason the
-    data class refuses a provider (ASES-PRV-01, None when it does not), and unaffordable the providers the plan
-    cannot be afforded on today."""
+    data class refuses a provider (ASES-PRV-01, None when it does not), model_rejected the reason a role's pinned
+    model fails models.classify_model_context (ASES-MOD-02, None when every role's model is accepted), and
+    unaffordable the providers the plan cannot be afforded on today."""
     budget_lines: tuple[str, ...] = ()
     calendar_lines: tuple[str, ...] = ()
     policy_violation: str | None = None
+    model_rejected: str | None = None
     unaffordable: tuple[str, ...] = ()
 
     @property
@@ -558,17 +560,44 @@ class Estimate:
         rows = list(self.lines)
         if self.policy_violation:
             rows.insert(0, f"Gate P would REFUSE this plan (data policy, ASES-PRV-01): {self.policy_violation}")
+        if self.model_rejected:
+            rows.insert(0, f"Gate P would REFUSE this plan (context length, ASES-MOD-02): {self.model_rejected}")
         if self.unaffordable:
             rows.append(f"Gate P would REFUSE this plan today: it cannot be afforded on {list(self.unaffordable)} "
                         f"(ASES-CAP-03)")
         return "\n".join(rows)
 
 
+def _first_model_rejection(plan, models_config: dict) -> str | None:
+    """ASES-MOD-02, acceptance 22.4: the first task whose role resolves to a model
+    models.classify_model_context rejects, as one sentence naming the role, the model and why -- or None
+    when every role's pinned model is accepted. Shared by swarm approve (through _estimate_lines, before any
+    card exists) and swarm run's pre-flight (config/models.yaml can change between approve and run, so it is
+    re-checked, not just trusted from approval time)."""
+    checked: set[tuple[str, str]] = set()
+    for task in plan.tasks:
+        pp = policy_mod.profile_provider(task.role, models_config)
+        if pp is None or (pp.provider, pp.model) in checked:
+            continue
+        checked.add((pp.provider, pp.model))
+        decision = models_mod.classify_declared_model(models_config, pp.provider, pp.model)
+        if not decision.accepted:
+            return (f"role '{task.role}' resolves to model {pp.provider}/{pp.model}, "
+                    f"{decision.status.replace('_', ' ')}: {decision.reason}")
+    return None
+
+
 def _estimate_lines(plan, project, models_config: dict, conn) -> Estimate:
-    """ASES-REV-03, ASES-CAP-03, ASES-CAP-04, ASES-PRV-01, ASES-PRV-04: the request budget and the calendar
-    time of a plan, in the lines the approve screen prints. `swarm critique` hands the same text to the
-    reviewer, so the critic and the user judge the same numbers. The first provider the data class refuses
-    stops the estimate (there is nothing to budget for a plan that cannot run)."""
+    """ASES-REV-03, ASES-CAP-03, ASES-CAP-04, ASES-PRV-01, ASES-PRV-04, ASES-MOD-02: the request budget and
+    the calendar time of a plan, in the lines the approve screen prints. `swarm critique` hands the same text
+    to the reviewer, so the critic and the user judge the same numbers. A role whose pinned model is rejected
+    (_first_model_rejection) stops the estimate before the data-class/budget loop even starts (ASES-MOD-02:
+    the controller must reject an under-declared model "before any card starts", so this is checked first);
+    the first provider the data class refuses stops it next (there is nothing to budget for a plan that
+    cannot run)."""
+    model_rejected = _first_model_rejection(plan, models_config)
+    if model_rejected:
+        return Estimate(model_rejected=model_rejected)
     providers = models_config["providers"]
     provider_policies = {name: p.get("data_policy") for name, p in providers.items()}
     provider_verified_at = {name: p.get("data_policy_verified_at") for name, p in providers.items()}
@@ -606,7 +635,9 @@ def _estimate_lines(plan, project, models_config: dict, conn) -> Estimate:
             )
         else:
             calendar_lines.append(f"  {provider}/{model}: needs {n} request(s), ~{minutes:.1f} min at this provider's pace")
-    return Estimate(tuple(budget_lines), tuple(calendar_lines), None, tuple(unaffordable))
+    return Estimate(
+        budget_lines=tuple(budget_lines), calendar_lines=tuple(calendar_lines), unaffordable=tuple(unaffordable),
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -808,6 +839,9 @@ def cmd_approve(args: argparse.Namespace) -> int:
 
     models_config = _load_models_config()
     estimate = _estimate_lines(plan, project, models_config, conn)
+    if estimate.model_rejected:
+        _err(f"Gate P REFUSED (ASES-MOD-02): {estimate.model_rejected}")
+        return 1
     if estimate.policy_violation:
         _err(f"Gate P REFUSED (ASES-PRV-01): {estimate.policy_violation}")
         return 1
@@ -1078,6 +1112,10 @@ def _run_loop(args: argparse.Namespace) -> int:
         return refused
 
     models_config = _load_models_config()
+    rejected = _first_model_rejection(plan, models_config)
+    if rejected:
+        _err(f"swarm run REFUSED (ASES-MOD-02): {rejected}")
+        return 1
     consecutive_errors = 0
     for i in range(args.max_iterations):
         number = i + 1

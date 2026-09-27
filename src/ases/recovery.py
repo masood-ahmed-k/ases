@@ -607,14 +607,18 @@ def _smoke_failed(row: dict) -> bool:
     return "fail" in (_word(row.get("smoke_test_result")), _word(row.get("smoke_test")))
 
 
-def _unfit_for_agent_role(row: dict) -> bool:
-    """A row that says outright it cannot serve an agent role: tool calling declared false, or a declared context
-    under the 64K floor (ASES-MOD-02, ASES-MOD-04). A row that declares neither is not judged here, that is the
-    doctor's job, so a minimal row still counts."""
+def _unfit_for_agent_role(row: dict, providers: dict) -> bool:
+    """A row that says outright it cannot serve an agent role: tool calling declared false, or a model
+    models.classify_model_context rejects (declared context under the 64K floor, or undeclared on a custom
+    OpenAI-compatible endpoint -- ASES-MOD-02, ASES-MOD-04). next_model must never switch a card onto a model
+    the controller would itself refuse at swarm approve/run pre-flight (acceptance 22.4); this is the "any
+    other place the controller picks a model" the work order calls out. A row that declares neither is not
+    judged here beyond classify_model_context's own call (a native-provider row with no declared context is
+    accepted, per that function's docstring), so a minimal row still counts."""
     if row.get("tool_calling") is False:
         return True
-    context = row.get("context_length")
-    return isinstance(context, int) and not isinstance(context, bool) and context < models_mod.MINIMUM_CONTEXT_LENGTH
+    provider_type = (providers.get(row.get("provider")) or {}).get("type")
+    return not models_mod.classify_model_context(row.get("context_length"), provider_type).accepted
 
 
 def next_model(
@@ -645,7 +649,7 @@ def next_model(
             continue
         if (provider, model) in unhealthy or (provider, "*") in unhealthy:
             continue
-        if _smoke_failed(row) or _unfit_for_agent_role(row):
+        if _smoke_failed(row) or _unfit_for_agent_role(row, providers):
             continue
         if data_class is not None:
             declared = row.get("data_policy") or (providers.get(provider) or {}).get("data_policy")

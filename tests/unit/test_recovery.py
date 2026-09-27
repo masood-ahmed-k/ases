@@ -1023,6 +1023,40 @@ def test_next_model_skips_a_model_that_says_it_cannot_serve_an_agent_role():
     assert recovery.next_model(models, "coder", "x", "current") == ("x", "ok")
 
 
+def test_next_model_skips_a_candidate_rejected_as_unknown_on_a_custom_openai_compatible_endpoint():
+    """ASES-MOD-02, acceptance 22.4: "any other place the controller picks a model" must never pick one
+    models.classify_model_context rejects. A candidate on a custom OpenAI-compatible endpoint (provider type
+    openai_compatible) with no declared context_length is rejected as unknown, the same as it would be at
+    swarm approve/run pre-flight -- next_model must skip it and fall through to a candidate it can vouch for,
+    exactly as it already does for a declared-too-small one (the test just above this one)."""
+    models = {
+        "providers": {"x": {"type": "openai_compatible"}},
+        "models": [
+            {"provider": "x", "model": "current", "role_class": "coder", "pinned": True},
+            {"provider": "x", "model": "undeclared", "role_class": "coder_candidate", "tool_calling": True},
+            {"provider": "x", "model": "ok", "role_class": "coder_candidate", "tool_calling": True,
+             "context_length": 64_000},
+        ],
+    }
+    assert recovery.next_model(models, "coder", "x", "current") == ("x", "ok")
+
+
+def test_next_model_accepts_an_undeclared_candidate_on_a_native_provider():
+    """The mirror image of the test above: a candidate on a NATIVE Hermes provider (type openrouter or
+    hermes_provider, or no declared type) with no declared context_length is accepted, per
+    models.classify_model_context's own documented reading of the blueprint -- next_model must still offer
+    it, not skip it as if it were the custom-endpoint case."""
+    models = {
+        "providers": {"x": {"type": "hermes_provider", "provider_id": "x-native"}},
+        "models": [
+            {"provider": "x", "model": "current", "role_class": "coder", "pinned": True},
+            {"provider": "x", "model": "undeclared-but-native", "role_class": "coder_candidate",
+             "tool_calling": True},
+        ],
+    }
+    assert recovery.next_model(models, "coder", "x", "current") == ("x", "undeclared-but-native")
+
+
 def test_next_model_never_leaves_the_data_class_when_it_is_given_one():
     assert recovery.next_model(MODELS, "coder", "xkiro", CODER_MODEL, data_class="public") == ("xkiro", CANDIDATE_1)
     # xkiro's declared policy (router_ztr_upstream_varies) does not clear "private": nothing to switch to.

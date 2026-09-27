@@ -410,11 +410,20 @@ def _check_sandbox(project: ases_config.ProjectConfig, models_config: dict, prof
     return rows
 
 
-def _check_model_registry(conn) -> list[DoctorCheck]:
+def _check_model_registry(conn, models_config: dict) -> list[DoctorCheck]:
+    """ASES-MOD-02, acceptance 22.4: one context_length[provider/model] row per registered model. PASS only
+    when context_length is declared and sufficient. Otherwise: FAIL when the model is PINNED and
+    models.classify_model_context rejects it -- the controller now refuses this at swarm approve/run
+    pre-flight, so the run really cannot start (row name kept as `context_length[...]`, unchanged, so nothing
+    downstream that keys off it breaks). Everything else -- an unpinned candidate the controller would
+    reject, or a model classify_model_context accepts but whose context is still undeclared (a native
+    provider with no declared context, trusted to Hermes's own knowledge/probing per that function's
+    docstring) -- stays a WARN, exactly as before this round: informational, never blocking a start."""
     checks: list[DoctorCheck] = []
     records = models_mod.list_models(conn)
     if not records:
         return [DoctorCheck("model_registry", "fail", "no models declared in config/models.yaml", ("ASES-MOD-02",))]
+    providers = models_config.get("providers") or {}
     for m in records:
         label = f"{m.provider}/{m.model}"
         if m.context_declared_and_sufficient:
@@ -424,12 +433,22 @@ def _check_model_registry(conn) -> list[DoctorCheck]:
                 ("ASES-MOD-02",),
             ))
         else:
-            checks.append(DoctorCheck(
-                f"context_length[{label}]", "warn",
-                f"context length {'undeclared' if m.context_length is None else f'only {m.context_length}'} "
-                f"in config/models.yaml -- confirm >= {models_mod.MINIMUM_CONTEXT_LENGTH} before pinning this model",
-                ("ASES-MOD-02",),
-            ))
+            provider_type = (providers.get(m.provider) or {}).get("type")
+            decision = models_mod.classify_model_context(m.context_length, provider_type)
+            if m.pinned and not decision.accepted:
+                checks.append(DoctorCheck(
+                    f"context_length[{label}]", "fail",
+                    f"pinned model {decision.status.replace('_', ' ')}: {decision.reason} -- the controller "
+                    f"refuses this at swarm approve/run pre-flight, so the run cannot start (ASES-MOD-02, 22.4)",
+                    ("ASES-MOD-02",),
+                ))
+            else:
+                checks.append(DoctorCheck(
+                    f"context_length[{label}]", "warn",
+                    f"context length {'undeclared' if m.context_length is None else f'only {m.context_length}'} "
+                    f"in config/models.yaml -- confirm >= {models_mod.MINIMUM_CONTEXT_LENGTH} before pinning this model",
+                    ("ASES-MOD-02",),
+                ))
         if m.smoke_tested:
             checks.append(DoctorCheck(
                 f"smoke_test[{label}]", "pass", f"last smoke test passed at {m.smoke_test_at}", ("ASES-MOD-04",)
@@ -656,7 +675,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         _check_hermes_doctor(),
         _check_gateway_dispatcher(),
         *_check_sandbox(project, models_config, profiles_mod),
-        *_check_model_registry(conn),
+        *_check_model_registry(conn, models_config),
         _check_role_profiles(project),
         _check_reviewer_diversity(project),
         *([profiles_unavailable] if profiles_unavailable is not None

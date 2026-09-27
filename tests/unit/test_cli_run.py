@@ -123,6 +123,30 @@ def test_run_refuses_to_start_on_a_primary_checkout_ases_cannot_trust(wired, mon
     assert "REFUSED (ASES-GIT-12)" in err and "stray.txt" in err
 
 
+def test_run_refuses_before_any_pass_when_a_pinned_role_model_is_rejected(wired, monkeypatch, capsys):
+    """ASES-MOD-02, acceptance 22.4: swarm run's own pre-flight refuses the same way swarm approve does, since
+    config/models.yaml can change between approve and run. Here the coder role's pinned model is on a custom
+    OpenAI-compatible endpoint with no declared context_length -- rejected as unknown -- and the refusal must
+    come before the first controller.run_pass call, exit non-zero like the other pre-flight refusals above."""
+    task = types.SimpleNamespace(key="T1", role="coder", sandbox_network=False, allow_gate_config_changes=False)
+    plan = types.SimpleNamespace(
+        project="p", gate_profiles={}, integration_branch="integration", serialization_links=(), tasks=(task,),
+    )
+    monkeypatch.setattr(cli.plan_mod, "load_plan_file", lambda *a, **kw: plan)
+    monkeypatch.setattr(cli, "_load_models_config", lambda: {
+        "providers": {"xkiro": {"type": "openai_compatible"}},
+        "models": [{"provider": "xkiro", "model": "undeclared-model", "role_class": "coder", "pinned": True}],
+    })
+    calls = _scripted_run_pass(monkeypatch, [_DONE])  # never reached if the refusal works
+
+    assert cli.cmd_run(wired.args) == 1
+
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "swarm run REFUSED (ASES-MOD-02)" in err
+    assert "coder" in err and "xkiro/undeclared-model" in err and "rejected unknown" in err
+
+
 def test_run_adopts_the_checkouts_head_only_after_the_guard_passes(wired, monkeypatch):
     adopted = []
     monkeypatch.setattr(cli.guards_mod, "adopt_current_head", lambda conn, project, repo: adopted.append(project) or "abc")
