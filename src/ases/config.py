@@ -229,6 +229,27 @@ def _validate_data_policy_verification_fields(providers: dict) -> None:
             )
 
 
+def _validate_verification_source_field(providers: dict) -> None:
+    """ASES-VER-01 (section 5.3, Appendix E): "swarm doctor MUST display the value it is using, the source
+    URL and the checked date." `verified_on` already carries the date; `source` is the optional companion
+    field for the page the value came from -- a URL from the blueprint's Appendix E, or one already written
+    in this file's own comments, never invented. Not every provider has one yet (some numbers are genuinely
+    unpublished, e.g. xkiro's), so it is optional and swarm doctor WARNs rather than fails when it is
+    missing; this only validates the SHAPE of whichever is present, same convention as
+    data_policy_source above."""
+    if not isinstance(providers, dict):
+        return
+    for name, entry in providers.items():
+        if not isinstance(entry, dict):
+            continue
+        source = entry.get("source")
+        if source is not None and not isinstance(source, str):
+            raise ConfigError(
+                f"config/models.yaml: providers.{name}.source must be a string (a URL from the blueprint's "
+                f"Appendix E or already written in this file's comments), got {source!r}"
+            )
+
+
 def load_models_config(path: str | pathlib.Path) -> dict:
     path = pathlib.Path(path)
     if not path.exists():
@@ -237,6 +258,7 @@ def load_models_config(path: str | pathlib.Path) -> dict:
     if "providers" not in raw or "models" not in raw:
         raise ConfigError("config/models.yaml must have top-level 'providers' and 'models' keys")
     _validate_data_policy_verification_fields(raw["providers"])
+    _validate_verification_source_field(raw["providers"])
     return raw
 
 

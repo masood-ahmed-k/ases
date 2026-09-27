@@ -322,6 +322,142 @@ def test_key_pooling_is_wired_into_the_report_and_warns_on_a_real_pool(tmp_path,
     assert report.checks[-1].name == "no_secrets_in_output"  # the secrets check still runs last
 
 
+# --- ASES-CAP-01/ASES-VER-01: the limits table shows a source URL, and WARNs when one is missing ------------
+
+
+def test_limits_table_passes_and_shows_the_source_when_every_provider_has_one():
+    models_config = {"providers": {
+        "a": {"limits": {"rpm": 20}, "verified_on": "2026-09-17", "source": "https://example.com/limits"},
+    }}
+
+    check = doctor._check_limits_table(models_config)
+
+    assert check.status == "pass"
+    assert "https://example.com/limits" in check.detail and "2026-09-17" in check.detail
+    assert check.requirement_ids == ("ASES-CAP-01", "ASES-VER-01")
+
+
+def test_limits_table_warns_and_names_the_provider_with_no_source():
+    models_config = {"providers": {
+        "a": {"limits": {"rpm": 20}, "verified_on": "2026-09-17", "source": "https://example.com/limits"},
+        "b": {"limits": {}, "verified_on": "2026-09-19"},   # no source
+    }}
+
+    check = doctor._check_limits_table(models_config)
+
+    assert check.status == "warn"
+    assert "b" in check.detail and "no source URL on record" in check.detail
+    assert "ASES-VER-01" in check.requirement_ids
+
+
+def test_limits_table_is_wired_into_the_report_and_warns_on_a_real_missing_source(tmp_path, monkeypatch):
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models_config = {**MODELS_CONFIG, "providers": {"unorouter": {"verified_on": "2026-09-17"}}}
+    models.sync_from_config(conn, models_config)
+
+    report = doctor.run(project, models_config, conn)
+
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["limits_displayed"].status == "warn"
+    assert "unorouter" in by_name["limits_displayed"].detail
+
+
+# --- p213/ASES-CFG-04/ASES-CFG-05: a provider key set in this process's own environment -----------------------
+
+
+def test_provider_keys_not_exported_passes_when_no_key_env_is_set(monkeypatch):
+    monkeypatch.delenv("SOME_PROVIDER_API_KEY", raising=False)
+    models_config = {"providers": {"a": {"key_env": "SOME_PROVIDER_API_KEY"}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+
+    assert check.status == "pass"
+    assert check.requirement_ids == ("ASES-CFG-04", "ASES-CFG-05")
+
+
+def test_provider_keys_not_exported_warns_and_names_the_variable(monkeypatch):
+    monkeypatch.setenv("SOME_PROVIDER_API_KEY", "sk-totally-secret-value")
+    models_config = {"providers": {"a": {"key_env": "SOME_PROVIDER_API_KEY"}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+
+    assert check.status == "warn"
+    assert "SOME_PROVIDER_API_KEY" in check.detail
+    assert "sk-totally-secret-value" not in check.detail   # the value is never printed
+    assert "Never export provider keys in the shell that launches the gateway or the controller" in check.detail
+
+
+def test_provider_keys_not_exported_ignores_an_empty_value(monkeypatch):
+    monkeypatch.setenv("SOME_PROVIDER_API_KEY", "")
+    models_config = {"providers": {"a": {"key_env": "SOME_PROVIDER_API_KEY"}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+
+    assert check.status == "pass"
+
+
+def test_provider_keys_not_exported_ignores_anonymous_providers(monkeypatch):
+    models_config = {"providers": {"opencode_free": {"key_env": None}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+
+    assert check.status == "pass"
+
+
+def test_provider_keys_not_exported_lists_other_credential_shaped_vars_as_info_only(monkeypatch):
+    monkeypatch.delenv("SOME_PROVIDER_API_KEY", raising=False)
+    monkeypatch.setenv("SOME_OTHER_TOKEN", "value-does-not-matter")
+    models_config = {"providers": {"a": {"key_env": "SOME_PROVIDER_API_KEY"}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+
+    assert check.status == "pass"   # an unrelated credential-shaped var never warns by itself
+    assert "SOME_OTHER_TOKEN" in check.detail
+    assert "value-does-not-matter" not in check.detail
+
+
+def test_provider_keys_not_exported_does_not_double_list_a_warned_key_env(monkeypatch):
+    monkeypatch.setenv("SOME_PROVIDER_API_KEY", "secret")
+    models_config = {"providers": {"a": {"key_env": "SOME_PROVIDER_API_KEY"}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+
+    assert check.status == "warn"
+    assert check.detail.count("SOME_PROVIDER_API_KEY") == 1
+
+
+def test_provider_keys_not_exported_never_leaks_a_value(monkeypatch):
+    monkeypatch.setenv("SOME_PROVIDER_API_KEY", "sk-totally-secret-value")
+    monkeypatch.setenv("SOME_OTHER_SECRET", "another-secret-value")
+    models_config = {"providers": {"a": {"key_env": "SOME_PROVIDER_API_KEY"}}}
+
+    check = doctor._check_provider_keys_not_exported(models_config)
+    no_secrets = doctor._check_no_secrets_in_output(check.detail)
+
+    assert no_secrets.status == "pass"
+
+
+def test_provider_keys_not_exported_is_wired_into_the_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-should-not-be-set-here")
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models_config = {**MODELS_CONFIG, "providers": {
+        **MODELS_CONFIG["providers"], "openrouter": {"key_env": "OPENROUTER_API_KEY"},
+    }}
+    models.sync_from_config(conn, models_config)
+
+    report = doctor.run(project, models_config, conn)
+
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["provider_keys_not_exported"].status == "warn"
+    assert "OPENROUTER_API_KEY" in by_name["provider_keys_not_exported"].detail
+    assert "sk-should-not-be-set-here" not in by_name["provider_keys_not_exported"].detail
+    assert report.checks[-1].name == "no_secrets_in_output"  # the secrets check still runs last
+
+
 # --- the rows other modules feed: profiles.verify_state and sandbox.doctor_checks ---------------------------
 
 

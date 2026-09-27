@@ -163,6 +163,43 @@ def test_a_non_string_verification_source_is_a_config_error(tmp_path):
         config.load_models_config(p)
 
 
+# --- providers.<name>.source (ASES-VER-01) -------------------------------------------------------
+
+
+def test_verification_source_field_parses_when_present(tmp_path):
+    p = _write(tmp_path / "models.yaml", (
+        "providers:\n"
+        "  a:\n"
+        "    verified_on: \"2026-09-19\"\n"
+        "    source: \"https://example.com/limits\"\n"
+        "models: []\n"
+    ))
+
+    raw = config.load_models_config(p)
+
+    assert raw["providers"]["a"]["source"] == "https://example.com/limits"
+
+
+def test_verification_source_field_is_absent_safe(tmp_path):
+    """No source at all: fine to load -- not every provider's numbers have a known page yet (xkiro's
+    limits are genuinely unpublished), and swarm doctor WARNs on the missing source rather than
+    refusing to load."""
+    p = _write(tmp_path / "models.yaml", "providers:\n  a:\n    verified_on: \"2026-09-19\"\nmodels: []\n")
+
+    raw = config.load_models_config(p)
+
+    assert raw["providers"]["a"].get("source") is None
+
+
+def test_a_non_string_verification_source_field_is_a_config_error(tmp_path):
+    p = _write(tmp_path / "models.yaml", (
+        "providers:\n  a:\n    verified_on: \"2026-09-19\"\n    source: 12345\nmodels: []\n"
+    ))
+
+    with pytest.raises(config.ConfigError, match="providers.a.source"):
+        config.load_models_config(p)
+
+
 def test_the_shipped_models_yaml_still_loads_and_documents_the_new_fields_as_comments(tmp_path):
     import pathlib
 
@@ -175,6 +212,18 @@ def test_the_shipped_models_yaml_still_loads_and_documents_the_new_fields_as_com
     for provider in raw["providers"].values():
         assert provider.get("data_policy_verified_at") is None
     assert text.isascii()
+
+
+def test_the_shipped_models_yaml_openrouter_source_is_a_real_appendix_e_url(tmp_path):
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "config" / "models.yaml"
+    raw = config.load_models_config(path)
+
+    assert raw["providers"]["openrouter"]["source"] == "https://openrouter.ai/docs/api-reference/limits"
+    # xkiro's limits are documented as genuinely unpublished (see the provider's own comment): no source
+    # invented for it just to fill the field.
+    assert raw["providers"]["xkiro"].get("source") is None
 
 
 def test_db_path_is_ases_db_under_ases_home(tmp_path):
