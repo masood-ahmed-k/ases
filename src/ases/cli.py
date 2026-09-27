@@ -32,8 +32,10 @@ import inspect
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import types
 from datetime import datetime, timedelta, timezone
@@ -55,7 +57,7 @@ from . import reconcile as reconcile_mod
 from . import report as report_mod
 from . import sandbox as sandbox_mod
 
-_GLYPH = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "pending": "[PEND]"}
+_GLYPH = {"pass": "[PASS]", "warn": "[WARN]", "fail": "[FAIL]", "pending": "[PEND]", "info": "[INFO]"}
 # swarm run keeps polling through an isolated failed pass (a hermes CLI timeout, a locked database) but
 # gives up when the same kind of failure repeats: past this many in a row it is a fault, not a blip.
 _MAX_CONSECUTIVE_PASS_ERRORS = 5
@@ -266,6 +268,121 @@ def cmd_models(_args: argparse.Namespace) -> int:
         pin = "pinned" if m.pinned else "unpinned"
         _out(f"{m.provider}/{m.model}  role={m.role_class or '-'}  context={ctx}  smoke={smoke}  {pin}")
     return 0
+
+
+# ---------------------------------------------------------------------------------------------
+# smoke-test (ASES-MOD-04): models.record_smoke_test had no production caller before this command
+# ---------------------------------------------------------------------------------------------
+
+_SMOKE_TEST_MARKER_FILE = "ases_smoke_test.json"
+_SMOKE_TEST_MARKER_BODY = '{"ok": true}'
+_SMOKE_TEST_TIMEOUT_DEFAULT = 120
+
+
+def _smoke_test_prompt() -> str:
+    """A tiny tool-calling task with a structured result (ASES-MOD-04, p125): the model is asked to use its real
+    Hermes file tool (not a simulated one, unlike evalkit's E9) to write a small marker file, then to answer with
+    exactly one JSON object. Both tool calling and a structured result are exercised through the real Hermes path
+    in one small, cheap call."""
+    return (
+        "This is an automated smoke test of your tool-calling path. Do exactly two things and nothing else. "
+        f"First, use your file tool to write a file named {_SMOKE_TEST_MARKER_FILE} in the current directory "
+        f"containing exactly this text and nothing else: {_SMOKE_TEST_MARKER_BODY}\n"
+        'Second, reply with exactly one JSON object and nothing else, with this exact shape: '
+        '{"file_written": true}'
+    )
+
+
+def _validate_smoke_test(workdir: pathlib.Path, stdout: str) -> tuple[bool, str]:
+    """Validates the structured result of one smoke-test call two ways, not one: the marker file the tool call
+    was asked to write really exists with the expected content (so a model that only CLAIMS to have used the
+    tool is caught), and the model's final reply really is the one JSON object it was asked for."""
+    marker = pathlib.Path(workdir) / _SMOKE_TEST_MARKER_FILE
+    if not marker.exists():
+        return False, f"the model did not create {_SMOKE_TEST_MARKER_FILE} with its file tool"
+    try:
+        body = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, f"{_SMOKE_TEST_MARKER_FILE} is not valid JSON: {exc}"
+    if body != {"ok": True}:
+        return False, f"{_SMOKE_TEST_MARKER_FILE} did not hold the expected content: {body!r}"
+    try:
+        reply = json.loads((stdout or "").strip())
+    except ValueError as exc:
+        return False, f"the model's final reply is not valid JSON: {exc}"
+    if not isinstance(reply, dict) or reply.get("file_written") is not True:
+        return False, f"the model's final reply did not hold the expected structured result: {reply!r}"
+    return True, "tool call verified (marker file written) and the structured result parsed"
+
+
+@_command
+def cmd_smoke_test(args: argparse.Namespace) -> int:
+    """ASES-MOD-04: "Before first use, run one smoke test per model through the real Hermes path: a tiny
+    tool-calling task with a structured result. Record the result and the latency." Before this command
+    models.record_smoke_test had no production caller: a smoke test could only be recorded by hand.
+
+    Spends real provider quota (ASES-DOC-04), so it is refused without --spend-quota, exactly like `swarm eval
+    run`: without the flag this prints the plan (what would be called and with which profile) and calls nothing.
+    The one call that really reaches a model is evals.default_invoke, reused rather than a second subprocess
+    path, so the same credential-scrubbed environment applies here too (ASES-CFG-05)."""
+    evals = _lazy("evals")
+    project = _load_project()
+    models_config = _load_models_config()
+    try:
+        candidate = evals.candidate_from_config(
+            models_config, f"{args.provider}/{args.model}", roles=project.roles, profile=args.profile,
+        )
+    except evals.EvalError as exc:
+        _err(f"swarm smoke-test: {exc}")
+        return 1
+    if not args.spend_quota:
+        _out("Smoke test plan (a dry run: nothing was called and no quota was spent)")
+        _out(f"  candidate: {candidate.label} (profile {candidate.profile})")
+        _out(f"  timeout:   {args.timeout}s")
+        _out("To spend this quota, run the same command again with --spend-quota.")
+        return 0
+    conn = _open_conn(project)
+    try:
+        models_mod.sync_from_config(conn, models_config)
+        workdir: pathlib.Path | None = None
+        result = None
+        try:
+            workdir = pathlib.Path(tempfile.mkdtemp(prefix="ases-smoke-"))
+            result = evals.default_invoke(candidate, _smoke_test_prompt(), workdir, args.timeout, tools=("file",))
+            if result.timed_out:
+                passed, detail = False, f"the model call did not finish within {args.timeout}s"
+            elif result.returncode != 0:
+                tail = (result.stderr or result.stdout or "").strip().replace("\n", " ")[:300]
+                passed, detail = False, f"the model call failed (exit {result.returncode}): {tail}"
+            else:
+                passed, detail = _validate_smoke_test(workdir, result.stdout)
+        except Exception as exc:  # noqa: BLE001 - a smoke test that cannot even run is a recorded failure,
+            # never a crash: default_invoke documents itself as never raising, but a temp-dir failure (disk
+            # full, no permission) or a future change to that contract must still end in a clean [FAIL], the
+            # same as every other way this command can fail.
+            passed, detail = False, f"the smoke test could not run: {type(exc).__name__}: {exc}"
+        finally:
+            if workdir is not None:
+                shutil.rmtree(workdir, ignore_errors=True)
+        # ASES-MOD-04 says "Record the result and the latency", not just the result: fold the latency (and the
+        # request count) into the detail string that is actually persisted, the same way it is already folded
+        # into the printed line below, so a reader of model_registry (swarm models, swarm doctor, a future smoke-
+        # test history) can see how long the last smoke test took without re-running it.
+        latency_suffix = (
+            f"; latency {result.latency_seconds:.1f}s, {result.requests} request(s)" if result is not None else ""
+        )
+        try:
+            models_mod.record_smoke_test(
+                conn, candidate.provider, candidate.model, "pass" if passed else "fail", detail + latency_suffix,
+            )
+        except KeyError as exc:
+            _err(f"swarm smoke-test: {exc}")
+            return 1
+    finally:
+        conn.close()
+    verdict = "PASS" if passed else "FAIL"
+    _out(f"Smoke test {candidate.label} via profile {candidate.profile}: {verdict} ({detail}){latency_suffix}")
+    return 0 if passed else 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1327,6 +1444,22 @@ def _describe(item) -> str:
     return str(line() if callable(line) else item)
 
 
+def _print_residual_risks(profiles) -> None:
+    """ASES-ROL-05: profiles.residual_risks()'s own docstring asks `swarm init` (and `swarm doctor`, see
+    doctor._check_residual_risks) to print the known, accepted limits of the profile hardening ASES can do next
+    to the plan, so nobody mistakes a clean change list for every gap being closed. `profiles` may be an older
+    build (or a test's stub) with no such function; then there is nothing to print."""
+    risks_fn = getattr(profiles, "residual_risks", None)
+    if risks_fn is None:
+        return
+    risks = list(risks_fn())
+    if not risks:
+        return
+    _out("Known limits swarm init cannot fix (ASES-ROL-05):")
+    for risk in risks:
+        _out(f"  - {risk}")
+
+
 @_command
 def cmd_init(args: argparse.Namespace) -> int:
     """ASES-ROL-01 to ASES-ROL-09, ASES-ARC-08, ASES-GIT-16, ASES-SEC-03: bring the Hermes profiles to the state
@@ -1380,6 +1513,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     _out(header + (f", {warnings} warning(s)" if warnings else "") + ("" if apply else " (dry run)"))
     for change in changes:
         _out(f"  {_describe(change)}")
+    _print_residual_risks(profiles)
     if not actionable:
         _out("The Hermes profiles are already in the desired state; nothing to do."
              + (" The warnings above are conditions ASES reports but does not change." if warnings else ""))
@@ -1495,6 +1629,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("models", help="List the model registry and its declared capabilities").set_defaults(
         func=cmd_models
     )
+
+    p_smoke = sub.add_parser(
+        "smoke-test",
+        help="ASES-MOD-04: one tool-calling smoke test through the real Hermes path (a dry run without "
+             "--spend-quota)",
+    )
+    p_smoke.add_argument("--provider", required=True, help="Provider as declared in config/models.yaml")
+    p_smoke.add_argument("--model", required=True, help="Model as declared in config/models.yaml")
+    p_smoke.add_argument("--profile", default=None,
+                         help="Hermes profile to play the model (default: the role map's profile for the "
+                              "model's role_class)")
+    p_smoke.add_argument("--spend-quota", dest="spend_quota", action="store_true",
+                         help="really call the model (spends real provider quota)")
+    p_smoke.add_argument("--timeout", type=_positive_int, default=_SMOKE_TEST_TIMEOUT_DEFAULT,
+                         help=f"seconds to wait for the model's answer (default {_SMOKE_TEST_TIMEOUT_DEFAULT})")
+    p_smoke.set_defaults(func=cmd_smoke_test)
 
     p_init = sub.add_parser(
         "init", help="Bring the Hermes profiles to the state ASES needs (a dry run unless --apply --yes)",

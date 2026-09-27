@@ -33,7 +33,7 @@ from . import models as models_mod
 from . import procenv as procenv_mod
 from . import sandbox as sandbox_mod
 
-Status = str  # "pass" | "warn" | "fail" | "pending"
+Status = str  # "pass" | "warn" | "fail" | "pending" | "info"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,6 +255,29 @@ def _check_profile_state(project: ases_config.ProjectConfig, models_config: dict
             f"profile_state[{number}]", "warn", f"{problem} (`swarm init` shows the fix)", _extract_requirement_ids(problem),
         )
         for number, problem in enumerate(problems, start=1)
+    ]
+
+
+def _check_residual_risks(profiles_mod: object | None) -> list[DoctorCheck]:
+    """ASES-ROL-05: profiles.residual_risks() names the known, accepted limits of the profile hardening this
+    build can do (its own docstring asks `swarm init` and `swarm doctor` to print them next to the plan, see
+    profiles.RESIDUAL_RISKS -- for example the Reviewer keeping write tools its prompt forbids it to use, because
+    Hermes has no read-only file toolset). Each one is an INFO row: never WARN or FAIL, because nothing here is
+    unhealthy or unexpected -- it is a documented, accepted gap, and a doctor that hid it behind "HEALTHY" would
+    be pretending the gap is closed. `profiles_mod` may be an older build with no such function (or the stub a
+    test puts in sys.modules), so a missing attribute is simply no rows, not a warning."""
+    fn = getattr(profiles_mod, "residual_risks", None)
+    if fn is None:
+        return []
+    try:
+        risks = [str(risk) for risk in fn()]
+    except Exception as exc:  # noqa: BLE001 - a doctor row never crashes the doctor
+        return [DoctorCheck(
+            "residual_risks", "warn", f"could not read the residual risks: {type(exc).__name__}: {exc}",
+            ("ASES-ROL-05",),
+        )]
+    return [
+        DoctorCheck(f"residual_risk[{i}]", "info", risk, ("ASES-ROL-05",)) for i, risk in enumerate(risks, start=1)
     ]
 
 
@@ -580,6 +603,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn) -> Doctor
         _check_reviewer_diversity(project),
         *([profiles_unavailable] if profiles_unavailable is not None
           else _check_profile_state(project, models_config, profiles_mod)),
+        *(_check_residual_risks(profiles_mod) if profiles_unavailable is None else []),
         _check_limits_table(models_config),
         _check_key_pooling(models_config),
         _check_provider_keys_not_exported(models_config),

@@ -24,7 +24,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from ases import bounds, cli, config, controller, critic, db, doctor, events, guards, hermes, killswitch, ledger
-from ases import reconcile
+from ases import models, reconcile
+
+try:  # another package's module: imported here, before _profiles_stub/_stub swap a fake into sys.modules
+    from ases import profiles as real_profiles
+except ImportError:
+    real_profiles = None
+
+needs_profiles = pytest.mark.skipif(real_profiles is None, reason="ases.profiles is not built in this checkout yet")
 
 ACCENT = "caf" + chr(0xE9)
 EMOJI = chr(0x1F600)
@@ -2362,7 +2369,7 @@ class _Change:
 
 
 def _profiles_stub(monkeypatch, *, changes=None, plan_takes_reuse=False, apply_takes_reuse=False,
-                   apply_takes_conn=True, result=None):
+                   apply_takes_conn=True, result=None, residual_risks=None):
     calls = types.SimpleNamespace(plan=[], apply=[])
     listed = list(changes if changes is not None else [
         _Change(f"create_profile coder-2: hermes profile create coder-2 {ACCENT}"),
@@ -2405,7 +2412,10 @@ def _profiles_stub(monkeypatch, *, changes=None, plan_takes_reuse=False, apply_t
             calls.apply_reuse = reuse_credentials_from
             return original_apply(changes, hermes_home, prompts_dir, **kw)
 
-    _stub(monkeypatch, "profiles", plan_init=plan_init, apply_init=apply_init)
+    stub_kwargs = dict(plan_init=plan_init, apply_init=apply_init)
+    if residual_risks is not None:
+        stub_kwargs["residual_risks"] = lambda: list(residual_risks)
+    _stub(monkeypatch, "profiles", **stub_kwargs)
     return calls
 
 
@@ -2646,6 +2656,59 @@ def test_init_without_the_profiles_module_is_one_line_and_exit_1(world, monkeypa
     assert "'profiles'" in _console(capsys)[1]
 
 
+# --- residual risks (ASES-ROL-05): profiles.residual_risks() printed next to swarm init's plan -------------------
+
+
+def test_init_prints_residual_risks_after_the_change_list(world, monkeypatch, capsys):
+    risks = ["Reviewer file access: keeps write tools its prompt forbids it to use.",
+             "Kanban toolset: appended to every dispatcher-spawned worker regardless of profile."]
+    _profiles_stub(monkeypatch, residual_risks=risks)
+
+    assert cli.main(["init"]) == 0
+
+    out, _ = _console(capsys)
+    assert "Known limits swarm init cannot fix (ASES-ROL-05):" in out
+    assert f"  - {risks[0]}" in out and f"  - {risks[1]}" in out
+
+
+def test_init_apply_also_prints_residual_risks(world, monkeypatch, capsys):
+    risks = ["Reviewer file access: keeps write tools its prompt forbids it to use."]
+    _profiles_stub(monkeypatch, residual_risks=risks)
+
+    assert cli.main(["init", "--apply", "--yes"]) == 0
+
+    assert f"  - {risks[0]}" in _console(capsys)[0]
+
+
+def test_init_prints_nothing_extra_when_there_are_no_residual_risks(world, monkeypatch, capsys):
+    _profiles_stub(monkeypatch, residual_risks=[])
+
+    assert cli.main(["init"]) == 0
+
+    assert "ASES-ROL-05" not in _console(capsys)[0]
+
+
+def test_init_prints_nothing_extra_when_the_profiles_module_has_no_residual_risks_function(world, monkeypatch, capsys):
+    _profiles_stub(monkeypatch)  # no residual_risks kwarg: matches a profiles build from before it existed
+
+    assert cli.main(["init"]) == 0
+
+    assert "ASES-ROL-05" not in _console(capsys)[0]
+
+
+@needs_profiles
+def test_init_prints_the_real_residual_risks(world, monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "ases.profiles", real_profiles)
+    monkeypatch.setattr(real_profiles, "plan_init", lambda *a, **kw: [])
+
+    assert cli.main(["init"]) == 0
+
+    out, _ = _console(capsys)
+    assert "Known limits swarm init cannot fix (ASES-ROL-05):" in out
+    for risk in real_profiles.RESIDUAL_RISKS:
+        assert f"  - {risk}" in out
+
+
 # ---------------------------------------------------------------------------------------------
 # eval, clean, retention
 # ---------------------------------------------------------------------------------------------
@@ -2866,6 +2929,292 @@ def test_models_lists_the_registry(world, monkeypatch, capsys):
     assert cli.main(["models"]) == 0
 
     assert "xkiro/coder-model  role=coder  context=65536  smoke=not run  pinned" in _console(capsys)[0]
+
+
+# ---------------------------------------------------------------------------------------------
+# smoke-test (ASES-MOD-04): models.record_smoke_test's first production caller
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _Candidate:
+    provider: str
+    model: str
+    role_class: str | None
+    profile: str
+    label: str
+
+
+class _EvalError(Exception):
+    pass
+
+
+def _fake_candidate_from_config(models_config, label, *, roles=None, profile=None):
+    rows = [m for m in models_config.get("models", []) if f"{m['provider']}/{m['model']}" == label]
+    if not rows:
+        raise _EvalError(f"unknown candidate {label!r}")
+    row = rows[0]
+    role_class = row.get("role_class")
+    chosen = profile or (roles or {}).get(role_class)
+    if not chosen:
+        raise _EvalError(f"no profile is known for {label!r}")
+    return _Candidate(row["provider"], row["model"], role_class, chosen, label)
+
+
+def _evals_stub(monkeypatch, invoke=None):
+    """A fake `ases.evals` module: candidate_from_config and EvalError behave like the real ones closely enough
+    for the CLI wiring under test, and default_invoke is `invoke` (or, with none given, a call that fails the
+    test, for the --spend-quota refusal tests where the model must never be reached)."""
+    calls = types.SimpleNamespace(invoke=[])
+
+    def default_invoke(candidate, prompt, workdir, timeout, **kwargs):
+        calls.invoke.append(dict(candidate=candidate, prompt=prompt, workdir=pathlib.Path(workdir),
+                                 timeout=timeout, kwargs=kwargs))
+        return invoke(candidate, prompt, pathlib.Path(workdir), timeout, **kwargs)
+
+    _stub(
+        monkeypatch, "evals", candidate_from_config=_fake_candidate_from_config, EvalError=_EvalError,
+        default_invoke=default_invoke if invoke is not None
+        else (lambda *a, **kw: pytest.fail("the model must not be called")),
+    )
+    return calls
+
+
+def _write_marker(workdir: pathlib.Path) -> None:
+    (workdir / cli._SMOKE_TEST_MARKER_FILE).write_text(cli._SMOKE_TEST_MARKER_BODY, encoding="utf-8")
+
+
+def _smoke_record(conn, model: str):
+    return {m.model: m for m in models.list_models(conn)}[model]
+
+
+def test_smoke_test_is_refused_without_spend_quota_and_calls_nothing(world, monkeypatch, capsys):
+    calls = _evals_stub(monkeypatch)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model"]) == 0
+
+    assert calls.invoke == []
+    out, _ = _console(capsys)
+    assert "dry run" in out and "nothing was called and no quota was spent" in out
+    assert "xkiro/coder-model (profile coder-1)" in out
+    assert "run the same command again with --spend-quota" in out
+
+
+def test_smoke_test_refuses_an_unknown_candidate_before_spending_anything(world, monkeypatch, capsys):
+    calls = _evals_stub(monkeypatch)
+
+    assert cli.main(["smoke-test", "--provider", "nope", "--model", "x", "--spend-quota"]) == 1
+
+    assert calls.invoke == []
+    assert "unknown candidate" in _console(capsys)[1]
+
+
+def test_smoke_test_records_a_pass_when_the_tool_call_and_the_reply_are_both_correct(world, monkeypatch, capsys):
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        assert candidate.label == "xkiro/coder-model" and candidate.profile == "coder-1"
+        assert kwargs.get("tools") == ("file",)
+        _write_marker(workdir)
+        return types.SimpleNamespace(returncode=0, stdout='{"file_written": true}', stderr="",
+                                     latency_seconds=1.75, requests=2, timed_out=False)
+
+    calls = _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"]) == 0
+
+    assert len(calls.invoke) == 1 and calls.invoke[0]["timeout"] == cli._SMOKE_TEST_TIMEOUT_DEFAULT
+    out, _ = _console(capsys)
+    assert "PASS" in out and "2 request(s)" in out
+    record = _smoke_record(world.conn, "coder-model")
+    assert record.smoke_tested is True
+    assert "verified" in record.smoke_test_detail
+    # ASES-MOD-04: "Record the result and the latency" - the latency must be PERSISTED, not just printed.
+    assert "latency 1.8s" in record.smoke_test_detail and "2 request(s)" in record.smoke_test_detail
+
+
+def test_smoke_test_persists_latency_even_on_a_recorded_failure(world, monkeypatch, capsys):
+    """The latency belongs in the persisted detail on every path that reaches a result, not only on PASS."""
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        _write_marker(workdir)
+        return types.SimpleNamespace(returncode=0, stdout="sure, all done!", stderr="", latency_seconds=0.9,
+                                     requests=1, timed_out=False)
+
+    _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"]) == 1
+
+    record = _smoke_record(world.conn, "coder-model")
+    assert record.smoke_test_result == "fail"
+    assert "not valid JSON" in record.smoke_test_detail
+    assert "latency 0.9s" in record.smoke_test_detail and "1 request(s)" in record.smoke_test_detail
+
+
+def test_smoke_test_records_a_fail_when_the_reply_is_not_valid_json(world, monkeypatch, capsys):
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        _write_marker(workdir)
+        return types.SimpleNamespace(returncode=0, stdout="sure, all done!", stderr="", latency_seconds=0.9,
+                                     requests=1, timed_out=False)
+
+    _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"]) == 1
+
+    out, _ = _console(capsys)
+    assert "FAIL" in out and "not valid JSON" in out
+    record = _smoke_record(world.conn, "coder-model")
+    assert record.smoke_tested is False and record.smoke_test_result == "fail"
+
+
+def test_smoke_test_records_a_fail_when_the_tool_was_never_actually_used(world, monkeypatch, capsys):
+    """The model can print plausible JSON without ever having called the file tool; the marker file is the proof."""
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        return types.SimpleNamespace(returncode=0, stdout='{"file_written": true}', stderr="", latency_seconds=0.5,
+                                     requests=1, timed_out=False)
+
+    _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "openrouter", "--model", "review-model", "--spend-quota"]) == 1
+
+    out, _ = _console(capsys)
+    assert "FAIL" in out and "did not create" in out
+    assert _smoke_record(world.conn, "review-model").smoke_test_result == "fail"
+
+
+def test_smoke_test_records_a_fail_when_the_model_call_itself_fails(world, monkeypatch, capsys):
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        return types.SimpleNamespace(returncode=2, stdout="", stderr="provider unavailable", latency_seconds=0.3,
+                                     requests=1, timed_out=False)
+
+    _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"]) == 1
+
+    out, _ = _console(capsys)
+    assert "FAIL" in out and "exit 2" in out and "provider unavailable" in out
+
+
+def test_smoke_test_records_a_fail_on_timeout(world, monkeypatch, capsys):
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        return types.SimpleNamespace(returncode=-1, stdout="", stderr="", latency_seconds=float(timeout),
+                                     requests=1, timed_out=True)
+
+    calls = _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota",
+                     "--timeout", "5"]) == 1
+
+    assert calls.invoke[0]["timeout"] == 5
+    out, _ = _console(capsys)
+    assert "FAIL" in out and "did not finish within 5s" in out
+
+
+def test_smoke_test_lets_the_profile_be_overridden(world, monkeypatch):
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        _write_marker(workdir)
+        return types.SimpleNamespace(returncode=0, stdout='{"file_written": true}', stderr="", latency_seconds=1.0,
+                                     requests=1, timed_out=False)
+
+    calls = _evals_stub(monkeypatch, invoke=invoke)
+
+    cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--profile", "coder-2",
+             "--spend-quota"])
+
+    assert calls.invoke[0]["candidate"].profile == "coder-2"
+
+
+def test_smoke_test_removes_its_temp_workdir_after_the_call(world, monkeypatch):
+    seen = {}
+
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        _write_marker(workdir)
+        seen["workdir"] = pathlib.Path(workdir)
+        return types.SimpleNamespace(returncode=0, stdout='{"file_written": true}', stderr="", latency_seconds=1.0,
+                                     requests=1, timed_out=False)
+
+    _evals_stub(monkeypatch, invoke=invoke)
+
+    cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"])
+
+    assert not seen["workdir"].exists()
+
+
+def test_smoke_test_records_a_fail_instead_of_crashing_when_the_invoke_call_itself_raises(world, monkeypatch, capsys):
+    """evals.default_invoke documents itself as never raising, but this command must not trust that blindly: an
+    exception from the call (or from anything else in the try block) is a recorded [FAIL], never a traceback."""
+    def invoke(candidate, prompt, workdir, timeout, **kwargs):
+        raise RuntimeError("provider connection reset")
+
+    _evals_stub(monkeypatch, invoke=invoke)
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"]) == 1
+
+    out, _ = _console(capsys)
+    assert "FAIL" in out and "RuntimeError" in out and "provider connection reset" in out
+    record = _smoke_record(world.conn, "coder-model")
+    assert record.smoke_tested is False and record.smoke_test_result == "fail"
+
+
+def test_smoke_test_records_a_fail_instead_of_crashing_when_the_temp_workdir_cannot_be_created(world, monkeypatch, capsys):
+    def broken_mkdtemp(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(cli.tempfile, "mkdtemp", broken_mkdtemp)
+    calls = _evals_stub(monkeypatch)  # the model must never be reached: there is no workdir to run it in
+
+    assert cli.main(["smoke-test", "--provider", "xkiro", "--model", "coder-model", "--spend-quota"]) == 1
+
+    assert calls.invoke == []
+    out, _ = _console(capsys)
+    assert "FAIL" in out and "no space left on device" in out
+    assert _smoke_record(world.conn, "coder-model").smoke_test_result == "fail"
+
+
+# --- _validate_smoke_test in isolation (the malformed-result cases, without going through the CLI) ---------------
+
+
+def test_validate_smoke_test_passes_when_the_marker_file_and_the_reply_are_both_correct(tmp_path):
+    _write_marker(tmp_path)
+
+    ok, detail = cli._validate_smoke_test(tmp_path, '{"file_written": true}')
+
+    assert ok is True and "verified" in detail
+
+
+def test_validate_smoke_test_fails_when_the_marker_file_is_missing(tmp_path):
+    ok, detail = cli._validate_smoke_test(tmp_path, '{"file_written": true}')
+
+    assert ok is False and "did not create" in detail
+
+
+def test_validate_smoke_test_fails_when_the_marker_file_has_the_wrong_content(tmp_path):
+    (tmp_path / cli._SMOKE_TEST_MARKER_FILE).write_text('{"ok": false}', encoding="utf-8")
+
+    ok, detail = cli._validate_smoke_test(tmp_path, '{"file_written": true}')
+
+    assert ok is False and "expected content" in detail
+
+
+def test_validate_smoke_test_fails_when_the_marker_file_is_not_json(tmp_path):
+    (tmp_path / cli._SMOKE_TEST_MARKER_FILE).write_text("not json", encoding="utf-8")
+
+    ok, detail = cli._validate_smoke_test(tmp_path, '{"file_written": true}')
+
+    assert ok is False and "is not valid JSON" in detail
+
+
+def test_validate_smoke_test_fails_when_the_reply_is_not_json(tmp_path):
+    _write_marker(tmp_path)
+
+    ok, detail = cli._validate_smoke_test(tmp_path, "sure, done!")
+
+    assert ok is False and "final reply is not valid JSON" in detail
+
+
+def test_validate_smoke_test_fails_when_the_reply_json_lacks_the_expected_shape(tmp_path):
+    _write_marker(tmp_path)
+
+    ok, detail = cli._validate_smoke_test(tmp_path, '{"something_else": 1}')
+
+    assert ok is False and "expected structured result" in detail
 
 
 # ---------------------------------------------------------------------------------------------

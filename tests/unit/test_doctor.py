@@ -68,6 +68,7 @@ class _World:
         self.verify_problems = []
         self.verify_calls = []
         self.specs = []
+        self.residual_risks = []
 
 
 @pytest.fixture(autouse=True)
@@ -88,6 +89,7 @@ def world(monkeypatch):
     stub = types.ModuleType("ases.profiles")
     stub.verify_state = fake_verify
     stub.desired_profiles = lambda project, models_config: list(state.specs)
+    stub.residual_risks = lambda: list(state.residual_risks)
     monkeypatch.setitem(sys.modules, "ases.profiles", stub)
     state.profiles = stub
     return state
@@ -742,6 +744,62 @@ def test_the_secret_check_still_runs_last_over_the_new_rows(tmp_path, monkeypatc
     assert all(check.detail.isascii() for check in report.checks)
 
 
+# --- residual risks (ASES-ROL-05): profiles.residual_risks() as INFO rows, never WARN or FAIL -------------------
+
+
+def test_residual_risks_are_info_rows_named_and_cited_in_order(tmp_path, monkeypatch, world):
+    world.residual_risks = ["Reviewer file access: keeps write tools its prompt forbids it to use.",
+                            "Kanban toolset: appended to every dispatcher-spawned worker regardless of profile."]
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    assert by_name["residual_risk[1]"].status == "info"
+    assert by_name["residual_risk[1]"].detail == world.residual_risks[0]
+    assert by_name["residual_risk[2]"].status == "info"
+    assert by_name["residual_risk[2]"].detail == world.residual_risks[1]
+    assert by_name["residual_risk[1]"].requirement_ids == ("ASES-ROL-05",)
+    assert report.ok is True  # never WARN or FAIL: they are known, accepted limits
+
+
+def test_no_residual_risk_rows_when_the_module_reports_none(tmp_path, monkeypatch, world):
+    world.residual_risks = []
+
+    _, _, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    assert not any(name.startswith("residual_risk") for name in by_name)
+
+
+def test_residual_risks_row_is_a_warn_when_reading_them_raises_not_a_crash(tmp_path, monkeypatch, world):
+    def boom():
+        raise RuntimeError("RESIDUAL_RISKS is not iterable")
+
+    world.profiles.residual_risks = boom
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    assert by_name["residual_risks"].status == "warn"
+    assert "RuntimeError" in by_name["residual_risks"].detail
+    assert report.ok is True
+
+
+def test_no_residual_risk_rows_when_the_profiles_module_is_missing(tmp_path, monkeypatch, world):
+    monkeypatch.setitem(sys.modules, "ases.profiles", None)
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    assert not any(name.startswith("residual_risk") for name in by_name)
+    assert report.ok is True
+
+
+def test_no_residual_risk_rows_when_an_older_profiles_build_has_no_such_function(tmp_path, monkeypatch, world):
+    del world.profiles.residual_risks  # a build from before this function existed
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    assert not any(name.startswith("residual_risk") for name in by_name)
+    assert report.ok is True
+
+
 needs_profiles = pytest.mark.skipif(real_profiles is None, reason="ases.profiles is not built in this checkout yet")
 
 
@@ -760,6 +818,21 @@ def test_the_real_profiles_module_feeds_the_warn_rows_and_the_worker_dirs(tmp_pa
     assert report.ok is True
     (_, profile_dirs, _), = world.sandbox_calls
     assert profile_dirs == [project.hermes_native_home / "profiles" / "coder-1"]  # not the reviewer, not coder-2/3
+
+
+@needs_profiles
+def test_the_real_residual_risks_are_wired_in_as_info_rows(tmp_path, monkeypatch, world):
+    """The real profiles.RESIDUAL_RISKS, through the real profiles.residual_risks(), land as one INFO row each,
+    in order, and never fail the report."""
+    monkeypatch.setitem(sys.modules, "ases.profiles", real_profiles)
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch)
+
+    rows = [name for name in by_name if name.startswith("residual_risk[")]
+    assert len(rows) == len(real_profiles.RESIDUAL_RISKS)
+    assert all(by_name[name].status == "info" for name in rows)
+    assert [by_name[name].detail for name in rows] == list(real_profiles.RESIDUAL_RISKS)
+    assert report.ok is True
 
 
 def test_takes_finds_a_named_keyword_or_a_var_keyword_and_gives_up_on_a_signature_it_cannot_read():
