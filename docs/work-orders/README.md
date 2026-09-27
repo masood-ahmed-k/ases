@@ -121,3 +121,14 @@ git worktree under `C:\Users\masoo\ases-wt\` and branch `r9/<package>`; Tier 2 l
 | `r10_rules.md` | shared rules: Write/Edit only (a heredoc eats backslashes), no `/tmp` for Windows Python, use `gitexec` and `events.PROJECT_SCOPE_SQL` | in use |
 | `r10_wp_basecheck.md` | BASECHECK: a work card's base commit is verified, detection plus merge refusal (ASES-GIT-01, GIT-16) | done, independently verified; `swarm doctor --repo` wired by the architect |
 | `r10_wp_small.md` | GATEPIN (ASES-QG-02), BUDGETFIX (CAP-03, CTL-01), CALLERS (MOD-04, ROL-05) | done, independently verified |
+
+## Round 11 and round 12 (2026-09-28): MOD02, stage A, the audit and its fixes
+
+The owner asked for autonomous work overnight ("keep doing things back to back", short test cycles, pushing allowed).
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r11_wp_mod02.md` | MOD02: an under-declared model is rejected before any card starts (ASES-MOD-02, acceptance 22.4) | done, independently verified |
+| (no work order; architect-run) | stage A: real doctor and `swarm init` dry run, `docs/stage-a-2026-09-28.md` | done; applying `swarm init` waits for the owner |
+| `r12_audit_findings.md` | a read-only adversarial audit of rounds 8-11: 12 findings confirmed, 1 refuted | done |
+| `r12_wp_fixes.md` | GATEINFRA (findings 0, 10, 11, 1), DATAFIX (4, 5, 6, 7), RUNSTART (2, 8, 3, 9) | done, independently reviewed |

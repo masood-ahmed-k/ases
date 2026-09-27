@@ -1245,6 +1245,24 @@ finding checked by an independent skeptic told to refute it) confirmed 12 real d
 (`docs/work-orders/r12_audit_findings.md`). Register after round 11: 51 covered, 39 in_progress, 10 partial, 3
 not_applicable, 0 not_covered.
 
+## Round 12: the audit's twelve findings fixed (2026-09-28)
+
+Three packages from the verified audit findings, each builder reproducing every finding with a failing test before fixing
+it, each passing its first independent review (with a nemotron second opinion). GATEINFRA: a gate checkout that fails for
+infrastructure reasons now raises `gates.GateCheckoutError` instead of reading as a red gate, and every caller treats it
+like `SandboxInfrastructureError`, so the post-merge re-run can no longer revert a correct, landed merge over a stale temp
+directory; a gate command's timeout now kills the whole process tree (`taskkill /T /F`), because on real Windows
+`subprocess.run(..., shell=True, timeout=...)` waited out a hung child (the audit measured 8 s for a 1 s timeout), which would
+have wedged the merge queue; a gate or merge worktree that cannot be removed is recorded as an event; and the docker CLI on
+the gate path no longer inherits the controller's credentials. DATAFIX: every `merge_records` write matches exactly one row
+and every single-row read prefers the project's own row, closing the ways a legacy NULL-project row kept by schema v8 could be
+reverted by another project's revert, collide on a UNIQUE key, or be double-counted. RUNSTART: a restarted `swarm run` no
+longer adopts whatever HEAD it finds (it refuses a HEAD moved since the last recorded one unless `--allow-head-move` is
+given, loudly); reconcile-on-start now runs before the project is marked running; the base-commit check re-checks a card
+whose branch Hermes has not created yet instead of blocking it; and doctor's texts no longer deny `--repo`. Worth noting for
+the method: every one of these twelve was invisible to the fake rig, which is why a skeptic-verified audit on real git, real
+SQLite and real Windows subprocesses paid off. Suite: 5,814 passed, 2 skipped, 0 failed.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and

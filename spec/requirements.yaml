@@ -75,10 +75,14 @@ requirements:
   section: '3.2'
   verified_by: 22.7, 22.15
   status: covered
-  note: 'ROUND 9 (2026-09-27, zero quota): MERGEPK made merge_records project-scoped (schema v8, key (project,
-    task_key)), so two projects reusing a task key in one database no longer share a merge record. EVENTSPROJ:
-    events.record writes the events.project column (from a keyword argument or the payload''s own project; a
-    disagreement raises), every record call site and every FROM events reader was classified, and
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): Every merge_records write now hits exactly one row and every
+    single-row read prefers the project''s own row over a legacy NULL-project row (reconcile, hardening, the
+    eval scorer, report, finalgates), closing four audit findings about two rows sharing a task key. Earlier
+    note: ROUND 9 (2026-09-27, zero quota): MERGEPK made merge_records project-scoped (schema v8, key
+    (project, task_key)), so two projects reusing a task key in one database no longer share a merge record.
+    EVENTSPROJ: events.record writes the events.project column (from a keyword argument or the payload''s own
+    project; a disagreement raises), every record call site and every FROM events reader was classified, and
     project-scoped readers use one definition, events.PROJECT_SCOPE_SQL (this project''s rows plus rows with
     no project recorded, never another project''s), including the report''s events, quality and health panels
     and the parked-card reasons, each with a two-project test that fails on the old code. Genuinely global
@@ -506,10 +510,17 @@ requirements:
   section: '8.1'
   verified_by: '22.8'
   status: partial
-  note: 'ROUND 9 (2026-09-27, zero quota): MERGEPK fixed the merge_records collision this note named as a separate
-    open risk: schema v8 rebuilds the table with PRIMARY KEY (project, task_key), backfills legacy rows from
-    plan_tasks only where exactly one project owns the key, and every reader and writer scopes by project with
-    gate_runs'' legacy-row semantics; a two-project acceptance test
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): Two real defects fixed. A gate checkout that failed for
+    infrastructure reasons (a stale directory, disk full) came back as an ordinary red gate, so the post-merge
+    re-run could revert a correct, landed merge; it now raises gates.GateCheckoutError, which every caller
+    treats like SandboxInfrastructureError (never a red gate, never a revert). And revert_merge''s UPDATE used
+    the NULL-tolerant project predicate, so reverting one project''s merge could also mark a legacy row
+    reverted; writes now match exactly one row. Still partial: a real post-merge revert has not happened in a
+    real run. Earlier note: ROUND 9 (2026-09-27, zero quota): MERGEPK fixed the merge_records collision this
+    note named as a separate open risk: schema v8 rebuilds the table with PRIMARY KEY (project, task_key),
+    backfills legacy rows from plan_tasks only where exactly one project owns the key, and every reader and
+    writer scopes by project with gate_runs'' legacy-row semantics; a two-project acceptance test
     (tests/acceptance/test_r9_mergepk_two_projects.py) fails on the old schema. Still partial for the reason
     below: a real post-merge failure triggering an actual revert has never been exercised in a real run.
     Earlier note: ROUND 6 (2026-09-22, zero quota): The post-merge revert trigger is now wired: after every
@@ -627,30 +638,35 @@ requirements:
   section: '8.4'
   verified_by: 22.5, 22.11
   status: partial
-  note: 'ROUND 9 (2026-09-27, zero quota): IDLEWT fixed the documented false positive (a card re-dispatched into
-    its worktree between two polls) with a one-shot grace pass earned only by a worktree a running card just
-    vacated; reproduced first in a test against the old code. Still a WARNING, not a card failure, on purpose:
-    a reviewer editing during review is still indistinguishable from this function''s inputs (running_paths
-    names only ''running'' cards), and a full dispatch-and-finish cycle entirely between two polls is still
-    invisible. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven for the primary-checkout half
-    (22.11): a worker that writes outside its own worktree trips check_primary_checkout end to end, records
-    integrity_violation, halts the run, and the integration branch never moves again. The other-worktree half
-    (check_idle_worktrees) stays partial with its documented false-positive gap unchanged this round. Earlier
-    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): guards.check_idle_worktrees runs every pass and
-    reports changes in worktrees no running card owns as WARNINGS (an idle_worktree_changed event), never a
-    halt: the first version has known false positives (a card re-dispatched into its worktree between two
-    polls). Earlier note: Built 2026-09-19: guards.check_primary_checkout runs at the start of every
-    controller pass and at swarm run start. The primary checkout must be on the integration branch, clean
-    (modified, staged, deleted and untracked files, except Hermes''s .worktrees/), and at the HEAD ASES itself
-    last wrote (adopted at run start, updated after every fast-forward it makes). A violation records an
-    integrity_violation event and halts the run with exit code 3 before anything is dispatched or merged. Two
-    deviations from the blueprint text, on purpose: the check is per pass, not around each spawn (Hermes, not
-    ASES, spawns workers), and it halts the run instead of failing one card (the writer cannot be attributed
-    to a card). Not covered: the other active worktrees (a stray write into another worker''s worktree) and
-    changes outside git entirely; on 2026-09-19 coder-1 ran pip install into Hermes''s own virtualenv
-    unnoticed, which only the Docker sandbox (ASES-SEC-03) prevents. integrity.py''s own snapshot() has quirks
-    (non -z porcelain quoting, rename strings, fail-open on a non-repo) that make this note''s earlier claim
-    that it was fully unit-tested overstated; guards.py does not use it.'
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): swarm run used to adopt whatever HEAD the primary checkout had at
+    startup, so a HEAD moved between two runs by anything but ASES was laundered into the base-check
+    allow-list. A restart now compares it with the head ASES last recorded and refuses (exit 3) unless
+    --allow-head-move is given, which prints a loud warning naming both heads; a first-ever run is unchanged.
+    Earlier note: ROUND 9 (2026-09-27, zero quota): IDLEWT fixed the documented false positive (a card
+    re-dispatched into its worktree between two polls) with a one-shot grace pass earned only by a worktree a
+    running card just vacated; reproduced first in a test against the old code. Still a WARNING, not a card
+    failure, on purpose: a reviewer editing during review is still indistinguishable from this function''s
+    inputs (running_paths names only ''running'' cards), and a full dispatch-and-finish cycle entirely between
+    two polls is still invisible. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven for the
+    primary-checkout half (22.11): a worker that writes outside its own worktree trips check_primary_checkout
+    end to end, records integrity_violation, halts the run, and the integration branch never moves again. The
+    other-worktree half (check_idle_worktrees) stays partial with its documented false-positive gap unchanged
+    this round. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): guards.check_idle_worktrees runs
+    every pass and reports changes in worktrees no running card owns as WARNINGS (an idle_worktree_changed
+    event), never a halt: the first version has known false positives (a card re-dispatched into its worktree
+    between two polls). Earlier note: Built 2026-09-19: guards.check_primary_checkout runs at the start of
+    every controller pass and at swarm run start. The primary checkout must be on the integration branch,
+    clean (modified, staged, deleted and untracked files, except Hermes''s .worktrees/), and at the HEAD ASES
+    itself last wrote (adopted at run start, updated after every fast-forward it makes). A violation records
+    an integrity_violation event and halts the run with exit code 3 before anything is dispatched or merged.
+    Two deviations from the blueprint text, on purpose: the check is per pass, not around each spawn (Hermes,
+    not ASES, spawns workers), and it halts the run instead of failing one card (the writer cannot be
+    attributed to a card). Not covered: the other active worktrees (a stray write into another worker''s
+    worktree) and changes outside git entirely; on 2026-09-19 coder-1 ran pip install into Hermes''s own
+    virtualenv unnoticed, which only the Docker sandbox (ASES-SEC-03) prevents. integrity.py''s own snapshot()
+    has quirks (non -z porcelain quoting, rename strings, fail-open on a non-repo) that make this note''s
+    earlier claim that it was fully unit-tested overstated; guards.py does not use it.'
 - id: ASES-GIT-13
   requirement: Diffs outside the declared touches block review
   section: '8.4'
@@ -931,14 +947,18 @@ requirements:
   section: '14.2'
   verified_by: '22.12'
   status: covered
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.12): the merge queue and review lane believe
-    only the controller''s own gate records, never a worker''s or reviewer''s self-report, across five real
-    tampering attempts run through the real controller.run_pass. Earlier note: gates.run_gate is the only
-    source of gate truth; the review lane sends a card back on a red re-check regardless of the worker''s own
-    claim, and since 2026-09-19 the merge queue believes only the controller''s own gate_runs records for the
-    exact head (a reviewer''s or coder''s claim that tests passed is never read; the real review on 2026-09-19
-    listed the gate as verified although it had no way to run anything). A profile with no commands is
-    rejected at Gate 0 because it would be vacuously green.'
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): An infrastructure failure of the gate checkout is no longer
+    recorded or acted on as a failing gate (GateCheckoutError), and a gate command''s timeout now really
+    bounds its wall clock on Windows (the whole process tree is killed), so a hung command cannot wedge the
+    merge queue. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-reconfirmed (22.12): the merge
+    queue and review lane believe only the controller''s own gate records, never a worker''s or reviewer''s
+    self-report, across five real tampering attempts run through the real controller.run_pass. Earlier note:
+    gates.run_gate is the only source of gate truth; the review lane sends a card back on a red re-check
+    regardless of the worker''s own claim, and since 2026-09-19 the merge queue believes only the
+    controller''s own gate_runs records for the exact head (a reviewer''s or coder''s claim that tests passed
+    is never read; the real review on 2026-09-19 listed the gate as verified although it had no way to run
+    anything). A profile with no commands is rejected at Gate 0 because it would be vacuously green.'
 - id: ASES-QG-02
   requirement: Gate commands are pinned; changing gate configuration needs an explicit plan task
   section: '14.3'
@@ -1177,7 +1197,11 @@ requirements:
   section: '19.2'
   verified_by: 22.3, 22.6
   status: in_progress
-  note: 'ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real,
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): A gate checkout that cannot be created is now an infrastructure
+    failure (GateCheckoutError, retried) rather than a failed attempt that spends fix-card budget, matching
+    p346: an infrastructure failure says nothing about the model or the task. Earlier note: ROUND 7 wave 1
+    (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real,
     previously-documented gap closed: a card stuck ready after an auth- or quota-shaped failure that never
     tripped Hermes''s own retry breaker was invisible to recovery.process_failures (which only ever examined
     blocked cards; its own docstring said so). It now also recovers a ready card whose latest run is auth- or
@@ -1234,7 +1258,10 @@ requirements:
   section: '19.4'
   verified_by: '22.7'
   status: in_progress
-  note: 'ROUND 7 wave 2 (2026-09-23, zero quota): A real instance of this row''s own bug fixed today, in the exact
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): Reconcile-on-start now runs BEFORE the project is marked running:
+    a refused start no longer leaves project_state ''running'' with its wall clock ticking. Earlier note:
+    ROUND 7 wave 2 (2026-09-23, zero quota): A real instance of this row''s own bug fixed today, in the exact
     function its docstring cites (_merge / _done_without_record, ASES-REC-04): reconcile.py hardcoded role !=
     "coder" to mean ''this role''s merge card legitimately has no git commit'', the same hardcoding just fixed
     in controller.py. A tester''s merge card marked done with no landed commit (crash, force-push, board/git
@@ -1475,36 +1502,41 @@ requirements:
   section: '8'
   verified_by: 22.2, 22.5
   status: in_progress
-  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
-    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show core.logAllRefUpdates is on in the real
-    test repository, so the round 10 base-commit check can read branch reflogs there; worktree_sync is still
-    on in the real profiles (swarm init sets it off, pending the owner''s yes), which per the Hermes source
-    only `hermes -w` reads anyway. Earlier note: ROUND 10 (2026-09-27, zero quota): BASECHECK built the check
-    blueprint p169''s last sentence asks for: guards.check_card_base reads a work branch''s creation commit
-    from its reflog (git forced to the C locale so the message is never translated) and requires it to be an
-    integration head ASES itself wrote or adopted, kept in a new integrity_heads history table (schema v9,
-    backfilled), so a card dispatched before a later merge still passes. It runs twice: every pass checks each
-    running card once and blocks a wrong or unverifiable base through the question path, and the merge queue
-    refuses such a branch outright, so a wrong base can never land even if detection missed it. ''Before a
-    worker starts'' is enforced as ''on the first pass that sees it running, and never mergeable'', because
-    Hermes, not ASES, starts the worker. swarm doctor --repo checks core.logAllRefUpdates, which the check
-    needs. Acceptance-tested on the fake board (tests/acceptance/test_r10_basecheck.py); never run against a
-    real dispatch. worktree_sync is pinned false (round 5) and, per the Hermes 0.21.3 source, the Kanban
-    dispatcher never syncs from a remote at all; the remaining gap is only that the check has not run against
-    a real dispatch. Earlier note: ROUND 9 T2B (2026-09-27, zero quota): Read against the installed Hermes
-    0.21.3 source (read only). worktree_sync is already pinned: profiles._config_rows sets worktree_sync:
-    false on every ASES-managed profile (built in round 5, citing this row), and profiles._check_profile
-    reports a live profile that has it on; T2B made swarm doctor tag that drift row with ASES-GIT-16 itself
-    (doctor._extract_requirement_ids), so a drifted value names this requirement. Still partial for two
-    reasons, both honest: the remote-tip case this row guards against has never been exercised (the real test
-    repo has no remote), and the second half of p169, ''Phase 3 MUST verify the actual base commit before a
-    worker starts'', is not built anywhere (listed as a new, separate work item; ASES-GIT-01 is set back to
-    partial for the same reason). Earlier note: Observed on the real 2026-09-19 run: the work-card worktree
-    Hermes created on dispatch was cut at the exact integration tip both times (232e12e for G1, 676628f for G2
-    after G1 merged), and the gate and merge worktrees ASES makes itself are detached at exact SHAs. Left
-    partial: the test repo has no remote, so Hermes''s default of syncing a worktree from the freshly fetched
-    remote tip (the case this requirement guards against) was never exercised, and whether worktree_sync must
-    be turned off explicitly is unverified.'
+  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
+    docs/work-orders/r12_audit_findings.md): The base-commit check no longer blocks a card whose branch Hermes
+    has not created yet (Hermes marks the card running before it runs git worktree add): such a card is
+    re-checked next pass, while an existing branch with a wrong or unreadable base still blocks, and the
+    merge-queue refusal stays the backstop. Earlier note: STAGE A (2026-09-28, zero provider quota): a real
+    swarm doctor against the real Hermes 0.21.3 install and the swarm init --global dry run
+    (docs/stage-a-2026-09-28.md) show core.logAllRefUpdates is on in the real test repository, so the round 10
+    base-commit check can read branch reflogs there; worktree_sync is still on in the real profiles (swarm
+    init sets it off, pending the owner''s yes), which per the Hermes source only `hermes -w` reads anyway.
+    Earlier note: ROUND 10 (2026-09-27, zero quota): BASECHECK built the check blueprint p169''s last sentence
+    asks for: guards.check_card_base reads a work branch''s creation commit from its reflog (git forced to the
+    C locale so the message is never translated) and requires it to be an integration head ASES itself wrote
+    or adopted, kept in a new integrity_heads history table (schema v9, backfilled), so a card dispatched
+    before a later merge still passes. It runs twice: every pass checks each running card once and blocks a
+    wrong or unverifiable base through the question path, and the merge queue refuses such a branch outright,
+    so a wrong base can never land even if detection missed it. ''Before a worker starts'' is enforced as ''on
+    the first pass that sees it running, and never mergeable'', because Hermes, not ASES, starts the worker.
+    swarm doctor --repo checks core.logAllRefUpdates, which the check needs. Acceptance-tested on the fake
+    board (tests/acceptance/test_r10_basecheck.py); never run against a real dispatch. worktree_sync is pinned
+    false (round 5) and, per the Hermes 0.21.3 source, the Kanban dispatcher never syncs from a remote at all;
+    the remaining gap is only that the check has not run against a real dispatch. Earlier note: ROUND 9 T2B
+    (2026-09-27, zero quota): Read against the installed Hermes 0.21.3 source (read only). worktree_sync is
+    already pinned: profiles._config_rows sets worktree_sync: false on every ASES-managed profile (built in
+    round 5, citing this row), and profiles._check_profile reports a live profile that has it on; T2B made
+    swarm doctor tag that drift row with ASES-GIT-16 itself (doctor._extract_requirement_ids), so a drifted
+    value names this requirement. Still partial for two reasons, both honest: the remote-tip case this row
+    guards against has never been exercised (the real test repo has no remote), and the second half of p169,
+    ''Phase 3 MUST verify the actual base commit before a worker starts'', is not built anywhere (listed as a
+    new, separate work item; ASES-GIT-01 is set back to partial for the same reason). Earlier note: Observed
+    on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at the exact
+    integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and merge
+    worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote, so
+    Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
+    guards against) was never exercised, and whether worktree_sync must be turned off explicitly is
+    unverified.'
 - id: ASES-CFG-05
   requirement: UnoRouter custom-endpoint credentials use Hermes custom-endpoint secret handling; do not
     export provider keys into worker shells
