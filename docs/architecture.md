@@ -1222,6 +1222,29 @@ were deliberately left alone (see Known gaps). The owner decided the same day th
 with no co-author lines, and that the reviewer's write access is accepted until the sandbox closes it. Register after round
 10: 50 covered, 40 in_progress, 10 partial, 3 not_applicable, 0 not_covered. Suite: 5,757 passed, 2 skipped, 0 failed.
 
+## Round 11 and real-run stage A: under-declared models rejected; the first real doctor since round 7 (2026-09-28)
+
+The owner went to sleep after asking for autonomous work ("keep doing things back to back", testing capped at about 30
+minutes a cycle, pushing allowed). Round 11 was one package, MOD02, from a gap found while tabulating what was left:
+blueprint 22.4 says the controller "must reject" a model declared below 64K "before any card starts", and only `swarm doctor`
+ever warned. `models.classify_model_context` now decides (too small, or undeclared on a custom `openai_compatible` endpoint,
+is rejected; a native Hermes provider with no declaration is not, because Hermes knows its models), and `swarm approve`,
+`swarm run`'s pre-flight and `recovery.next_model` all honour it; `tests/acceptance/test_22_4_context.py` plays p406. It
+passed its first review and live verification (5,778 passed).
+
+Then stage A, zero provider quota (full record: `docs/stage-a-2026-09-28.md`). The v7-to-v9 migration was rehearsed on a copy
+of the real database, the real database was backed up, and a real `swarm doctor --repo` against the Phase 3 test repository
+came back HEALTHY, migrating the real database exactly as rehearsed. It showed the machine ready (Hermes 0.21.3, gateway
+running, Docker reachable, reflogs on, every pinned model above the context floor, no provider key exported) and the real
+Hermes profiles never brought to ASES's desired state (22 drift warnings: memory on, surplus toolsets, `worktree_sync` on,
+kanban limits unset, `auto_decompose` true). `swarm init --global` was run as a dry run only: its 20 changes wait for the
+owner's yes, because they rewrite the owner's real Hermes configuration.
+
+Also that night: a read-only adversarial audit of everything rounds 8 to 11 built (five Sonnet finders on a snapshot, each
+finding checked by an independent skeptic told to refute it) confirmed 12 real defects and refuted one; round 12 fixes them
+(`docs/work-orders/r12_audit_findings.md`). Register after round 11: 51 covered, 39 in_progress, 10 partial, 3
+not_applicable, 0 not_covered.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and

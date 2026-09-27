@@ -154,20 +154,28 @@ requirements:
   section: '6.2'
   verified_by: 22.1, 22.5
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Same as ASES-ROL-08: the kanban limits, failure_limit,
-    auto_decompose false, auto_promote_children false and no default assignee are in the opt-in global desired
-    state of profiles.plan_init (`swarm init --global`); not applied. Hermes''s auto_decompose defaults to
-    true. Earlier note: kanban.max_in_progress etc. not yet written into Hermes config.yaml for this board --
-    still relying on defaults.'
+  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
+    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the kanban limits are still NOT applied
+    on the real machine: max_in_progress and max_in_progress_per_profile unset, failure_limit 2 instead of 3,
+    auto_decompose true, auto_promote_children unset. swarm init --global --apply --yes would set all five; it
+    waits for the owner''s yes. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Same as
+    ASES-ROL-08: the kanban limits, failure_limit, auto_decompose false, auto_promote_children false and no
+    default assignee are in the opt-in global desired state of profiles.plan_init (`swarm init --global`); not
+    applied. Hermes''s auto_decompose defaults to true. Earlier note: kanban.max_in_progress etc. not yet
+    written into Hermes config.yaml for this board -- still relying on defaults.'
 - id: ASES-ROL-01
   requirement: Phase 3 starts with three core profiles; tester and other roles are added only after measured
     evaluation
   section: 4.1, 16
   verified_by: 22.17 at level L2
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py holds the roster as data: lead, coder-1 and
-    reviewer active; coder-2, coder-3 and tester defined but inactive until enabled. `swarm init` is a dry run
-    by default; nothing has been applied to the real Hermes.'
+  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
+    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the three core profiles (lead, coder-1,
+    reviewer) exist with a model configured, but their SOUL.md prompts and toolsets differ from ASES''s
+    desired state; applying swarm init fixes that, pending the owner''s yes. Earlier note: BUILT AND WIRED,
+    NOT RUN FOR REAL (2026-09-22): profiles.py holds the roster as data: lead, coder-1 and reviewer active;
+    coder-2, coder-3 and tester defined but inactive until enabled. `swarm init` is a dry run by default;
+    nothing has been applied to the real Hermes.'
 - id: ASES-ROL-02
   requirement: Profiles are created by cloning from the default profile, with a description
   section: '4.2'
@@ -218,7 +226,11 @@ requirements:
   section: '4.2'
   verified_by: Inspection
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py turns memory off for every profile
+  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
+    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show long-term memory still switched on in
+    all three real profiles (memory.memory_enabled and memory.user_profile_enabled unset, and the memory
+    toolset present). swarm init --apply --yes would turn it off; it waits for the owner''s yes. Earlier note:
+    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py turns memory off for every profile
     (memory.memory_enabled, memory.user_profile_enabled and the memory toolset) in the desired state; not
     applied to the real profiles.'
 - id: ASES-ROL-08
@@ -227,14 +239,17 @@ requirements:
   section: '4.3'
   verified_by: 22.5, 22.9
   status: in_progress
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-proven (22.5): three cards ran simultaneously with three
-    distinct worktrees, branches, profiles and lease-assigned port blocks/compose names, and a fourth stayed
-    queued by max_in_progress, through the real controller and dispatcher. Still not applied to the user''s
-    real Hermes (swarm init --global remains dry-run only, unchanged from round 5). Earlier note: BUILT AND
-    WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts kanban.max_in_progress
-    (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global state; `swarm init
-    --global` shows it and applies it only after `--apply --yes`. Not applied: it changes the user''s whole
-    Hermes.'
+  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
+    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show kanban.max_in_progress is unset on the
+    real machine (Hermes derives a cap from memory); swarm init --global would set it to 3, pending the
+    owner''s yes. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven (22.5): three cards ran
+    simultaneously with three distinct worktrees, branches, profiles and lease-assigned port blocks/compose
+    names, and a fourth stayed queued by max_in_progress, through the real controller and dispatcher. Still
+    not applied to the user''s real Hermes (swarm init --global remains dry-run only, unchanged from round 5).
+    Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts
+    kanban.max_in_progress (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global
+    state; `swarm init --global` shows it and applies it only after `--apply --yes`. Not applied: it changes
+    the user''s whole Hermes.'
 - id: ASES-MOD-01
   requirement: Model IDs are discovered, and a capability record is kept per model
   section: '5'
@@ -246,25 +261,33 @@ requirements:
     before first use
   section: '5.1'
   verified_by: '22.4'
-  status: in_progress
-  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The specific evidence this note cites is stale --
-    glm-5.3-thinking:free is no longer in config/models.yaml at all. It was hosted on UnoRouter, which ''was
-    removed entirely 2026-09-19, per an explicit user decision ("dont use unorouter at all - its complete
-    waste")'' (config/models.yaml''s own provider-block comment); the lead role it used to fill moved to
-    xKiro''s qwen/qwen3.8-max:free (context_length 1050000, pinned: true). Checked every model currently
-    declared in config/models.yaml: none has context_length: null, and every custom-endpoint (xkiro, type
-    openai_compatible) model in use or candidate today declares context_length far above the 64K floor
-    (qwen3.8-max:free and qwen3-coder-plus:free at 1,050,000; minimax-m3:free at 1,000,000; minimax-m2.5:free
-    at 204,000) -- so doctor''s WARN-on-null-context path does not currently fire for anything live. That
-    said, the row''s actual requirement (the controller MUST reject an under-declared model before any card
-    starts, per blueprint 22.4''s wording) is still not built: grepping controller.py, policy.py and gates.py
-    for MINIMUM_CONTEXT_LENGTH / context_declared_and_sufficient finds no caller -- only doctor.py (a
-    report-time WARN) and recovery.py (a reactive, post-hoc failure classification after a card has already
-    run) use the check. Status stays in_progress: the specific stale example is corrected and the field is
-    honestly clean today, but pre-dispatch enforcement is the part of this requirement that does not exist
-    yet, not a warning about one now-removed model. Earlier note: the check mechanism is built and doctor
-    correctly WARNs today: glm-5.3-thinking:free has no declared context_length in config/models.yaml yet, so
-    it is not yet fit to pin (see config/models.yaml''s note on this)'
+  status: covered
+  note: 'ROUND 11 (2026-09-28, zero quota): MOD02 built the rejection this note said was missing.
+    models.classify_model_context is the one decision (accepted; rejected as too small below 64,000; rejected
+    as unknown when undeclared on a custom openai_compatible endpoint; a native Hermes provider with no
+    declared context is not rejected, since Hermes knows its models). swarm approve refuses before any card
+    exists, swarm run''s pre-flight refuses, recovery.next_model never switches to a rejected model, and swarm
+    doctor shows a pinned rejected model as FAIL. Acceptance 22.4 plays blueprint p406''s three steps at zero
+    quota (tests/acceptance/test_22_4_context.py). The real swarm doctor on 2026-09-28 found every pinned
+    model declared at or above the floor. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota): The
+    specific evidence this note cites is stale -- glm-5.3-thinking:free is no longer in config/models.yaml at
+    all. It was hosted on UnoRouter, which ''was removed entirely 2026-09-19, per an explicit user decision
+    ("dont use unorouter at all - its complete waste")'' (config/models.yaml''s own provider-block comment);
+    the lead role it used to fill moved to xKiro''s qwen/qwen3.8-max:free (context_length 1050000, pinned:
+    true). Checked every model currently declared in config/models.yaml: none has context_length: null, and
+    every custom-endpoint (xkiro, type openai_compatible) model in use or candidate today declares
+    context_length far above the 64K floor (qwen3.8-max:free and qwen3-coder-plus:free at 1,050,000;
+    minimax-m3:free at 1,000,000; minimax-m2.5:free at 204,000) -- so doctor''s WARN-on-null-context path does
+    not currently fire for anything live. That said, the row''s actual requirement (the controller MUST reject
+    an under-declared model before any card starts, per blueprint 22.4''s wording) is still not built:
+    grepping controller.py, policy.py and gates.py for MINIMUM_CONTEXT_LENGTH /
+    context_declared_and_sufficient finds no caller -- only doctor.py (a report-time WARN) and recovery.py (a
+    reactive, post-hoc failure classification after a card has already run) use the check. Status stays
+    in_progress: the specific stale example is corrected and the field is honestly clean today, but
+    pre-dispatch enforcement is the part of this requirement that does not exist yet, not a warning about one
+    now-removed model. Earlier note: the check mechanism is built and doctor correctly WARNs today:
+    glm-5.3-thinking:free has no declared context_length in config/models.yaml yet, so it is not yet fit to
+    pin (see config/models.yaml''s note on this)'
 - id: ASES-MOD-03
   requirement: Lead, Reviewer and Debugger use pinned model IDs; routers are for workers only
   section: '5.2'
@@ -1452,32 +1475,36 @@ requirements:
   section: '8'
   verified_by: 22.2, 22.5
   status: in_progress
-  note: 'ROUND 10 (2026-09-27, zero quota): BASECHECK built the check blueprint p169''s last sentence asks for:
-    guards.check_card_base reads a work branch''s creation commit from its reflog (git forced to the C locale
-    so the message is never translated) and requires it to be an integration head ASES itself wrote or
-    adopted, kept in a new integrity_heads history table (schema v9, backfilled), so a card dispatched before
-    a later merge still passes. It runs twice: every pass checks each running card once and blocks a wrong or
-    unverifiable base through the question path, and the merge queue refuses such a branch outright, so a
-    wrong base can never land even if detection missed it. ''Before a worker starts'' is enforced as ''on the
-    first pass that sees it running, and never mergeable'', because Hermes, not ASES, starts the worker. swarm
-    doctor --repo checks core.logAllRefUpdates, which the check needs. Acceptance-tested on the fake board
-    (tests/acceptance/test_r10_basecheck.py); never run against a real dispatch. worktree_sync is pinned false
-    (round 5) and, per the Hermes 0.21.3 source, the Kanban dispatcher never syncs from a remote at all; the
-    remaining gap is only that the check has not run against a real dispatch. Earlier note: ROUND 9 T2B
-    (2026-09-27, zero quota): Read against the installed Hermes 0.21.3 source (read only). worktree_sync is
-    already pinned: profiles._config_rows sets worktree_sync: false on every ASES-managed profile (built in
-    round 5, citing this row), and profiles._check_profile reports a live profile that has it on; T2B made
-    swarm doctor tag that drift row with ASES-GIT-16 itself (doctor._extract_requirement_ids), so a drifted
-    value names this requirement. Still partial for two reasons, both honest: the remote-tip case this row
-    guards against has never been exercised (the real test repo has no remote), and the second half of p169,
-    ''Phase 3 MUST verify the actual base commit before a worker starts'', is not built anywhere (listed as a
-    new, separate work item; ASES-GIT-01 is set back to partial for the same reason). Earlier note: Observed
-    on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at the exact
-    integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and merge
-    worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote, so
-    Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
-    guards against) was never exercised, and whether worktree_sync must be turned off explicitly is
-    unverified.'
+  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
+    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show core.logAllRefUpdates is on in the real
+    test repository, so the round 10 base-commit check can read branch reflogs there; worktree_sync is still
+    on in the real profiles (swarm init sets it off, pending the owner''s yes), which per the Hermes source
+    only `hermes -w` reads anyway. Earlier note: ROUND 10 (2026-09-27, zero quota): BASECHECK built the check
+    blueprint p169''s last sentence asks for: guards.check_card_base reads a work branch''s creation commit
+    from its reflog (git forced to the C locale so the message is never translated) and requires it to be an
+    integration head ASES itself wrote or adopted, kept in a new integrity_heads history table (schema v9,
+    backfilled), so a card dispatched before a later merge still passes. It runs twice: every pass checks each
+    running card once and blocks a wrong or unverifiable base through the question path, and the merge queue
+    refuses such a branch outright, so a wrong base can never land even if detection missed it. ''Before a
+    worker starts'' is enforced as ''on the first pass that sees it running, and never mergeable'', because
+    Hermes, not ASES, starts the worker. swarm doctor --repo checks core.logAllRefUpdates, which the check
+    needs. Acceptance-tested on the fake board (tests/acceptance/test_r10_basecheck.py); never run against a
+    real dispatch. worktree_sync is pinned false (round 5) and, per the Hermes 0.21.3 source, the Kanban
+    dispatcher never syncs from a remote at all; the remaining gap is only that the check has not run against
+    a real dispatch. Earlier note: ROUND 9 T2B (2026-09-27, zero quota): Read against the installed Hermes
+    0.21.3 source (read only). worktree_sync is already pinned: profiles._config_rows sets worktree_sync:
+    false on every ASES-managed profile (built in round 5, citing this row), and profiles._check_profile
+    reports a live profile that has it on; T2B made swarm doctor tag that drift row with ASES-GIT-16 itself
+    (doctor._extract_requirement_ids), so a drifted value names this requirement. Still partial for two
+    reasons, both honest: the remote-tip case this row guards against has never been exercised (the real test
+    repo has no remote), and the second half of p169, ''Phase 3 MUST verify the actual base commit before a
+    worker starts'', is not built anywhere (listed as a new, separate work item; ASES-GIT-01 is set back to
+    partial for the same reason). Earlier note: Observed on the real 2026-09-19 run: the work-card worktree
+    Hermes created on dispatch was cut at the exact integration tip both times (232e12e for G1, 676628f for G2
+    after G1 merged), and the gate and merge worktrees ASES makes itself are detached at exact SHAs. Left
+    partial: the test repo has no remote, so Hermes''s default of syncing a worktree from the freshly fetched
+    remote tip (the case this requirement guards against) was never exercised, and whether worktree_sync must
+    be turned off explicitly is unverified.'
 - id: ASES-CFG-05
   requirement: UnoRouter custom-endpoint credentials use Hermes custom-endpoint secret handling; do not
     export provider keys into worker shells
@@ -1590,9 +1617,13 @@ requirements:
   section: 5.3, Appendix E
   verified_by: '22.1'
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): DOCTOR: config/models.yaml carries a source field and swarm doctor
-    displays value, source URL and checked date, WARNing where a source is missing. Sources were taken only
-    from blueprint Appendix E or the file''s own comments, never invented: today only openrouter has one
-    (Appendix E [S12]); xkiro and opencode_free WARN until someone records where their numbers came from.
-    Earlier note: config/models.yaml records verified_on per provider and doctor displays it; the source URLs
-    from Appendix E are not yet echoed into the doctor report itself'
+  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
+    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the real doctor displays value, source
+    and checked date as built in round 9: openrouter has its source
+    (https://openrouter.ai/docs/api-reference/limits); xkiro and opencode_free have no source on record, which
+    only the owner can supply. Earlier note: ROUND 9 (2026-09-27, zero quota): DOCTOR: config/models.yaml
+    carries a source field and swarm doctor displays value, source URL and checked date, WARNing where a
+    source is missing. Sources were taken only from blueprint Appendix E or the file''s own comments, never
+    invented: today only openrouter has one (Appendix E [S12]); xkiro and opencode_free WARN until someone
+    records where their numbers came from. Earlier note: config/models.yaml records verified_on per provider
+    and doctor displays it; the source URLs from Appendix E are not yet echoed into the doctor report itself'
