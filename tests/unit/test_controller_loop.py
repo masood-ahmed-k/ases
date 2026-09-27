@@ -446,10 +446,22 @@ def test_halted_reads_a_stopped_project_and_its_reason(tmp_path):
     assert controller._halted(conn, "t3") == (True, "swarm stop")
 
 
-def test_halted_takes_a_paused_projects_reason_from_the_project_paused_event(tmp_path):
-    """bounds.set_status keeps a reason only for `stopped`, so pause_and_report records it in an event."""
+def test_halted_reads_a_paused_projects_reason_from_project_state(tmp_path):
+    """ASES-CTL-01, the register's fixed known gap: bounds.set_status now keeps a reason for `paused` the same
+    way it does for `stopped`, so _halted reads it straight from project_state and never needs the
+    project_paused event pause_and_report also records."""
     conn = db.connect(tmp_path / "ases.db")
-    bounds.set_status(conn, "t3", "paused", "dropped by set_status")
+    bounds.set_status(conn, "t3", "paused", "wall clock reached")
+
+    assert controller._halted(conn, "t3") == (True, "wall clock reached")
+
+
+def test_halted_falls_back_to_the_project_paused_event_when_project_state_has_no_reason(tmp_path):
+    """A `paused` row with no stop_reason (written directly, or by a caller that passed none) still gets its
+    reason from the newest project_paused event; only when neither has one does it fall back to the bare status.
+    This is the fallback chain _pause_reason exists for, kept for rows older than the fix above."""
+    conn = db.connect(tmp_path / "ases.db")
+    bounds.set_status(conn, "t3", "paused")
     assert controller._halted(conn, "t3") == (True, "the project is paused")
 
     events.record(conn, "project_paused", {"project": "someone-else", "reason": "not mine"})
@@ -2528,17 +2540,17 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
         ["warn one"], rig.results["recovery"], ["T2"], ["n1"])
 
 
-@pytest.mark.parametrize("status, reason_event", [("stopped", None), ("paused", "wall clock reached")])
-def test_a_halted_project_returns_at_once_and_does_nothing_else(tmp_path, monkeypatch, status, reason_event):
+@pytest.mark.parametrize("status", ["stopped", "paused"])
+def test_a_halted_project_returns_at_once_and_does_nothing_else(tmp_path, monkeypatch, status):
+    """ASES-CTL-01: `paused` now keeps its own reason in project_state exactly like `stopped` does (bounds.py's
+    set_status), so both statuses report it here the same way and neither needs the project_paused event."""
     rig = PassRig(tmp_path, monkeypatch)
     bounds.set_status(rig.conn, "p", status, "swarm stop")
-    if reason_event:
-        events.record(rig.conn, "project_paused", {"project": "p", "reason": reason_event})
 
     summary = rig.run()
 
     assert rig.order == []                                       # not even the primary-checkout guard
-    assert summary["stopped"] is True and summary["stop_reason"] == (reason_event or "swarm stop")
+    assert summary["stopped"] is True and summary["stop_reason"] == "swarm stop"
     assert set(summary) == SUMMARY_KEYS and summary["finished"] is False and summary["merged"] == []
 
 

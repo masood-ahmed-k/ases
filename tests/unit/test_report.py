@@ -1704,6 +1704,36 @@ def test_status_for_the_seeded_scenario(scenario_report):
     ]   # the sixth health event is not shown: the status keeps the last five
 
 
+def test_status_shows_a_pauses_reason_in_parentheses_after_the_status_word(conn, tmp_path, monkeypatch):
+    """ASES-CTL-01: the register's known gap was that a pause's reason was dropped, so swarm status never showed
+    why a project was paused. It is now part of project_state and appears right on the status line."""
+    _fake_hermes(monkeypatch, {})
+    _state(conn, status="paused", stop_reason="project_wall_clock_minutes reached: 240 of 240")
+    line = next(l for l in report.render_status(_build(conn, tmp_path)).splitlines() if l.startswith("Project:"))
+    assert line.endswith("status paused (project_wall_clock_minutes reached: 240 of 240)")
+
+
+def test_status_shows_a_stops_reason_the_same_way_a_pauses_is_shown(conn, tmp_path, monkeypatch):
+    _fake_hermes(monkeypatch, {})
+    _state(conn, status="stopped", stop_reason="swarm stop")
+    line = next(l for l in report.render_status(_build(conn, tmp_path)).splitlines() if l.startswith("Project:"))
+    assert line.endswith("status stopped (swarm stop)")
+
+
+def test_status_shows_no_parenthetical_when_there_is_no_reason(conn, tmp_path, monkeypatch):
+    _fake_hermes(monkeypatch, {})
+    _state(conn, status="running")
+    line = next(l for l in report.render_status(_build(conn, tmp_path)).splitlines() if l.startswith("Project:"))
+    assert line.endswith("status running")
+
+
+def test_status_clips_a_long_pause_reason_at_150_characters(conn, tmp_path, monkeypatch):
+    _fake_hermes(monkeypatch, {})
+    _state(conn, status="paused", stop_reason="x" * 400)
+    line = next(l for l in report.render_status(_build(conn, tmp_path)).splitlines() if l.startswith("Project:"))
+    assert line.endswith("status paused (" + "x" * 147 + "...)")
+
+
 def test_status_shows_project_bounds_always_and_task_bounds_only_once_used(conn, tmp_path, monkeypatch):
     _fake_hermes(monkeypatch, {})
     bounds_line = next(l for l in report.render_status(_build(conn, tmp_path)).splitlines() if l.startswith("Bounds:"))

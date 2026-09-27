@@ -433,8 +433,16 @@ def test_set_status_records_the_reason_for_a_stop(conn):
     assert _state(conn)["stop_reason"] == "replans_per_project reached: 2 of 2"
 
 
-@pytest.mark.parametrize("status", ["planning", "running", "paused", "finished"])
-def test_set_status_stores_a_reason_only_for_stopped(conn, status):
+def test_set_status_records_the_reason_for_a_pause(conn):
+    """ASES-CTL-01, the register's known gap: bounds.set_status(paused) used to drop the reason, kept only in a
+    project_paused event. It is now part of project_state like a stop's reason is, so swarm status/report and the
+    stop/resume path can show it without going back to the events table."""
+    bounds.set_status(conn, "p1", "paused", "project_wall_clock_minutes reached: 240 of 240", now=NOW)
+    assert _state(conn)["stop_reason"] == "project_wall_clock_minutes reached: 240 of 240"
+
+
+@pytest.mark.parametrize("status", ["planning", "running", "finished"])
+def test_set_status_stores_a_reason_only_for_stopped_or_paused(conn, status):
     bounds.set_status(conn, "p1", status, "a reason", now=NOW)
     assert _state(conn)["stop_reason"] is None
 
@@ -444,8 +452,19 @@ def test_set_status_stopped_without_a_reason_stores_none(conn):
     assert _state(conn)["stop_reason"] is None
 
 
+def test_set_status_paused_without_a_reason_stores_none(conn):
+    bounds.set_status(conn, "p1", "paused", now=NOW)
+    assert _state(conn)["stop_reason"] is None
+
+
 def test_set_status_moving_off_stopped_clears_the_old_reason(conn):
     bounds.set_status(conn, "p1", "stopped", "wall clock", now=NOW)
+    bounds.set_status(conn, "p1", "running", now=NOW + timedelta(minutes=1))
+    assert _state(conn)["stop_reason"] is None
+
+
+def test_set_status_moving_off_paused_clears_the_old_reason(conn):
+    bounds.set_status(conn, "p1", "paused", "wall clock", now=NOW)
     bounds.set_status(conn, "p1", "running", now=NOW + timedelta(minutes=1))
     assert _state(conn)["stop_reason"] is None
 
@@ -454,6 +473,20 @@ def test_set_status_replaces_the_reason_of_an_earlier_stop(conn):
     bounds.set_status(conn, "p1", "stopped", "first", now=NOW)
     bounds.set_status(conn, "p1", "stopped", "second", now=NOW + timedelta(minutes=1))
     assert _state(conn)["stop_reason"] == "second"
+
+
+def test_set_status_replaces_the_reason_of_an_earlier_pause(conn):
+    bounds.set_status(conn, "p1", "paused", "first", now=NOW)
+    bounds.set_status(conn, "p1", "paused", "second", now=NOW + timedelta(minutes=1))
+    assert _state(conn)["stop_reason"] == "second"
+
+
+def test_set_status_switching_between_stopped_and_paused_carries_the_new_reason(conn):
+    """Both statuses use the same stop_reason column, so going from one to the other must replace it, not merge or
+    keep the old one around."""
+    bounds.set_status(conn, "p1", "stopped", "kill switch", now=NOW)
+    bounds.set_status(conn, "p1", "paused", "wall clock reached", now=NOW + timedelta(minutes=1))
+    assert (_state(conn)["status"], _state(conn)["stop_reason"]) == ("paused", "wall clock reached")
 
 
 def test_set_status_leaves_started_at_the_deadline_and_the_replan_count_alone(conn):
@@ -1691,7 +1724,7 @@ def test_finish_project_is_not_fooled_by_a_status_that_lands_after_the_status_wa
     state = _state(conn)
     assert state["status"] == arrives
     assert state["updated_at"] == "2026-09-19T12:05:00+00:00"  # the arriving write, not ours
-    assert state["stop_reason"] == ("kill switch" if arrives == "stopped" else None)
+    assert state["stop_reason"] == ("kill switch" if arrives in ("stopped", "paused") else None)
 
 
 def test_finish_project_creates_the_row_when_the_project_has_none(conn, fake_board):

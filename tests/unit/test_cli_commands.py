@@ -1640,7 +1640,9 @@ def test_run_starts_the_project_reconciles_then_loops_until_finished(runw, capsy
     ("stopped", "swarm stop", "is stopped (swarm stop)"),
     ("stopped", None, "is stopped (no reason was recorded)"),
     ("finished", None, "is finished; there is nothing left to run"),
-    ("paused", None, "is paused"),
+    ("paused", None, "is paused (a bound was reached or a final gate failed)"),
+    ("paused", "project_wall_clock_minutes reached: 240 of 240",
+     "is paused (project_wall_clock_minutes reached: 240 of 240)"),
 ])
 def test_run_refuses_a_stopped_finished_or_paused_project_with_exit_4_and_says_why(runw, capsys, status, reason,
                                                                                    said):
@@ -2268,7 +2270,20 @@ def test_resume_sets_a_paused_project_back_to_running(world, monkeypatch, capsys
     assert cli.main(["resume", "--repo", str(world.repo)]) == 0
 
     assert bounds.get_state(world.conn, "t3")["status"] == "running"
+    out = _console(capsys)[0]
+    assert "project t3: was paused, now running" in out
+    assert "(reason: project wall clock reached)" in out  # ASES-CTL-01: the pause reason is shown on resume too
+
+
+def test_resume_says_nothing_extra_when_the_pause_had_no_recorded_reason(world, monkeypatch, capsys):
+    bounds.start_project(world.conn, "t3")
+    bounds.set_status(world.conn, "t3", "paused")
+    _resume_world(world, monkeypatch)
+
+    assert cli.main(["resume", "--repo", str(world.repo)]) == 0
+
     assert "project t3: was paused, now running" in _console(capsys)[0]
+    assert "(reason:" not in _console(capsys)[0]
 
 
 def test_resume_a_stopped_project_returns_to_running_when_it_had_started(world, monkeypatch):
@@ -2897,7 +2912,8 @@ def test_the_calendar_line_says_when_a_provider_declares_no_rate_limit(world, mo
 
 
 def test_run_says_the_project_is_paused_when_a_pause_lands_without_a_recorded_reason(runw, monkeypatch, capsys):
-    """bounds.set_status keeps a reason only for a stop, so a pause has none in project_state."""
+    """No reason was passed to set_status here, so project_state has none and _halt_reason falls back to the bare
+    status (a pause given a reason is covered by the tests around _refuse_unless_startable and swarm resume)."""
     def pause_during_the_pass(*args, **kwargs):
         bounds.set_status(runw.world.conn, "t3", "paused")
         return _pass()
