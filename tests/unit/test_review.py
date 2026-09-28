@@ -43,6 +43,17 @@ def _branch_with_changes(repo, branch, files: dict):
 _LEAK = "sk-or-v1-PLANTEDVALUE0123456789abcd"
 
 
+@pytest.fixture(autouse=True)
+def _fake_gate_record_comment(monkeypatch):
+    """Round 16 (ASES-QG-01): gate_before_review now posts a gate-record comment through hermes.kanban_comment
+    on every result. This file's tests stub hermes functions one at a time rather than installing the full
+    ases.fakes.board.FakeHermes, so without this, an unmocked call would reach for a real `hermes` process --
+    exactly the zero-quota rule this repo is built under. Autouse so none of this file's tests written before
+    round 16 need a change of their own; a test that cares about the comment's own content overrides this with
+    its own monkeypatch, the same way every other hermes function here is stubbed one at a time."""
+    monkeypatch.setattr(hermes, "kanban_comment", lambda *a, **kw: None)
+
+
 def test_in_scope_diff_passes_and_reaches_gate1(repo, tmp_path, monkeypatch):
     _branch_with_changes(repo, "swarm/T1", {"src/a.py": "x=1\n"})
     conn = db.connect(tmp_path / "ases.db")
@@ -287,6 +298,18 @@ def _forbid_hermes(monkeypatch):
         if name.startswith("kanban_"):
             monkeypatch.setattr(hermes, name, _boom)
     monkeypatch.setattr(hermes, "_run", _boom, raising=False)
+
+
+def _forbid_review_sendback(monkeypatch):
+    """Only kanban_reopen_review is forbidden, i.e. "the card is not sent back". Round 16:
+    gate_before_review now also posts a gate-record comment through kanban_comment even when the card stays in
+    review (a "not run" record, see test_review.py's dedicated gate-record tests) -- the autouse
+    _fake_gate_record_comment fixture already stubs THAT call to a no-op, so a test using this helper is
+    checking one thing, not asserting "no Hermes call at all" against a call this round intentionally adds."""
+    def _boom(*args, **kwargs):
+        raise AssertionError("the card must not be sent back")
+
+    monkeypatch.setattr(hermes, "kanban_reopen_review", _boom)
 
 
 def _scenario(repo, kind):
@@ -1582,11 +1605,13 @@ def test_the_error_reason_is_one_short_ascii_line_and_never_repeats_a_secret(rep
 
 def test_gate_before_review_keeps_the_card_in_review_when_the_tamper_check_could_not_run(repo, tmp_path, monkeypatch):
     """A check that failed to run says nothing about the card, and the merge-time check is authoritative and fails
-    closed. So the card is NOT sent back (no Hermes call at all), the failure is recorded, and it returns True."""
+    closed. So the card is NOT sent back (kanban_reopen_review is never called), the failure is recorded, and it
+    returns True. Round 16: a "not run" gate record IS posted (ASES-QG-01, see the dedicated gate-record tests)
+    -- _forbid_review_sendback checks only that the card stays in review, not that no Hermes call was made."""
     _branch_with_changes(repo, "swarm/E4", {"src/a.py": "x=1\n"})
     conn = db.connect(tmp_path / "ases.db")
     _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: boom"))
-    _forbid_hermes(monkeypatch)
+    _forbid_review_sendback(monkeypatch)
     attempts = _forbid_gate1(monkeypatch)
 
     ok = review.gate_before_review(
@@ -1608,7 +1633,7 @@ def test_gate_before_review_passes_its_project_through_to_a_tamper_check_error_e
     _branch_with_changes(repo, "swarm/E4B", {"src/a.py": "x=1\n"})
     conn = db.connect(tmp_path / "ases.db")
     _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: boom"))
-    _forbid_hermes(monkeypatch)
+    _forbid_review_sendback(monkeypatch)
     _forbid_gate1(monkeypatch)
 
     ok = review.gate_before_review(
@@ -1957,3 +1982,259 @@ def test_gate_before_review_passes_project_config_and_task_through_to_check_bran
     )
 
     assert (seen["project_config"], seen["task"]) == (project_config, task)
+
+
+# --- gate_before_review: the ASES-QG-01 gate-record comment (round 16) ---------------------------------------
+
+
+def _posted_comments(monkeypatch):
+    """Replace hermes.kanban_comment (which the autouse _fake_gate_record_comment fixture already stubs to a
+    no-op) with one that also records what was posted, so a test can inspect it."""
+    posted = []
+    monkeypatch.setattr(
+        hermes, "kanban_comment", lambda board, card_id, text, **kw: posted.append((board, card_id, text)),
+    )
+    return posted
+
+
+def test_format_gate_record_shows_the_header_gate_commit_result_and_commands():
+    text = review._format_gate_record("abc123", "pass", ["pytest -q", "ruff check"], "line one\nline two")
+    out = text.splitlines()
+    assert out[0] == review.GATE_RECORD_HEADER == "ASES gate record"
+    assert "gate: gate1" in out and "commit: abc123" in out and "result: PASS" in out
+    assert "commands: pytest -q; ruff check" in out
+    assert "line one" in text and "line two" in text
+
+
+def test_format_gate_record_keeps_only_a_short_tail_of_a_long_output():
+    body = "x" * 5000
+    text = review._format_gate_record("abc", "fail", ["echo x"], body)
+    tail = text.splitlines()[-1]
+    assert len(tail) == review._GATE_RECORD_TAIL_LIMIT == len(body[-review._GATE_RECORD_TAIL_LIMIT:])
+    assert tail == body[-review._GATE_RECORD_TAIL_LIMIT:]
+
+
+def test_format_gate_record_redacts_a_secret_shaped_value_in_the_output():
+    text = review._format_gate_record("abc", "fail", ["echo x"], f"leaked: {_LEAK}")
+    assert _LEAK not in text and "[redacted]" in text
+
+
+def test_format_gate_record_has_no_trailing_body_line_when_there_is_no_output():
+    text = review._format_gate_record("", "not_run", ["echo x"], "")
+    assert text.splitlines()[-1] == "commands: echo x"
+
+
+def test_gate_before_review_posts_a_pass_gate_record_with_the_real_output_and_only_once(
+    repo, tmp_path, monkeypatch,
+):
+    """ASES-QG-01 / ASES-REV-05: a green Gate 1 re-check is posted to the card, naming the gate, the outcome, the
+    full commit SHA, the pinned commands and a tail of the real gate output -- and only once, even though Gate 1
+    re-runs on every review-lane poll while the card sits waiting for the reviewer to be dispatched (the second
+    call here is exactly that second poll, on the exact same, unmoved commit)."""
+    _branch_with_changes(repo, "swarm/GR1", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    posted = _posted_comments(monkeypatch)
+    head = _head(repo, "swarm/GR1")
+
+    ok1 = review.gate_before_review(
+        "b", "t_1", repo, "swarm/GR1", "integration", ["echo gate-output-marker"], ["src/*"],
+        conn=conn, task_key="GR1",
+    )
+    ok2 = review.gate_before_review(
+        "b", "t_1", repo, "swarm/GR1", "integration", ["echo gate-output-marker"], ["src/*"],
+        conn=conn, task_key="GR1",
+    )
+
+    assert (ok1, ok2) == (True, True)
+    assert len(posted) == 1  # not reposted on the second, identical pass
+    board, card_id, text = posted[0]
+    assert (board, card_id) == ("b", "t_1")
+    assert text.splitlines()[0] == review.GATE_RECORD_HEADER
+    assert f"commit: {head}" in text and "result: PASS" in text
+    assert "commands: echo gate-output-marker" in text
+    assert "gate-output-marker" in text  # the real gate output's own tail made it into the comment
+
+
+def test_gate_before_review_posts_a_fail_gate_record(repo, tmp_path, monkeypatch):
+    branch, touches, commands = _scenario(repo, "gate1_red")
+    conn = db.connect(tmp_path / "ases.db")
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda *a, **kw: None)
+    posted = _posted_comments(monkeypatch)
+
+    ok = review.gate_before_review(
+        "b", "t_2", repo, branch, "integration", commands, touches, conn=conn, task_key="GR2",
+    )
+
+    assert ok is False
+    assert len(posted) == 1
+    text = posted[0][2]
+    assert "result: FAIL" in text and "[exit 1]" in text
+
+
+def test_gate_before_review_posts_a_not_run_gate_record_truthfully_for_an_out_of_scope_diff(
+    repo, tmp_path, monkeypatch,
+):
+    branch, touches, commands = _scenario(repo, "out_of_scope")
+    conn = db.connect(tmp_path / "ases.db")
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda *a, **kw: None)
+    posted = _posted_comments(monkeypatch)
+    gate_ran = _forbid_gate1(monkeypatch)
+
+    ok = review.gate_before_review(
+        "b", "t_3", repo, branch, "integration", commands, touches, conn=conn, task_key="GR3",
+    )
+
+    assert ok is False and gate_ran == []  # Gate 1 truly never ran
+    assert len(posted) == 1
+    text = posted[0][2]
+    assert "result: NOT RUN" in text and "SECRETS.md" in text
+
+
+def test_gate_before_review_posts_a_not_run_gate_record_for_a_tamper_check_error_and_never_reposts_it(
+    repo, tmp_path, monkeypatch,
+):
+    """The one case where the card stays in review (never sent back) and the check is retried on the exact
+    same, unmoved commit every poll: the "not run" record must still be posted only once."""
+    _branch_with_changes(repo, "swarm/GR4", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _raise_in_check_range(monkeypatch, tamper.TamperCheckError("git diff failed: boom"))
+    posted = _posted_comments(monkeypatch)
+
+    ok1 = review.gate_before_review(
+        "b", "t_4", repo, "swarm/GR4", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR4",
+    )
+    ok2 = review.gate_before_review(
+        "b", "t_4", repo, "swarm/GR4", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR4",
+    )
+
+    assert (ok1, ok2) == (True, True)
+    assert len(posted) == 1
+    assert "result: NOT RUN" in posted[0][2]
+
+
+def test_gate_before_review_reposts_when_a_retried_tamper_check_error_goes_on_to_an_actual_pass(
+    repo, tmp_path, monkeypatch,
+):
+    """A DIFFERENT outcome for the SAME commit is new information for the reviewer and must still reach the
+    card, even though _gate_record_posted already has an entry for this (task_key, commit): the dedup key
+    includes the outcome, not just the commit, exactly so a transient tamper-check failure that clears on
+    retry is not hidden behind a stale "not run yet" forever."""
+    _branch_with_changes(repo, "swarm/GR5", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    posted = _posted_comments(monkeypatch)
+    real_check_range = tamper.check_range
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise tamper.TamperCheckError("git diff failed: boom")
+        return real_check_range(*args, **kwargs)
+
+    monkeypatch.setattr(tamper, "check_range", flaky)
+
+    ok1 = review.gate_before_review(
+        "b", "t_5", repo, "swarm/GR5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR5",
+    )
+    ok2 = review.gate_before_review(
+        "b", "t_5", repo, "swarm/GR5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR5",
+    )
+
+    assert (ok1, ok2) == (True, True)
+    assert [text.splitlines()[3] for _, _, text in posted] == ["result: NOT RUN", "result: PASS"]
+
+
+def test_gate_before_review_records_a_gate1_record_posted_event_with_the_project(repo, tmp_path, monkeypatch):
+    _branch_with_changes(repo, "swarm/GR7", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    _posted_comments(monkeypatch)
+    head = _head(repo, "swarm/GR7")
+
+    review.gate_before_review(
+        "b", "t_7", repo, "swarm/GR7", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR7",
+        project="proj-z",
+    )
+
+    assert _events(conn, "gate1_record_posted") == [
+        {"task_key": "GR7", "card_id": "t_7", "head": head, "outcome": "pass"},
+    ]
+    row = conn.execute("SELECT project FROM events WHERE kind = 'gate1_record_posted'").fetchone()
+    assert row["project"] == "proj-z"
+
+
+def test_gate_before_review_survives_a_hermes_failure_while_posting_the_gate_record(
+    repo, tmp_path, monkeypatch,
+):
+    """Round 16 review finding: a Hermes hiccup while posting the gate-record comment (kanban_comment raising
+    hermes.HermesCommandError, simulating a real Hermes CLI/network failure) must not turn an otherwise-green
+    Gate 1 into an uncaught exception. gate_before_review's only caller (controller.process_review_lane) is not
+    wrapped in the pass's `_isolated` helper, so an exception here would stop the review lane and every step
+    after it in that controller pass, not just this one card."""
+    _branch_with_changes(repo, "swarm/GR8", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    head = _head(repo, "swarm/GR8")
+
+    def boom(board, card_id, text, **kw):
+        raise hermes.HermesCommandError(["kanban", "comment"], 1, "hermes: connection refused")
+
+    monkeypatch.setattr(hermes, "kanban_comment", boom)
+
+    ok = review.gate_before_review(
+        "b", "t_8", repo, "swarm/GR8", "integration", ["echo gate-ok"], ["src/*"],
+        conn=conn, task_key="GR8", project="proj-z",
+    )
+
+    assert ok is True  # the gate result is still returned correctly despite the failed comment post
+    assert _events(conn, "gate1_record_posted") == []
+    failed = _events(conn, "gate_record_post_failed")
+    assert len(failed) == 1
+    assert failed[0]["task_key"] == "GR8" and failed[0]["card_id"] == "t_8"
+    assert failed[0]["head"] == head and failed[0]["outcome"] == "pass"
+    assert "HermesCommandError" in failed[0]["error"]
+    row = conn.execute("SELECT project FROM events WHERE kind = 'gate_record_post_failed'").fetchone()
+    assert row["project"] == "proj-z"
+
+
+def test_gate_before_review_retries_the_gate_record_post_on_the_next_pass_after_a_hermes_failure(
+    repo, tmp_path, monkeypatch,
+):
+    """Since a failed post is never marked as posted (_gate_record_posted has no matching event), the next
+    review-lane pass on the same, unmoved commit tries again -- and this time it goes through."""
+    _branch_with_changes(repo, "swarm/GR9", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    calls = {"n": 0}
+    posted = []
+
+    def flaky(board, card_id, text, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise hermes.HermesCommandError(["kanban", "comment"], 1, "hermes: connection refused")
+        posted.append((board, card_id, text))
+
+    monkeypatch.setattr(hermes, "kanban_comment", flaky)
+
+    ok1 = review.gate_before_review(
+        "b", "t_9", repo, "swarm/GR9", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR9",
+    )
+    ok2 = review.gate_before_review(
+        "b", "t_9", repo, "swarm/GR9", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR9",
+    )
+
+    assert (ok1, ok2) == (True, True)
+    assert len(posted) == 1  # the retried post succeeded, and only that one comment went to the card
+    assert len(_events(conn, "gate1_record_posted")) == 1
+    assert len(_events(conn, "gate_record_post_failed")) == 1
+
+
+def test_check_branch_for_merge_never_posts_a_gate_record(repo, tmp_path, monkeypatch):
+    """The gate-record comment is a review-lane thing (gate_before_review posts it, not check_branch itself):
+    the merge queue's own, independent check must not also start posting comments no work order asked for."""
+    _branch_with_changes(repo, "swarm/GR6", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    posted = _posted_comments(monkeypatch)
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/GR6", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GR6",
+    )
+
+    assert result.kind == "ok" and posted == []

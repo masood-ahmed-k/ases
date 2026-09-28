@@ -744,7 +744,11 @@ def process_review_lane(
     start (sandbox.SandboxInfrastructureError: Docker down, the pinned image missing; round 12 finding 0:
     gates.GateCheckoutError, its own throwaway checkout could not be created) is not a red gate: it is
     recorded once per card as a `sandbox_infrastructure_error` event and the card is left exactly where it is,
-    to be re-checked next pass, never sent back and never silently run on the host instead."""
+    to be re-checked next pass, never sent back and never silently run on the host instead.
+
+    Round 16 (ASES-QG-01, ASES-REV-05): review.gate_before_review itself now posts what it decided to the card
+    as a comment (a reviewer has no other way to see the controller's own gate record), so this function makes
+    no separate call for that; see gate_before_review's own docstring."""
     sent_back = []
     for card in hermes_mod.kanban_list(board, status="review"):
         row = conn.execute(
