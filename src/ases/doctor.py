@@ -165,6 +165,68 @@ def _check_log_all_ref_updates(repo: pathlib.Path | None) -> DoctorCheck:
     )
 
 
+# Git's own boolean-true spellings for a config value (git-config(1)): case folded by the .lower() below.
+_GIT_TRUE_SPELLINGS = ("true", "yes", "on", "1")
+
+
+def _check_worktree_relative_paths(repo: pathlib.Path | None, sandbox_enabled: bool) -> DoctorCheck:
+    """WORKERGIT (round 15, docs/work-orders/r15_wp_sandbox.md; ASES-SEC-03): a worker's Docker terminal backend
+    can only commit inside the linked worktree Hermes dispatches it into when the PROJECT repository's own
+    `worktree.useRelativePaths` is true (git 2.48+): `git worktree add` then records the new worktree's own
+    `.git` gitdir pointer as a RELATIVE path, the only kind that can resolve once just the worktree is mounted
+    into the container (sandbox.py's module docstring has the full mechanism; scripts/workergit_live_check.py
+    proves it against a real container). controller.ensure_repo_bootstrapped sets this for a repository ASES
+    itself creates from empty; an EXISTING repository (the common case) is never touched there, so this is what
+    tells a person it still needs `git config worktree.useRelativePaths true` run once, by hand, in that
+    repository.
+
+    Same `repo` is None handling as _check_log_all_ref_updates: without --repo there is nothing to read. Unlike
+    that check, "unset" here is NOT healthy: worktree.useRelativePaths defaults to false (the opposite polarity
+    of core.logAllRefUpdates), so unset and an explicit "false" report the same way. A healthy value is any of
+    git's own boolean-true spellings (_GIT_TRUE_SPELLINGS: "true", "yes", "on", "1"), not only the literal "true"
+    controller.ensure_repo_bootstrapped writes -- a human hand-editing the config is free to use any of them, and
+    git itself treats them identically. Severity: a WARN always (matching every other repository-shape check in
+    this module), raised to a FAIL only once `sandbox_enabled` is true -- that is the point a worker's own `git
+    commit` inside the container is demonstrably broken by this, not a theoretical future problem, the same
+    "pending vs FAIL only once the sandbox is really on"
+    reasoning `_check_sandbox` already applies elsewhere in this module."""
+    if repo is None:
+        return DoctorCheck(
+            "worktree_relative_paths", "pending",
+            "not checked: swarm doctor was not given the project repository's path this time (pass --repo). "
+            "A worker's Docker terminal backend needs worktree.useRelativePaths=true there to commit inside "
+            "its dispatched worktree (WORKERGIT).",
+            _SANDBOX_IDS,
+        )
+    try:
+        result = subprocess.run(
+            [*gitexec.GIT, "-C", str(repo), "config", "--get", "worktree.useRelativePaths"],
+            capture_output=True, text=True, timeout=10, env=gitexec.git_env(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return DoctorCheck(
+            "worktree_relative_paths", "warn", f"could not read worktree.useRelativePaths in {repo}: {exc}",
+            _SANDBOX_IDS,
+        )
+    value = result.stdout.strip().lower()
+    if value in _GIT_TRUE_SPELLINGS:
+        return DoctorCheck(
+            "worktree_relative_paths", "pass",
+            f"worktree.useRelativePaths={value} in {repo}: a dispatched worker can commit inside its own linked "
+            "worktree",
+            _SANDBOX_IDS,
+        )
+    status = "fail" if sandbox_enabled else "warn"
+    why = f"worktree.useRelativePaths={value}" if value else "worktree.useRelativePaths is unset (default false)"
+    return DoctorCheck(
+        "worktree_relative_paths", status,
+        f"{why} in {repo}: run `git config worktree.useRelativePaths true` there once, by hand, or a worker's "
+        "own `git commit` inside its dispatched worktree fails (WORKERGIT)"
+        + (" -- the sandbox is enabled, so this blocks real work today" if sandbox_enabled else ""),
+        _SANDBOX_IDS,
+    )
+
+
 _WORKTREE_LEAK_KINDS = ("gate_worktree_leak", "merge_worktree_leak")
 _WORKTREE_LEAK_IDS = ("ASES-GIT-12",)
 
@@ -784,7 +846,8 @@ def _check_no_secrets_in_output(report_text_so_far: str) -> DoctorCheck:
 
 
 def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: pathlib.Path | None = None) -> DoctorReport:
-    """`repo` (round 10, package BASECHECK): the project repository's path, for _check_log_all_ref_updates. Keyword
+    """`repo` (round 10, package BASECHECK; round 15, package WORKERGIT): the project repository's path, for
+    _check_log_all_ref_updates and _check_worktree_relative_paths. Keyword
     -only and optional so a caller that does not pass one (cmd_doctor without --repo; see that check's own
     docstring) keeps working unchanged, getting a "pending" row for it instead of a forced signature change."""
     profiles_mod, profiles_unavailable = _load_profiles_module()
@@ -793,6 +856,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         _check_not_under_onedrive(project),
         _check_git_longpaths(project),
         _check_log_all_ref_updates(repo),
+        _check_worktree_relative_paths(repo, bool(getattr(project, "sandbox_enabled", False))),
         _check_leaked_worktrees(project, conn, repo),
         _check_gitattributes(project),
         _check_python_version(),

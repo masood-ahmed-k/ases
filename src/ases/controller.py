@@ -118,10 +118,14 @@ def ensure_repo_bootstrapped(repo: pathlib.Path, integration_branch: str, *, con
     when a file of that name is not already there, so a repository that already had one before bootstrapping
     keeps it.
 
-    Never writes git config (the standing hard rule): the commit's author and committer are given with a
-    `-c user.name=... -c user.email=...` pair scoped to that one git invocation, the same throwaway-identity
-    pattern already used elsewhere in this codebase for a repository with no identity of its own
-    (evalkit/codetasks.py's E8 fixture, fakes/worker.py's _IDENTITY).
+    Never writes IDENTITY into git config (the standing hard rule): the commit's author and committer are given
+    with a `-c user.name=... -c user.email=...` pair scoped to that one git invocation, the same
+    throwaway-identity pattern already used elsewhere in this codebase for a repository with no identity of its
+    own (evalkit/codetasks.py's E8 fixture, fakes/worker.py's _IDENTITY). WORKERGIT (round 15) is the one
+    deliberate exception to "never writes git config" in the broader sense: `worktree.useRelativePaths=true` IS
+    written persistently (not `-c`-scoped) into a brand-new repository's own `.git/config`, because it is a
+    repository-shape setting a linked worktree's `git` needs to resolve inside a Docker sandbox (ASES-SEC-03),
+    not an identity or a credential.
 
     Never raises for an ordinary git failure: a step that fails records a repo_bootstrap_error event (only when
     `conn` is given) naming which step and git's own text, and returns False, leaving the repository exactly as
@@ -166,6 +170,23 @@ def ensure_repo_bootstrapped(repo: pathlib.Path, integration_branch: str, *, con
     if result.returncode != 0:
         _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
                           step=step, detail=_clean(f"{result.stdout}{result.stderr}", 300))
+        return False
+
+    # WORKERGIT (docs/work-orders/r15_wp_sandbox.md; ASES-SEC-03): a dispatched card's linked worktree only lets
+    # its own `git` commit inside a Docker sandbox when THIS repository records a relative gitdir for a new
+    # worktree (git 2.48+; sandbox.py's module docstring has the full mechanism, proven live in
+    # scripts/workergit_live_check.py). Set once, here, before any worktree is ever cut from this repository:
+    # `git worktree add` reads it at the moment it runs, so setting it now (long before Hermes's Kanban
+    # dispatcher ever calls `git worktree add`) is exactly as good as setting it right before that call, and
+    # this is the one place ASES already touches a brand-new repository's own git config. An EXISTING repository
+    # (the common case: has_dot_git True with real history, returned False above already) is never touched
+    # here, matching every other guarantee this function makes about a repository that already had commits --
+    # doctor.py's worktree_relative_paths check is what tells a person an existing repository still needs
+    # `git config worktree.useRelativePaths true` run by hand.
+    relpaths = _bootstrap_git(repo, ["config", "worktree.useRelativePaths", "true"])
+    if relpaths.returncode != 0:
+        _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                          step="worktree_relative_paths", detail=_clean(f"{relpaths.stdout}{relpaths.stderr}", 300))
         return False
 
     add = _bootstrap_git(repo, ["add", "-A"])

@@ -33,6 +33,13 @@ def good() -> dict:
     return sandbox.terminal_block(POLICY)
 
 
+def good_volumes(*extra: object) -> list:
+    """WORKERGIT: good()'s own docker_volumes (the mandatory git mounts, sandbox.GIT_WORKTREE_VOLUMES) plus
+    whatever extra entries a test wants to check on top of them. A bare `[extra]` would ALSO be missing every
+    one of the five git mounts, which is a real, separate problem most of these tests are not about."""
+    return [*sandbox.GIT_WORKTREE_VOLUMES, *extra]
+
+
 def problems_of(block: dict, policy: SandboxPolicy = POLICY) -> list[str]:
     return sandbox.check_terminal_block(block, policy, home=HOME)
 
@@ -239,12 +246,13 @@ def test_ordinary_names_are_not_credential_shaped(name):
 def test_terminal_block_is_table_33_without_cwd_and_with_the_no_reuse_key():
     """Two deliberate differences from the blueprint's table 33, both proven from the Hermes source: cwd is left
     out (it would stop the worktree being mounted) and docker_persist_across_processes is false (a reused
-    container keeps the previous card's mount)."""
+    container keeps the previous card's mount). docker_volumes (WORKERGIT, round 15) carries the five mandatory
+    git mounts every Docker-backend worker needs to commit inside its own dispatched worktree."""
     assert good() == {
         "backend": "docker", "docker_image": IMAGE,
         "docker_mount_cwd_to_workspace": True, "docker_run_as_host_user": True, "docker_forward_env": [],
         "docker_network": False, "container_cpu": 2, "container_memory": 4096,
-        "docker_persist_across_processes": False,
+        "docker_persist_across_processes": False, "docker_volumes": list(sandbox.GIT_WORKTREE_VOLUMES),
     }
     assert "cwd" not in good()
 
@@ -369,9 +377,11 @@ def test_table_33s_cwd_would_defeat_the_worktree_mount_on_the_installed_hermes(t
 
 
 def test_every_key_terminal_block_emits_exists_in_the_installed_hermes():
-    """Read-only. The blueprint says to confirm the keys against the example config, but docker_network and
-    docker_persist_across_processes are real and not in that file, so a key also counts when Hermes bridges it
-    from config.yaml (TERMINAL_CONFIG_ENV_MAP), which is what makes a terminal: key take effect."""
+    """Read-only. The blueprint says to confirm the keys against the example config, but docker_network,
+    docker_persist_across_processes and docker_volumes are real and not in that file, so a key also counts when
+    Hermes bridges it from config.yaml (TERMINAL_CONFIG_ENV_MAP), which is what makes a terminal: key take
+    effect (docker_volumes is WORKERGIT's own addition, round 15: confirmed in TERMINAL_CONFIG_ENV_MAP,
+    hermes_cli/config.py, but likewise absent from cli-config.yaml.example)."""
     source = _hermes_source()
     if source is None:
         pytest.skip("Hermes 0.21.x source is not installed here")
@@ -379,9 +389,10 @@ def test_every_key_terminal_block_emits_exists_in_the_installed_hermes():
     config_py = (source / "hermes_cli" / "config.py").read_text(encoding="utf-8", errors="replace")
     start = config_py.index("TERMINAL_CONFIG_ENV_MAP = {")
     bridge = config_py[start:config_py.index("def _terminal_env_value", start)]
+    known_omissions = {"docker_network", "docker_persist_across_processes", "docker_volumes"}
     for key in good():
         assert f'"{key}"' in bridge, f"{key} is not bridged from config.yaml by this Hermes"
-        assert re.search(rf"\b{key}\b", example) or key in {"docker_network", "docker_persist_across_processes"}, (
+        assert re.search(rf"\b{key}\b", example) or key in known_omissions, (
             f"{key} is in neither the example config nor the known omissions"
         )
 
@@ -638,15 +649,17 @@ def test_an_image_that_is_not_a_reference_is_refused(image):
 ])
 def test_dangerous_docker_volumes_are_refused(volume, needle):
     block = good()
-    block["docker_volumes"] = [volume]
+    block["docker_volumes"] = good_volumes(volume)
     found = problems_of(block)
     assert any("docker_volumes entry" in p and needle in p for p in found), found
 
 
 def test_docker_volumes_posix_home_is_refused():
     block = good()
-    block["docker_volumes"] = ["/home/tester/.ssh:/root/.ssh", "/home/tester:/h"]
+    block["docker_volumes"] = good_volumes("/home/tester/.ssh:/root/.ssh", "/home/tester:/h")
     found = sandbox.check_terminal_block(block, POLICY, home=POSIX_HOME)
+    # The five mandatory WORKERGIT git mounts are ${env:...}-templated, so none of them is "_path_like" and none
+    # adds a problem here (see _volume_problems); only the two sensitive entries this test is actually about do.
     assert len(found) == 2 and "~/.ssh" in found[0] and "home directory" in found[1]
 
 
@@ -656,7 +669,7 @@ def test_docker_volumes_posix_home_is_refused():
 ])
 def test_harmless_docker_volumes_are_accepted(volume):
     block = good()
-    block["docker_volumes"] = [volume]
+    block["docker_volumes"] = good_volumes(volume)
     assert problems_of(block) == []
 
 
@@ -664,7 +677,7 @@ def test_harmless_docker_volumes_are_accepted(volume):
 def test_a_volume_with_no_host_part_is_judged_like_hermes_does(volume):
     """Hermes only skips an entry with no colon at all; ':/workspace' still counts as an explicit /workspace mount."""
     block = good()
-    block["docker_volumes"] = [volume]
+    block["docker_volumes"] = good_volumes(volume)
     found = problems_of(block)
     if "/workspace" in volume:
         assert len(found) == 1 and "targets /workspace" in found[0], found
@@ -720,14 +733,174 @@ def test_a_root_owned_home_does_not_make_its_own_worktrees_a_system_path_problem
 
 def test_malformed_docker_volumes_are_reported():
     block = good()
-    block["docker_volumes"] = [5]
+    block["docker_volumes"] = good_volumes(5)
     assert problems_of(block) == ["docker_volumes has an entry that is not a string"]
     block["docker_volumes"] = "C:\\x:/y"
     assert problems_of(block) == ["docker_volumes is not a list"]
     block["docker_volumes"] = None
     assert problems_of(block) == ["docker_volumes is not a list"]
-    block["docker_volumes"] = []
+    block["docker_volumes"] = good_volumes()
     assert problems_of(block) == []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WORKERGIT (round 15): the mandatory git mounts a worker needs to commit inside its own dispatched worktree
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_git_worktree_volumes_is_five_entries_templated_on_terminal_cwd():
+    """Every entry is `${env:TERMINAL_CWD}/../../.git...:<container target>[:ro]` -- the literal walk-up from a
+    canonical <repo>/.worktrees/<task_id> worktree to <repo>/.git (sandbox.py's module docstring, WORKERGIT
+    section). Container targets are /.git (the only one read-only) plus objects, refs, logs, worktrees."""
+    volumes = sandbox.git_worktree_volumes()
+    assert volumes == sandbox.GIT_WORKTREE_VOLUMES
+    assert len(volumes) == 5 == len(set(volumes))
+    up = "${env:TERMINAL_CWD}/../../.git"
+    assert set(volumes) == {
+        f"{up}:/.git:ro", f"{up}/objects:/.git/objects", f"{up}/refs:/.git/refs", f"{up}/logs:/.git/logs",
+        f"{up}/worktrees:/.git/worktrees",
+    }
+    readonly = [entry for entry in volumes if entry.endswith(":ro")]
+    assert readonly == [f"{up}:/.git:ro"], "only the base .git mount is read-only; the other four are writable"
+
+
+def test_terminal_block_docker_volumes_is_exactly_git_worktree_volumes():
+    assert good()["docker_volumes"] == list(sandbox.git_worktree_volumes())
+
+
+def test_check_terminal_block_requires_every_git_worktree_volume():
+    """docker_volumes missing entirely, or missing just one of the five, is refused -- a worker could not commit
+    inside its dispatched worktree without all five (sandbox.py's module docstring, WORKERGIT section)."""
+    block = good()
+    del block["docker_volumes"]
+    found = problems_of(block)
+    assert len(found) == 5 and all("is missing the git mount" in p for p in found), found
+
+    for missing in sandbox.GIT_WORKTREE_VOLUMES:
+        block = good()
+        block["docker_volumes"] = [v for v in sandbox.GIT_WORKTREE_VOLUMES if v != missing]
+        found = problems_of(block)
+        assert len(found) == 1 and missing in found[0] and "is missing the git mount" in found[0], (missing, found)
+
+
+@pytest.mark.parametrize("extra", [
+    "${env:TERMINAL_CWD}/../../.git/config:/.git/config",  # writable override of the read-only base .git mount
+    "${env:TERMINAL_CWD}/../../.git/hooks:/.git/hooks",
+    "${env:TERMINAL_CWD}/../../.git:/.git",  # the base mount again, without :ro
+    "C:\\Users\\tester\\other-repo\\.git:/.git:ro",  # a literal path, not even templated
+])
+def test_check_terminal_block_refuses_anything_extra_that_reaches_into_git(extra):
+    block = good()
+    block["docker_volumes"] = good_volumes(extra)
+    found = problems_of(block)
+    # _short()/repr() may re-escape backslashes, so check the phrase and a distinctive fragment, not `extra` itself.
+    assert any("reaches into .git outside the WORKERGIT git mounts" in p and ".git" in p for p in found), found
+
+
+def test_check_terminal_block_does_not_flag_an_unrelated_volume_as_a_git_mount():
+    block = good()
+    block["docker_volumes"] = good_volumes("/srv/cache:/cache")
+    assert problems_of(block) == []
+
+
+@pytest.mark.parametrize("entry", [
+    "C:\\repo\\.git:/x:ro", "/repo/.git:/x:ro", "C:\\repo\\.git", ".git:/x",
+])
+def test_mentions_git_dir_matches_dot_git_with_either_slash_style(entry):
+    assert sandbox._mentions_git_dir(entry) is True
+
+
+@pytest.mark.parametrize("entry", [
+    "something.git:/x", "repo.git-backup:/x", "C:\\repo\\something.git:/x", "/srv/cache:/cache",
+    "named_volume:/data", "/repo/.gitignore:/x",
+])
+def test_mentions_git_dir_does_not_false_positive_on_a_name_that_merely_contains_git(entry):
+    """A directory literally named "something.git" (a bare clone, common convention) is not itself a WORKERGIT
+    git-internals mount, and must not be refused as one."""
+    assert sandbox._mentions_git_dir(entry) is False
+
+
+def test_check_terminal_block_does_not_flag_a_something_dot_git_named_volume():
+    """The regression case behind the two tests above, through the real checker: a volume whose host path is
+    named like a bare git clone (not a WORKERGIT git-internals mount) is left alone."""
+    block = good()
+    block["docker_volumes"] = good_volumes("/srv/vendor/upstream.git:/vendor/upstream.git:ro")
+    assert problems_of(block) == []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# A ${env:...}-templated docker_volumes entry (GIT_WORKTREE_VOLUMES' own syntax) must not hide a sensitive mount.
+# Mirrors SSH_SPELLINGS above: same sensitive locations, spelled the way WORKERGIT itself legitimizes.
+# ---------------------------------------------------------------------------------------------------------------
+
+TEMPLATED_SENSITIVE_MOUNTS = [
+    "${env:HOME}/.ssh:/root/.ssh:ro",
+    "${env:PROJECT_DIR}/.env:/x/.env:ro",
+    "${env:HOME}/.aws/credentials:/x:ro",
+    "${env:TERMINAL_CWD}/../..:/repo-root",  # the whole repo root, not just .git (ASES-SEC-03)
+    "${env:HOME}:/root:ro",  # a template with nothing after it, standing for the home directory itself
+    "${env:A}${env:B}/.ssh:/x:ro",  # more than one leading template
+    "/data/${env:USER}/.ssh:/x:ro",  # the template is not a leading prefix, only reachable mid-string
+    "/home/${env:USER}/.ssh/${env:TMP}:/mnt",  # sensitive segment sandwiched between two templates
+    "/home/${env:USER}/.ssh/${env:TMP}/scratch:/mnt",  # same, with an innocuous-looking tail after the last one
+]
+
+
+@pytest.mark.parametrize("mount", TEMPLATED_SENSITIVE_MOUNTS)
+def test_a_templated_env_reference_does_not_hide_a_sensitive_mount(mount):
+    """Before the fix, _path_like rejected anything starting with '$' as not path-like at all, so a
+    ${env:...}-templated entry reached no sensitive-path check whatsoever, whatever host location it named."""
+    block = good()
+    block["docker_volumes"] = good_volumes(mount)
+    found = problems_of(block)
+    assert found and all(p.startswith("docker_volumes entry") for p in found), found
+
+
+def test_a_templated_mount_is_caught_the_same_way_its_literal_equivalent_is():
+    """Same host location, templated and literal: both must trip the identical sensitive-path reason, proving the
+    templated entry reaches the same check a literal path already does, not a separate weaker one."""
+    literal = good()
+    literal["docker_volumes"] = good_volumes(POSIX_HOME + "/.ssh:/root/.ssh:ro")
+    templated = good()
+    templated["docker_volumes"] = good_volumes("${env:HOME}/.ssh:/root/.ssh:ro")
+    literal_found = sandbox.check_terminal_block(literal, POLICY, home=POSIX_HOME)
+    templated_found = sandbox.check_terminal_block(templated, POLICY, home=POSIX_HOME)
+    assert literal_found and "is or lies inside ~/.ssh" in literal_found[0]
+    assert templated_found and "is or lies inside ~/.ssh" in templated_found[0]
+
+
+@pytest.mark.parametrize("mount", [
+    "${env:WORKSPACE}/data:/data:rw",  # an unrelated variable naming an ordinary subdirectory
+    "/data/${env:USER}/cache:/x:rw",  # same, template not a leading prefix
+])
+def test_a_templated_mount_that_resolves_somewhere_ordinary_is_not_flagged(mount):
+    """The generalised check must not turn every ${env:...} mount into a false positive: an unrelated variable
+    naming an ordinary subdirectory stays clean, the same as its literal '~/data' equivalent already does."""
+    block = good()
+    block["docker_volumes"] = good_volumes(mount)
+    assert problems_of(block) == []
+
+
+def test_templated_candidate_hosts_returns_one_candidate_per_marker_occurrence():
+    assert sandbox._templated_candidate_hosts("${env:HOME}/.ssh:/x:ro") == ["~/.ssh"]
+    assert sandbox._templated_candidate_hosts("${env:A}${env:B}/.ssh:/x:ro") == ["~/.ssh"]  # adjacent templates
+    assert sandbox._templated_candidate_hosts("${env:TERMINAL_CWD}:/x:ro") == ["~"]  # template alone, nothing follows
+    # The template IS the entire entry: collapsed to "~" alone, which has no ':' at all, so _split_volume
+    # reports no host at all -- matching Hermes's own "an entry with no colon is skipped" (no functional mount
+    # is ever created once ${env:X} is really expanded to a colon-less value, so there is nothing to check).
+    assert sandbox._templated_candidate_hosts("${env:X}") == []
+    assert sandbox._templated_candidate_hosts("/data/${env:USER}/.ssh:/x:ro") == ["~/.ssh"]  # not a leading prefix
+    assert sandbox._templated_candidate_hosts("/plain/path:/x:ro") == []  # no template at all
+    assert sandbox._templated_candidate_hosts("${env:X}data:/y:ro") == []  # not a '/'-rooted continuation
+    assert sandbox._templated_candidate_hosts("${env:X}data") == []  # no separator at all: not well-formed
+    # a sensitive segment between two templates: one candidate anchored at EACH marker, not only the last.
+    assert sandbox._templated_candidate_hosts("/home/${env:USER}/.ssh/${env:TMP}/scratch:/mnt") == [
+        "~/.ssh/~/scratch", "~/scratch",
+    ]
+
+
+def test_a_compliant_terminal_block_from_terminal_block_has_no_git_mount_problems():
+    assert problems_of(good()) == []
 
 
 @pytest.mark.parametrize("args", [
@@ -2253,7 +2426,7 @@ def test_no_spelling_gets_a_sensitive_path_through_as_a_mount(spelling):
 @pytest.mark.parametrize("spelling", SSH_SPELLINGS)
 def test_no_spelling_gets_a_sensitive_path_through_as_a_docker_volume(spelling):
     block = good()
-    block["docker_volumes"] = [spelling + ":/root/x:ro"]
+    block["docker_volumes"] = good_volumes(spelling + ":/root/x:ro")
     found = problems_of(block)
     assert found and all(p.startswith("docker_volumes entry") for p in found), found
 
@@ -2315,7 +2488,7 @@ def test_a_double_slash_posix_path_is_not_a_share():
 ])
 def test_the_container_engine_and_system_directories_are_never_a_worker_mount(volume, needle):
     block = good()
-    block["docker_volumes"] = [volume]
+    block["docker_volumes"] = good_volumes(volume)
     found = problems_of(block)
     assert found and all(p.startswith("docker_volumes entry") for p in found), found
     assert any(needle in p for p in found), found
@@ -2337,7 +2510,7 @@ def test_ordinary_absolute_directories_are_still_fine_as_volumes():
     for volume in ("/srv/cache:/cache", "/var/cache/pip:/root/.cache/pip:ro", "/opt/toolchain:/opt/tc:ro",
                    "/usr/share/zoneinfo:/usr/share/zoneinfo:ro", "/tmp/x:/y", "/data:/data"):
         block = good()
-        block["docker_volumes"] = [volume]
+        block["docker_volumes"] = good_volumes(volume)
         assert problems_of(block) == [], volume
 
 
