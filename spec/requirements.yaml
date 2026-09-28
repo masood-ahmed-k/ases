@@ -201,8 +201,15 @@ requirements:
   section: '4.2'
   verified_by: Inspection
   status: covered
-  note: SOUL.md for each profile carries the Appendix C role prompt, versioned in this repo's own profile-setup
-    notes (docs/architecture.md).
+  note: 'ROUND 16 (2026-09-28, zero quota): PROMPTVER (commit 1b5cb8b) fixed a real bug the swarm init dry run
+    exposed: profiles.prompt_version() previously reported one global PROMPT_VERSION for every prompt, so
+    reviewer prompt v2 would have installed under a header still saying version 1; it now reads each
+    prompt''s own first line, with PROMPT_VERSION kept only as the fallback. PACKEDREFS (commit e7e2ce8)
+    added prompts/coder.md version 2, rule 5, telling the coder the packed-refs.lock message after an
+    in-sandbox commit is expected and to check git log -1 rather than commit again. Both versioned prompts
+    were applied for real by swarm init --global --apply --yes (12 changes, 0 failed), with dated backups of
+    every file it touched. Earlier note: SOUL.md for each profile carries the Appendix C role prompt,
+    versioned in this repo''s own profile-setup notes (docs/architecture.md).'
 - id: ASES-ROL-04
   requirement: One process per profile; parallel coders use separate profiles
   section: '4.2'
@@ -804,16 +811,24 @@ requirements:
   section: '10.2'
   verified_by: '22.10'
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): DOCTOR: swarm doctor WARNs when a provider key_env named in
-    config/models.yaml is set in the controller''s own environment (blueprint p213), naming the variable,
-    never the value, and lists other credential-shaped names as INFO. GITHARDEN: every controller git call now
-    runs with gitexec.git_env() (the credential scrub) and with repository hooks and core.fsmonitor disabled,
-    so a planted hook or fsmonitor script in a worker-writable repository no longer runs with the
-    controller''s credentials (proven before/after). The worker-terminal half below is unchanged: it needs the
-    Docker sandbox, never run for real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
-    sandbox.py: the profile check rejects any forwarded credential-shaped variable and key_visibility_test
-    looks for planted secrets in `env` output from a container ASES starts (never run for real). It cannot see
-    inside Hermes-managed worker containers, and the real profiles still use the local backend.'
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): scripts/sandbox_live_check.py''s key_visibility_test (commit
+    6954e88) and scripts/workergit_live_check.py''s no-credential-shaped-env-var check (commit c80827f)
+    proved no provider key is visible inside a real Docker terminal on ases-sandbox:py311-2
+    (docs/stage-b-2026-09-28.md). The Docker sandbox the earlier note said this needed is now switched on
+    (config/swarm.yaml sandbox.enabled: true, commit 409dc86; swarm doctor reports sandbox_docker and
+    sandbox_image PASS). Not yet proven: both probes used a standalone live-check container, not a real
+    Hermes-dispatched worker terminal; no real Hermes worker has run inside Docker yet, which is the S1
+    finish after the 00:00 UTC OpenRouter quota reset. Earlier note: ROUND 9 (2026-09-27, zero quota):
+    DOCTOR: swarm doctor WARNs when a provider key_env named in config/models.yaml is set in the
+    controller''s own environment (blueprint p213), naming the variable, never the value, and lists other
+    credential-shaped names as INFO. GITHARDEN: every controller git call now runs with gitexec.git_env()
+    (the credential scrub) and with repository hooks and core.fsmonitor disabled, so a planted hook or
+    fsmonitor script in a worker-writable repository no longer runs with the controller''s credentials
+    (proven before/after). The worker-terminal half below is unchanged: it needs the Docker sandbox, never
+    run for real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: the profile
+    check rejects any forwarded credential-shaped variable and key_visibility_test looks for planted secrets
+    in `env` output from a container ASES starts (never run for real). It cannot see inside Hermes-managed
+    worker containers, and the real profiles still use the local backend.'
 - id: ASES-RTE-01
   requirement: No hidden fallback; the provider and model actually used are recorded
   section: '11.2'
@@ -955,14 +970,23 @@ requirements:
   section: '13.2'
   verified_by: 22.6, 22.12
   status: partial
-  note: 'Seen firing in a real review-lane transition on 2026-09-19 (the card entered review at 16:53:45, the
-    controller re-ran Gate 1 in a clean worktree, pass, and the reviewer was spawned one second later). Two
-    real defects were fixed first, both invisible to mocked tests: the send-back used request-changes, which
-    real Hermes rejects for a card that only sits in review (now reopen-review, probed on a scratch board),
-    and run_pass dispatched before policing the review lane. Since then the merge queue re-checks
-    independently, so the gateway-dispatcher race no longer lets an unchecked commit merge. Left partial: the
-    send-back path (red Gate 1, out-of-scope diff) has never fired in a real run, and when Hermes''s
-    dispatcher wins the race the re-check happens at merge time instead of when the card enters review.'
+  note: 'ROUND 16 (2026-09-28, zero quota): EVIDENCE (commit 0373fe7) closed the gap stage C''s reviewer hit:
+    review._post_gate_record now posts the controller''s Gate 1 result as a card comment headed ''ASES gate
+    record'' (GATE_RECORD_HEADER), redacted before truncation, deduplicated by a gate1_record_posted event,
+    and a posting failure never breaks the review pass; prompts/reviewer.md version 2 tells the reviewer
+    where the record is and that a missing record is not itself a reason to request changes, while still
+    never saying a check passed without seeing the record. Independently reviewed (a Sonnet reviewer plus a
+    nemotron second opinion); the review loop failed once, on the comment-posting failure itself, then
+    passed. Left partial, unchanged below: the send-back path and the merge-time race have still never fired
+    in a real run. Earlier note: Seen firing in a real review-lane transition on 2026-09-19 (the card
+    entered review at 16:53:45, the controller re-ran Gate 1 in a clean worktree, pass, and the reviewer was
+    spawned one second later). Two real defects were fixed first, both invisible to mocked tests: the
+    send-back used request-changes, which real Hermes rejects for a card that only sits in review (now
+    reopen-review, probed on a scratch board), and run_pass dispatched before policing the review lane.
+    Since then the merge queue re-checks independently, so the gateway-dispatcher race no longer lets an
+    unchecked commit merge. Left partial: the send-back path (red Gate 1, out-of-scope diff) has never fired
+    in a real run, and when Hermes''s dispatcher wins the race the re-check happens at merge time instead of
+    when the card enters review.'
 - id: ASES-REV-06
   requirement: The verdict is a tool call with schema-checked metadata stored by commit
   section: '13.2'
@@ -1064,14 +1088,20 @@ requirements:
   section: '14.3'
   verified_by: '22.12'
   status: covered
-  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX: gates can now run inside the Docker sandbox.
-    gates.resolve_runner picks host or sandbox for every gate caller (Gate 1 in both review paths, Gate 3, the
-    post-merge re-run, Gates 4/5); sandbox runs use a self-contained checkout (clone --no-hardlinks, detached
-    at the SHA, no pointer back into the host repository). The switch stays off by default because Docker has
-    never run for real on this machine; with it off, gates run on the host in a clean checkout exactly as
-    before, with round 8''s scrubbed environment. Earlier note: gates.run_gate always checks out a throwaway
-    worktree at the exact commit SHA, never the worker''s live directory. Docker-level sandboxing is still
-    Phase 5 (noted as a gap in gates.py''s docstring).'
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): the sandbox switch this row depends on is proven against real
+    Docker (scripts/sandbox_live_check.py, commit 6954e88; docs/stage-b-2026-09-28.md) and is now on:
+    config/swarm.yaml''s sandbox.enabled is true (SANDBOX ON, commit 409dc86), applied to the coder-1
+    profile and to the controller''s own gate calls by swarm init --global --apply --yes (12 changes, 0
+    failed) and confirmed HEALTHY by swarm doctor. Not yet proven: no real gate run inside Docker has
+    happened with a real Hermes worker driving the card; that is the S1 finish after the 00:00 UTC
+    OpenRouter quota reset. Earlier note: ROUND 9 (2026-09-27, zero quota): GATESANDBOX: gates can now run
+    inside the Docker sandbox. gates.resolve_runner picks host or sandbox for every gate caller (Gate 1 in
+    both review paths, Gate 3, the post-merge re-run, Gates 4/5); sandbox runs use a self-contained checkout
+    (clone --no-hardlinks, detached at the SHA, no pointer back into the host repository). The switch stays
+    off by default because Docker has never run for real on this machine; with it off, gates run on the host
+    in a clean checkout exactly as before, with round 8''s scrubbed environment. Earlier note:
+    gates.run_gate always checks out a throwaway worktree at the exact commit SHA, never the worker''s live
+    directory. Docker-level sandboxing is still Phase 5 (noted as a gap in gates.py''s docstring).'
 - id: ASES-QG-05
   requirement: Acceptance tests come from the contract and should precede the implementation
   section: '14.3'
@@ -1381,21 +1411,37 @@ requirements:
   section: '21.1'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: only the worktree may be mounted (the Docker
-    socket and system paths are refused) and committed .env and key files are overlaid with an empty file.
-    Unit-tested only; no container has run.'
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): SANDBOXIMG (commit 6954e88) and the architect''s
+    ases-sandbox:py311-2 rebuild (commit 5aa88d9) proved the mount-list denial on real Docker:
+    scripts/sandbox_live_check.py''s key_visibility_test and its committed-.env-not-readable gate both
+    passed against a live container (docs/stage-b-2026-09-28.md). The rebuild also fixed a bug the real run
+    exposed: a chmod-and-retry rmtree, since stale root-owned git objects survived
+    rmtree(ignore_errors=True) on Windows. Not yet proven: no real Hermes worker has run inside Docker, only
+    the standalone live-check container; that is the S1 finish after the 00:00 UTC OpenRouter quota reset.
+    Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: only the worktree may be
+    mounted (the Docker socket and system paths are refused) and committed .env and key files are overlaid
+    with an empty file. Unit-tested only; no container has run.'
 - id: ASES-SEC-03
   requirement: From Phase 5 workers use the Docker terminal backend with only the worktree mounted
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX wired the controller''s own gate runs to the sandbox (this
-    note''s ''the controller''s own gate runs do not use docker_run_argv yet'' is no longer true), opt-in and
-    off by default; Docker or the image missing is an infrastructure failure (an event, the card held), never
-    a red gate and never a silent host run. Worker containers are still configured per Hermes profile and
-    Docker has never run for real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py
-    plus `swarm init --sandbox` (dry run by default) can put the Docker terminal block into a worker profile;
-    the controller''s own gate runs do not use docker_run_argv yet and Docker was never started. Real Hermes
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): WORKERGIT (commit c80827f) proved a worker can commit inside
+    its own dispatched worktree in real Docker: scripts/workergit_live_check.py passed the worktree cut, the
+    relative gitdir, blocked hooks and config writes, and commit-visible-from-host, against
+    ases-sandbox:py311-2 (git 2.54, commit 5aa88d9) with worktree.useRelativePaths=true and the
+    repository''s .git mounted read-only with writable objects/refs/logs/worktrees sub-mounts
+    (docs/stage-b-2026-09-28.md). The harmless packed-refs.lock message the in-sandbox commit printed is
+    explained and handled in round 16 (commit e7e2ce8). Not yet proven: no real Hermes worker has committed
+    this way, only the live-check probe, and the known refs/heads/main-move risk (caught downstream by
+    guards.check_primary_checkout) has still never been exercised by a real dispatch. Earlier note: ROUND 9
+    (2026-09-27, zero quota): GATESANDBOX wired the controller''s own gate runs to the sandbox (this note''s
+    ''the controller''s own gate runs do not use docker_run_argv yet'' is no longer true), opt-in and off by
+    default; Docker or the image missing is an infrastructure failure (an event, the card held), never a red
+    gate and never a silent host run. Worker containers are still configured per Hermes profile and Docker
+    has never run for real. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py plus
+    `swarm init --sandbox` (dry run by default) can put the Docker terminal block into a worker profile; the
+    controller''s own gate runs do not use docker_run_argv yet and Docker was never started. Real Hermes
     0.21.3 facts: an explicit terminal.cwd of /workspace defeats the worktree mount (omitted),
     docker_persist_across_processes must be false, docker_run_as_host_user does nothing on native Windows, a
     git worktree''s .git file points outside the mount so git fails inside a worktree-only sandbox (a design
@@ -1419,24 +1465,36 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX: task-scoped exceptions are now modelled in the plan schema
-    (sandbox_network plus a required sandbox_network_reason), validated in Gate 0, visible at Gate P, folded
-    into the gate-profile pin (and passed by swarm approve and swarm run''s pre-flight, so a flipped flag is
-    refused), and applied only to that task''s own Gate 1 and Gate 3 candidate runs. Worker containers cannot
-    be task-scoped this way: Hermes configures them per profile, not per card. Earlier note: BUILT AND WIRED,
-    NOT RUN FOR REAL (2026-09-22): sandbox.py: docker_run_argv defaults to --network none and the profile
-    check refuses docker_network true unless the policy allows it. Task-scoped exceptions are not modelled in
-    the plan schema.'
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): scripts/sandbox_live_check.py''s exfiltration_probe proved
+    default-deny network for real: the outbound call from inside ases-sandbox:py311-2 failed as required
+    (docs/stage-b-2026-09-28.md, commit 6954e88). The task-scoped sandbox_network exception path from round
+    9 was not exercised by this probe. Not yet proven: no real Hermes worker container has run with a
+    task-scoped network exception on or off; that is the S1 finish after the 00:00 UTC OpenRouter quota
+    reset. Earlier note: ROUND 9 (2026-09-27, zero quota): GATESANDBOX: task-scoped exceptions are now
+    modelled in the plan schema (sandbox_network plus a required sandbox_network_reason), validated in Gate
+    0, visible at Gate P, folded into the gate-profile pin (and passed by swarm approve and swarm run''s
+    pre-flight, so a flipped flag is refused), and applied only to that task''s own Gate 1 and Gate 3
+    candidate runs. Worker containers cannot be task-scoped this way: Hermes configures them per profile,
+    not per card. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: docker_run_argv
+    defaults to --network none and the profile check refuses docker_network true unless the policy allows
+    it. Task-scoped exceptions are not modelled in the plan schema.'
 - id: ASES-SEC-06
   requirement: Provider keys stay outside the sandbox; the egress proxy is optional and user-approved
   section: '21.3'
   verified_by: '22.10'
   status: in_progress
-  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): scripts/sandbox_live_check.py''s key_visibility_test proved
+    on real Docker that a planted secret is not visible in env or in .env inside ases-sandbox:py311-2
+    (docs/stage-b-2026-09-28.md, commit 6954e88); scripts/workergit_live_check.py separately found no
+    credential-shaped environment variable visible in a real worktree container (commit c80827f). The
+    owner''s egress-proxy decision recorded below is unchanged by this round. Not yet proven: both probes
+    used a standalone live-check container, not a real Hermes-dispatched worker; no real Hermes worker has
+    run inside Docker yet, which is the S1 finish after the 00:00 UTC OpenRouter quota reset. Earlier note:
+    STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
     docs/stage-c-2026-09-28.md): OWNER-AUTHORISED DECISION (2026-09-28): the optional Hermes egress proxy is
     NOT installed. In ASES every model call is made by the Hermes agent process on the host, outside the
-    terminal sandbox; nothing that runs inside a container needs a provider key, so there is no credential for
-    a proxy to swap. Revisit only if a tool inside the sandbox ever must call a provider. The
+    terminal sandbox; nothing that runs inside a container needs a provider key, so there is no credential
+    for a proxy to swap. Revisit only if a tool inside the sandbox ever must call a provider. The
     keys-outside-the-sandbox half is proven by the round 15 live probes. Earlier note: BUILT AND WIRED, NOT
     RUN FOR REAL (2026-09-22): sandbox.py keeps provider keys out of the container argv (no inherited
     environment, no --env-file, credential-shaped names refused); pull_command only returns argv for a human
@@ -1682,11 +1740,16 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): GATESANDBOX: sandboxed gate runs default to --network none; the only
-    exception is a task''s own Gate-0-validated, pinned sandbox_network flag (see ASES-SEC-05). Earlier note:
-    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: default-deny network in docker_run_argv and in
-    the profile terminal block check; exfiltration_probe proves it from inside a container (never run for
-    real).'
+  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): scripts/sandbox_live_check.py''s exfiltration_probe proved
+    default-deny network for real on ases-sandbox:py311-2 (commit 6954e88): the network call failed from
+    inside the sandbox, as required (docs/stage-b-2026-09-28.md). Not yet proven: the task-scoped exception
+    path (sandbox_network true) has not been exercised against a real container, and no real Hermes worker
+    has run inside Docker yet; that is the S1 finish after the 00:00 UTC OpenRouter quota reset. Earlier
+    note: ROUND 9 (2026-09-27, zero quota): GATESANDBOX: sandboxed gate runs default to --network none; the
+    only exception is a task''s own Gate-0-validated, pinned sandbox_network flag (see ASES-SEC-05). Earlier
+    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py: default-deny network in
+    docker_run_argv and in the profile terminal block check; exfiltration_probe proves it from inside a
+    container (never run for real).'
 - id: ASES-PRV-04
   requirement: Private/confidential projects require an explicitly verified provider data policy; data-class
     rules are never relaxed to keep work flowing

@@ -3803,3 +3803,88 @@ Overall: every CLOCK work-order item is implemented as specified, production beh
 
 Nemotron second opinion, as relayed by the reviewer: Ran an independent nemotron-super second opinion (own prompt built from the full diff plus my own controller.py findings, not reusing the builder's earlier nemotron run). It confirmed: (1) the default_now seam is byte-identical to old production behavior and has no production mutation hazard; (2) the naive-vs-aware UTC handling in _today is correct with no midnight off-by-one; (3) the UTC boundary test genuinely exercises the 23:59:59/00:00:00 transition; (4) converting test_22_9_quota.py to patch the public default_now instead of the private _today is a real improvement, not just a relabeling, given the confirmed controller.py constraint; (5) it found no signature-mismatch or default-behavior-change bugs. It did initially flag, then walk back into confusion over, whether report.py's 'requests today by model' query was left inconsistent with the ledger reads, because it only had the diff hunks and not the full file. I resolved that myself by reading the full report.py source: that query already computed its day from the report's own `now` before this round (via `day = now.strftime(...)`, querying the unrelated usage_ingested table), so it was already consistent, and CLOCK's change is exactly what makes the ledger-backed used/remaining numbers agree with it too, not a missed spot. Nemotron's final stated verdict was SOUND.
 
+
+## Round 15 and 16 (2026-09-28): stage B, the sandbox switched on, and the reviewer's evidence
+
+Work orders: r15_wp_sandbox.md (round 15), r16_wp_evidence.md (round 16). This section is an architect-written
+summary, not a verbatim transcript: it is drawn from the architect's own facts record
+(C:\Users\masoo\ases-wt\_pytest\r16-facts.md) and the seven commits' own messages (`git log --format=%B -1 <id>`
+for 6954e88, c80827f, 5aa88d9, 0373fe7, 1b5cb8b, e7e2ce8, 409dc86). Unlike the fuller per-package reports
+elsewhere in this file, this session did not run these builds or reviews and holds no builder/reviewer
+transcripts to reproduce.
+
+### SANDBOXIMG (round 15)
+
+Built `docker/sandbox/Dockerfile` and `scripts/sandbox_live_check.py` (commit 6954e88, merged 5f3bd43),
+independently reviewed. What the spec did not anticipate: the first pinned image, `python:3.11-slim` (Debian,
+git 2.47.3), turned out too old for WORKERGIT's own relative-worktree design (git 2.48+ is required; found only
+once both live checks were run for real against it, not by inspection); the live check itself needed a
+chmod-and-retry `rmtree`, since a container's read-only git objects survived `rmtree(ignore_errors=True)` on
+Windows and produced a silent partial cleanup on the next run; and the base image's own `GPG_KEY` (a public
+signing-key fingerprint, not a secret) tripped the credential-shaped-name check and needed an explicit exclusion
+by name. `tests/unit/test_sandbox_image.py` covers the lexical checks plus a real regression test of the fixed
+`rmtree`.
+
+### WORKERGIT (round 15)
+
+Built how a worker commits inside its own dispatched worktree in Docker: `worktree.useRelativePaths=true` set on
+a repository ASES creates, the repository's `.git` mounted read-only at `/.git` with five writable sub-mounts
+(objects, refs, logs, worktrees) built from Hermes's own `${env:TERMINAL_CWD}/../../.git...` expansion,
+`scripts/workergit_live_check.py` proving it on real Docker (commit c80827f, merged fb56c72). What the spec did
+not anticipate, per the commit message: two independent review rounds found and fixed a mount-policy bug that
+had stopped refusing every other mount, and a replace-not-merge of a profile's own `docker_volumes` with
+WORKERGIT's five entries. The harmless `packed-refs.lock` message a sandboxed commit prints was already visible
+during this package's own live-check runs; round 16's PACKEDREFS explains it.
+
+### Architect notes (round 15)
+
+- The image SANDBOXIMG built could not open WORKERGIT's relative worktrees (git 2.47.3 versus the 2.48+ that
+  `extensions.relativeWorktrees` needs). Replaced with `ases-sandbox:py311-2` (`python:3.11-alpine` pinned by
+  sha256 digest, git 2.54.0-r0, `pytest==9.1.1`, non-root user `sandbox` uid 1000, `safe.directory /workspace`
+  against a "detected dubious ownership" refusal), commit 5aa88d9. Full account, with the re-run PASS lines for
+  both live checks: `docs/stage-b-2026-09-28.md`.
+- The optional Hermes egress proxy stays not installed, an owner-authorised decision recorded in `ASES-SEC-06`,
+  unchanged by this round.
+- Round 15 full suite: 5897 passed, 2 skipped.
+
+### EVIDENCE (round 16)
+
+Built from stage C's own finding: the reviewer requested changes on S1 (pass 10 in docs/stage-c-2026-09-28.md)
+because it could not run the tests itself and saw no evidence the controller's Gate 1 had passed. Correction: the
+commit message of 0373fe7 (already pushed, so left as it is) says W1; the stage C record is right, W1 merged
+cleanly at pass 6 and it was S1 that was sent back.
+`review._post_gate_record` (commit 0373fe7, merged bbb5f6d) now posts the controller's Gate 1 result as a card
+comment headed "ASES gate record" (`GATE_RECORD_HEADER`), redacted before truncation, posted once per run
+(deduplicated by a `gate1_record_posted` event), with a posting failure contained rather than breaking the
+review pass. `prompts/reviewer.md` version 2 tells the reviewer where the record is and that a missing one means
+the gate has not run yet, never by itself a reason to request changes, while keeping "never say a check passed
+unless a gate record shows it". Independently reviewed (a Sonnet reviewer plus a nemotron second opinion); per
+the facts file, the review loop failed once, on the comment-posting failure itself, then passed on the fix.
+
+### Architect notes (round 16)
+
+- PROMPTVER (commit 1b5cb8b): found by the architect in the `swarm init` dry run, not built by a dispatched
+  package. `profiles.prompt_version()` had reported one global `PROMPT_VERSION` (1) for every prompt regardless
+  of a prompt's own version line, so reviewer prompt version 2 (from EVIDENCE) would have been installed under a
+  header still saying version 1. Now reads each prompt's own first line, `PROMPT_VERSION` kept only as the
+  fallback. ASES-ROL-03.
+- PACKEDREFS (commit e7e2ce8): a plain `git commit` inside the sandbox prints `error: Unable to create
+  '/.git/packed-refs.lock': Read-only file system` and still exits 0. Traced with `GIT_TRACE_REFS`: the commit's
+  own ref transaction had already succeeded; the error comes from git's sequencer cleanup afterward, deleting
+  the absent `CHERRY_PICK_HEAD`/`REVERT_HEAD` pseudorefs, which needs a lock in the read-only base `.git` mount.
+  No git setting skips that cleanup, and making `packed-refs` writable would need the base mount writable, which
+  is what keeps hooks and config out of a worker's reach. `prompts/coder.md` version 2, rule 5, tells the coder
+  the line is expected, to check `git log -1` instead of committing again, and never to delete a branch or tag.
+  Recorded as item 4 of `sandbox.py`'s WORKERGIT notes. ASES-SEC-03, ROL-03.
+- SANDBOX ON (commit 409dc86): `config/swarm.yaml`'s `sandbox.enabled` flipped to `true`; `test_config.py`
+  (shipped-config test) and `test_cli_commands.py` (real-config loader test) updated. Switched on for real
+  afterward: the test repository's five card worktrees made relative, `swarm init --global --apply --yes` (12
+  changes, 0 failed, backups named), `swarm doctor` `HEALTHY`. Full record: `docs/stage-b-2026-09-28.md`.
+  Targeted suite after PROMPTVER/PACKEDREFS: 1346 passed, 1 skipped; after SANDBOX ON: 1272 passed, 1 skipped;
+  full suite with round 16 merged: 5912 passed, 2 skipped (685.9 s).
+- Still open after round 16: no real Hermes worker has run inside Docker yet. A zero-quota check driving
+  Hermes's own Docker terminal code with the real `coder-1` profile is being built in parallel (HERMESDOCKER;
+  result to be added by the architect). S1 is parked for OpenRouter's daily quota (resets 00:00 UTC); finishing
+  it is the first real run with Docker workers and sandboxed gates, deciding whether `ASES-SEC-02`, `SEC-03`,
+  `SEC-05`, `SEC-06`, `SEC-07` and `ASES-CFG-04` can move to `covered`.
+
