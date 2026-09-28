@@ -16,6 +16,13 @@ check_branch_for_merge is the merge queue's own, independent check: it repeats t
 and touches checks and then believes only the controller's own gate_runs records (ASES-QG-01), never the
 review lane having seen the card.
 
+The controller's own gate_runs records are invisible to the reviewer profile, which has no database access and
+often no terminal (round 16, the 2026-09-28 stage-C run: a reviewer with no terminal requested changes on
+otherwise-passing work because it could not itself confirm the controller's claim that the tests passed). So
+gate_before_review also posts what check_branch decided to the card as a comment (_post_gate_record), headed
+GATE_RECORD_HEADER: a reviewer that reads the card (as prompts/reviewer.md tells it to) has the controller's own
+record in front of it, on pass, on a red Gate 1, and on Gate 1 never having run at all.
+
 The controller's own send-back is `reopen-review` (hermes.kanban_reopen_review), NOT `request-changes`:
 request-changes is the reviewer's verdict and Hermes rejects it (exit 1, "task is not in an active review
 run") on a card that is merely sitting in `review`, which is where this module finds it (2026-09-19 fix,
@@ -44,6 +51,21 @@ from . import gitexec
 from . import hermes as hermes_mod
 from . import integrity
 from . import tamper as tamper_mod
+
+
+# ASES-QG-01 ("An agent cannot mark anything as passed by saying so: the controller believes only its own gate
+# records") + ASES-REV-05: the fixed, recognisable header gate_before_review's own comment starts with, so a
+# reviewer (and prompts/reviewer.md) can find it on the card, and so _gate_record_posted can tell whether one
+# for a given (task_key, commit, outcome) has gone out already.
+GATE_RECORD_HEADER = "ASES gate record"
+
+# check_branch's own `kind` values that mean Gate 1 actually ran, mapped to the outcome word the comment and the
+# dedup key use. Every other kind (unresolvable_branch, no_merge_base, out_of_scope, tamper, tamper_check_error)
+# means Gate 1 was never reached for this commit, and is posted as "not_run": a reviewer must never be left
+# assuming a record exists when none does (round 16, the stage-C finding this package builds).
+_GATE_RECORD_OUTCOME = {"ok": "pass", "gate1_red": "fail"}
+_GATE_RECORD_LABEL = {"pass": "PASS", "fail": "FAIL", "not_run": "NOT RUN"}
+_GATE_RECORD_TAIL_LIMIT = 800  # a "short tail", not the whole (already gate_runs-sized) output
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,11 +123,21 @@ def gate_before_review(
     `project` (events.py package, round 9) is optional because this function's own signature has no plan to read
     one from; its one caller, controller.process_review_lane, has `plan.project` in scope and passes it through so
     the tamper_check_error/tamper_blocked events it records carry the same project as gate1_recheck_failed, the
-    sibling event that caller already records a few lines later."""
+    sibling event that caller already records a few lines later.
+
+    Round 16 (ASES-QG-01, ASES-REV-05): whatever check_branch decides is also posted to the card as a comment
+    (_post_gate_record) before anything else happens with it -- a pass, a red Gate 1, or Gate 1 never having
+    run at all (out of scope, a tamper finding, an unresolvable branch, or the tamper check itself failing to
+    run), because a reviewer with no terminal of its own has nothing else to cite as evidence the controller
+    actually ran anything (the gap the 2026-09-28 stage-C run found and this package closes). A Hermes failure
+    while posting that comment never reaches here: _post_gate_record contains it, records a
+    gate_record_post_failed event, and this function still returns the correct pass/fail/not-run outcome for the
+    card exactly as if the comment had gone out (see _post_gate_record's own docstring)."""
     result = check_branch(
         repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
         allow_gate_config_changes=allow_gate_config_changes, project_config=project_config, task=task,
     )
+    _post_gate_record(board, card_id, result, gate1_commands, conn=conn, task_key=task_key, project=project)
     if result.kind == "tamper_check_error":
         events_mod.record(conn, "tamper_check_error", {
             "task_key": task_key, "card_id": card_id, "head": result.head, "reason": result.detail,
@@ -119,6 +151,95 @@ def gate_before_review(
         hermes_mod.kanban_reopen_review(board, card_id, result.detail)
         return False
     return True
+
+
+def _gate_record_posted(conn, task_key: str, head: str, outcome: str) -> bool:
+    """True when a gate1_record_posted event already carries this exact (task_key, commit, outcome). A poll that
+    re-runs check_branch and reaches the SAME determination for a commit that has not moved (the ordinary case:
+    Gate 1 re-runs on every review-lane pass while a card sits waiting for the reviewer to be dispatched) must not
+    add a second, identical comment to the card. A DIFFERENT outcome for the SAME commit is not "the same" and is
+    not suppressed here -- see _post_gate_record for why that matters (the tamper check's own transient error,
+    retried, can still go on to a real Gate 1 pass or fail for that same commit)."""
+    return conn.execute(
+        "SELECT 1 FROM events WHERE kind = 'gate1_record_posted' "
+        "AND json_extract(payload, '$.task_key') = ? AND json_extract(payload, '$.head') = ? "
+        "AND json_extract(payload, '$.outcome') = ? LIMIT 1",
+        (task_key, head, outcome),
+    ).fetchone() is not None
+
+
+def _post_gate_record(
+    board: str, card_id: str, result: BranchCheck, gate1_commands: list[str], *, conn, task_key: str,
+    project: str | None,
+) -> None:
+    """ASES-QG-01 + ASES-REV-05 (see gate_before_review's own docstring, round 16): post check_branch's result to
+    the card as a comment through the existing Hermes wrapper (hermes.kanban_comment), so a reviewer that cannot
+    run `pytest` itself has the controller's own record to cite instead of the controller's word alone.
+
+    Every result gate_before_review reaches is posted, truthfully: "pass" and "fail" mean Gate 1 actually ran
+    (result.kind "ok" / "gate1_red"); anything else means it did not, and is posted as "not_run" with the reason
+    check_branch already produced (an out-of-scope diff, a tamper finding, an unresolvable branch, or the tamper
+    check itself failing to run) -- a reviewer must never be left assuming a record exists when none does.
+
+    For "pass"/"fail" the comment's output is the gate_runs row _run_gate1 just inserted on this same connection
+    (read back by task_key + commit_sha, latest first): check_branch's own BranchCheck.detail throws the full
+    output away on a pass (it is just "Gate 1 green for <head>"), and _run_gate1's docstring already redacted it
+    once (events.redact_text, ASES-SEC-01) before it went into gate_runs.detail. gate_runs is a fact this exact
+    call just wrote through `conn`, in the same transaction, so the read-back sees it whether or not conn has
+    been committed yet.
+
+    Posted once per (task_key, commit, outcome) -- see _gate_record_posted. A Hermes failure while posting the
+    comment (hermes_mod.HermesCommandError: the same exception every other Hermes call site in this codebase
+    catches, for example triage.py's kanban_show or reconcile.py's own comment call) is not raised: this is an
+    evidence side effect, not the gate result itself, and gate_before_review's caller
+    (controller.process_review_lane) is not wrapped in the pass's `_isolated` helper the way process_recovery,
+    process_bounds and process_unpark are, so an uncaught exception here would turn even a green Gate 1 into a
+    crash that stops the rest of that controller pass for every other card too (round 16 review finding). The
+    failure is recorded instead (gate_record_post_failed) and _gate_record_posted is left with no entry, so the
+    NEXT review-lane pass retries the post exactly as if this one had never been attempted."""
+    outcome = _GATE_RECORD_OUTCOME.get(result.kind, "not_run")
+    if _gate_record_posted(conn, task_key, result.head, outcome):
+        return
+    if outcome in ("pass", "fail"):
+        row = conn.execute(
+            "SELECT detail FROM gate_runs WHERE task_key = ? AND gate = 'gate1' AND commit_sha = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_key, result.head),
+        ).fetchone()
+        body = row["detail"] if row is not None else ""
+    else:
+        body = result.detail
+    try:
+        hermes_mod.kanban_comment(board, card_id, _format_gate_record(result.head, outcome, gate1_commands, body))
+    except hermes_mod.HermesCommandError as exc:
+        events_mod.record(conn, "gate_record_post_failed", {
+            "task_key": task_key, "card_id": card_id, "head": result.head, "outcome": outcome,
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }, project=project)
+        return
+    events_mod.record(conn, "gate1_record_posted", {
+        "task_key": task_key, "card_id": card_id, "head": result.head, "outcome": outcome,
+    }, project=project)
+
+
+def _format_gate_record(head: str, outcome: str, commands: list[str], body: str | None) -> str:
+    """The comment text: GATE_RECORD_HEADER (a fixed, recognisable first line prompts/reviewer.md tells the
+    reviewer to look for), the gate name, the outcome, the full commit SHA, the pinned Gate 1 commands, and a
+    short TAIL of the output or reason -- ASES-SEC-01: redacted with events.redact_text even though the "pass"/
+    "fail" body is already redacted once by gates.run_gate before it reached gate_runs.detail (redaction is
+    cheap and idempotent, and this is text a person reads, so it never relies on a single layer of it)."""
+    commands = [commands] if isinstance(commands, str) else list(commands or [])
+    cmds = "; ".join(str(c) for c in commands) or "(none)"
+    tail = events_mod.redact_text(body or "")
+    if len(tail) > _GATE_RECORD_TAIL_LIMIT:
+        tail = tail[-_GATE_RECORD_TAIL_LIMIT:]
+    lines = [
+        GATE_RECORD_HEADER, "gate: gate1", f"commit: {head}", f"result: {_GATE_RECORD_LABEL[outcome]}",
+        f"commands: {cmds}",
+    ]
+    if tail.strip():
+        lines.append(tail)
+    return "\n".join(lines)
 
 
 def check_branch(
