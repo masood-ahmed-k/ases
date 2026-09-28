@@ -36,9 +36,10 @@ A real, load-bearing finding this script surfaced on this machine: `worktree.use
 2.48+ inside the container (it marks the repository with `extensions.relativeWorktrees = true`, which git < 2.48
 refuses outright: "fatal: unknown repository extension found: relativeworktrees" on EVERY git command against that
 repository). SANDBOXIMG's first image, ases-sandbox:py311-1 on Debian 13, had git 2.47.3, so the architect moved the
-sandbox image to the Alpine base (ases-sandbox:py311-2, git 2.54.0; see docker/sandbox/Dockerfile). This script
-still checks the pinned image's git version first and says plainly whether it can run this proof; only if it
-cannot does it build a small throwaway alpine image of its own, reported as a finding, never switched silently.
+sandbox image to the Alpine base (ases-sandbox:py311-2, git 2.54.0; py311-3 then added bash for Hermes, see
+docker/sandbox/Dockerfile). This script still checks the pinned image's git version first and says plainly
+whether it can run this proof; only if it cannot does it build a small throwaway alpine image of its own, reported
+as a finding, never switched silently.
 """
 from __future__ import annotations
 
@@ -66,7 +67,7 @@ REPO = WORKDIR / "repo"
 TASK_ID = "workergit-livecheck-task1"
 BRANCH = f"wt/{TASK_ID}"
 
-PINNED_IMAGE = "ases-sandbox:py311-2"
+PINNED_IMAGE = "ases-sandbox:py311-3"
 _MIN_GIT = (2, 48)
 FALLBACK_DOCKERFILE = "FROM alpine:latest\nRUN apk add --no-cache git\n"
 FALLBACK_IMAGE = "ases-workergit-livecheck:alpine-git"

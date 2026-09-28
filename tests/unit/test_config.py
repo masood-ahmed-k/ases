@@ -360,7 +360,7 @@ def test_the_shipped_swarm_yaml_documents_both_blocks_and_turns_the_sandbox_on()
 
 
 def test_the_shipped_swarm_yaml_names_a_pinned_sandbox_image():
-    """SANDBOXIMG (round 15): config/swarm.yaml sandbox.image names ases-sandbox:py311-2, built from
+    """SANDBOXIMG (round 15): config/swarm.yaml sandbox.image names ases-sandbox:py311-3, built from
     docker/sandbox/Dockerfile, and that name is a PINNED reference (sandbox._unpinned_reason has nothing to say
     about it: a tag other than latest, same rule doctor's sandbox_image_configured check applies), so `swarm
     doctor`'s image check is meaningful rather than silently accepting a moving target."""
@@ -371,8 +371,8 @@ def test_the_shipped_swarm_yaml_names_a_pinned_sandbox_image():
     path = pathlib.Path(__file__).resolve().parents[2] / "config" / "swarm.yaml"
     cfg = config.load_swarm_config(path)
 
-    assert cfg.sandbox["image"] == "ases-sandbox:py311-2"
+    assert cfg.sandbox["image"] == "ases-sandbox:py311-3"
     policy = sandbox_mod.SandboxPolicy.from_config(cfg.sandbox_policy_config())
-    assert policy.image == "ases-sandbox:py311-2"
+    assert policy.image == "ases-sandbox:py311-3"
     assert sandbox_mod._unpinned_reason(policy.image) is None
     assert sandbox_mod._image_problems({"docker_image": policy.image}) == []
