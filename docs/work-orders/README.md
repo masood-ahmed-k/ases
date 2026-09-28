@@ -156,6 +156,7 @@ changes on a card it could not itself verify.
 | (no separate work order; architect-run) | PROMPTVER: each prompt's version read from its own first line, not one global constant (ASES-ROL-03) | done |
 | (no separate work order; architect-run) | PACKEDREFS: the harmless `packed-refs.lock` line after a sandboxed commit traced and explained, coder prompt version 2 rule 5 (ASES-SEC-03, ROL-03) | done |
 | (no separate work order; architect-run) | SANDBOX ON: `config/swarm.yaml` `sandbox.enabled: true`, applied for real by `swarm init --global --apply --yes`, `swarm doctor` HEALTHY (ASES-SEC-03, CFG-04, QG-04) | done |
+| (no separate work order; Sonnet-built, architect-finished) | HERMESDOCKER: `scripts/hermes_docker_terminal_check.py` drives Hermes's own Docker terminal code with the real `coder-1` profile at zero quota; it found Hermes needs bash, so `ases-sandbox:py311-3` adds a pinned bash (ASES-SEC-03, SEC-02, SEC-07, CFG-04) | done, all probes PASS twice on py311-3 |
 
 See `docs/stage-b-2026-09-28.md` for the full stage B record, with the verbatim PASS lines and the switch-on
 steps, and `builder-findings.md` for what SANDBOXIMG, WORKERGIT and EVIDENCE found that their own work orders did

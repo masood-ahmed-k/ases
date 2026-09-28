@@ -1315,11 +1315,11 @@ changes, 0 failed, every changed file backed up), and `swarm doctor` came back `
 16 merged: 5,912 passed, 2 skipped (685.9 s).
 
 What this proves and what it does not: gates and the worker profile now run through Docker rather than the local
-backend, on the pinned `ases-sandbox:py311-2` image, and every check above ran against a real container. No real
-Hermes worker has yet run inside Docker: every PASS is a standalone probe script or a throwaway worktree, never
-an actual dispatched card. A zero-quota check driving Hermes's own Docker terminal code directly against the
-real `coder-1` profile is being built in parallel (HERMESDOCKER; result to be added by the architect, see
-`docs/stage-b-2026-09-28.md`). S1 is parked for OpenRouter's daily quota (resets 00:00 UTC); finishing it is the
+backend, and every check above ran against a real container. HERMESDOCKER (merge 5bd81bf) then drove Hermes's
+own Docker terminal code with the real `coder-1` profile config at zero quota and found that Hermes runs every
+command as `bash -c` while the Alpine image had no bash: every worker command would have failed with exit 127.
+`ases-sandbox:py311-3` adds a pinned bash, and on it every HERMESDOCKER probe passes through Hermes's own
+`execute` (details in `docs/stage-b-2026-09-28.md`). No real dispatched card has yet run inside Docker. S1 is parked for OpenRouter's daily quota (resets 00:00 UTC); finishing it is the
 first real run with Docker workers and sandboxed gates, and decides whether `ASES-SEC-02`, `SEC-03`, `SEC-05`,
 `SEC-06`, `SEC-07` and `ASES-CFG-04` can move to `covered`.
 
