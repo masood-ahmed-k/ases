@@ -1263,6 +1263,21 @@ whose branch Hermes has not created yet instead of blocking it; and doctor's tex
 the method: every one of these twelve was invisible to the fake rig, which is why a skeptic-verified audit on real git, real
 SQLite and real Windows subprocesses paid off. Suite: 5,814 passed, 2 skipped, 0 failed.
 
+## Rounds 13 and 14: a second audit of the new code, and the last zero-quota items (2026-09-28)
+
+Round 13 ran two things side by side. TIDY folded the two process-tree kill helpers (gates and evals) into one,
+`procenv.kill_process_tree`, keeping each caller's exact behaviour, and gave `swarm doctor` a read-only warning for a gate or
+merge worktree that was recorded as leaked and still exists. A second read-only audit looked only at what rounds 11 and 12
+had just changed, on the principle that new code is where new bugs are: three findings confirmed, none refuted
+(`docs/work-orders/r14_audit2_findings.md`). All three were in the run-start code round 12 had reordered: the MOD-02 model
+pre-flight still ran after the wall clock started (the very bug round 12 fixed for reconcile, reintroduced for another
+refusal), a pause landing during reconcile could be flipped back to running, and a card whose branch never appeared was
+skipped silently forever. Round 14's RUNSTART2 fixed all three (every refusal before the clock starts; a re-read right before
+starting; a bounded, visible grace of 5 passes, never a block), and CLOCK made the ledger's day injectable so the daily-reset
+arithmetic is tested without monkeypatching a private function, with a test on the UTC midnight boundary. Both packages
+passed their first review. With this, the zero-quota queue is empty: everything left needs the owner (applying `swarm init`,
+Docker for real, a real run, source URLs, two design decisions). Suite: 5,833 passed, 2 skipped, 0 failed.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and

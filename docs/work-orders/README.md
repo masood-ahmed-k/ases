@@ -132,3 +132,11 @@ The owner asked for autonomous work overnight ("keep doing things back to back",
 | (no work order; architect-run) | stage A: real doctor and `swarm init` dry run, `docs/stage-a-2026-09-28.md` | done; applying `swarm init` waits for the owner |
 | `r12_audit_findings.md` | a read-only adversarial audit of rounds 8-11: 12 findings confirmed, 1 refuted | done |
 | `r12_wp_fixes.md` | GATEINFRA (findings 0, 10, 11, 1), DATAFIX (4, 5, 6, 7), RUNSTART (2, 8, 3, 9) | done, independently reviewed |
+
+## Rounds 13 and 14 (2026-09-28): tidy-ups, a second audit of the new code, and its fixes
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r13_wp_tidy.md` | TIDY: one process-tree kill helper; doctor reports leaked gate worktrees (ASES-GIT-12) | done, independently reviewed |
+| `r14_audit2_findings.md` | a second read-only audit of what rounds 11 and 12 changed: 3 findings confirmed, 0 refuted | done |
+| `r14_wp.md` | RUNSTART2 (the three findings: ASES-REC-04, MOD-02, GIT-16), CLOCK (an injectable ledger clock, ASES-CAP-03) | done, independently reviewed |
