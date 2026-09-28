@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from datetime import datetime, timezone
+from typing import Callable
 
 # ASES-CAP-03 / blueprint [p133], bounds table section 9.3: "the limit in section 5.3 minus a 10 percent
 # reserve". This is the ONE place the 10 percent default lives; every reader of a budgets mapping that may
@@ -18,14 +19,43 @@ from datetime import datetime, timezone
 DEFAULT_DAILY_RESERVE_PERCENT = 10
 
 
-def _today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _real_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def record_usage(conn: sqlite3.Connection, provider: str, model: str, n: int = 1) -> None:
+# ASES-CAP-03's daily-reset arithmetic (section 9.3) needs a UTC "today" everywhere in this module, and every
+# public function below takes its own `now` keyword for exactly that (None means the real wall clock, exactly
+# as before this existed). `default_now` is the ONE extra seam on top: the fallback every one of those `now`
+# keywords resolves to when a caller does not pass its own. Production code never touches it. It exists so a
+# whole controller pass -- whose callers do not thread a `now` of their own down into process_budget_gate, only
+# into process_recovery/process_bounds/process_finalize (see r14_wp.md, package CLOCK) -- can still be pointed
+# at a simulated day in a test, by replacing this one public, documented attribute
+# (`monkeypatch.setattr(ledger, "default_now", lambda: fixed_moment)`), instead of reaching into a private
+# function's internals the way tests/acceptance/test_22_9_quota.py used to (monkeypatching `ledger._today`
+# itself, which was never meant as a seam). An explicit `now=` on any call below always wins over this default.
+default_now: Callable[[], datetime] = _real_now
+
+
+def _today(now: datetime | None = None) -> str:
+    """The UTC calendar day `now` falls on, as `YYYY-MM-DD`: the ledger's day-bucketing key everywhere.
+
+    `now` is this call's own injected moment. When it is omitted, `default_now()` is asked instead (the real
+    wall clock, unless a test has replaced it). A naive `now` is assumed to already be UTC, the same convention
+    report._utc uses for every other clock parameter in this codebase."""
+    moment = now if now is not None else default_now()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    else:
+        moment = moment.astimezone(timezone.utc)
+    return moment.strftime("%Y-%m-%d")
+
+
+def record_usage(
+    conn: sqlite3.Connection, provider: str, model: str, n: int = 1, *, now: datetime | None = None,
+) -> None:
     if n <= 0:
         raise ValueError("n must be positive")
-    today = _today()
+    today = _today(now)
     conn.execute(
         """
         INSERT INTO requests_ledger (provider, model, utc_date, count, updated_at)
@@ -38,19 +68,19 @@ def record_usage(conn: sqlite3.Connection, provider: str, model: str, n: int = 1
     )
 
 
-def usage_today(conn: sqlite3.Connection, provider: str, model: str) -> int:
+def usage_today(conn: sqlite3.Connection, provider: str, model: str, *, now: datetime | None = None) -> int:
     row = conn.execute(
         "SELECT count FROM requests_ledger WHERE provider = ? AND model = ? AND utc_date = ?",
-        (provider, model, _today()),
+        (provider, model, _today(now)),
     ).fetchone()
     return row["count"] if row else 0
 
 
-def usage_today_for_provider(conn: sqlite3.Connection, provider: str) -> int:
+def usage_today_for_provider(conn: sqlite3.Connection, provider: str, *, now: datetime | None = None) -> int:
     """Sum across every model on this provider -- OpenRouter's daily cap is per account, not per model."""
     row = conn.execute(
         "SELECT COALESCE(SUM(count), 0) AS total FROM requests_ledger WHERE provider = ? AND utc_date = ?",
-        (provider, _today()),
+        (provider, _today(now)),
     ).fetchone()
     return row["total"]
 
@@ -72,11 +102,13 @@ class Affordability:
     reason: str
 
 
-def remaining_today(conn: sqlite3.Connection, provider_limits: dict, provider: str) -> int | None:
+def remaining_today(
+    conn: sqlite3.Connection, provider_limits: dict, provider: str, *, now: datetime | None = None,
+) -> int | None:
     limit = daily_limit(provider_limits, provider)
     if limit is None:
         return None
-    used = usage_today_for_provider(conn, provider)
+    used = usage_today_for_provider(conn, provider, now=now)
     return max(limit - used, 0)
 
 
@@ -88,19 +120,21 @@ def can_afford(
     *,
     reserve_percent: float = DEFAULT_DAILY_RESERVE_PERCENT,
     extra_reserve: int = 0,
+    now: datetime | None = None,
 ) -> Affordability:
     """ASES-CAP-03: no card becomes ready unless the budget covers it plus a review reserve.
 
     reserve_percent holds back that fraction of the day's cap (project.budgets.daily_reserve_percent);
     extra_reserve holds back a flat number of requests on top (project.budgets.review_reserve_requests).
     The default matches DEFAULT_DAILY_RESERVE_PERCENT above; a caller that means no reserve at all must
-    pass reserve_percent=0 explicitly.
+    pass reserve_percent=0 explicitly. `now` is this call's own injected moment (None means default_now, the
+    real wall clock unless a test has replaced it): see _today's docstring.
     """
     limit = daily_limit(provider_limits, provider)
     if limit is None:
         return Affordability(True, None, None, "provider has no known daily cap")
 
-    remaining = remaining_today(conn, provider_limits, provider)
+    remaining = remaining_today(conn, provider_limits, provider, now=now)
     usable = remaining - extra_reserve - int(limit * reserve_percent / 100)
     if usable >= estimated_requests:
         return Affordability(True, remaining, limit, "within budget")

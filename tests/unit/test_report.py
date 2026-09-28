@@ -248,8 +248,12 @@ def scenario(tmp_path, monkeypatch, conn):
     _lineage(conn, "T1", 2, 1, 3)
     _lineage(conn, "T3", 3, 0, 0)
 
-    ledger.record_usage(conn, "openrouter", REVIEWER_MODEL, 37)
-    ledger.record_usage(conn, "xkiro", CODER_MODEL, 12)
+    # `now=NOW`: this whole scenario is fixed at 2026-09-19 (every timestamp below is that day), and since round
+    # 14 (package CLOCK) the budget panel asks the ledger for usage on the report's OWN day (`now`), not
+    # whatever day the wall clock happens to be on when the test runs, so the ledger rows must land on the same
+    # day too.
+    ledger.record_usage(conn, "openrouter", REVIEWER_MODEL, 37, now=NOW)
+    ledger.record_usage(conn, "xkiro", CODER_MODEL, 12, now=NOW)
     _ingested(conn, "s1", "reviewer", "openrouter", REVIEWER_MODEL, 30, 90000, 1500, "2026-09-19 10:45:00")
     _ingested(conn, "s2", "coder-1", "xkiro", CODER_MODEL, 8, 800, 80, "2026-09-19T10:15:00+00:00")
     _ingested(conn, "s3", "coder-1", "xkiro", CODER_MODEL, 4, 400, 40, "2026-09-19 11:15:00")
@@ -555,7 +559,7 @@ def test_capped_provider_arithmetic(scenario_report):
 
 def test_credits_change_the_limit_and_an_overspent_day_has_nothing_remaining(conn, tmp_path, monkeypatch):
     _fake_hermes(monkeypatch, {})
-    ledger.record_usage(conn, "openrouter", "m", 60)
+    ledger.record_usage(conn, "openrouter", "m", 60, now=NOW)  # `_build` below reports as of NOW; same day
     capped = {"providers": {"openrouter": {"limits": {"per_day_default": 50, "per_day_after_credits": 1000},
                                            "credits_purchased": False}}}
     row = _build(conn, tmp_path, models_config=capped)["budget"]["providers"][0]
@@ -578,9 +582,9 @@ def test_uncapped_provider_has_no_numbers_and_reads_no_known_cap(scenario_report
 
 def test_a_providers_daily_total_sums_its_models_and_ignores_other_days_and_providers(conn, tmp_path, monkeypatch):
     _fake_hermes(monkeypatch, {})
-    ledger.record_usage(conn, "openrouter", "model-a", 10)
-    ledger.record_usage(conn, "openrouter", "model-b", 5)
-    ledger.record_usage(conn, "xkiro", "model-a", 7)
+    ledger.record_usage(conn, "openrouter", "model-a", 10, now=NOW)  # `_build` below reports as of NOW
+    ledger.record_usage(conn, "openrouter", "model-b", 5, now=NOW)
+    ledger.record_usage(conn, "xkiro", "model-a", 7, now=NOW)
     conn.execute("INSERT INTO requests_ledger (provider, model, utc_date, count, updated_at) "
                  "VALUES ('openrouter', 'model-a', '2000-01-01', 40, 'x')")
     rows = {r["provider"]: r for r in _build(conn, tmp_path)["budget"]["providers"]}

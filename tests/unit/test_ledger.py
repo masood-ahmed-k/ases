@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from ases import db, ledger
 
 LIMITS = {
@@ -76,3 +78,83 @@ def test_can_afford_reserves_10_percent_by_default_when_reserve_percent_is_omitt
     assert omitted.can_afford is False
     zero_reserve = ledger.can_afford(conn, LIMITS, "openrouter", 46, reserve_percent=0)
     assert zero_reserve.can_afford is True  # an explicit 0 still means 0, never the default
+
+
+# --- round 14, package CLOCK: the injectable clock (ASES-CAP-03's daily-reset arithmetic, section 9.3). ---
+
+
+def test_today_defaults_to_the_real_utc_day_with_no_now_given():
+    """No behaviour change: with no `now` and no default_now override, `_today()` still reads the real wall
+    clock, exactly as it did before this module had an injectable clock at all."""
+    assert ledger._today() == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def test_explicit_now_scopes_every_read_and_write_to_that_calendar_day(tmp_path):
+    """Every public function takes its own `now`: a call with an explicit `now` reads and writes that UTC day,
+    never the real wall clock, with no monkeypatching at all."""
+    conn = db.connect(tmp_path / "ases.db")
+    day_one = datetime(2026, 3, 1, 10, 0, tzinfo=timezone.utc)
+    day_two = datetime(2026, 3, 2, 10, 0, tzinfo=timezone.utc)
+
+    ledger.record_usage(conn, "openrouter", "m", n=9, now=day_one)
+    assert ledger.usage_today(conn, "openrouter", "m", now=day_one) == 9
+    assert ledger.usage_today_for_provider(conn, "openrouter", now=day_one) == 9
+    # A different day's read sees none of it: the row is scoped by day, not carried forward.
+    assert ledger.usage_today(conn, "openrouter", "m", now=day_two) == 0
+    assert ledger.usage_today_for_provider(conn, "openrouter", now=day_two) == 0
+
+    remaining = ledger.remaining_today(conn, LIMITS, "openrouter", now=day_one)
+    assert remaining == 50 - 9
+    afford = ledger.can_afford(conn, LIMITS, "openrouter", 5, reserve_percent=0, now=day_one)
+    assert afford.can_afford is True and afford.remaining_today == 41
+
+
+def test_utc_day_boundary_usage_counts_against_the_day_it_happened_on(tmp_path):
+    """ASES-CAP-03's daily-reset arithmetic at the actual boundary: usage recorded at 23:59:59 UTC counts
+    against that calendar day, and one second later, at 00:00:00 the next UTC day, the ledger has reset (a
+    fresh day, nothing carried over), exactly the case the register's note on ASES-CAP-03 said could only be
+    tested by monkeypatching ledger._today before this round."""
+    conn = db.connect(tmp_path / "ases.db")
+    end_of_day = datetime(2026, 3, 1, 23, 59, 59, tzinfo=timezone.utc)
+    start_of_next_day = datetime(2026, 3, 2, 0, 0, 0, tzinfo=timezone.utc)
+
+    ledger.record_usage(conn, "openrouter", "m", n=30, now=end_of_day)
+    assert ledger.usage_today(conn, "openrouter", "m", now=end_of_day) == 30
+    assert ledger.usage_today_for_provider(conn, "openrouter", now=end_of_day) == 30
+    assert ledger.remaining_today(conn, LIMITS, "openrouter", now=end_of_day) == 50 - 30
+
+    # One second later: a new UTC day, a fresh ledger row, the cap fully restored.
+    assert ledger.usage_today(conn, "openrouter", "m", now=start_of_next_day) == 0
+    assert ledger.usage_today_for_provider(conn, "openrouter", now=start_of_next_day) == 0
+    assert ledger.remaining_today(conn, LIMITS, "openrouter", now=start_of_next_day) == 50
+
+    # Usage recorded on the new day never touches the old day's row.
+    ledger.record_usage(conn, "openrouter", "m", n=12, now=start_of_next_day)
+    assert ledger.usage_today(conn, "openrouter", "m", now=start_of_next_day) == 12
+    assert ledger.usage_today(conn, "openrouter", "m", now=end_of_day) == 30
+
+
+def test_today_treats_a_naive_now_as_already_utc():
+    """A naive `now` (no tzinfo) is assumed to already be UTC, the same convention report._utc documents for
+    every other clock parameter in this codebase, so a caller cannot accidentally shift the day by feeding in
+    a timezone-naive moment."""
+    naive = datetime(2026, 4, 10, 23, 0)
+    aware = datetime(2026, 4, 10, 23, 0, tzinfo=timezone.utc)
+    assert ledger._today(naive) == ledger._today(aware) == "2026-04-10"
+
+
+def test_default_now_is_the_fallback_used_when_a_call_gives_no_now_of_its_own(tmp_path, monkeypatch):
+    """`default_now` (a public, documented attribute, not a private function) is the one seam a caller with no
+    `now` of its own falls back to. Replacing it points every subsequent call at a simulated day, exactly what
+    tests/acceptance/test_22_9_quota.py now does instead of monkeypatching ledger._today directly."""
+    conn = db.connect(tmp_path / "ases.db")
+    fixed = datetime(2026, 5, 1, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(ledger, "default_now", lambda: fixed)
+
+    ledger.record_usage(conn, "openrouter", "m", n=4)          # no now= given: falls back to default_now()
+    assert ledger.usage_today(conn, "openrouter", "m") == 4
+    assert ledger.usage_today(conn, "openrouter", "m", now=fixed) == 4
+
+    # An explicit `now` on a single call still wins over the patched default.
+    other_day = datetime(2026, 5, 2, 8, 0, tzinfo=timezone.utc)
+    assert ledger.usage_today(conn, "openrouter", "m", now=other_day) == 0
