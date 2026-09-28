@@ -1,14 +1,16 @@
 """Doctor logic tested with hermes.py mocked out -- no subprocess, no real Hermes needed. The real-Hermes
 path is covered separately by tests/integration/test_doctor_real_hermes.py."""
 import dataclasses
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import types
 
 import pytest
 
-from ases import config, db, doctor, hermes, models, sandbox
+from ases import config, db, doctor, events, hermes, models, sandbox
 
 try:  # another package's module: imported here, before the autouse fixture below swaps a stub into sys.modules
     from ases import profiles as real_profiles
@@ -1051,3 +1053,197 @@ def test_log_all_ref_updates_is_wired_into_run_when_a_repo_is_given(tmp_path, mo
 
     checks = {c.name: c for c in report.checks}
     assert checks["log_all_ref_updates"].status == "warn"
+
+
+# --- round 13 (TIDY): leaked_worktrees, ASES-GIT-12 --------------------------------------------------------------
+
+
+def _committed_repo(tmp_path):
+    """A real git repository with one commit, so `git worktree add` has something to check out (unlike
+    `_git_repo` above, which the log_all_ref_updates checks never need to add a worktree to)."""
+    repo = tmp_path / "leak-target-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "integration"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(repo), check=True)
+    return repo
+
+
+def test_leaked_worktrees_passes_when_no_events_are_recorded(tmp_path):
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+
+    check = doctor._check_leaked_worktrees(project, conn, None)
+
+    assert check.status == "pass"
+    assert "no gate/merge worktree-leak events" in check.detail
+    assert check.requirement_ids == ("ASES-GIT-12",)
+
+
+def test_leaked_worktrees_warns_when_the_recorded_directory_still_exists(tmp_path):
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    leaked_dir = tmp_path / "leaked-gate-wt"
+    leaked_dir.mkdir()
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T1", "gate": "gate1", "path": str(leaked_dir), "git_exit_code": 128}, project=project.name,
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, None)
+
+    assert check.status == "warn"
+    assert str(leaked_dir) in check.detail
+    assert "directory still on disk" in check.detail
+    assert "git worktree prune" in check.detail
+    assert check.requirement_ids == ("ASES-GIT-12",)
+
+
+def test_leaked_worktrees_passes_when_the_recorded_path_was_already_cleaned_up(tmp_path):
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    gone = tmp_path / "already-gone"  # never created
+    events.record(
+        conn, "merge_worktree_leak", {"task_key": "T2", "path": str(gone), "git_exit_code": 128},
+        project=project.name,
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, None)
+
+    assert check.status == "pass"
+    assert "already cleaned up" in check.detail
+
+
+def test_leaked_worktrees_is_project_scoped(tmp_path):
+    """A leak recorded for a different project must not turn up in this project's report (events.PROJECT_SCOPE_SQL,
+    the one project-scope filter every reader of the events table uses)."""
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    leaked_dir = tmp_path / "someone-elses-leak"
+    leaked_dir.mkdir()
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T3", "gate": "gate1", "path": str(leaked_dir), "git_exit_code": 128},
+        project="a-different-project",
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, None)
+
+    assert check.status == "pass"
+
+
+def test_leaked_worktrees_dedupes_the_same_path_reported_by_both_a_gate_and_a_merge_leak(tmp_path):
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    leaked_dir = tmp_path / "leaked-both"
+    leaked_dir.mkdir()
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T4", "gate": "gate1", "path": str(leaked_dir), "git_exit_code": 128}, project=project.name,
+    )
+    events.record(
+        conn, "merge_worktree_leak", {"task_key": "T4", "path": str(leaked_dir), "git_exit_code": 128},
+        project=project.name,
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, None)
+
+    assert check.status == "warn"
+    assert "1 leaked gate/merge worktree(s)" in check.detail
+
+
+def test_leaked_worktrees_never_deletes_anything(tmp_path):
+    """Read-only, like every other doctor check: the leaked directory (and whatever a hung gate command left
+    inside it) must still be there afterwards."""
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    leaked_dir = tmp_path / "leaked-readonly"
+    leaked_dir.mkdir()
+    (leaked_dir / "marker.txt").write_text("still here", encoding="utf-8")
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T5", "gate": "gate1", "path": str(leaked_dir), "git_exit_code": 128}, project=project.name,
+    )
+
+    doctor._check_leaked_worktrees(project, conn, None)
+
+    assert leaked_dir.exists()
+    assert (leaked_dir / "marker.txt").read_text(encoding="utf-8") == "still here"
+
+
+def test_leaked_worktrees_notes_it_could_not_cross_check_git_without_a_repo(tmp_path):
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    leaked_dir = tmp_path / "leaked-no-repo"
+    leaked_dir.mkdir()
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T6", "gate": "gate1", "path": str(leaked_dir), "git_exit_code": 128}, project=project.name,
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, None)
+
+    assert check.status == "warn"
+    assert "not given --repo" in check.detail
+
+
+def test_leaked_worktrees_warns_when_git_worktree_list_still_registers_it_though_the_directory_is_gone(tmp_path):
+    """Round 12's own finding is the mirror image of this: `git worktree remove --force` can deregister a
+    worktree even while failing to delete its directory. This proves the OTHER stale state is caught too -- a
+    directory deleted by hand, without ever running `git worktree remove`, leaves git's own registration
+    behind, and `git worktree list` (not just disk existence) is exactly what catches that."""
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    repo = _committed_repo(tmp_path)
+    wt = tmp_path / "stale-registered-wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(wt), "integration"],
+        capture_output=True, text=True, check=True,
+    )
+    shutil.rmtree(wt)  # deleted by hand, WITHOUT `git worktree remove`: git still has it registered
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T7", "gate": "gate1", "path": str(wt), "git_exit_code": 0}, project=project.name,
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, repo)
+
+    assert check.status == "warn"
+    assert "still registered in `git worktree list`" in check.detail
+
+
+def test_leaked_worktrees_matches_a_registered_path_of_different_case_on_windows(tmp_path):
+    """Windows' filesystem is case-insensitive, but a leak event's recorded path (str(tmp_root), whatever case
+    tempfile/pathlib happened to return) and git's own report of the very same directory are not guaranteed to
+    agree on case: this must still count as the same directory, not two different ones."""
+    if os.name != "nt":
+        pytest.skip("case-insensitive path matching is a Windows-only concern")
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    repo = _committed_repo(tmp_path)
+    wt = tmp_path / "CaseSensitiveWT"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(wt), "integration"],
+        capture_output=True, text=True, check=True,
+    )
+    shutil.rmtree(wt)  # gone from disk, only git's own registration is left to find it by
+    differently_cased_path = str(wt).replace("CaseSensitiveWT", "casesensitivewt")
+    events.record(
+        conn, "gate_worktree_leak",
+        {"task_key": "T8", "gate": "gate1", "path": differently_cased_path, "git_exit_code": 0},
+        project=project.name,
+    )
+
+    check = doctor._check_leaked_worktrees(project, conn, repo)
+
+    assert check.status == "warn"
+    assert "still registered in `git worktree list`" in check.detail
+
+
+def test_leaked_worktrees_is_wired_into_run(tmp_path, monkeypatch):
+    _, _report, checks = _run(tmp_path, monkeypatch)
+
+    assert checks["leaked_worktrees"].status == "pass"

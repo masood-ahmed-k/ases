@@ -135,18 +135,15 @@ def _kill_process_tree(pid: int) -> None:
     Popen.kill()/terminate() (TerminateProcess) ends that wrapper but never touches a grandchild that inherited
     the same stdout/stderr pipe handles, so `taskkill /PID <pid> /T /F` ends the whole tree instead. On POSIX,
     `_run_commands` starts the command in its own session (start_new_session=True), which makes its process
-    group id equal to its own pid, so os.killpg ends the command and everything it started. This mirrors
-    evals.py's own `_kill_process_tree` (the same hazard, fixed there first); kept as gates.py's own copy
-    rather than an import because evals.py is outside this package's file ownership (round 12, GATEINFRA)."""
-    try:
-        if _IS_WINDOWS:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
-        else:
-            import signal
+    group id equal to its own pid, so os.killpg ends the command and everything it started.
 
-            os.killpg(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-    except (OSError, subprocess.SubprocessError):
-        pass
+    Round 13 (TIDY): the actual kill is now procenv.kill_process_tree, the one definition this and evals.py's own
+    `_kill_process_tree` both delegate to (round 12 kept this as gates.py's own copy of evals.py's older one only
+    because GATEINFRA did not own evals.py; see procenv.kill_process_tree's docstring for the full story,
+    including why evals.py's caller passes `process_group=False` instead of this module's `True`). This thin
+    wrapper stays so `gates._kill_process_tree` keeps working as `_run_commands`' injectable default and a test
+    can still flip `gates._IS_WINDOWS` and see it take effect here."""
+    procenv_mod.kill_process_tree(pid, is_windows=_IS_WINDOWS, process_group=True)
 
 
 def _run_commands(
