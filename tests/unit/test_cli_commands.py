@@ -3278,7 +3278,7 @@ def test_the_real_config_loaders_read_the_files_of_the_repository():
     project = cli._load_project()
     models_config = cli._load_models_config()
 
-    assert project.integration_branch == "integration" and project.sandbox_enabled is False
+    assert project.integration_branch == "integration" and project.sandbox_enabled is True
     assert {"providers", "models"} <= set(models_config)
 
 

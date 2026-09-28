@@ -342,7 +342,8 @@ def test_a_project_config_built_by_hand_still_gets_both_blocks():
     assert cfg.retention == config.DEFAULT_RETENTION
 
 
-def test_the_shipped_swarm_yaml_documents_both_blocks_and_keeps_the_sandbox_off():
+def test_the_shipped_swarm_yaml_documents_both_blocks_and_turns_the_sandbox_on():
+    """The sandbox was switched on 2026-09-28 (round 16), after both real-Docker live checks passed."""
     import pathlib
 
     path = pathlib.Path(__file__).resolve().parents[2] / "config" / "swarm.yaml"
@@ -350,7 +351,7 @@ def test_the_shipped_swarm_yaml_documents_both_blocks_and_keeps_the_sandbox_off(
 
     cfg = config.load_swarm_config(path)
 
-    assert cfg.sandbox_enabled is False
+    assert cfg.sandbox_enabled is True
     assert cfg.sandbox["terminal_backend"] == "docker" and cfg.sandbox["mount"] == "worktree_only"
     assert cfg.sandbox["network_default"] is False and cfg.sandbox["forward_env"] == []
     assert (cfg.logs_days, cfg.reports_days) == (30, 90)

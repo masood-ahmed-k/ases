@@ -137,9 +137,9 @@ def _load_policy() -> sandbox_mod.SandboxPolicy:
 
 
 class _SandboxEnabledProject:
-    """Duck-typed project_config for gates.resolve_runner (see its own docstring): the real config/swarm.yaml
-    keeps sandbox.enabled: false until WORKERGIT's design is proven, so this live check builds its own
-    stand-in with the sandbox switched ON, carrying the same policy (same pinned image, same limits)."""
+    """Duck-typed project_config for gates.resolve_runner (see its own docstring): this live check builds its own
+    stand-in with the sandbox switched ON, carrying the same policy (same pinned image, same limits), so it
+    proves the sandboxed path whatever config/swarm.yaml's own sandbox.enabled says (true since 2026-09-28)."""
 
     def __init__(self, policy_config: dict) -> None:
         self.sandbox_enabled = True

@@ -43,9 +43,12 @@ hermes:
   native_home: "C:/Users/masoo/AppData/Local/hermes"
 
 # Worker sandbox (blueprint Appendix B and section 21.3; ASES-SEC-03, ASES-SEC-05, ASES-CFG-04).
-# OFF until the worker git design (round 15's WORKERGIT) is proven: while `enabled` is false, `swarm doctor`
-# reports the sandbox checks as warnings, and `swarm init` leaves the workers' terminal blocks alone. Set it to
-# true only after `swarm doctor` shows the sandbox rows green; from then on those rows are failures.
+# ON since 2026-09-28 (round 16, owner's "do all"), after the worker git design (round 15's WORKERGIT) and the image
+# passed both real-Docker live checks (scripts/sandbox_live_check.py, scripts/workergit_live_check.py; see
+# docs/stage-b-2026-09-28.md). With `enabled` true, `swarm init` writes the Docker terminal block into every worker
+# profile, the controller's own gates run in the sandbox (gates.resolve_runner), and `swarm doctor` reports a
+# sandbox row that is not green as a failure, not a warning. Setting it back to false returns workers and gates to
+# the host, with doctor's sandbox rows as warnings again.
 # The other keys are the Appendix B keys and are validated by sandbox.SandboxPolicy: the backend must be docker,
 # the mount must be worktree_only, network access is default-deny (network_default: true is refused) and only
 # ever opened by an explicit task-scoped exception. Optional keys: cpu, memory_mb, pids_limit, extra_deny (not
@@ -59,7 +62,7 @@ hermes:
 # doctor`'s sandbox_image row now passes once that build has run (it only checks the image is present locally,
 # never builds or pulls it itself).
 sandbox:
-  enabled: false
+  enabled: true
   terminal_backend: docker
   network_default: false
   mount: worktree_only
