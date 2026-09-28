@@ -507,7 +507,7 @@ def test_render_soul_header_names_version_profile_and_role_and_the_footer_is_wri
     coder = _soul_for(project, "coder-2")
     assert coder.startswith("# ASES role: coder (profile coder-2)\n")
     header = coder.split("\n\n", 1)[0]
-    assert f"ASES {profiles.ases_version()}" in header and "prompt version 1" in header
+    assert f"ASES {profiles.ases_version()}" in header and "prompt version 2" in header  # coder.md, round 16
     assert "swarm project ases" in header and "prompts/coder.md" in header
     assert coder.count(SENTENCE) == 1  # the prompt's own last line is not repeated by the footer
     assert coder.rstrip().endswith(profiles.WORKER_RULES)

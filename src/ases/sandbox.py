@@ -131,6 +131,14 @@ a --basetemp, never the real test repository:
    one of those same downstream gate/checkout reads. None of the writable five reaches `.git/config` or
    `.git/hooks` (both stay under the read-only base /.git mount), so a worker cannot plant a hook or change repo
    config that way.
+4. The price of the read-only base mount (found 2026-09-28 by tracing a sandboxed commit with GIT_TRACE_REFS):
+   deleting ANY ref needs `.git/packed-refs.lock` in the common directory, so it fails with "Read-only file
+   system". A plain `git commit` hits this too, harmlessly: its own ref transaction succeeds, and only the
+   sequencer cleanup that follows (deleting the absent CHERRY_PICK_HEAD / REVERT_HEAD pseudorefs) prints
+   "error: Unable to create '/.git/packed-refs.lock'" while the command still exits 0. No git setting skips that
+   cleanup, and making packed-refs writable would need the base mount writable, which is what keeps hooks and
+   config out of reach, so the coder prompt (version 2, rule 5) says the line is expected, to check `git log -1`
+   instead of committing again, and never to delete a branch or tag.
 """
 from __future__ import annotations
 
