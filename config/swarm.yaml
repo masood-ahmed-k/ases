@@ -43,13 +43,20 @@ hermes:
   native_home: "C:/Users/masoo/AppData/Local/hermes"
 
 # Worker sandbox (blueprint Appendix B and section 21.3; ASES-SEC-03, ASES-SEC-05, ASES-CFG-04).
-# OFF until Docker is running and the user has pulled a pinned image: while `enabled` is false, `swarm doctor`
+# OFF until the worker git design (round 15's WORKERGIT) is proven: while `enabled` is false, `swarm doctor`
 # reports the sandbox checks as warnings, and `swarm init` leaves the workers' terminal blocks alone. Set it to
 # true only after `swarm doctor` shows the sandbox rows green; from then on those rows are failures.
 # The other keys are the Appendix B keys and are validated by sandbox.SandboxPolicy: the backend must be docker,
 # the mount must be worktree_only, network access is default-deny (network_default: true is refused) and only
-# ever opened by an explicit task-scoped exception. Optional keys, not set here: image (a pinned reference,
-# for example python:3.11-slim@sha256:<digest>), cpu, memory_mb, pids_limit, extra_deny.
+# ever opened by an explicit task-scoped exception. Optional keys: cpu, memory_mb, pids_limit, extra_deny (not
+# set here, so SandboxPolicy's own defaults apply).
+# image (round 15, SANDBOXIMG): ases-sandbox:py311-1, built from docker/sandbox/Dockerfile -- an official
+# python:3.11-slim base pinned by @sha256 digest, git, and pytest==9.1.1 (matching this project's own venv), on a
+# fixed non-root user (see the Dockerfile's own comment for why: docker_run_as_host_user does nothing on native
+# Windows, so this is the closest available substitute for ASES-SEC-03's "the host user"). Pulled and built
+# locally with `docker build -t ases-sandbox:py311-1 -f docker/sandbox/Dockerfile docker/sandbox`; `swarm
+# doctor`'s sandbox_image row now passes once that build has run (it only checks the image is present locally,
+# never builds or pulls it itself).
 sandbox:
   enabled: false
   terminal_backend: docker
@@ -57,6 +64,7 @@ sandbox:
   mount: worktree_only
   forward_env: []
   network_exceptions: explicit_allowlist
+  image: ases-sandbox:py311-1
 
 # How long ASES keeps what it writes under ases_home (ASES-OBS-02: "Transcripts and logs stay local under a
 # retention setting"). `swarm retention` applies these (a dry run unless --apply is given). Each is a whole
