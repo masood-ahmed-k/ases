@@ -2071,7 +2071,29 @@ def test_apply_result_lines_report_the_copied_names_and_nothing_else_about_crede
 def test_plan_init_the_soul_row_names_the_prompt_and_its_version(tmp_path):
     plan = _plan(_project(tmp_path), tmp_path / "hermes")
     why = next(c.why for c in plan if c.kind == "write_soul" and c.profile == "reviewer")
-    assert why == "ASES-ROL-03: role prompt prompts/reviewer.md (prompt version 1)"
+    assert why == "ASES-ROL-03: role prompt prompts/reviewer.md (prompt version 2)"
+
+
+def test_prompt_version_is_read_from_each_prompts_own_first_line():
+    """Round 16 finding: reviewer.md moved to version 2, but the SOUL.md header and the change list still printed a
+    single global "prompt version 1" for every prompt. Each prompt's own first line is now the source."""
+    assert profiles.prompt_version("ASES reviewer prompt, version 2.\n\nbody\n") == 2
+    assert profiles.prompt_version("ASES plan critique (Gate P), prompt version 7. Filled in by x.\n") == 7
+    assert profiles.prompt_version("Do it.\n") == profiles.PROMPT_VERSION
+    # Only the first line counts: a "version 9" later in the body is not the prompt's version.
+    assert profiles.prompt_version("No version here.\nversion 9\n") == profiles.PROMPT_VERSION
+    for path in sorted(PROMPTS_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        stated = re.search(r"\bversion (\d+)\b", text.splitlines()[0])
+        assert stated is not None, f"{path.name} states no version on its first line"
+        assert profiles.prompt_version(text) == int(stated.group(1))
+
+
+def test_render_soul_header_carries_the_reviewer_prompts_own_version(tmp_path):
+    project = _project(tmp_path)
+    spec = _spec(project, "reviewer")
+    soul = profiles.render_soul(spec, (PROMPTS_DIR / "reviewer.md").read_text(encoding="utf-8"), project)
+    assert "prompt version 2" in soul.split("\n\n", 1)[0]
 
 
 # The exact prompts/reviewer.md text before round 16 (git show HEAD:prompts/reviewer.md on the commit this
