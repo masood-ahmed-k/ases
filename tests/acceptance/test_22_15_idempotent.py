@@ -21,6 +21,13 @@ from ases import hermes as hermes_mod
 from ases import triage as triage_mod
 
 
+class _InjectedCrash(Exception):
+    """Raised by a fail_next-armed call in place of the real one, and caught here outside the normal flow:
+    this is what "the process died at this instant" looks like from the caller's side. A type of its own,
+    never HermesCommandError (a legitimate Hermes refusal would also raise that) and never a bare
+    RuntimeError, so `pytest.raises` here can only ever catch the fault this test injected."""
+
+
 def _db_files(db_path: pathlib.Path) -> list[pathlib.Path]:
     """db.connect opens the database in WAL mode, which leaves -wal and -shm siblings next to the main file;
     all three must go for "deleting the ASES database" to mean what it says."""
@@ -84,6 +91,55 @@ def test_22_15_card_creation_is_idempotent_twice_and_once_more_after_the_databas
         )
     }
     assert rows_after == rows_before
+
+
+def test_22_15_a_crash_mid_creation_is_safely_repeated_with_no_duplicate_cards(world, create_cards):
+    """ASES-REC-03's own scenario (spec/requirements.yaml: "Card creation uses idempotency keys, so repeating
+    a half-finished creation is safe"), not yet covered by the clean, complete repeats above:
+    create_cards_from_plan's own docstring names the mechanism ("the whole loop runs inside a create_cards
+    intent... so a crash half way leaves an OPEN intent for reconcile-on-start, which then asks for this call
+    to be repeated"). Reproduced with a REAL injected failure, armed after the world fixture's fake is already
+    installed (ases.fakes.board.FakeHermes.fail_next; see tests/unit/test_fakes.py for the round 6 fix that
+    makes this safe): kanban_link is the LAST call create_cards_from_plan makes for a brand new task, after
+    BOTH its cards already exist on the board but before plan_tasks/events remember either of them, so failing
+    it once lands the crash squarely mid-task: T1 half-finished (both cards created, unlinked, no bookkeeping
+    written), T2 never started at all.
+    """
+    fake = world.fake
+    fake.fail_next(
+        "kanban_link",
+        error=_InjectedCrash("controller died between creating T1's two cards and linking them"))
+
+    with pytest.raises(_InjectedCrash):
+        create_cards(world)
+
+    half_finished = world.fake.cards()
+    assert len(half_finished) == 2                            # T1's work and merge card only; T2 untouched
+    half_finished_ids = {c["id"] for c in half_finished}
+    assert not world.conn.execute(
+        "SELECT 1 FROM plan_tasks WHERE project = ?", (world.plan.project,)).fetchall()  # no bookkeeping at all
+
+    pairs = create_cards(world)
+
+    # The repeat finishes what the crash interrupted and completes the rest: still exactly one work and one
+    # merge card per task (no duplicates), T1's are the SAME two cards the crashed attempt already made
+    # (idempotency_key found them again, nothing new was created for T1), and T2's are created for the first
+    # time now.
+    all_cards = world.fake.cards()
+    assert len(all_cards) == 4
+    assert len({c["id"] for c in all_cards}) == 4              # 4 distinct ids: no duplicate card anywhere
+    assert {pairs["T1"].work_card_id, pairs["T1"].merge_card_id} == half_finished_ids
+    rows = {
+        row["task_key"]: (row["work_card_id"], row["merge_card_id"])
+        for row in world.conn.execute(
+            "SELECT task_key, work_card_id, merge_card_id FROM plan_tasks WHERE project = ?",
+            (world.plan.project,),
+        )
+    }
+    assert rows == {
+        "T1": (pairs["T1"].work_card_id, pairs["T1"].merge_card_id),
+        "T2": (pairs["T2"].work_card_id, pairs["T2"].merge_card_id),
+    }
 
 
 def test_22_15_a_fix_card_is_forgotten_after_the_database_is_deleted(world, create_cards):

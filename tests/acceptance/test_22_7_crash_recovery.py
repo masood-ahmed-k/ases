@@ -31,7 +31,6 @@ import json
 import pytest
 
 from ases import gates as gates_mod
-from ases import hermes
 from ases import reconcile
 from ases.fakes import worker as fw
 
@@ -243,7 +242,7 @@ def test_22_7_crash_point_2_during_a_candidate_build(world_factory, one_task_pla
 # ---------------------------------------------------------------------------------------------
 
 
-def test_22_7_crash_point_3_between_fast_forward_and_merge_card_completion(world, run_until, git, monkeypatch):
+def test_22_7_crash_point_3_between_fast_forward_and_merge_card_completion(world, run_until, git):
     """22.7 crash point 3: "again between the fast-forward and the merge-card completion." Reproduces, through
     the real controller instead of the hand-built fixtures, the exact scenario test_reconcile.py's own
     test_c_a_completed_record_with_the_card_not_done_completes_the_card already proves in isolation: "a landed
@@ -258,41 +257,31 @@ def test_22_7_crash_point_3_between_fast_forward_and_merge_card_completion(world
     other, and this is the one crash point in 22.7 that is defined by that exact gap: the commit and the
     record both already exist, and only the board (the merge card's status) has not been told yet -- and
     process_merge_queue also wraps that one kanban_complete call in its own KIND_COMPLETE_MERGE_CARD intent, so
-    the crash leaves that open too. That is reproduced here by monkeypatching `hermes.kanban_complete` itself,
-    which `fake.install()` already pointed at `FakeHermes.kanban_complete` (a bound method): the stub raises
-    the FIRST time it is called for THIS merge card's id, before delegating to the real (fake) implementation,
-    so it fires before
-    FakeHermes._complete_task runs at all -- the merge card's status is therefore provably untouched by this
-    one call, exactly what "the process died before this call's effect was observed" requires. (FakeHermes's
-    own `fail_next` would do the same job, but its validation checks that `hermes.<name>` is still a plain
-    function at the moment it is armed; by the time `world`/`world_factory` hand out an already-installed
-    fake, `hermes.kanban_complete` is already the fake's bound method, so `fail_next` refuses every name here
-    with "is not a public function of the hermes module" -- a real gap in the rig for any test that arms a
-    failure after install(), worth a CORE/FIX-owned fix, not something an AC-* package may make in
-    ases/fakes/board.py. Monkeypatching `hermes.kanban_complete` directly, scoped to this one merge card's id,
-    sidesteps it cleanly and is no less faithful: a coder's own agent_complete on a WORK card is a different
-    fake method entirely and is never touched by this.
+    the crash leaves that open too. Reproduced with fake.fail_next("kanban_complete", card_id=t1.merge_card_id,
+    ...): fail_next always fires before the real call's effect (board.py's own docstring for it), so the merge
+    card's status is provably untouched by this one call, exactly what "the process died before this call's
+    effect was observed" requires; scoped to this one merge card's id, so a coder's own agent_complete on a
+    WORK card (a different fake method entirely) is never touched by it, and every other kanban_complete call
+    passes straight through.
+
+    (Round 17: this test used to have to monkeypatch hermes.kanban_complete directly instead, because
+    fail_next's own validation once rejected every name once a fake was already installed (world/world_factory
+    hand out one that always is) -- fixed at round 6 (src/ases/fakes/board.py's _HERMES_PUBLIC_NAMES) but never
+    simplified back to the natural call here until this round confirmed, with a card_id-filtered regression
+    test of its own (tests/unit/test_fakes.py: test_fail_next_card_id_filter_also_survives_install), that the
+    fix covers this exact shape too.)
     """
     fake = world.fake
     pairs = world.create_cards()
     t1, t2 = pairs["T1"], pairs["T2"]
 
-    real_kanban_complete = hermes.kanban_complete  # fake.install() already pointed this at FakeHermes.kanban_complete
-    fired = False
+    fake.fail_next(
+        "kanban_complete", card_id=t1.merge_card_id,
+        error=_SimulatedCrash("controller died after the fast-forward, before kanban_complete on the merge card"))
 
-    def _crash_once_for_t1s_merge_card(board, card_id, **kwargs):
-        nonlocal fired
-        if card_id == t1.merge_card_id and not fired:
-            fired = True
-            raise _SimulatedCrash(
-                "controller died after the fast-forward, before kanban_complete on the merge card")
-        return real_kanban_complete(board, card_id, **kwargs)
-
-    with monkeypatch.context() as m:
-        m.setattr(hermes, "kanban_complete", _crash_once_for_t1s_merge_card)
-        with pytest.raises(_SimulatedCrash):
-            for _ in range(10):
-                world.one_pass()
+    with pytest.raises(_SimulatedCrash):
+        for _ in range(10):
+            world.one_pass()
 
     row = world.conn.execute(
         "SELECT squash_commit, completed_at FROM merge_records WHERE task_key = 'T1'").fetchone()
