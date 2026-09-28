@@ -70,7 +70,7 @@ OVERLAP_PLAN = {
 def test_22_8_1_gate0_serializes_overlapping_touches(world_factory, create_cards):
     """[ASES-GIT-08] "Two cards with overlapping touches are serialized by Gate 0." Confirms overlapping
     TOUCHES alone (not an explicit depends_on) triggers the same work-card-waits-on-merge-card wiring
-    test_22_2's dependency scenario already proves for an explicit dependency (test_scenarios_demo.py), so
+    test_22_2's dependency scenario already proves for an explicit dependency (test_22_2_end_to_end.py), so
     this stays short: its only point is that the serialization link comes from Gate 0 itself."""
     world = world_factory(plan_raw=OVERLAP_PLAN)
 

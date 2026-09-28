@@ -5,7 +5,7 @@ seconds, and swarm resume must continue correctly." ASES-REC-06.
 
 Drives the REAL killswitch.stop_all / killswitch.resume_all / reconcile.reconcile and controller.run_pass
 against ases.fakes.board.FakeHermes, with real git worktrees and scripted workers, the same rig
-test_scenarios_demo.py uses. killswitch.stop_all takes hermes calls (pause, kanban_list, kanban_show, reclaim)
+test_22_2_end_to_end.py uses. killswitch.stop_all takes hermes calls (pause, kanban_list, kanban_show, reclaim)
 that default to the (now faked) hermes module once FakeHermes.install(monkeypatch) has run, so this test never
 overrides them; it only overrides the process- and Docker-facing hooks (killer, alive, command_line,
 list_containers, stop_container), which default to REAL OS/Docker calls and so must never be left un-faked

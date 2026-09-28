@@ -1160,7 +1160,41 @@ requirements:
   section: '22'
   verified_by: Inspection
   status: partial
-  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): Re-checked all sixteen scenarios against
+  note: 'ROUND 17 (2026-09-28, zero quota): Built the two full scenarios the ROUND 9 paragraph below still called
+    reduced. tests/acceptance/test_22_2_end_to_end.py replaces test_scenarios_demo.py''s 22.2 half with the whole of
+    blueprint p402: an empty repository through controller.ensure_repo_bootstrapped, Gate 0
+    (plan_mod.load_plan_file), Gate P (critic.run_critique/next_step with a fake invoke), controller.publish_plan
+    proven to run and record its commit before any card exists, the two-task merge through Gate 1, Gate 3, one
+    squash commit per task and both merge cards done, and a worker question answered through
+    cli.cmd_questions/cli.cmd_answer themselves (not just the questions module) surviving a controller restart.
+    tests/acceptance/test_22_6_review.py replaces test_scenarios_demo.py''s 22.6 half the same way, keeping its one
+    CHANGES_REQUIRED/corrected-commit test and adding the two clauses no test at any level had proven before: a
+    commit landed on a card''s branch after the reviewer''s PASS voids that approval and needs its own Gate 1 run
+    and reviewer PASS (review.check_branch_for_merge''s stale_review path, proven by writing an out-of-band commit
+    into the card''s real worktree right before the merge queue''s own check reads the branch head), and repeating
+    the same violation until the review-round lineage budget is spent escalates through recovery.escalation''s own
+    two stages (a Lead re-plan question, then, once that one re-plan is also spent, a block-for-user question)
+    instead of looping forever -- both regression-proven by disabling the mechanism in src/ases/review.py and
+    src/ases/controller.py, watching the matching test fail, then reverting (see this package''s report).
+    test_scenarios_demo.py itself is removed: nothing it asserted was dropped, only moved. Correcting a stale claim
+    in the paragraph below: 22.4 (context test) is NOT missing an acceptance-level scenario the way the ROUND 9
+    sentence says; ROUND 11 built the rejection (this register''s own ASES-MOD-02 row already reads status: covered,
+    note ''ROUND 11 ... MOD02 built the rejection this note said was missing'') and
+    tests/acceptance/test_22_4_context.py exists today, calling cli._estimate_lines (the real function swarm approve
+    calls) and proving all three of p406''s steps end to end, including that no card is ever created for a rejected
+    model (world.pairs == {}). Every other scenario the ROUND 9 paragraph names was re-checked against
+    tests/acceptance/ today and is unchanged: 22.3, 22.5, 22.7 to 22.10, and 22.12 to 22.16 still exist as genuine
+    acceptance-level tests, with no skip or xfail marker on a single test function among any of them, and 22.11 is
+    still honestly split exactly as that paragraph says, a disclosed, Phase-5-scoped boundary (Docker never starts
+    anywhere in this suite by design), not a silent gap: three of its four blueprint clauses are proven end to end,
+    the fourth (a real sandboxed network block) only at the unit/policy level. With 22.2, 22.4 and 22.6 now
+    genuinely closed and 22.1 correctly excluded (p398), 22.11''s one remaining reduced clause is the only thing
+    left anywhere in the sixteen, so status stays partial rather than moving to covered: this round''s own deciding
+    rule is all of 22.2 to 22.16 as genuine FULL acceptance tests, and 22.11 does not yet fully verify its own
+    blueprint text, only three quarters of it. What is missing, precisely: 22.11''s real-Docker
+    sandboxed-network-block clause, proven today only by sandbox.py''s own unit tests (tests/unit/test_sandbox.py)
+    and an unrun exfiltration probe (this register''s ASES-SEC-05/ASES-SEC-07 rows), never by a live container
+    inside this acceptance suite. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota): Re-checked all sixteen scenarios against
     tests/acceptance/ and the blueprint''s own text (blueprint.txt p396 to p431). 22.1 is correctly excluded:
     p398 states real providers are used only in 22.1, the Phase 2 evaluation and 22.17, so 22.1 is the
     ''unless stated otherwise'' exception p396 itself names, not a gap. Thirteen scenarios exist as genuine

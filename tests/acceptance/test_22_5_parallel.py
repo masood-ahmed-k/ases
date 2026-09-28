@@ -5,7 +5,7 @@ project names, no cross-worktree changes in the integrity snapshots, and three s
 stays queued because of kanban.max_in_progress." ASES-GIT-01, ASES-GIT-04, ASES-GIT-12, ASES-GIT-14.
 
 Drives the REAL controller (controller.run_pass, guards, leases, mergeq) against ases.fakes.board.FakeHermes,
-with real git worktrees and scripted workers, the same rig test_scenarios_demo.py uses.
+with real git worktrees and scripted workers, the same rig test_22_2_end_to_end.py uses.
 
 tests/acceptance/conftest.py's world_factory cannot build this scenario's plan: make_world's roles map is fixed
 to {"coder": "coder-1"} and ases.policy.resolve_assignee(role, roles_map) is a strict one role, one profile
@@ -112,7 +112,7 @@ def _commit_subjects(git, world) -> list[str]:
 
 def _refs_moved_only_by_fast_forward(git, world, moves: int) -> None:
     """The newest `moves` reflog entries of the integration branch are the merge queue's fast-forwards, and
-    nothing else moved the branch after the plan was published (same check as test_scenarios_demo.py's 22.2)."""
+    nothing else moved the branch after the plan was published (same check as test_22_2_end_to_end.py)."""
     entries = git(world, "reflog", "show", "integration", "--format=%gs").splitlines()
     assert len(entries) == moves + 2, entries  # the seeded commit, the plan commit, then one fast-forward per merge
     assert all(entry.startswith("merge ") and entry.endswith("Fast-forward") for entry in entries[:moves]), entries
