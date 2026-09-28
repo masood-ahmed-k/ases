@@ -29,6 +29,7 @@ import subprocess
 import sys
 
 from . import config as ases_config
+from . import containers as containers_mod
 from . import events as events_mod
 from . import gitexec
 from . import hermes as hermes_mod
@@ -419,6 +420,9 @@ def _check_gateway_dispatcher() -> DoctorCheck:
 
 
 _SANDBOX_IDS = ("ASES-SEC-03", "ASES-CFG-04")
+# The orphan-container and profile-isolation rows (round 17): the sandbox itself, the reconcile-on-start
+# sweep that stops orphans (p352-p353) and the kill switch that stops every sandbox (p357).
+_CONTAINER_IDS = ("ASES-SEC-03", "ASES-REC-04", "ASES-REC-06")
 _PROFILE_IDS = ("ASES-ROL-02", "ASES-ROL-07", "ASES-ARC-08")
 # The roles that are not workers when profiles.desired_profiles cannot say: the lead plans and the reviewer only
 # has the Kanban verdict tools and read access (ASES-ROL-05), so neither runs a worker's shell.
@@ -595,6 +599,152 @@ def _check_sandbox(project: ases_config.ProjectConfig, models_config: dict, prof
             detail += " (sandbox not enabled, so only a warning)"
         rows.append(DoctorCheck(str(name), "pass" if ok else bad, detail, _SANDBOX_IDS))
     return rows
+
+
+def _check_orphan_containers(project: ases_config.ProjectConfig) -> list[DoctorCheck]:
+    """CONTAINERS (round 17), ASES-SEC-03: a read-only row listing this project's own orphaned worker
+    sandboxes (ases.containers.find_orphan_containers: a RUNNING container labelled hermes-agent=1, whose
+    Hermes profile is one of this project's own (project.roles.values()), with no card of this project
+    currently running under that profile), names only, plus the command to reclaim them by hand. Shown only
+    while sandbox.enabled is true (see that module's docstring for why a container cannot be tied to one
+    card): no rows at all otherwise, matching config/swarm.yaml `sandbox: enabled: false` being the ordinary,
+    unremarkable case. Docker unreachable is reported and is never a failure (nothing here ever stops a
+    container: only ases.containers.sweep_orphan_containers, called elsewhere, does that)."""
+    if not bool(getattr(project, "sandbox_enabled", False)):
+        return []
+    ok, why = sandbox_mod.docker_available()
+    if not ok:
+        return [DoctorCheck(
+            "orphan_containers", "pending", f"could not check for orphaned worker containers: {why}", _CONTAINER_IDS,
+        )]
+    try:
+        orphans = containers_mod.find_orphan_containers(project.board, project)
+    except Exception as exc:  # noqa: BLE001 - a doctor row never crashes the doctor
+        return [DoctorCheck(
+            "orphan_containers", "warn",
+            f"could not check for orphaned worker containers: {type(exc).__name__}: {exc}", _CONTAINER_IDS,
+        )]
+    if orphans is None:
+        return [DoctorCheck(
+            "orphan_containers", "pending",
+            "could not list running cards on the board, so orphaned worker containers were not checked this run",
+            _CONTAINER_IDS,
+        )]
+    if not orphans:
+        return [DoctorCheck(
+            "orphan_containers", "pass", "no orphaned worker containers found for this project's profiles",
+            _CONTAINER_IDS,
+        )]
+    names = [name for name, _ in orphans]
+    cleanup = "; ".join(f"docker stop -t 5 {name}" for name in names)
+    return [DoctorCheck(
+        "orphan_containers", "warn",
+        f"{len(names)} orphaned worker container(s) (no card of this project is running under their profile): "
+        f"{', '.join(names)}. Reclaim by hand with: {cleanup}",
+        _CONTAINER_IDS,
+    )]
+
+
+def _sibling_swarm_configs(project: ases_config.ProjectConfig) -> list[pathlib.Path]:
+    """Every OTHER project's config/swarm.yaml this can find one level under project.workspace_root's parent
+    directory and one level under project.ases_home's parent directory (the two directories deduplicated
+    when they are the same one) -- the layout this machine's own project actually has, a repository root
+    holding config/swarm.yaml with workspace_root and ases_home configured as paths near it. Never recurses
+    further than one level, and never raises: a parent that does not exist or that this process cannot read
+    contributes nothing rather than failing the scan. Best-effort only, not a real project registry (ASES
+    has none): see _check_profile_isolation, the only caller."""
+    roots: list[pathlib.Path] = []
+    seen_roots: set[str] = set()
+    for base in (project.workspace_root, project.ases_home):
+        try:
+            parent = pathlib.Path(base).resolve().parent
+        except OSError:
+            continue
+        key = str(parent)
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        roots.append(parent)
+    found: list[pathlib.Path] = []
+    seen_configs: set[str] = set()
+    for root in roots:
+        try:
+            candidates = sorted(root.iterdir())
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                if not candidate.is_dir():
+                    continue
+                swarm_path = candidate / "config" / "swarm.yaml"
+                if not swarm_path.is_file():
+                    continue
+            except OSError:
+                continue
+            key = str(swarm_path)
+            if key in seen_configs:
+                continue
+            seen_configs.add(key)
+            found.append(swarm_path)
+    return found
+
+
+def _check_profile_isolation(project: ases_config.ProjectConfig) -> list[DoctorCheck]:
+    """CONTAINERS (round 17 fix round 2), a reviewer finding on the first pass of this package:
+    find_orphan_containers (the function _check_orphan_containers above also calls) matches "this project's
+    own" Hermes profiles by NAME ALONE (project.roles.values()), because that is all a real container's
+    labels ever carry (containers.py's own module docstring, "HARD CONSTRAINT, NOT A SUGGESTION"). Two ASES
+    projects on this machine that configure the same profile name are not safe together once either has
+    sandbox.enabled: project A's sweep only ever reads its OWN board, so it can see project B's live
+    container as idle and stop it.
+
+    This row is the best a single machine can verify without ASES having a real project registry (it has
+    none): a WARN, never a FAIL (a false positive here costs nothing; a missed one costs a running
+    container), for every OTHER project's config/swarm.yaml this can find (_sibling_swarm_configs) whose
+    declared profile names overlap this project's own under a DIFFERENT project name. A sibling with the
+    SAME project name is a worktree of this same project (every round-17 package worktree has its own
+    config/swarm.yaml with name: ases) and is never a collision. Shown only while sandbox.enabled is true,
+    matching _check_orphan_containers: the risk this warns about only exists once this project's own sweep
+    can actually stop a container. Never raises: an unreadable or malformed sibling config is skipped, and
+    an unexpected error in the scan itself is a WARN row, never a doctor crash."""
+    if not bool(getattr(project, "sandbox_enabled", False)):
+        return []
+    try:
+        project_profiles = {str(name) for name in (getattr(project, "roles", None) or {}).values() if name}
+        collisions: list[str] = []
+        checked = 0
+        for swarm_path in _sibling_swarm_configs(project):
+            try:
+                other = ases_config.load_swarm_config(swarm_path)
+            except Exception:  # noqa: BLE001 - not every config/swarm.yaml found this way even parses; skip it
+                continue
+            checked += 1
+            if not other.name or other.name == project.name:
+                continue
+            other_profiles = {str(name) for name in (getattr(other, "roles", None) or {}).values() if name}
+            shared = sorted(project_profiles & other_profiles)
+            if shared:
+                collisions.append(f"project \"{other.name}\" ({swarm_path}) also declares: {', '.join(shared)}")
+    except Exception as exc:  # noqa: BLE001 - a doctor row never crashes the doctor
+        return [DoctorCheck(
+            "profile_isolation", "warn",
+            f"could not check for a profile-name collision with another local project: {type(exc).__name__}: {exc}",
+            _CONTAINER_IDS,
+        )]
+    if collisions:
+        return [DoctorCheck(
+            "profile_isolation", "warn",
+            "this project's Hermes profile name(s) are also declared by another local project's config -- "
+            "its orphan sweep and this one can each mistake the other's live container for its own idle one: "
+            + "; ".join(collisions) + ". Give every project's roles distinct Hermes profile names.",
+            _CONTAINER_IDS,
+        )]
+    return [DoctorCheck(
+        "profile_isolation", "pass",
+        f"no other local project's config/swarm.yaml (checked {checked}) declares one of this project's "
+        f"{len(project_profiles)} Hermes profile name(s)",
+        _CONTAINER_IDS,
+    )]
 
 
 def _check_model_registry(conn, models_config: dict) -> list[DoctorCheck]:
@@ -865,6 +1015,8 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         _check_hermes_doctor(),
         _check_gateway_dispatcher(),
         *_check_sandbox(project, models_config, profiles_mod),
+        *_check_orphan_containers(project),
+        *_check_profile_isolation(project),
         *_check_model_registry(conn, models_config),
         _check_role_profiles(project),
         _check_reviewer_diversity(project),

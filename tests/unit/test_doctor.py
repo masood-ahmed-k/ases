@@ -10,7 +10,7 @@ import types
 
 import pytest
 
-from ases import config, db, doctor, events, hermes, models, sandbox
+from ases import config, containers as containers_mod, db, doctor, events, hermes, models, sandbox
 
 try:  # another package's module: imported here, before the autouse fixture below swaps a stub into sys.modules
     from ases import profiles as real_profiles
@@ -72,6 +72,12 @@ class _World:
         self.verify_calls = []
         self.specs = []
         self.residual_risks = []
+        # CONTAINERS (round 17): docker_available True and no orphans by default, so every existing test in
+        # this file keeps its "no test here reaches a real Docker daemon" guarantee; a test of
+        # _check_orphan_containers itself overrides one or both.
+        self.docker_available = (True, "fake docker reachable")
+        self.orphan_calls = []
+        self.orphan_containers = []
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +95,16 @@ def world(monkeypatch):
         return list(state.verify_problems)
 
     monkeypatch.setattr(sandbox, "doctor_checks", fake_checks)
+
+    def fake_docker_available(**kwargs):
+        return state.docker_available
+
+    def fake_find_orphans(board, project, **kwargs):
+        state.orphan_calls.append((board, project, kwargs))
+        return state.orphan_containers
+
+    monkeypatch.setattr(sandbox, "docker_available", fake_docker_available)
+    monkeypatch.setattr(containers_mod, "find_orphan_containers", fake_find_orphans)
     stub = types.ModuleType("ases.profiles")
     stub.verify_state = fake_verify
     stub.desired_profiles = lambda project, models_config: list(state.specs)
@@ -737,6 +753,228 @@ def test_the_docker_placeholder_row_is_gone(tmp_path, monkeypatch, world):
 
     assert "docker_sandbox" not in by_name
     assert not hasattr(doctor, "_check_docker_sandbox")
+
+
+# =============================================================================================================
+# orphan_containers (CONTAINERS, round 17; ASES-SEC-03)
+# =============================================================================================================
+
+
+def test_orphan_containers_row_is_absent_when_the_sandbox_is_not_enabled(tmp_path, monkeypatch, world):
+    _, _, by_name = _run_healthy(tmp_path, monkeypatch)  # no ENABLED: sandbox.enabled defaults false
+
+    assert "orphan_containers" not in by_name
+    assert world.orphan_calls == []  # never even asked: cheap when the sandbox is off
+
+
+def test_orphan_containers_row_is_pending_when_docker_is_not_reachable(tmp_path, monkeypatch, world):
+    world.docker_available = (False, "docker daemon not reachable")
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]  # keep the rest of the row green
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    assert by_name["orphan_containers"].status == "pending"
+    assert "docker daemon not reachable" in by_name["orphan_containers"].detail
+    assert world.orphan_calls == []  # not a failure, and never asked without Docker
+    assert report.ok is True
+
+
+def test_orphan_containers_row_passes_when_none_are_found(tmp_path, monkeypatch, world):
+    world.orphan_containers = []
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]  # keep the rest of the row green
+
+    project, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    assert by_name["orphan_containers"].status == "pass"
+    assert "no orphaned worker containers" in by_name["orphan_containers"].detail
+    assert world.orphan_calls == [(project.board, project, {})]
+    assert report.ok is True
+
+
+def test_orphan_containers_row_warns_and_names_the_cleanup_command(tmp_path, monkeypatch, world):
+    world.orphan_containers = [("hermes-abc12345", "coder-1"), ("hermes-def67890", "coder-1")]
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]  # keep the rest of the row green
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    row = by_name["orphan_containers"]
+    assert row.status == "warn"
+    assert "hermes-abc12345" in row.detail and "hermes-def67890" in row.detail
+    assert "docker stop -t 5 hermes-abc12345" in row.detail
+    assert "docker stop -t 5 hermes-def67890" in row.detail
+    assert {"ASES-SEC-03", "ASES-REC-04", "ASES-REC-06"} <= set(row.requirement_ids)
+    assert report.ok is True  # a WARN never fails the doctor
+
+
+def test_orphan_containers_row_is_pending_when_the_board_could_not_be_read(tmp_path, monkeypatch, world):
+    world.orphan_containers = None  # find_orphan_containers's own "unknown, do nothing" answer
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]  # keep the rest of the row green
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    assert by_name["orphan_containers"].status == "pending"
+    assert "could not list running cards" in by_name["orphan_containers"].detail
+    assert report.ok is True
+
+
+def test_orphan_containers_row_is_a_warn_not_a_crash_when_the_check_itself_raises(tmp_path, monkeypatch, world):
+    def broken(board, project, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(containers_mod, "find_orphan_containers", broken)
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]  # keep the rest of the row green
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    assert by_name["orphan_containers"].status == "warn"
+    assert "boom" in by_name["orphan_containers"].detail
+    assert report.ok is True
+
+
+# =============================================================================================================
+# profile_isolation (CONTAINERS, round 17 fix round 2; reviewer finding, blocker)
+# =============================================================================================================
+
+_SIBLING_SWARM_YAML = """
+project:
+  name: {name}
+  environment: native
+  data_class: private
+  workspace_root: {ws}
+  ases_home: {home}
+  board: default
+  integration_branch: integration
+roles: {{{roles}}}
+concurrency: {{max_in_progress: 3, per_profile: 1, hard_max: 6}}
+budgets:
+  attempts_per_card: 3
+  review_rounds_per_task: 3
+  fix_cards_per_task: 2
+  replans_per_project: 2
+  max_cards: 40
+  card_runtime_minutes: 45
+  daily_reserve_percent: 10
+  review_reserve_requests: 20
+hermes:
+  tested_version: "0.21.3"
+  native_home: "{home}/hermes-home"
+"""
+
+
+def _write_sibling_config(directory, *, name, roles):
+    """A loadable config/swarm.yaml under `directory` (one level under a scan root, the layout
+    _sibling_swarm_configs looks for), project name `name`, roles-mapping body `roles` (e.g.
+    "lead: lead, coder: coder-1")."""
+    config_dir = directory / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "swarm.yaml").write_text(
+        _SIBLING_SWARM_YAML.format(
+            name=name, roles=roles, ws=(directory / "ws").as_posix(), home=(directory / "home").as_posix(),
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_profile_isolation_row_is_absent_when_the_sandbox_is_not_enabled(tmp_path, monkeypatch, world):
+    _, _, by_name = _run_healthy(tmp_path, monkeypatch)  # no ENABLED: sandbox.enabled defaults false
+
+    assert "profile_isolation" not in by_name
+
+
+def test_profile_isolation_row_passes_when_no_sibling_project_exists(tmp_path, monkeypatch, world):
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]  # keep the rest of the row green
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    row = by_name["profile_isolation"]
+    assert row.status == "pass"
+    assert "checked 0" in row.detail
+    assert {"ASES-SEC-03", "ASES-REC-04", "ASES-REC-06"} <= set(row.requirement_ids)
+    assert report.ok is True
+
+
+def test_profile_isolation_ignores_a_sibling_with_the_same_project_name(tmp_path, monkeypatch, world):
+    """Another worktree of THIS project (every round-17 package worktree has its own config/swarm.yaml with
+    name: ases) shares every role name by construction and must never be read as a collision."""
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]
+    _write_sibling_config(
+        tmp_path / "other-worktree", name="ases", roles="lead: lead, coder: coder-1, reviewer: reviewer",
+    )
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    row = by_name["profile_isolation"]
+    assert row.status == "pass"
+    assert "checked 1" in row.detail
+    assert report.ok is True
+
+
+def test_profile_isolation_warns_on_a_real_collision_with_another_projects_config(tmp_path, monkeypatch, world):
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]
+    _write_sibling_config(
+        tmp_path / "other-project", name="widgets", roles="lead: other-lead, coder: coder-1, reviewer: qa-1",
+    )
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    row = by_name["profile_isolation"]
+    assert row.status == "warn"
+    assert "widgets" in row.detail  # the other project's name
+    assert "coder-1" in row.detail  # the shared profile name
+    assert "qa-1" not in row.detail and "other-lead" not in row.detail  # not shared: must not be named
+    assert report.ok is True  # a WARN never fails the doctor
+
+
+def test_profile_isolation_ignores_a_sibling_config_that_fails_to_parse(tmp_path, monkeypatch, world):
+    world.sandbox_rows = [("sandbox_docker", True, "docker daemon reachable")]
+    bad_config_dir = tmp_path / "broken-project" / "config"
+    bad_config_dir.mkdir(parents=True, exist_ok=True)
+    (bad_config_dir / "swarm.yaml").write_text("project:\n  name: broken\n", encoding="utf-8")  # missing keys
+
+    _, report, by_name = _run_healthy(tmp_path, monkeypatch, ENABLED)
+
+    row = by_name["profile_isolation"]
+    assert row.status == "pass"  # the unparseable sibling is skipped, never a crash
+    assert "checked 0" in row.detail
+    assert report.ok is True
+
+
+def test_profile_isolation_checks_both_workspace_root_and_ases_home_parent_directories(tmp_path):
+    """Direct call (no Docker/Hermes fakes needed: this row is a pure function of `project`). Proves
+    _sibling_swarm_configs looks under BOTH project.workspace_root's parent and project.ases_home's parent,
+    not only one of them -- built with the two under unrelated parent directories so a test that only
+    checked one root would still fail."""
+    ws_parent = tmp_path / "ws-parent"
+    home_parent = tmp_path / "home-parent"
+    (ws_parent / "self-ws").mkdir(parents=True)
+    (home_parent / "self-home").mkdir(parents=True)
+    _write_sibling_config(ws_parent / "sibling-by-workspace", name="via-workspace", roles="coder: coder-1")
+    _write_sibling_config(home_parent / "sibling-by-ases-home", name="via-ases-home", roles="coder: coder-1")
+    project = config.ProjectConfig(
+        name="ases", environment="native", data_class="public",
+        workspace_root=ws_parent / "self-ws", ases_home=home_parent / "self-home",
+        board="b", integration_branch="integration",
+        roles={"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"},
+        concurrency={}, budgets={}, hermes_tested_version="0.21.3", hermes_native_home=tmp_path / "hermes",
+        sandbox={"enabled": True},
+    )
+
+    (row,) = doctor._check_profile_isolation(project)
+
+    assert row.status == "warn"
+    assert "via-workspace" in row.detail
+    assert "via-ases-home" in row.detail
+
+
+def test_profile_isolation_direct_call_is_a_no_op_list_when_sandbox_is_disabled(tmp_path):
+    project = config.ProjectConfig(
+        name="ases", environment="native", data_class="public",
+        workspace_root=tmp_path / "ws", ases_home=tmp_path / "home", board="b", integration_branch="integration",
+        roles={"coder": "coder-1"}, concurrency={}, budgets={}, hermes_tested_version="0.21.3",
+        hermes_native_home=tmp_path / "hermes", sandbox={"enabled": False},
+    )
+
+    assert doctor._check_profile_isolation(project) == []
 
 
 def test_the_sandbox_is_checked_against_the_policy_in_the_config_and_the_real_home(tmp_path, monkeypatch, world):
