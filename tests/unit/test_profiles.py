@@ -940,6 +940,9 @@ def test_plan_init_sandbox_terminal_block_goes_to_workers_that_have_a_terminal_o
     assert by["terminal.backend"] == "docker" and by["terminal.docker_image"] == IMAGE
     assert by["terminal.docker_persist_across_processes"] is False and by["terminal.docker_network"] is False
     assert "terminal.cwd" not in by
+    # WORKERGIT (round 15): every sandboxed worker plan carries the mandatory git mounts, so its own `git` can
+    # commit inside the linked worktree Hermes dispatches it into (sandbox.py's module docstring).
+    assert by["terminal.docker_volumes"] == list(sandbox.GIT_WORKTREE_VOLUMES)
 
 
 def test_plan_init_sandbox_keeps_other_terminal_keys_and_reports_what_it_does_not_manage(tmp_path):
@@ -955,6 +958,38 @@ def test_plan_init_sandbox_keeps_other_terminal_keys_and_reports_what_it_does_no
     assert rows == [("set_config", "terminal.docker_network", False)]
     warnings = [c.why for c in plan if c.kind == "warning"]
     assert len(warnings) == 1 and "cwd" in warnings[0] and "ASES-SEC-03" in warnings[0]
+
+
+def test_plan_init_sandbox_docker_volumes_keeps_a_profiles_own_extra_mount(tmp_path):
+    """WORKERGIT review fix: terminal_block() always returns just the five mandatory git mounts, so a profile's own
+    pre-existing, legitimate extra docker_volumes entry (the kind check_terminal_block already accepts, e.g. a
+    read-only cache mount) must survive in the proposed terminal.docker_volumes value rather than being silently
+    replaced. Here the profile already has exactly the merged value, so nothing should be proposed at all."""
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project, sandbox_on=True)
+    cfg = _matching_config("coder-1", sandbox_on=True)
+    cfg["terminal"]["docker_volumes"] = list(sandbox.GIT_WORKTREE_VOLUMES) + ["/srv/cache:/cache:ro"]
+    _write_profile(home, "coder-1", cfg=cfg)
+    plan = profiles.plan_init(project, MODELS, home, PROMPTS_DIR, sandbox_enabled=True, policy=POLICY)
+    assert not [c for c in plan if c.kind == "warning"]
+    rows = [c for c in plan if c.profile == "coder-1" and c.kind == "set_config"]
+    assert not [c for c in rows if c.target == "terminal.docker_volumes"]  # already matches: no proposed change
+
+
+def test_plan_init_sandbox_docker_volumes_merges_extra_mount_when_a_git_mount_is_missing(tmp_path):
+    """Same as above, but the profile's docker_volumes is missing one mandatory git mount alongside its own extra
+    mount, so a set_config row for docker_volumes IS proposed; its `after` value must be the five mandatory mounts
+    plus the profile's own extra, not the extra dropped."""
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project, sandbox_on=True)
+    cfg = _matching_config("coder-1", sandbox_on=True)
+    incomplete_git_mounts = list(sandbox.GIT_WORKTREE_VOLUMES)[:-1]  # missing the worktrees admin-dir mount
+    cfg["terminal"]["docker_volumes"] = incomplete_git_mounts + ["/srv/cache:/cache:ro"]
+    _write_profile(home, "coder-1", cfg=cfg)
+    plan = profiles.plan_init(project, MODELS, home, PROMPTS_DIR, sandbox_enabled=True, policy=POLICY)
+    assert not [c for c in plan if c.kind == "warning"]
+    by = {c.target: c.after for c in plan if c.profile == "coder-1" and c.kind == "set_config"}
+    assert by["terminal.docker_volumes"] == list(sandbox.GIT_WORKTREE_VOLUMES) + ["/srv/cache:/cache:ro"]
 
 
 def test_plan_init_sandbox_reads_one_as_true_only_when_the_type_is_right(tmp_path):

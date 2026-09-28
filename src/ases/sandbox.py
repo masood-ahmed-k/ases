@@ -58,6 +58,79 @@ guessed:
    or --network wins, and a bare word replaces the image). docker_env, env_passthrough and credential_files are
    other ways for a secret or a host file to reach the container, and a docker_volumes entry containing ':/workspace'
    makes Hermes skip the worktree mount. The checker covers all of these.
+
+WORKERGIT (round 15, docs/work-orders/r15_wp_sandbox.md): how a worker commits inside its own dispatched worktree.
+
+The problem: Hermes's Kanban dispatcher cuts a card's worktree with `git worktree add <repo>/.worktrees/<task_id>
+<start-point>` from the board repository (hermes_cli/kanban_db_workspace.py:422 _ensure_git_worktree, :443
+_anchored_worktree's `target = repo_root / ".worktrees" / task_id`, read-only, under
+C:\\Users\\masoo\\AppData\\Local\\hermes\\hermes-agent). A linked worktree's own `.git` is a FILE naming the main
+repository's `.git/worktrees/<task_id>` admin directory; by default that name is an ABSOLUTE host path, which does
+not exist inside a Linux container that mounts only the worktree (item 4 above -- `docker_mount_cwd_to_workspace`
+mounts the worktree itself at /workspace, nothing else), so a worker's own `git` fails there today ("not a git
+repository"), the open design question ASES-SEC-03's own register note names.
+
+The fix, verified against a real Docker container (scripts/workergit_live_check.py) on a throwaway repository under
+a --basetemp, never the real test repository:
+1. `worktree.useRelativePaths=true` (git 2.48+; controller.ensure_repo_bootstrapped sets it for a repository ASES
+   itself creates from empty, doctor.py's worktree_relative_paths check reports when an existing one has it off)
+   makes `git worktree add` record a RELATIVE gitdir: for the canonical `<repo>/.worktrees/<task_id>` layout,
+   empirically `gitdir: ../../.git/worktrees/<task_id>` inside the worktree's own `.git` file, and `commondir:
+   ../..` inside the admin directory. A relative '..' cannot climb above a container's filesystem root (POSIX
+   clamps it there), so from /workspace (the mounted worktree, itself two directories below the repository root)
+   that pointer resolves to exactly /.git/worktrees/<task_id> -- which is where mounting the repository's own
+   `.git` at /.git puts it.
+2. Hermes's own docker_volumes are `-v host:container[:ro]` strings Hermes reads back out of the profile's config
+   (hermes_cli/config.py TERMINAL_CONFIG_ENV_MAP; tools/environments/docker.py DockerEnvironment._mount_args
+   passes each straight to `-v`, skipping only an entry with no colon), and, critically, Hermes's own config
+   loader expands `${VAR}` / `${env:VAR}` in EVERY string value, mounts included, before mirroring config.yaml
+   into the environment variables the terminal actually launches with (installed Hermes 0.21.3, cli.py:488-490
+   "Expand ${ENV_VAR} references before bridging to env vars", `defaults = _expand_env_vars(defaults)`, run
+   BEFORE cli.py:498's `_mirror_config_to_env`). The kanban dispatcher pins the dispatched worktree's own absolute
+   host path into TERMINAL_CWD before the worker process starts (kanban_db_dispatch.py:2590 `env["TERMINAL_CWD"]
+   = workspace`), and terminal_block() carries no `cwd` key (item 4 above), so that pin survives untouched into
+   this expansion. A docker_volumes entry of the literal string "${env:TERMINAL_CWD}/../../.git:/.git:ro"
+   therefore expands, at each worker's own startup, to THAT task's own repository .git -- one static profile
+   config.yaml, correct for every project and every card, with no per-task or per-project rewrite (confirmed
+   empirically: Docker itself normalises a host bind-mount source containing '..', mixed slash styles included,
+   before the daemon ever sees it). git_worktree_volumes() below is exactly these five entries.
+3. Hermes never compares nested docker_volumes mount targets against each other (each is its own bind mount;
+   confirmed empirically, in either arg order), so the five are, together with the worktree at /workspace:
+     - .git -> /.git, READ-ONLY: config, hooks, HEAD, every OTHER branch's history.
+     - .git/objects -> /.git/objects, writable: the blobs/trees/commits a commit creates.
+     - .git/refs -> /.git/refs, writable: the branch ref(s) a commit moves.
+     - .git/logs -> /.git/logs, writable: the reflog entry a commit appends.
+     - .git/worktrees -> /.git/worktrees, writable: every dispatched card's own per-worktree HEAD/index/ORIG_HEAD
+       admin state (Hermes's own static, per-ROLE config.yaml has no per-task variable this design could use to
+       name only THIS card's own admin subdirectory -- TERMINAL_CWD is the only per-task value Hermes exports,
+       and config-string expansion substitutes a whole `${env:VAR}` value verbatim, never a substring of it -- so
+       the whole directory is what a static config can express; see the WORKERGIT report for the alternative
+       considered and rejected: rewriting config.yaml per dispatch, which would race two cards on the same role).
+   Proven with a real container (scripts/workergit_live_check.py): `git status`, `git add`, `git commit` succeed
+   on the card's own branch and the commit is visible from the host afterwards; writing `/.git/hooks/pre-commit`
+   or editing `/.git/config` fails (Read-only file system); no planted host key is visible in `env` (docker_volumes
+   never forwards environment; that is docker_env/docker_forward_env's job, unrelated to these five).
+
+   What a worker COULD still do with objects/refs/logs/worktrees writable, deliberately not narrower than that
+   (also proven live): move ANOTHER branch's ref with `git update-ref refs/heads/<other> <sha>` (refs/ is not
+   scoped to the worker's own branch), or, in principle, tamper with a DIFFERENT concurrently-dispatched card's
+   own worktree admin state under .git/worktrees/<other-task-id> (the whole directory is mounted, not one
+   subdirectory, per point 3 above), or overwrite the bytes of an EXISTING loose object under .git/objects with
+   corrupt data (objects/ is the one shared, single store every worktree and every branch reads from -- this is
+   inherent to how git worktrees share one repository, not something a narrower mount could avoid while still
+   letting a worker commit). Every one of these is caught downstream, not prevented at the mount: moving the
+   INTEGRATION branch's own ref is caught immediately by guards.check_primary_checkout (it compares the primary
+   checkout's live HEAD, which reads that same shared ref, against the expected_head the controller already knew
+   -- proven live: `git update-ref refs/heads/main <sha>` from inside the sandbox is immediately visible as
+   `git rev-parse HEAD` in the primary checkout); a tampered CARD branch is caught by the base-commit check
+   (guards.check_card_base / _branch_created_from, reading that branch's own reflog) the next time its card is
+   evaluated, and by the merge queue's own Gate 1 / Gate 3 re-checks (mergeq.py) before anything from a tampered
+   branch could ever be merged, whatever the tampering; a corrupted loose object is caught the next time anything
+   reads it, because git verifies a loose object's hash against its own content on read and refuses it with an
+   explicit error ("corrupt loose object") rather than returning the corrupt bytes silently -- plausibly during
+   one of those same downstream gate/checkout reads. None of the writable five reaches `.git/config` or
+   `.git/hooks` (both stay under the read-only base /.git mount), so a worker cannot plant a hook or change repo
+   config that way.
 """
 from __future__ import annotations
 
@@ -271,6 +344,30 @@ class SandboxPolicy:
         return cls(**kwargs)
 
 
+# WORKERGIT (module docstring): the docker_volumes entries a worker's Docker terminal needs to commit inside its
+# own dispatched linked worktree. `${env:TERMINAL_CWD}` is Hermes's own config-string expansion of the dispatched
+# worktree's absolute host path (see the module docstring for why this is correct per-task and per-project with
+# no rewrite); the literal suffix walks up from a canonical <repo>/.worktrees/<task_id> worktree to <repo>/.git.
+# A tuple, not a function of any argument: nothing here is specific to one repository or one card.
+_GIT_WORKTREE_CWD_REF = "${env:TERMINAL_CWD}"
+_GIT_WORKTREE_UP = "/../../.git"
+GIT_WORKTREE_VOLUMES: tuple[str, ...] = (
+    f"{_GIT_WORKTREE_CWD_REF}{_GIT_WORKTREE_UP}:/.git:ro",
+    f"{_GIT_WORKTREE_CWD_REF}{_GIT_WORKTREE_UP}/objects:/.git/objects",
+    f"{_GIT_WORKTREE_CWD_REF}{_GIT_WORKTREE_UP}/refs:/.git/refs",
+    f"{_GIT_WORKTREE_CWD_REF}{_GIT_WORKTREE_UP}/logs:/.git/logs",
+    f"{_GIT_WORKTREE_CWD_REF}{_GIT_WORKTREE_UP}/worktrees:/.git/worktrees",
+)
+
+
+def git_worktree_volumes() -> tuple[str, ...]:
+    """WORKERGIT: the five `docker_volumes` entries every Docker-backend worker profile needs so its own `git`
+    can commit inside the linked worktree Hermes dispatches it into (module docstring, WORKERGIT section, for the
+    full mechanism and what stays writable). A plain accessor for GIT_WORKTREE_VOLUMES so callers never need the
+    module-level constant's name; check_terminal_block uses the same constant to verify a profile carries them."""
+    return GIT_WORKTREE_VOLUMES
+
+
 def terminal_block(policy: SandboxPolicy) -> dict:
     """ASES-SEC-03, ASES-SEC-05, ASES-CFG-04: the `terminal:` block for a worker profile's config.yaml (table 33).
 
@@ -279,7 +376,13 @@ def terminal_block(policy: SandboxPolicy) -> dict:
     mounted (Hermes starts the container in /workspace by itself), and an added
     docker_persist_across_processes: false, which is what makes "only its worktree mounted" true across cards
     (otherwise Hermes re-attaches to the previous card's container and its old /workspace mount). There is no
-    PID-limit key to emit: Hermes applies its own fixed --pids-limit 256."""
+    PID-limit key to emit: Hermes applies its own fixed --pids-limit 256.
+
+    WORKERGIT: docker_volumes carries git_worktree_volumes(), unconditionally -- every profile this block is
+    written into is a worker Hermes dispatches into a linked worktree (ASES-SEC-03's own "only its worktree
+    mounted" already assumes that), so there is no profile that would want the Docker backend without also being
+    able to commit inside it. A caller with extra mounts of its own merges them in afterward, same as any other
+    key here (see profiles.py's _terminal_rows, which reports rather than deletes a key ASES does not manage)."""
     return {
         "backend": "docker",
         "docker_image": policy.image,
@@ -290,6 +393,7 @@ def terminal_block(policy: SandboxPolicy) -> dict:
         "container_cpu": _plain_number(policy.cpu),
         "container_memory": policy.memory_mb,
         "docker_persist_across_processes": False,
+        "docker_volumes": list(GIT_WORKTREE_VOLUMES),
     }
 
 
@@ -707,6 +811,62 @@ def _path_like(host: str) -> bool:
     return host.startswith(("/", "~", "./", "../", ".\\", "..\\", "\\\\")) or bool(_DRIVE_RE.match(host))
 
 
+_TEMPLATE_RE = re.compile(r"\$\{[^}]*\}")
+_TEMPLATE_MARKER = "~"
+
+
+def _templated_candidate_hosts(entry: str) -> list[str]:
+    """WORKERGIT: entry may reference one or more Hermes `${env:VAR}` templates ANYWHERE in its host text, not
+    only as a leading prefix -- Hermes's own config-string expansion substitutes every `${env:VAR}` occurrence in
+    a string value wherever it sits (module docstring), so `/data/${env:USER}/.ssh:/x:ro` is exactly as real a
+    shape as GIT_WORKTREE_VOLUMES' own leading `${env:TERMINAL_CWD}/...`. Two things break for any templated
+    shape without this: `_split_volume` reads left to right, so a ':' embedded inside `${env:VAR}` is mistaken
+    for the host/container separator and the real host text is lost; and `_path_like` never recognises a string
+    starting with '$' as a path at all. Together, a templated entry previously reached NO sensitive-path check
+    below, whatever host location it named, while the identical location spelled literally is caught (see
+    SSH_SPELLINGS-style tests).
+
+    Hermes resolves `${env:VAR}` from whatever environment the caller merging the mount in supplies, which this
+    static config check cannot predict (config.py's `_env_ref_lookup` places no allow-list on the variable
+    name), so the safe reading is the conservative one: replace EVERY `${...}` occurrence in entry with the
+    marker '~' first (this alone fixes the colon-confusion above, since none of the embedded colons survive),
+    then split the result exactly like an ordinary template-free entry to recover its real host text -- now a
+    path with a literal '~' standing in for each unresolved template, wherever it sits.
+
+    A sensitive segment can sit BETWEEN two templates just as easily as after the last one (an entry with
+    multiple `${...}` references, e.g. `/home/${env:USER}/.ssh/${env:TMP}/scratch:/mnt`, only reaches `.ssh`
+    once its first template resolves; the second one is irrelevant to that) -- so this returns one candidate
+    PER marker occurrence in the host, each built by treating that one occurrence as if it were the home
+    directory (the same conservative anchor a bare literal '~/...' mount already gets) and keeping everything
+    from there on, including any further '~' markers or literal text: `_mount_hazard` below then judges each
+    candidate independently, and the entry is flagged if ANY of them is hazardous. Whatever comes BEFORE a given
+    marker occurrence is dropped for THAT candidate only (a different candidate, anchored at an earlier or later
+    marker, still covers it) -- not a loss, since the point is "does this occurrence, or anything after it,
+    reach a sensitive location", not "what canonical path does the whole templated entry resolve to" (unknowable
+    without the real environment).
+
+    Returns [] when entry has no `${...}` at all (the caller's own literal-path handling covers that case) or
+    the host side collapses to something falsy or with no marker in it (`_split_volume` still could not make
+    sense of it even once every embedded colon is gone -- not a well-formed volumes entry)."""
+    if not _TEMPLATE_RE.search(entry):
+        return []
+    collapsed = _TEMPLATE_RE.sub(_TEMPLATE_MARKER, entry)
+    host, _container, _options = _split_volume(collapsed)
+    if not host or _TEMPLATE_MARKER not in host:
+        return []
+    candidates = []
+    start = 0
+    while True:
+        index = host.find(_TEMPLATE_MARKER, start)
+        if index == -1:
+            break
+        suffix = host[index + 1:]
+        if suffix == "" or suffix.startswith(("/", "\\")):
+            candidates.append(_TEMPLATE_MARKER + suffix)
+        start = index + 1
+    return candidates
+
+
 def _volume_problems(volumes: object, home: object) -> list[str]:
     if not isinstance(volumes, list):
         return ["docker_volumes is not a list"]
@@ -720,6 +880,10 @@ def _volume_problems(volumes: object, home: object) -> list[str]:
             continue  # Hermes skips an entry with no colon
         host, _container, _options = _split_volume(entry)
         shown = _short(entry)
+        for templated in _templated_candidate_hosts(entry):
+            hazard = _mount_hazard(_canon(_expand_home(templated, str(home)), admin_shares=True), home_ctx)
+            if hazard:
+                problems.append(f"docker_volumes entry {shown} {hazard}")
         # Hermes tests the substring ':/workspace' anywhere in a volume and then skips the worktree mount.
         if ":/workspace" in entry:
             problems.append(f"docker_volumes entry {shown} targets /workspace, so Hermes skips the worktree mount")
@@ -727,6 +891,47 @@ def _volume_problems(volumes: object, home: object) -> list[str]:
             hazard = _mount_hazard(_canon(_expand_home(host, str(home)), admin_shares=True), home_ctx)
             if hazard:
                 problems.append(f"docker_volumes entry {shown} {hazard}")
+    return problems
+
+
+_GIT_PATH_SEGMENT_RE = re.compile(r"(?:^|[\\/])\.git(?:[\\/:]|$)", re.IGNORECASE)
+
+
+def _mentions_git_dir(entry: str) -> bool:
+    """WORKERGIT: does entry (a whole docker_volumes string, host or container side, templated or literal) name
+    a `.git` path component anywhere? A `.git` segment can end in a slash, at the end of the string, or at the
+    ':' that separates a docker_volumes entry's host/container/options fields (so a bare ".../.git:/.git:ro"
+    matches on both sides). Used only to flag an UNEXPECTED entry that reaches into git internals: the five
+    GIT_WORKTREE_VOLUMES entries are matched by exact string first (_git_worktree_volume_problems) and never
+    reach this at all."""
+    return bool(_GIT_PATH_SEGMENT_RE.search(entry))
+
+
+def _git_worktree_volume_problems(volumes: object) -> list[str]:
+    """WORKERGIT (ASES-SEC-03; module docstring, WORKERGIT section): docker_volumes must carry every one of
+    git_worktree_volumes(), verbatim -- a worker's own `git status`/`add`/`commit` inside its dispatched worktree
+    needs all five -- and nothing else may reach into `.git` at all: an extra entry that duplicates one of the
+    five with different flags (the base mount missing ':ro', for example) or reaches a path the five
+    deliberately leave read-only (.git/config, .git/hooks) is refused, whether it is one of Hermes's literal
+    shapes or a ${env:...} template of its own. Unconditional (called on every terminal block, docker_volumes
+    key present or not): every profile this checker is asked about is a Docker-backend worker Hermes dispatches
+    into a linked worktree, so there is no profile that legitimately has none of the five.
+
+    Silent (returns []) when volumes is not a list: _volume_problems already reports "docker_volumes is not a
+    list" in that case, and there is nothing more useful to say about a value that is not even the right shape."""
+    if not isinstance(volumes, list):
+        return []
+    present = [entry for entry in volumes if isinstance(entry, str)]
+    problems = [
+        f"docker_volumes is missing the git mount {expected!r} (WORKERGIT: a worker could not commit inside "
+        "its dispatched worktree without it)"
+        for expected in GIT_WORKTREE_VOLUMES if expected not in present
+    ]
+    problems += [
+        f"docker_volumes entry {_short(entry)!r} reaches into .git outside the WORKERGIT git mounts, which is "
+        "not allowed (it could widen what a worker can read or write there)"
+        for entry in present if entry not in GIT_WORKTREE_VOLUMES and _mentions_git_dir(entry)
+    ]
     return problems
 
 
@@ -858,6 +1063,7 @@ def check_terminal_block(terminal: object, policy: SandboxPolicy, *, home: objec
     problems += _image_problems(terminal)
     if "docker_volumes" in terminal:
         problems += _volume_problems(terminal["docker_volumes"], home)
+    problems += _git_worktree_volume_problems(terminal.get("docker_volumes", []))
     if "docker_extra_args" in terminal:
         problems += _extra_args_problems(terminal["docker_extra_args"], policy)
     if terminal.get("docker_shared_container_key"):

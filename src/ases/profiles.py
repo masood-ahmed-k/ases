@@ -849,9 +849,21 @@ def _terminal_rows(
 ) -> tuple[list[tuple[str, Any, Any, str]], list[str]]:
     """ASES-SEC-03: one row per key of the Docker terminal block that differs (so other terminal keys the user set
     survive), and the problems sandbox.check_terminal_block still finds in the merged block: those are keys ASES does
-    not manage (a cwd, extra mounts) and are reported, not deleted."""
-    block = sandbox_mod.terminal_block(policy)
+    not manage (a cwd, extra mounts) and are reported, not deleted.
+
+    WORKERGIT: docker_volumes is special-cased. sandbox.terminal_block() always returns exactly the five mandatory
+    git mounts (sandbox.GIT_WORKTREE_VOLUMES), because it has no view of a profile's existing config. Any entry a
+    profile's current docker_volumes already carries that is not one of those five is an extra mount of the caller's
+    own (the same class of thing check_terminal_block already accepts as harmless), so it is appended, in place,
+    after the mandatory ones, before the before/after row is built. Without this the row would silently propose
+    replacing the whole list and drop the extra."""
+    block = dict(sandbox_mod.terminal_block(policy))
     current = cfg.get("terminal") if isinstance(cfg.get("terminal"), dict) else {}
+    current_volumes = current.get("docker_volumes")
+    if isinstance(current_volumes, list):
+        extra = [v for v in current_volumes if v not in sandbox_mod.GIT_WORKTREE_VOLUMES]
+        if extra:
+            block["docker_volumes"] = list(block["docker_volumes"]) + extra
     rows = [
         (f"terminal.{key}", current.get(key), value, "ASES-SEC-03: workers use the Docker terminal backend")
         for key, value in block.items() if not _strict_equal(current.get(key, _MISSING), value)

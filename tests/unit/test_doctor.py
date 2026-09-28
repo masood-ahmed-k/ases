@@ -1055,6 +1055,112 @@ def test_log_all_ref_updates_is_wired_into_run_when_a_repo_is_given(tmp_path, mo
     assert checks["log_all_ref_updates"].status == "warn"
 
 
+# --- round 15 (WORKERGIT): worktree_relative_paths, ASES-SEC-03 ---------------------------------------------------
+
+
+def _worktree_repo(tmp_path, *, use_relative_paths=None):
+    """A real git repository, `worktree.useRelativePaths` left at its (false) default, explicitly set true/false,
+    or explicitly unset again -- same shape as _git_repo above, for the WORKERGIT check."""
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "integration"], cwd=str(repo), check=True)
+    if use_relative_paths is True:
+        subprocess.run(["git", "config", "worktree.useRelativePaths", "true"], cwd=str(repo), check=True)
+    elif use_relative_paths is False:
+        subprocess.run(["git", "config", "worktree.useRelativePaths", "false"], cwd=str(repo), check=True)
+    elif use_relative_paths == "unset":
+        subprocess.run(["git", "config", "--unset", "worktree.useRelativePaths"], cwd=str(repo))  # ok if never set
+    return repo
+
+
+def test_worktree_relative_paths_is_pending_without_a_repository_path():
+    check = doctor._check_worktree_relative_paths(None, False)
+
+    assert check.status == "pending"
+    assert check.requirement_ids == ("ASES-SEC-03", "ASES-CFG-04")
+
+
+def test_worktree_relative_paths_passes_when_explicitly_true(tmp_path):
+    repo = _worktree_repo(tmp_path, use_relative_paths=True)
+
+    check = doctor._check_worktree_relative_paths(repo, False)
+
+    assert check.status == "pass" and "true" in check.detail and str(repo) in check.detail
+
+
+@pytest.mark.parametrize("spelling", ["yes", "on", "1", "TRUE", "Yes"])
+def test_worktree_relative_paths_passes_for_every_git_true_spelling(tmp_path, spelling):
+    """git-config(1) treats true/yes/on/1 (any case) as boolean-true; controller.ensure_repo_bootstrapped only
+    ever writes the literal "true", but a human hand-editing the config is free to use any of these, and this
+    check must not misreport a healthy repository as unset/false just because the spelling differs."""
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "integration"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "worktree.useRelativePaths", spelling], cwd=str(repo), check=True)
+
+    check = doctor._check_worktree_relative_paths(repo, True)
+
+    assert check.status == "pass", check.detail
+
+
+@pytest.mark.parametrize("sandbox_enabled,expected", [(False, "warn"), (True, "fail")])
+def test_worktree_relative_paths_is_unhealthy_when_unset_the_false_default(tmp_path, sandbox_enabled, expected):
+    """Opposite polarity from core.logAllRefUpdates: worktree.useRelativePaths defaults to FALSE, so unset must
+    read the same as an explicit false, not as healthy. Severity only reaches FAIL once the sandbox is actually
+    on -- that is the point a worker's own commit is demonstrably broken by this."""
+    repo = _worktree_repo(tmp_path, use_relative_paths="unset")
+
+    check = doctor._check_worktree_relative_paths(repo, sandbox_enabled)
+
+    assert check.status == expected
+    assert "worktree.useRelativePaths" in check.detail and str(repo) in check.detail
+
+
+@pytest.mark.parametrize("sandbox_enabled,expected", [(False, "warn"), (True, "fail")])
+def test_worktree_relative_paths_is_unhealthy_when_explicitly_false(tmp_path, sandbox_enabled, expected):
+    repo = _worktree_repo(tmp_path, use_relative_paths=False)
+
+    check = doctor._check_worktree_relative_paths(repo, sandbox_enabled)
+
+    assert check.status == expected
+    assert check.requirement_ids == ("ASES-SEC-03", "ASES-CFG-04")
+
+
+def test_worktree_relative_paths_is_pending_through_run_by_default(tmp_path, monkeypatch):
+    _, _report, checks = _run(tmp_path, monkeypatch)
+
+    assert checks["worktree_relative_paths"].status == "pending"
+
+
+def test_worktree_relative_paths_is_wired_into_run_when_a_repo_is_given(tmp_path, monkeypatch):
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+    repo = _worktree_repo(tmp_path, use_relative_paths=False)
+
+    report = doctor.run(project, MODELS_CONFIG, conn, repo=repo)
+
+    checks = {c.name: c for c in report.checks}
+    assert checks["worktree_relative_paths"].status == "warn"  # sandbox not enabled in this project config
+
+
+def test_worktree_relative_paths_fails_through_run_once_the_sandbox_is_enabled(tmp_path, monkeypatch, world):
+    """world (autouse) fakes sandbox.doctor_checks and ases.profiles so this reaches the FAIL branch without a
+    real Docker daemon or real profiles on disk."""
+    _stub_hermes(monkeypatch)
+    project = _project(tmp_path, ENABLED)
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+    repo = _worktree_repo(tmp_path, use_relative_paths=False)
+
+    report = doctor.run(project, MODELS_CONFIG, conn, repo=repo)
+
+    checks = {c.name: c for c in report.checks}
+    assert checks["worktree_relative_paths"].status == "fail"
+    assert report.ok is False
+
+
 # --- round 13 (TIDY): leaked_worktrees, ASES-GIT-12 --------------------------------------------------------------
 
 

@@ -2647,13 +2647,39 @@ def test_ensure_repo_bootstrapped_is_a_no_op_on_an_already_correct_repo(tmp_path
     assert _git_ok("rev-parse", "HEAD", cwd=repo).stdout.strip() == tip
 
 
-def test_ensure_repo_bootstrapped_never_writes_git_config(tmp_path):
+def test_ensure_repo_bootstrapped_never_writes_git_identity(tmp_path):
     repo = tmp_path / "no_identity"
 
     assert controller.ensure_repo_bootstrapped(repo, "integration") is True
 
     local_config = (repo / ".git" / "config").read_text(encoding="utf-8")
     assert "[user]" not in local_config  # the commit's identity was scoped to that one git call, never persisted
+
+
+def test_ensure_repo_bootstrapped_sets_worktree_use_relative_paths(tmp_path):
+    """WORKERGIT (round 15, ASES-SEC-03): the one deliberate exception to "never writes git config" -- a
+    dispatched card's own `git worktree add` needs this set beforehand so its worktree records a relative gitdir
+    a Docker sandbox can resolve (sandbox.py's module docstring, WORKERGIT section)."""
+    repo = tmp_path / "relpaths"
+
+    assert controller.ensure_repo_bootstrapped(repo, "integration") is True
+
+    assert _git_ok("config", "--get", "worktree.useRelativePaths", cwd=repo).stdout.strip() == "true"
+
+
+def test_ensure_repo_bootstrapped_never_sets_worktree_use_relative_paths_on_an_existing_repo(tmp_path):
+    """A repository that already has history is never touched here at all (existing guarantee); this specifically
+    confirms the new WORKERGIT config step does not become an exception to that."""
+    repo = _plain_repo(tmp_path, name="already_has_history")
+
+    assert controller.ensure_repo_bootstrapped(repo, "integration") is False
+
+    # Not _git_ok: a repository with no worktree.useRelativePaths set is the expected, healthy-for-this-test
+    # outcome, and `git config --get` on a missing key exits 1, which _git_ok would treat as a test failure.
+    result = subprocess.run(
+        ["git", "config", "--get", "worktree.useRelativePaths"], cwd=str(repo), capture_output=True, text=True,
+    )
+    assert result.returncode != 0 or result.stdout.strip() != "true"
 
 
 def test_ensure_repo_bootstrapped_keeps_a_pre_existing_readme_and_gitignore(tmp_path):
