@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import bounds as bounds_mod
 from . import config as ases_config
+from . import containers as containers_mod
 from . import controller as controller_mod
 from . import critic as critic_mod
 from . import db as ases_db
@@ -1020,6 +1021,17 @@ def _reconcile_on_start(project, repo, plan, conn, ignore: bool) -> int | None:
     else:
         _print_reconcile(report)
         blocked_count = len(list(getattr(report, "blocked", None) or []))
+
+    # p353 (section 19.4): orphan worker sandboxes from a previous controller session are reclaimed before new
+    # work starts, independently of whatever reconcile itself found (pure cleanup: never blocks a start, never
+    # raised past here -- see containers.sweep_orphan_containers's own docstring for why it cannot fail).
+    try:
+        swept = containers_mod.sweep_orphan_containers(project.board, project, conn)
+        if swept.stopped:
+            _out(f"[CONTAINERS] stopped {len(swept.stopped)} orphaned worker container(s): {', '.join(swept.stopped)}")
+    except Exception as exc:  # noqa: BLE001 - orphan cleanup must never block or fail a start
+        _out(f"[CONTAINERS] orphan container sweep failed: {type(exc).__name__}: {exc}"[:300])
+
     if not blocked_count:
         return None
     if ignore:
@@ -1433,6 +1445,7 @@ def _stop_all(args: argparse.Namespace) -> int:
         remaining = max(float(killswitch_mod.DEADLINE_SECONDS) - (time.monotonic() - started), 5.0)
         report = killswitch_mod.stop_all(
             project.board, target.plan, conn=conn, reason=reason, deadline_seconds=remaining,
+            profiles=sorted({str(name) for name in (project.roles or {}).values() if name}),
         )
         _print_stop_summary(target.project, report)
         try:

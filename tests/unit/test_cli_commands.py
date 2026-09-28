@@ -1989,7 +1989,7 @@ def _fake_stop_all(monkeypatch, report=None, raises=None):
 
     def fake(board, plan, *, conn, reason="swarm stop", deadline_seconds=30.0, **kwargs):
         calls.append(types.SimpleNamespace(board=board, project=plan.project, plan=plan, reason=reason,
-                                           deadline=deadline_seconds))
+                                           deadline=deadline_seconds, kwargs=kwargs))
         if raises is not None:
             raise raises
         return report if report is not None else killswitch.StopReport(
@@ -2030,6 +2030,16 @@ def test_stop_passes_the_reason(world, monkeypatch):
     cli.main(["stop", "--repo", str(world.repo), "--reason", "user pulled the plug"])
 
     assert calls[0].reason == "user pulled the plug"
+
+
+def test_stop_passes_this_projects_hermes_profiles_so_real_worker_sandboxes_are_stopped(world, monkeypatch):
+    """Round 17 (ASES-REC-06): a real worker's container is found by its Hermes profile, not its card id, so
+    swarm stop must hand killswitch.stop_all the project's own profiles (project.roles values, deduplicated)."""
+    calls = _fake_stop_all(monkeypatch)
+
+    cli.main(["stop", "--repo", str(world.repo)])
+
+    assert calls[0].kwargs["profiles"] == sorted(set(world.project.roles.values()))
 
 
 def test_stop_exits_1_when_it_could_not_finish_within_the_deadline(world, monkeypatch, capsys):

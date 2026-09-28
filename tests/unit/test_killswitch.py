@@ -29,6 +29,7 @@ REAL = types.SimpleNamespace(
     terminate_tree=killswitch.terminate_tree,
     process_command_line=killswitch.process_command_line,
     default_list_containers=killswitch.default_list_containers,
+    default_list_profile_containers=killswitch.default_list_profile_containers,
     default_stop_container=killswitch.default_stop_container,
     _run=killswitch._run,
     _Win32=killswitch._Win32,
@@ -50,7 +51,7 @@ def _refuse(name):
 def no_real_effects(monkeypatch):
     REACHED.clear()
     for name in ("pid_alive", "terminate_tree", "process_command_line", "default_list_containers",
-                 "default_stop_container", "_run", "_Win32"):
+                 "default_list_profile_containers", "default_stop_container", "_run", "_Win32"):
         monkeypatch.setattr(killswitch, name, _refuse(f"killswitch.{name}"))
     for name in ("pause", "resume", "kanban_list", "kanban_show", "kanban_reclaim"):
         monkeypatch.setattr(hermes, name, _refuse(f"hermes.{name}"))
@@ -106,6 +107,7 @@ class World:
         self.reclaim_fails = set()
         self.pause_error = None
         self.containers = []
+        self.profile_containers = []  # what a listing by Hermes profile finds (round 17)
         self.container_stop_fails = set()
         self.container_stop_raises = set()
         self.on_pause = None
@@ -197,6 +199,10 @@ class World:
         self.log.append(("containers", tuple(sorted(card_ids))))
         return list(self.containers)
 
+    def list_profile_containers(self, profiles):
+        self.log.append(("profile_containers", tuple(sorted(profiles))))
+        return list(self.profile_containers)
+
     def stop_container(self, name):
         self.log.append(("stop_container", name))
         if name in self.container_stop_raises:
@@ -205,6 +211,8 @@ class World:
             return False
         if name in self.containers:
             self.containers.remove(name)
+        if name in self.profile_containers:
+            self.profile_containers.remove(name)
         return True
 
     def hooks(self):
@@ -212,6 +220,7 @@ class World:
             pause=self.pause, kanban_list=self.kanban_list, kanban_show=self.kanban_show, reclaim=self.reclaim,
             killer=self.killer, alive=self.alive, command_line=self.command_line,
             list_containers=self.list_containers, stop_container=self.stop_container,
+            list_profile_containers=self.list_profile_containers,
             now=self.clock.now, sleep=self.clock.sleep,
         )
 
@@ -880,6 +889,78 @@ def test_duplicate_container_names_are_stopped_once(world, conn):
 
     assert report.containers_stopped == ["sbx"]
     assert world.kinds().count("stop_container") == 1
+
+
+def test_a_real_workers_sandbox_is_found_by_its_hermes_profile_and_stopped(world, conn):
+    """Round 17 (ASES-REC-06, p357 "terminate worker process trees and sandboxes"): a real worker's container is
+    labelled hermes-task-id="default", never its card id, so the card-id listing finds nothing. The listing by this
+    project's Hermes profiles must find it and swarm stop must stop it, even though its card is running."""
+    two_running(world, conn)
+    world.containers = []  # what the card-id match finds for a real Hermes container: nothing
+    world.profile_containers = ["hermes-1a2b3c4d"]
+
+    report = run_stop(world, conn, profiles=["reviewer", "coder-1", "lead", "coder-1"])
+
+    assert ("profile_containers", ("coder-1", "lead", "reviewer")) in world.log
+    assert report.containers_stopped == ["hermes-1a2b3c4d"]
+    assert world.profile_containers == []
+
+
+def test_a_container_found_by_card_id_and_by_profile_is_stopped_once(world, conn):
+    seed(conn, "T1", "w1", "m1")
+    world.containers = ["sbx"]
+    world.profile_containers = ["sbx", "hermes-9f"]
+
+    report = run_stop(world, conn, profiles=["coder-1"])
+
+    assert sorted(report.containers_stopped) == ["hermes-9f", "sbx"]
+    assert world.kinds().count("stop_container") == 2
+
+
+def test_without_profiles_the_profile_listing_never_runs(world, conn):
+    seed(conn, "T1", "w1", "m1")
+    world.profile_containers = ["hermes-1a2b3c4d"]
+
+    report = run_stop(world, conn)
+    run_stop(world, conn, profiles=[])
+
+    assert "profile_containers" not in world.kinds()
+    assert report.containers_stopped == []
+
+
+def test_a_profile_listing_failure_is_a_note_and_the_card_id_containers_still_stop(world, conn):
+    seed(conn, "T1", "w1", "m1")
+    world.containers = ["sbx-w1"]
+
+    def broken(profiles):
+        raise OSError("docker daemon is down")
+
+    report = run_stop(world, conn, profiles=["coder-1"], list_profile_containers=broken)
+
+    assert report.containers_stopped == ["sbx-w1"]
+    assert any("by Hermes profile" in note and "daemon is down" in note for note in report.notes)
+
+
+def test_the_profile_listing_keeps_only_the_given_profiles_of_hermes_containers(monkeypatch):
+    """default_list_profile_containers reads ases.containers's hermes-agent=1 listing (Docker's own label filter)
+    and keeps only this project's profiles: another profile's container, or one with no profile label, is never
+    returned, so swarm stop never touches it."""
+    from ases import containers
+
+    monkeypatch.setattr(killswitch, "default_list_profile_containers", REAL.default_list_profile_containers)
+    monkeypatch.setattr(containers, "default_list_hermes_containers", lambda: [
+        ("hermes-aaaa", "coder-1"), ("hermes-bbbb", "someone-elses-profile"), ("hermes-cccc", ""),
+        ("hermes-dddd", "reviewer"), ("hermes-aaaa", "coder-1"),
+    ])
+
+    assert killswitch.default_list_profile_containers(["coder-1", "reviewer"]) == ["hermes-aaaa", "hermes-dddd"]
+    assert killswitch.default_list_profile_containers([]) == []
+
+    def no_docker():
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(containers, "default_list_hermes_containers", no_docker)
+    assert killswitch.default_list_profile_containers(["coder-1"]) == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1860,7 +1941,31 @@ def test_default_list_containers_matches_names_and_labels_by_card_id_only(monkey
     names = REAL.default_list_containers(["t_1", "t_2"])
 
     assert names == ["sbx-t_1-web-1", "unrelated-db", "another-t_2-app"]  # not my-postgres, not t_12
-    assert seen == [["docker", "ps", "--format", "{{.Names}}|{{.Labels}}"]]
+    # CONTAINERS (round 17): docker ps is now filtered server-side to label=hermes-agent=1 first (killswitch.
+    # default_list_containers's own docstring has the empirical finding), so an unrelated container can never
+    # match even if this fake's own listing text (unrealistically) puts a card id in one of its labels.
+    assert seen == [["docker", "ps", "--filter", "label=hermes-agent=1", "--format", "{{.Names}}|{{.Labels}}"]]
+
+
+def test_default_list_containers_matches_the_real_hermes_label_format(monkeypatch):
+    """CONTAINERS (round 17): the exact label text confirmed against installed Hermes 0.21.3 by
+    scripts/hermes_container_labels_check.py (docker ps --format {{.Labels}}, Docker's own alphabetical key
+    order): "hermes-agent=1,hermes-egress=off,hermes-profile=coder-1,hermes-task-id=default". A real,
+    CLI-dispatched worker's hermes-task-id is always literally "default" (never the real card id: see
+    ases.containers's module docstring for why), so this also proves the match logic still works if that
+    label ever DID carry the real id (a hypothetical here, not today's reality), on top of the real,
+    unmodified label string for the part that is real today."""
+    seen = []
+    real_shape = "hermes-a1b2c3d4|hermes-agent=1,hermes-egress=off,hermes-profile=coder-1,hermes-task-id=default"
+    monkeypatch.setattr(killswitch, "_run", lambda args, timeout: seen.append(args) or (0, real_shape))
+
+    assert REAL.default_list_containers(["default"]) == ["hermes-a1b2c3d4"]  # matches when asked for it directly
+
+    hypothetical = "hermes-a1b2c3d4|hermes-agent=1,hermes-egress=off,hermes-profile=coder-1,hermes-task-id=t_1"
+    monkeypatch.setattr(killswitch, "_run", lambda args, timeout: seen.append(args) or (0, hypothetical))
+
+    assert REAL.default_list_containers(["t_1"]) == ["hermes-a1b2c3d4"]
+    assert REAL.default_list_containers(["t_2"]) == []  # a different card id never matches
 
 
 def test_default_list_containers_returns_nothing_without_card_ids_and_never_calls_docker():

@@ -2270,6 +2270,48 @@ def test_a_failing_sweep_does_not_lose_the_cards_that_were_provisioned(tmp_path,
     assert "db locked" in payloads(w.conn, "lease_sweep_error")[0]["error"]
 
 
+def test_provisioning_also_sweeps_orphan_containers_when_a_project_is_given(tmp_path, monkeypatch):
+    """CONTAINERS (round 17), p353's per-pass half: process_provision runs the orphan container sweep too,
+    when it is given a project (run_pass always passes one). The sweep's own logic (which containers, which
+    profiles) is tested in test_containers.py; this is wiring only."""
+    w = make_world(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        controller.containers_mod, "sweep_orphan_containers",
+        lambda board, project, conn: seen.append((board, project, conn)),
+    )
+
+    controller.process_provision("b", w.plan, w.project, conn=w.conn)
+
+    assert seen == [("b", w.project, w.conn)]
+
+
+def test_a_failing_container_sweep_does_not_lose_the_cards_that_were_provisioned(tmp_path, monkeypatch):
+    w = make_world(tmp_path, monkeypatch)
+    from ases import leases
+    monkeypatch.setattr(leases, "provision_running_cards", lambda *a, **kw: ["n1"])
+    monkeypatch.setattr(
+        controller.containers_mod, "sweep_orphan_containers",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("docker exploded")),
+    )
+
+    assert controller.process_provision("b", w.plan, w.project, conn=w.conn) == ["n1"]
+
+    assert payloads(w.conn, "pass_step_error")[0]["step"] == "container_sweep"
+
+
+def test_provisioning_without_a_project_never_sweeps_containers(tmp_path, monkeypatch):
+    """A caller that does not pass `project` (every call above, and any build older than round 17) keeps the
+    sweep off entirely: process_provision must not even look at containers.sweep_orphan_containers."""
+    w = make_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        controller.containers_mod, "sweep_orphan_containers",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not be called without a project")),
+    )
+
+    assert controller.process_provision("b", w.plan, conn=w.conn) == []
+
+
 def test_provisioning_writes_the_env_file_into_a_running_cards_real_worktree(tmp_path, monkeypatch):
     repo = git_repo(tmp_path)
     w = make_world(tmp_path, monkeypatch)
@@ -2772,7 +2814,7 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
     assert rig.args["review"] == (("b", "the-repo", rig.plan, rig.project), {"conn": rig.conn})
     assert rig.args["card_base"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
-    assert rig.args["provision"] == (("b", rig.plan), {"conn": rig.conn})
+    assert rig.args["provision"] == (("b", rig.plan, rig.project), {"conn": rig.conn})
     assert rig.args["merge"][1]["models_config"] is rig.models
     assert rig.args["finalize"] == (everything, timed)
     assert (summary["warnings"], summary["recovery"], summary["unparked"], summary["provisioned"]) == (

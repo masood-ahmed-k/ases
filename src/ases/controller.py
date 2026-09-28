@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 
 from . import bounds as bounds_mod
 from . import config as ases_config
+from . import containers as containers_mod
 from . import db as ases_db
 from . import events
 from . import gates as gates_mod
@@ -2051,13 +2052,20 @@ def pause_and_report(
 # --- provisioning, idle worktrees, finish ----------------------------------------------------------------------------
 
 
-def process_provision(board: str, plan: plan_mod.Plan, *, conn) -> list[str]:
+def process_provision(
+    board: str, plan: plan_mod.Plan, project: ases_config.ProjectConfig | None = None, *, conn,
+) -> list[str]:
     """ASES-GIT-14 (Table: "Each card gets its own port block, COMPOSE_PROJECT_NAME, database name or schema, and temp
     directory through environment variables written to .env.ases in its worktree"): give every running work card its
     env file (leases.provision_running_cards, best effort by nature: Hermes starts the worker in the same step as it
     creates the worktree, so the file arrives on the pass after) and release the leases of cards that are no longer
     live (leases.sweep_finished). A BLOCKED card counts as live, because it waits for an answer and then resumes in the
-    same worktree with the same ports. Returns the ids of the cards provisioned this pass."""
+    same worktree with the same ports. Returns the ids of the cards provisioned this pass.
+
+    `project` (round 17, package CONTAINERS) is keyword-optional, positional so an existing caller that does
+    not pass one (every test that calls this directly) keeps working unchanged: it gates
+    containers.sweep_orphan_containers, p353's per-pass half (reconcile-on-start, cli.py, is the other). None
+    skips the sweep entirely, same as sandbox_enabled=False does inside that function."""
     provisioned = leases_mod.provision_running_cards(board, conn, plan)
     try:
         leases_mod.sweep_finished(board, conn, plan, live_statuses=_LEASE_LIVE_STATUSES)
@@ -2065,6 +2073,15 @@ def process_provision(board: str, plan: plan_mod.Plan, *, conn) -> list[str]:
         events.record(
             conn, "lease_sweep_error", {"error": _clean(f"{type(exc).__name__}: {exc}")}, project=plan.project,
         )
+    if project is not None:
+        try:
+            containers_mod.sweep_orphan_containers(board, project, conn)
+        except Exception as exc:  # noqa: BLE001 - a container that is not swept now is swept next pass
+            events.record(
+                conn, "pass_step_error",
+                {"step": "container_sweep", "error": _clean(f"{type(exc).__name__}: {exc}")},
+                project=plan.project,
+            )
     return list(provisioned)
 
 
@@ -2430,7 +2447,7 @@ def run_pass(
         plan.project,
     ))
     summary["provisioned"] = _isolated(
-        conn, summary, "provision", lambda: process_provision(board, plan, conn=conn), [],
+        conn, summary, "provision", lambda: process_provision(board, plan, project, conn=conn), [],
         plan.project,
     )
     summary["merged"] = process_merge_queue(

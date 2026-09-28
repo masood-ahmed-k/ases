@@ -52,8 +52,19 @@ guessed:
    worktree at /workspace. docker_persist_across_processes: false (a real key) stops the reuse, so terminal_block
    adds it. container_persistent: false cannot replace it: Hermes then refuses the process-global TERMINAL_CWD as a
    mount source and gives the worker an empty tmpfs. The price of not reusing a container is that a worker killed
-   by a timeout or the kill switch leaves its container running (Hermes only reaps Exited ones). Nothing removes
-   those yet; they carry the label hermes-agent=1 and the profile in hermes-profile.
+   by a timeout or the kill switch leaves its container running (Hermes only reaps Exited ones). Round 17
+   (package CONTAINERS) closes what used to read "nothing removes those yet" here: ases.containers.
+   sweep_orphan_containers now reclaims a leftover container, wired into reconcile-on-start (blueprint p353)
+   and the per-pass provisioning step. It cannot do this by card id: confirmed against the real, installed
+   Hermes source (ases.containers's module docstring has the full finding, file:line), a CLI-dispatched
+   worker's container label hermes-task-id is always the literal string "default", never the real card id, so
+   an orphan is found by Hermes PROFILE instead -- they really do carry the label hermes-agent=1 and the
+   active profile in hermes-profile, and a profile's own containers are swept only once nothing of this
+   project is running under it. `swarm doctor` shows, read-only, any it could not reach (Docker off, or
+   reachable but the profile still has a card running). `swarm stop` (killswitch.stop_all, step f) does not
+   wait for that: it stops every running Hermes container of this project's profiles, live work included,
+   because the kill switch stops the whole system (p357), proven on real Docker by
+   scripts/orphan_sweep_live_check.py.
 6. docker_extra_args is appended verbatim after Hermes's own flags, so it can undo any of them (a later -v, --memory
    or --network wins, and a bare word replaces the image). docker_env, env_passthrough and credential_files are
    other ways for a secret or a host file to reach the container, and a docker_volumes entry containing ':/workspace'

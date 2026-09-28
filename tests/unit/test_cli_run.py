@@ -180,6 +180,41 @@ def test_run_halts_with_exit_code_3_and_names_the_problems_on_a_security_event(w
     assert "SECURITY EVENT" in err and "stray.txt" in err
 
 
+def test_orphan_containers_are_swept_on_start_before_any_pass(wired, monkeypatch, capsys):
+    """p353 (section 19.4): orphan worker sandboxes from a previous controller session are reclaimed before
+    new work starts. cli.cmd_run wires containers.sweep_orphan_containers into reconcile-on-start; this
+    proves it runs, and runs before the very first pass. The sweep's own logic (which containers, which
+    profiles) is tested in test_containers.py; this is wiring only."""
+    order = []
+    monkeypatch.setattr(
+        cli.containers_mod, "sweep_orphan_containers",
+        lambda board, project, conn: order.append("swept") or types.SimpleNamespace(stopped=["hermes-abc12345"]),
+    )
+
+    def fake_run_pass(*a, **kw):
+        order.append("pass")
+        return _DONE
+
+    monkeypatch.setattr(cli.controller_mod, "run_pass", fake_run_pass)
+
+    assert cli.cmd_run(wired.args) == 0
+
+    assert order == ["swept", "pass"]
+    assert "stopped 1 orphaned worker container(s): hermes-abc12345" in capsys.readouterr().out
+
+
+def test_a_failing_orphan_sweep_does_not_block_the_start(wired, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli.containers_mod, "sweep_orphan_containers",
+        lambda board, project, conn: (_ for _ in ()).throw(RuntimeError("docker exploded")),
+    )
+    monkeypatch.setattr(cli.controller_mod, "run_pass", lambda *a, **kw: _DONE)
+
+    assert cli.cmd_run(wired.args) == 0
+
+    assert "orphan container sweep failed" in capsys.readouterr().out
+
+
 def test_serialization_lines_tell_the_user_what_gate_0_added():
     link = types.SimpleNamespace(later="T2", earlier="T1", reason="touches overlap: src/* and src/a.py")
     plan = types.SimpleNamespace(serialization_links=(link,))

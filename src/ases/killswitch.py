@@ -457,12 +457,29 @@ def _mentions(text: str | None, card_id: str) -> bool:
 def default_list_containers(card_ids: list[str]) -> list[str]:
     """Names of the running Docker containers whose name or labels name one of `card_ids` (the sandbox of a
     worker, section 21.3). `docker ps` lists every container the user has, so the filter here is what keeps an
-    unrelated one safe. Returns [] and never raises when Docker is absent or its daemon is down."""
+    unrelated one safe. Returns [] and never raises when Docker is absent or its daemon is down.
+
+    CONTAINERS (round 17): confirmed against Hermes 0.21.3's real, installed container labels
+    (scripts/hermes_container_labels_check.py; ases.containers's module docstring has the full empirical
+    finding, file:line). Every container Hermes creates for a worker carries hermes-agent=1
+    (tools/environments/docker.py:585 in the installed source), so `docker ps` is now filtered to that label
+    SERVER-SIDE before the name/label text match below ever runs: a container that is not Hermes's own can
+    never match, whatever its name or its OTHER labels happen to say (Docker Desktop's own
+    "desktop.docker.io/..." labels among them) -- closing exactly the false-positive risk the text match alone
+    could not rule out. This does NOT make the id match itself reliable: under ASES's own current profile
+    configuration a kanban-dispatched worker's container label hermes-task-id is always the literal string
+    "default", never the real card id (ases.containers's module docstring explains why, with file:line), so
+    this function will not find a real worker's container by card id today. ases.containers.
+    find_orphan_containers finds this project's orphaned containers a different way, by Hermes profile, since
+    that label IS the real active profile name."""
     ids = [str(card_id) for card_id in (card_ids or []) if card_id]
     if not ids:
         return []
     try:
-        code, out = _run(["docker", "ps", "--format", "{{.Names}}|{{.Labels}}"], _HELPER_TIMEOUT)
+        code, out = _run(
+            ["docker", "ps", "--filter", "label=hermes-agent=1", "--format", "{{.Names}}|{{.Labels}}"],
+            _HELPER_TIMEOUT,
+        )
     except Exception:  # noqa: BLE001 - no docker, or it hung: nothing to stop
         return []
     if code != 0:
@@ -474,6 +491,24 @@ def default_list_containers(card_ids: list[str]) -> list[str]:
         if name and name not in names and any(_mentions(name, i) or _mentions(labels, i) for i in ids):
             names.append(name)
     return names
+
+
+def default_list_profile_containers(profiles: list[str]) -> list[str]:
+    """Names of the running containers Hermes created (label hermes-agent=1, matched by Docker itself) whose
+    hermes-profile label is one of `profiles`. This, not default_list_containers, is what finds a real worker's
+    sandbox: under ASES's own profile config a dispatched worker's container never carries its card id (its
+    hermes-task-id label is the literal "default"; ases.containers's module docstring has the evidence, file:line
+    in Hermes 0.21.3), while hermes-profile is the worker's real profile. Returns [] and never raises when Docker
+    is absent or its daemon is down."""
+    wanted = {str(profile) for profile in (profiles or []) if profile}
+    if not wanted:
+        return []
+    from . import containers as containers_mod  # imported here: ases.containers imports this module
+    try:
+        found = containers_mod.default_list_hermes_containers()
+    except Exception:  # noqa: BLE001 - no docker, or it hung: nothing to stop
+        return []
+    return list(dict.fromkeys(name for name, profile in found if name and profile in wanted))
 
 
 def default_stop_container(name: str) -> bool:
@@ -521,6 +556,7 @@ class _Hooks:
     alive: Callable[[int], bool]
     command_line: Callable[[int], str | None]
     list_containers: Callable[[list[str]], list[str]]
+    list_profile_containers: Callable[[list[str]], list[str]]
     stop_container: Callable[[str], bool]
 
 
@@ -813,20 +849,34 @@ def _kill_workers(stop: _Stop, hooks: _Hooks, targets: list[_Target]) -> None:
         stop.note(f"card {_cid(card_id)}: worker pid {pid} is still alive after it was terminated")
 
 
-def _stop_containers(stop: _Stop, hooks: _Hooks, card_ids: list[str]) -> None:
-    """Step f. The card ids handed to list_containers are this plan's own (its plan_tasks cards and any fix cards
-    found), so only a sandbox that names one of them is stopped, whether or not its card is still running."""
-    if not card_ids:
-        return
-    listing = stop.call(stop.deadline_at, hooks.list_containers, list(card_ids))
+def _listed_containers(stop: _Stop, fn: Callable[[list[str]], list[str]], keys: list[str], what: str) -> list[str]:
+    """One container listing inside the stop's time box: the names it returned, or [] with a note."""
+    listing = stop.call(stop.deadline_at, fn, list(keys))
     if not listing.ok:
-        stop.note(f"could not list Docker containers: {listing.error}")
-        return
+        stop.note(f"could not list Docker containers {what}: {listing.error}")
+        return []
     try:
-        names = list(dict.fromkeys(str(name) for name in (listing.value or []) if name))
+        return [str(name) for name in (listing.value or []) if name]
     except TypeError:
-        stop.note("could not read the container list: unexpected answer")
-        return
+        stop.note(f"could not read the container list {what}: unexpected answer")
+        return []
+
+
+def _stop_containers(stop: _Stop, hooks: _Hooks, card_ids: list[str], profiles: list[str]) -> None:
+    """Step f. Two listings, stopped together: the sandboxes whose name or labels name one of this plan's card ids
+    (its plan_tasks cards and any fix cards found), and every running Hermes container of this project's own
+    profiles (`profiles`). The second is the one that finds a real worker's sandbox (round 17: Hermes labels it
+    with the worker's profile, never its card id; see default_list_profile_containers). Both listings only ever
+    name containers carrying hermes-agent=1. Stopping by profile is right here, unlike the per-pass orphan sweep
+    (ases.containers), which spares a profile with live work: swarm stop stops the whole system, so live work is
+    exactly what must stop. Profile names are unique per machine across ASES projects (a hard constraint, see
+    ases.containers's module docstring; swarm doctor's profile_isolation row checks it)."""
+    names: list[str] = []
+    if card_ids:
+        names += _listed_containers(stop, hooks.list_containers, card_ids, "by card id")
+    if profiles:
+        names += _listed_containers(stop, hooks.list_profile_containers, profiles, "by Hermes profile")
+    names = list(dict.fromkeys(names))
     if not names:
         return
     for name, outcome in stop.call_all(stop.deadline_at, hooks.stop_container, names):
@@ -846,7 +896,9 @@ def _guarded(stop: _Stop, what: str, fn: Callable[..., Any], *args: Any) -> Any:
         return None
 
 
-def _stop_steps(stop: _Stop, hooks: _Hooks, board: str, plan: Any, conn: sqlite3.Connection, reason: str) -> None:
+def _stop_steps(
+    stop: _Stop, hooks: _Hooks, board: str, plan: Any, conn: sqlite3.Connection, reason: str, profiles: list[str],
+) -> None:
     report = stop.report
     project = plan.project
 
@@ -877,14 +929,15 @@ def _stop_steps(stop: _Stop, hooks: _Hooks, board: str, plan: Any, conn: sqlite3
     # e. Terminate the workers that pass the safety rules.
     _guarded(stop, "terminating workers", _kill_workers, stop, hooks, targets)
 
-    # f. Stop the sandboxes of this plan's cards.
-    _guarded(stop, "stopping containers", _stop_containers, stop, hooks, sorted(plan_ids | set(fix_ids)))
+    # f. Stop the sandboxes of this plan's cards and of this project's Hermes profiles.
+    _guarded(stop, "stopping containers", _stop_containers, stop, hooks, sorted(plan_ids | set(fix_ids)), profiles)
 
 
 def stop_all(
     board: str, plan: Any, *, conn: sqlite3.Connection, deadline_seconds: float = DEADLINE_SECONDS,
     reason: str = "swarm stop", pause=None, kanban_list=None, kanban_show=None, reclaim=None, killer=None,
     alive=None, command_line=None, list_containers=None, stop_container=None, now=None, sleep=None,
+    profiles=None, list_profile_containers=None,
 ) -> StopReport:
     """ASES-REC-06, section 19.6: "swarm stop MUST stop the whole system within 30 seconds: hermes pause to stop
     new dispatch, reclaim every running card, terminate worker process trees and sandboxes, stop the merge queue
@@ -899,7 +952,10 @@ def stop_all(
     before the queue looks at the flag again. Nothing else is written.
 
     Only cards of `plan` (plan_tasks rows for plan.project, plus fix cards whose parent is one of them) are
-    touched, so unrelated cards on the same board are left alone. The time box: no outside call gets more than
+    touched, so unrelated cards on the same board are left alone. `profiles` names this project's own Hermes
+    profiles (project.roles.values()); every running Hermes container of one of them is stopped in step f,
+    since that is the only way to find a real worker's sandbox (see _stop_containers). None or empty skips that
+    listing. The time box: no outside call gets more than
     a third of `deadline_seconds`, the Hermes calls together get at most two thirds, and a step whose time has run
     out is skipped and recorded, with the flag already set. `now` is the monotonic clock and `sleep` the sleeper;
     both, and every outside effect, are parameters so a test never touches a real process or Docker. Left as
@@ -915,8 +971,12 @@ def stop_all(
         alive=alive if alive is not None else pid_alive,
         command_line=command_line if command_line is not None else process_command_line,
         list_containers=list_containers if list_containers is not None else default_list_containers,
+        list_profile_containers=(
+            list_profile_containers if list_profile_containers is not None else default_list_profile_containers
+        ),
         stop_container=stop_container if stop_container is not None else default_stop_container,
     )
+    profile_names = sorted({str(profile) for profile in (profiles or []) if profile})
     try:
         limit = max(float(deadline_seconds), 0.0)
     except (TypeError, ValueError):
@@ -924,7 +984,7 @@ def stop_all(
     report = StopReport(started_at=_utc_now())
     stop = _Stop(report, limit, clock, sleep if sleep is not None else time.sleep)
     try:
-        _stop_steps(stop, hooks, board, plan, conn, reason)
+        _stop_steps(stop, hooks, board, plan, conn, reason, profile_names)
     except Exception as exc:  # noqa: BLE001 - the kill switch reports, it never raises
         stop.note(f"swarm stop hit an unexpected error and may be incomplete: {_err(exc)}")
     elapsed = max(clock() - stop.start, 0.0)
