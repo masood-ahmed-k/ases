@@ -2071,6 +2071,54 @@ def _card_base_verified(conn, card_id: str, branch: str) -> bool:
     ).fetchone() is not None
 
 
+# Round 14 (RUNSTART2, finding A2-1): guards.branch_exists cannot tell "Hermes claimed the card but has not yet
+# run `git worktree add -b`" (benign, resolves within a pass or two) from "the ref existed and then vanished" (an
+# out-of-band deletion, or the ASES-GIT-12 kind of tamper guards.py's own module docstring warns about) -- both
+# read as `code != 0`. The skip below is safe to keep silent for a FEW passes (that is the whole point: it must
+# not yank a brand-new, perfectly legitimate card into `blocked` over nothing but dispatch timing), but silent
+# forever hides the second case with zero visibility anywhere in ASES. _MAX_CONSECUTIVE_PASS_ERRORS already sets
+# this codebase's own bar for "not a blip any more" at 5 consecutive misses; the same number is used here, for
+# the same reason and at the same default --sleep-seconds=20 pace (about 100 seconds), comfortably longer than a
+# worktree-add subprocess has ever been observed to lag. Past that many consecutive misses, ONE informational
+# card_base_branch_unverifiable event names the card (visible in the events log and swarm status), and no more
+# card_base_branch_missing_pass rows are written for it after that (nothing further to count). This never blocks
+# the card by itself -- mergeq.merge_task's own `_check_base` stays the enforcement backstop either way, exactly
+# as it already is for the ordinary "not yet created" case this grace exists for.
+_MISSING_BRANCH_GRACE_PASSES = 5
+
+
+def _branch_missing_escalated(conn, card_id: str, branch: str) -> bool:
+    """Whether the bounded grace above has already fired once for this exact (card_id, branch) pair."""
+    return conn.execute(
+        "SELECT 1 FROM events WHERE kind = 'card_base_branch_unverifiable' "
+        "AND json_extract(payload, '$.card_id') = ? AND json_extract(payload, '$.branch') = ? LIMIT 1",
+        (card_id, branch),
+    ).fetchone() is not None
+
+
+def _record_branch_missing_pass(conn, card_id: str, task_key: str, branch: str, project: str) -> None:
+    """One more consecutive pass on which `branch` had no ref yet, counted by how many
+    card_base_branch_missing_pass events already carry this exact (card_id, branch) pair (the same dedup fields
+    _card_base_verified matches on). Past _MISSING_BRANCH_GRACE_PASSES, escalate once (_record_once, matched on
+    card_id and branch) and stop counting: the escalation already made it visible, so there is nothing more to
+    gain from logging every further pass forever."""
+    if _branch_missing_escalated(conn, card_id, branch):
+        return
+    events.record(conn, "card_base_branch_missing_pass", {
+        "card_id": card_id, "task_key": task_key, "branch": branch, "project": project,
+    })
+    streak = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind = 'card_base_branch_missing_pass' "
+        "AND json_extract(payload, '$.card_id') = ? AND json_extract(payload, '$.branch') = ?",
+        (card_id, branch),
+    ).fetchone()[0]
+    if streak >= _MISSING_BRANCH_GRACE_PASSES:
+        _record_once(conn, "card_base_branch_unverifiable", {
+            "card_id": card_id, "task_key": task_key, "branch": branch, "project": project,
+            "passes_missing": streak,
+        }, match=("card_id", "branch"))
+
+
 def process_card_base_checks(board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn) -> list[str]:
     """ASES-GIT-01, ASES-GIT-16 (blueprint p169's second sentence: "Phase 3 MUST verify the actual base commit
     before a worker starts"). This is the DETECTION half; mergeq.merge_task's own `_check_base` (wired into every
@@ -2112,6 +2160,14 @@ def process_card_base_checks(board: str, repo: pathlib.Path, plan: plan_mod.Plan
     immediately, exactly as before. mergeq.merge_task's own `_check_base` is the enforcement backstop either way,
     so a card this misses this pass can still never have its branch land.
 
+    Round 14 (RUNSTART2, finding A2-1): that skip used to be unbounded and entirely unrecorded, which also hid the
+    rarer case guards.branch_exists cannot rule out -- the ref existed and was then deleted out of band, not just
+    "not yet created". _record_branch_missing_pass counts consecutive misses per (card_id, branch) and, past
+    _MISSING_BRANCH_GRACE_PASSES, records one card_base_branch_unverifiable event naming the card. This is
+    visibility only, never a block: the merge-queue's `_check_base` remains the sole enforcement either way, and a
+    card that starts resolving again (the ordinary case) simply moves on to check_card_base next pass as before,
+    leaving the miss-pass events behind unread.
+
     Only this plan's own work cards (the plan_tasks rows of plan.project) are looked at: a merge card is never
     `running` (the merge queue is the only writer to the integration branch, never a worker), and another
     project's card on the same board is left to its own controller pass, exactly like process_budget_gate scopes
@@ -2139,7 +2195,11 @@ def process_card_base_checks(board: str, repo: pathlib.Path, plan: plan_mod.Plan
         if _card_base_verified(conn, card_id, branch):
             continue
         if not guards_mod.branch_exists(repo, branch):
-            continue  # Hermes claimed the card but has not yet run `git worktree add -b`: recheck next pass
+            # Hermes claimed the card but has not yet run `git worktree add -b`: recheck next pass. A2-1: bounded
+            # so a branch that never resolves (or was deleted out of band) is eventually made visible, not
+            # skipped forever.
+            _record_branch_missing_pass(conn, card_id, task_key, branch, plan.project)
+            continue
         result = guards_mod.check_card_base(repo, branch, allowed)
         if result.ok:
             _record_once(conn, "card_base_verified", {

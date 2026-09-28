@@ -2408,8 +2408,13 @@ def test_process_card_base_checks_skips_a_card_whose_branch_does_not_exist_yet(t
     """Finding 3 (round 12, RUNSTART, ASES-GIT-01/GIT-16): Hermes's own claim_task commits status='running' before
     its LATER `git worktree add -b` subprocess actually creates the branch and its reflog. A controller pass that
     lands in that window must not yank an otherwise-legitimate card into `blocked` over a branch that simply does
-    not exist YET; it must be skipped, unrecorded, so the very next pass rechecks it. The merge queue's own
-    `_check_base` stays the backstop that keeps a genuinely bad base from ever landing."""
+    not exist YET; it must be skipped, so the very next pass rechecks it. The merge queue's own `_check_base`
+    stays the backstop that keeps a genuinely bad base from ever landing.
+
+    Round 14 (RUNSTART2, finding A2-1): the skip is no longer unrecorded -- one card_base_branch_missing_pass
+    event is written per consecutive miss, so a branch that never resolves can eventually be escalated (see
+    test_process_card_base_checks_escalates_visibly_after_a_bounded_number_of_misses_but_never_blocks below) -- but
+    a single miss, well under the grace bound, still never blocks or violates the card."""
     repo = git_repo(tmp_path, with_branch=False)  # swarm/T1-coder has not been created at all yet
     w = make_world(tmp_path, monkeypatch)
     guards.adopt_current_head(w.conn, "t3", repo)
@@ -2419,7 +2424,10 @@ def test_process_card_base_checks_skips_a_card_whose_branch_does_not_exist_yet(t
 
     assert problems == []
     assert w.board.cards[w.work("T1")]["status"] == "running"  # not yanked into blocked over a timing artifact
-    assert not any(kind.startswith("card_base_") for kind in kinds(w.conn))
+    assert not any(kind.startswith("card_base_violation") or kind.startswith("card_base_branch_unverifiable")
+                   for kind in kinds(w.conn))
+    (miss,) = payloads(w.conn, "card_base_branch_missing_pass")
+    assert miss["task_key"] == "T1" and miss["branch"] == "swarm/T1-coder"
 
     # Hermes's worktree-add subprocess catches up: the branch now exists, cut from the adopted head.
     git("branch", "swarm/T1-coder", "integration", cwd=repo)
@@ -2427,6 +2435,41 @@ def test_process_card_base_checks_skips_a_card_whose_branch_does_not_exist_yet(t
     assert problems == []
     (payload,) = payloads(w.conn, "card_base_verified")
     assert payload["branch"] == "swarm/T1-coder"
+    assert len(payloads(w.conn, "card_base_branch_missing_pass")) == 1  # the one earlier miss, none added once found
+
+
+def test_process_card_base_checks_escalates_visibly_after_a_bounded_number_of_misses_but_never_blocks(
+    tmp_path, monkeypatch,
+):
+    """Finding A2-1 (round 14, RUNSTART2, ASES-GIT-01/GIT-16): guards.branch_exists cannot tell "not yet created"
+    from "created, then the ref vanished" (an out-of-band deletion), so the skip above must not stay silent
+    forever. Past controller._MISSING_BRANCH_GRACE_PASSES consecutive misses, one card_base_branch_unverifiable
+    event names the card -- visible in the events log -- but the card is never blocked by this alone: the
+    merge-queue's own `_check_base` stays the enforcement backstop, exactly as it already is for the ordinary
+    not-yet-created case this grace exists for."""
+    repo = git_repo(tmp_path, with_branch=False)  # swarm/T1-coder is never created at all
+    w = make_world(tmp_path, monkeypatch)
+    guards.adopt_current_head(w.conn, "t3", repo)
+    w.board.cards[w.work("T1")].update(status="running", branch_name="swarm/T1-coder")
+
+    for n in range(1, controller._MISSING_BRANCH_GRACE_PASSES):
+        problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+        assert problems == []
+        assert not payloads(w.conn, "card_base_branch_unverifiable")  # not escalated yet
+        assert len(payloads(w.conn, "card_base_branch_missing_pass")) == n
+
+    problems = controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)  # the bound-th consecutive miss
+
+    assert problems == []
+    assert w.board.cards[w.work("T1")]["status"] == "running"  # visibility only, never a block
+    (escalation,) = payloads(w.conn, "card_base_branch_unverifiable")
+    assert escalation["task_key"] == "T1" and escalation["branch"] == "swarm/T1-coder"
+    assert escalation["passes_missing"] == controller._MISSING_BRANCH_GRACE_PASSES
+
+    # Further misses neither pile up a second escalation nor keep growing the miss-pass log forever.
+    controller.process_card_base_checks("b", repo, w.plan, conn=w.conn)
+    assert len(payloads(w.conn, "card_base_branch_unverifiable")) == 1
+    assert len(payloads(w.conn, "card_base_branch_missing_pass")) == controller._MISSING_BRANCH_GRACE_PASSES
 
 
 def test_process_card_base_checks_still_blocks_a_branch_that_exists_with_a_bad_base(tmp_path, monkeypatch):
