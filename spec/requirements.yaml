@@ -157,29 +157,38 @@ requirements:
   requirement: Kanban limits are set explicitly and no default assignee exists
   section: '6.2'
   verified_by: 22.1, 22.5
-  status: in_progress
-  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
-    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the kanban limits are still NOT applied
-    on the real machine: max_in_progress and max_in_progress_per_profile unset, failure_limit 2 instead of 3,
-    auto_decompose true, auto_promote_children unset. swarm init --global --apply --yes would set all five; it
-    waits for the owner''s yes. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Same as
-    ASES-ROL-08: the kanban limits, failure_limit, auto_decompose false, auto_promote_children false and no
-    default assignee are in the opt-in global desired state of profiles.plan_init (`swarm init --global`); not
-    applied. Hermes''s auto_decompose defaults to true. Earlier note: kanban.max_in_progress etc. not yet
-    written into Hermes config.yaml for this board -- still relying on defaults.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): swarm init --global --apply --yes set the kanban limits on the real machine
+    (max_in_progress 3, max_in_progress_per_profile 1, failure_limit 3, auto_decompose false,
+    auto_promote_children false); a real swarm doctor afterwards shows no drift, and the real run showed the
+    per-profile limit holding a second card as ready. Earlier note: STAGE A (2026-09-28, zero provider quota):
+    a real swarm doctor against the real Hermes 0.21.3 install and the swarm init --global dry run
+    (docs/stage-a-2026-09-28.md) show the kanban limits are still NOT applied on the real machine:
+    max_in_progress and max_in_progress_per_profile unset, failure_limit 2 instead of 3, auto_decompose true,
+    auto_promote_children unset. swarm init --global --apply --yes would set all five; it waits for the
+    owner''s yes. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): Same as ASES-ROL-08: the
+    kanban limits, failure_limit, auto_decompose false, auto_promote_children false and no default assignee
+    are in the opt-in global desired state of profiles.plan_init (`swarm init --global`); not applied.
+    Hermes''s auto_decompose defaults to true. Earlier note: kanban.max_in_progress etc. not yet written into
+    Hermes config.yaml for this board -- still relying on defaults.'
 - id: ASES-ROL-01
   requirement: Phase 3 starts with three core profiles; tester and other roles are added only after measured
     evaluation
   section: 4.1, 16
   verified_by: 22.17 at level L2
-  status: in_progress
-  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
-    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the three core profiles (lead, coder-1,
-    reviewer) exist with a model configured, but their SOUL.md prompts and toolsets differ from ASES''s
-    desired state; applying swarm init fixes that, pending the owner''s yes. Earlier note: BUILT AND WIRED,
-    NOT RUN FOR REAL (2026-09-22): profiles.py holds the roster as data: lead, coder-1 and reviewer active;
-    coder-2, coder-3 and tester defined but inactive until enabled. `swarm init` is a dry run by default;
-    nothing has been applied to the real Hermes.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): the three core profiles (lead, coder-1, reviewer) now carry ASES''s desired
+    state on the real machine (prompts, minimal toolsets, memory off) and ran a real project end to end;
+    coder-2, coder-3 and tester stay defined but inactive, as the requirement says, until measurement
+    justifies them. Earlier note: STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the
+    real Hermes 0.21.3 install and the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the three
+    core profiles (lead, coder-1, reviewer) exist with a model configured, but their SOUL.md prompts and
+    toolsets differ from ASES''s desired state; applying swarm init fixes that, pending the owner''s yes.
+    Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py holds the roster as data: lead,
+    coder-1 and reviewer active; coder-2, coder-3 and tester defined but inactive until enabled. `swarm init`
+    is a dry run by default; nothing has been applied to the real Hermes.'
 - id: ASES-ROL-02
   requirement: Profiles are created by cloning from the default profile, with a description
   section: '4.2'
@@ -229,31 +238,37 @@ requirements:
   requirement: Worker memory is disabled or scoped per project
   section: '4.2'
   verified_by: Inspection
-  status: in_progress
-  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
-    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show long-term memory still switched on in
-    all three real profiles (memory.memory_enabled and memory.user_profile_enabled unset, and the memory
-    toolset present). swarm init --apply --yes would turn it off; it waits for the owner''s yes. Earlier note:
-    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py turns memory off for every profile
-    (memory.memory_enabled, memory.user_profile_enabled and the memory toolset) in the desired state; not
-    applied to the real profiles.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): long-term memory is now off in all three real profiles (memory.memory_enabled
+    and memory.user_profile_enabled false, no memory toolset), confirmed by a real swarm doctor with no drift.
+    Earlier note: STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes
+    0.21.3 install and the swarm init --global dry run (docs/stage-a-2026-09-28.md) show long-term memory
+    still switched on in all three real profiles (memory.memory_enabled and memory.user_profile_enabled unset,
+    and the memory toolset present). swarm init --apply --yes would turn it off; it waits for the owner''s
+    yes. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.py turns memory off for every
+    profile (memory.memory_enabled, memory.user_profile_enabled and the memory toolset) in the desired state;
+    not applied to the real profiles.'
 - id: ASES-ROL-08
   requirement: Concurrency starts at 3, is raised only after the recovery tests pass, and never exceeds
     6
   section: '4.3'
   verified_by: 22.5, 22.9
-  status: in_progress
-  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
-    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show kanban.max_in_progress is unset on the
-    real machine (Hermes derives a cap from memory); swarm init --global would set it to 3, pending the
-    owner''s yes. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven (22.5): three cards ran
-    simultaneously with three distinct worktrees, branches, profiles and lease-assigned port blocks/compose
-    names, and a fourth stayed queued by max_in_progress, through the real controller and dispatcher. Still
-    not applied to the user''s real Hermes (swarm init --global remains dry-run only, unchanged from round 5).
-    Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts
-    kanban.max_in_progress (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global
-    state; `swarm init --global` shows it and applies it only after `--apply --yes`. Not applied: it changes
-    the user''s whole Hermes.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): kanban.max_in_progress is 3 on the real machine, the configuration''s
+    hard_max is 6, and the real run showed the limits in force. Earlier note: STAGE A (2026-09-28, zero
+    provider quota): a real swarm doctor against the real Hermes 0.21.3 install and the swarm init --global
+    dry run (docs/stage-a-2026-09-28.md) show kanban.max_in_progress is unset on the real machine (Hermes
+    derives a cap from memory); swarm init --global would set it to 3, pending the owner''s yes. Earlier note:
+    ROUND 6 (2026-09-22, zero quota): Acceptance-proven (22.5): three cards ran simultaneously with three
+    distinct worktrees, branches, profiles and lease-assigned port blocks/compose names, and a fourth stayed
+    queued by max_in_progress, through the real controller and dispatcher. Still not applied to the user''s
+    real Hermes (swarm init --global remains dry-run only, unchanged from round 5). Earlier note: BUILT AND
+    WIRED, NOT RUN FOR REAL (2026-09-22): profiles.plan_init(include_global=True) puts kanban.max_in_progress
+    (start 3, hard maximum 6) and max_in_progress_per_profile 1 into the desired global state; `swarm init
+    --global` shows it and applies it only after `--apply --yes`. Not applied: it changes the user''s whole
+    Hermes.'
 - id: ASES-MOD-01
   requirement: Model IDs are discovered, and a capability record is kept per model
   section: '5'
@@ -343,29 +358,34 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: partial
-  note: 'ROUND 14 (2026-09-28, zero quota): the ledger''s day is injectable (every function that reads today takes
-    an optional clock, defaulting to the real UTC time), the report''s budget panel uses the report''s own
-    clock, and a test pins the UTC midnight reset; acceptance 22.9 no longer monkeypatches a private function.
-    This closes the test-infrastructure half named below. Still partial: the review-reserve half and the daily
-    reset have not been seen against a real provider. Earlier note: ROUND 10 (2026-09-27, zero quota):
-    BUDGETFIX: the daily reserve now has one default, ledger.DEFAULT_DAILY_RESERVE_PERCENT = 10 (blueprint
-    section 9.3: ''the limit in section 5.3 minus a 10 percent reserve''), used by bounds, policy, report and
-    ledger.can_afford; policy and the report used to fall back to 0 when a project''s budgets omitted the key,
-    so the budget gate, the Gate P estimate and the report could disagree. An explicit 0 still means 0.
-    Earlier note: ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for
-    kanban_specify): A real bug fixed this round: create_cards_from_plan used to forget a task''s fix or retry
-    card (or, for a retry card specifically, create a genuine DUPLICATE work card) if the ASES database was
-    deleted and card creation re-run a third time, since both of its ''does a fix/retry card already exist''
-    signals lived only in that database. It now asks the BOARD directly (the merge card''s own parent lineage,
-    disambiguated by each candidate''s created_at, never by id or list order, since real Hermes card ids are
-    RANDOM and only the fake board''s happen to be sequential -- a subtlety the builder''s report documents
-    precisely, worth reading before anyone builds similar board-native recovery logic). Acceptance-tested for
-    both the fix-card and retry-card case. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven
-    end to end (22.9): a card over the daily budget is parked (scheduled, budget: reason), an independent
-    affordable task proceeds normally, several idle passes show exactly one card_parked_for_budget event with
-    no thrashing and the fake provider never started, the report shows the reset time, no purchase language
-    appears anywhere, and after the simulated UTC-midnight reset the card unparks and completes with the other
-    task''s state intact. Left partial: the review-reserve half and the daily-reset arithmetic against a REAL
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): a real provider really ran out: OpenRouter''s free daily quota was used up
+    mid-review and ASES recovery classified the failure as quota and parked the card until the next UTC
+    midnight instead of retrying. The pre-dispatch half (a card never made ready without budget plus the
+    review reserve) has not been seen against real exhaustion. Earlier note: ROUND 14 (2026-09-28, zero
+    quota): the ledger''s day is injectable (every function that reads today takes an optional clock,
+    defaulting to the real UTC time), the report''s budget panel uses the report''s own clock, and a test pins
+    the UTC midnight reset; acceptance 22.9 no longer monkeypatches a private function. This closes the
+    test-infrastructure half named below. Still partial: the review-reserve half and the daily reset have not
+    been seen against a real provider. Earlier note: ROUND 10 (2026-09-27, zero quota): BUDGETFIX: the daily
+    reserve now has one default, ledger.DEFAULT_DAILY_RESERVE_PERCENT = 10 (blueprint section 9.3: ''the limit
+    in section 5.3 minus a 10 percent reserve''), used by bounds, policy, report and ledger.can_afford; policy
+    and the report used to fall back to 0 when a project''s budgets omitted the key, so the budget gate, the
+    Gate P estimate and the report could disagree. An explicit 0 still means 0. Earlier note: ROUND 7 wave 1
+    (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real bug fixed this
+    round: create_cards_from_plan used to forget a task''s fix or retry card (or, for a retry card
+    specifically, create a genuine DUPLICATE work card) if the ASES database was deleted and card creation
+    re-run a third time, since both of its ''does a fix/retry card already exist'' signals lived only in that
+    database. It now asks the BOARD directly (the merge card''s own parent lineage, disambiguated by each
+    candidate''s created_at, never by id or list order, since real Hermes card ids are RANDOM and only the
+    fake board''s happen to be sequential -- a subtlety the builder''s report documents precisely, worth
+    reading before anyone builds similar board-native recovery logic). Acceptance-tested for both the fix-card
+    and retry-card case. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.9):
+    a card over the daily budget is parked (scheduled, budget: reason), an independent affordable task
+    proceeds normally, several idle passes show exactly one card_parked_for_budget event with no thrashing and
+    the fake provider never started, the report shows the reset time, no purchase language appears anywhere,
+    and after the simulated UTC-midnight reset the card unparks and completes with the other task''s state
+    intact. Left partial: the review-reserve half and the daily-reset arithmetic against a REAL
     Hermes/provider are still unverified, and ledger.py has no injectable clock (tests must monkeypatch
     ledger._today directly). Earlier note: Three layers, all unit-tested: cmd_approve checks the whole plan''s
     budget at Gate P; controller.process_budget_gate re-checks every ready card on every pass and parks it
@@ -844,28 +864,32 @@ requirements:
   requirement: Plan critique and diff review are done by the independent Reviewer profile
   section: '13'
   verified_by: '22.1'
-  status: partial
-  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The ''Plan critique (the critic role in Gate P) is not
-    built'' sentence in this note is stale. src/ases/critic.py exists and implements exactly that (module
-    docstring: ''Gate P plan critique: the independent Reviewer reads the plan before the user is asked to
-    approve it (section 13.1; ASES-REV-01, ASES-REV-02, ASES-REV-03, ASES-LED-01)''), is unit-tested (123
-    cases in tests/unit/test_critic.py) and is acceptance-proven end to end per ASES-REV-02''s own note
-    (22.14: a plan with a cycle, a missing criterion or a missing touches entry fails Gate 0, a scripted
-    critic returns CHANGES_REQUIRED twice, next_step crosses the bound correctly, and the user''s rejection
-    leaves no implementation card ever created). That closes the half of the requirement the old note said was
-    missing. The diff-review half stays exactly as this note already, correctly, described: proven for real on
-    2026-09-19 (the independent Reviewer, OpenRouter cohere/north-mini-code:free, approved via kanban_complete
-    with review_outcome metadata; the merge queue only merged once the reviewer profile completed the card),
-    but the reviewer verified less than it claimed (it listed the gate as verified after its own attempt to
-    run the tests failed, since it has no command tools, relying on the coder''s hand-off) -- a genuine,
-    disclosed reliability gap, not a coverage gap, and the reason this row stays partial rather than covered
-    even though both critique and diff review now exist and are exercised. Earlier note: Diff review by the
-    independent Reviewer profile happened for real on 2026-09-19: the reviewer (OpenRouter
-    cohere/north-mini-code:free, a different provider and family from the Lead on xKiro) read the coder''s two
-    files and approved via kanban_complete with review_outcome metadata, and the merge queue only merged once
-    the reviewer profile had completed the card. Plan critique (the critic role in Gate P) is not built. The
-    reviewer verified less than it claimed: it listed the gate as verified after its own attempt to run the
-    tests failed (it has no command tools), relying on the coder''s hand-off.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): both halves ran live on the real reviewer profile: the Gate P critique (swarm
+    critique, PASS for the exact plan hash) and the diff reviews (W1 approved and merged; S1 reviewed, see the
+    round 16 note on why it asked for changes). Earlier note: ROUND 9 register hygiene (2026-09-27, zero
+    quota): The ''Plan critique (the critic role in Gate P) is not built'' sentence in this note is stale.
+    src/ases/critic.py exists and implements exactly that (module docstring: ''Gate P plan critique: the
+    independent Reviewer reads the plan before the user is asked to approve it (section 13.1; ASES-REV-01,
+    ASES-REV-02, ASES-REV-03, ASES-LED-01)''), is unit-tested (123 cases in tests/unit/test_critic.py) and is
+    acceptance-proven end to end per ASES-REV-02''s own note (22.14: a plan with a cycle, a missing criterion
+    or a missing touches entry fails Gate 0, a scripted critic returns CHANGES_REQUIRED twice, next_step
+    crosses the bound correctly, and the user''s rejection leaves no implementation card ever created). That
+    closes the half of the requirement the old note said was missing. The diff-review half stays exactly as
+    this note already, correctly, described: proven for real on 2026-09-19 (the independent Reviewer,
+    OpenRouter cohere/north-mini-code:free, approved via kanban_complete with review_outcome metadata; the
+    merge queue only merged once the reviewer profile completed the card), but the reviewer verified less than
+    it claimed (it listed the gate as verified after its own attempt to run the tests failed, since it has no
+    command tools, relying on the coder''s hand-off) -- a genuine, disclosed reliability gap, not a coverage
+    gap, and the reason this row stays partial rather than covered even though both critique and diff review
+    now exist and are exercised. Earlier note: Diff review by the independent Reviewer profile happened for
+    real on 2026-09-19: the reviewer (OpenRouter cohere/north-mini-code:free, a different provider and family
+    from the Lead on xKiro) read the coder''s two files and approved via kanban_complete with review_outcome
+    metadata, and the merge queue only merged once the reviewer profile had completed the card. Plan critique
+    (the critic role in Gate P) is not built. The reviewer verified less than it claimed: it listed the gate
+    as verified after its own attempt to run the tests failed (it has no command tools), relying on the
+    coder''s hand-off.'
 - id: ASES-REV-02
   requirement: A plan goes back to the Lead at most twice
   section: '13.1'
@@ -897,21 +921,25 @@ requirements:
   section: '13.1'
   verified_by: '22.14'
   status: in_progress
-  note: 'ROUND 9 register hygiene (2026-09-27, zero quota): The ''while the real T1/T2 dispatch (22.2) is in
-    flight'' framing is stale -- that dispatch is not in flight, it completed on 2026-09-19
-    (docs/architecture.md, ''The first real end-to-end run'': swarm approve at 16:51:56 through swarm run''s
-    exit 0 at 16:59:05, project greet-e2e). The underlying gap this row actually cares about still stands,
-    though: that same run used `swarm approve --yes` (docs/architecture.md''s own run log says so explicitly),
-    which skips the interactive input() confirmation entirely (cli.py: `if not getattr(args, ''yes'', False):
-    ... input(''Proceed? [y/N] '')`), so the real interactive y/N prompt itself has genuinely still never
-    fired in a real approve run -- only argparse wiring (`swarm approve --help`) has been smoke-tested for
-    real. Status stays in_progress; promote to covered once a real `swarm approve` run without --yes actually
-    confirms the prompt. Earlier note: cmd_approve now prints budget + calendar time (ASES-CAP-04) and then
-    blocks on an interactive input() confirmation before publish_plan/create_cards_from_plan run; --yes skips
-    it for scripted use. Argparse wiring smoke-tested for real (swarm approve --help); the interactive prompt
-    itself has not yet been exercised against a real approve run -- deliberately deferred to avoid touching
-    the live ases-phase3 board/test-repo-phase3 while the real T1/T2 dispatch (22.2) is in flight. Promote to
-    covered after the next real `swarm approve` run confirms the prompt.'
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): swarm approve showed the budget, the calendar-time estimate and the critic''s
+    PASS before creating any card, and cards appeared only after it. It ran with --yes, so the interactive
+    confirmation itself is still unexercised. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota):
+    The ''while the real T1/T2 dispatch (22.2) is in flight'' framing is stale -- that dispatch is not in
+    flight, it completed on 2026-09-19 (docs/architecture.md, ''The first real end-to-end run'': swarm approve
+    at 16:51:56 through swarm run''s exit 0 at 16:59:05, project greet-e2e). The underlying gap this row
+    actually cares about still stands, though: that same run used `swarm approve --yes`
+    (docs/architecture.md''s own run log says so explicitly), which skips the interactive input() confirmation
+    entirely (cli.py: `if not getattr(args, ''yes'', False): ... input(''Proceed? [y/N] '')`), so the real
+    interactive y/N prompt itself has genuinely still never fired in a real approve run -- only argparse
+    wiring (`swarm approve --help`) has been smoke-tested for real. Status stays in_progress; promote to
+    covered once a real `swarm approve` run without --yes actually confirms the prompt. Earlier note:
+    cmd_approve now prints budget + calendar time (ASES-CAP-04) and then blocks on an interactive input()
+    confirmation before publish_plan/create_cards_from_plan run; --yes skips it for scripted use. Argparse
+    wiring smoke-tested for real (swarm approve --help); the interactive prompt itself has not yet been
+    exercised against a real approve run -- deliberately deferred to avoid touching the live ases-phase3
+    board/test-repo-phase3 while the real T1/T2 dispatch (22.2) is in flight. Promote to covered after the
+    next real `swarm approve` run confirms the prompt.'
 - id: ASES-REV-04
   requirement: Review requests carry handoff evidence
   section: '13.2'
@@ -1205,33 +1233,36 @@ requirements:
   section: '19.2'
   verified_by: 22.3, 22.6
   status: in_progress
-  note: 'ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
-    docs/work-orders/r12_audit_findings.md): A gate checkout that cannot be created is now an infrastructure
-    failure (GateCheckoutError, retried) rather than a failed attempt that spends fix-card budget, matching
-    p346: an infrastructure failure says nothing about the model or the task. Earlier note: ROUND 7 wave 1
-    (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real,
-    previously-documented gap closed: a card stuck ready after an auth- or quota-shaped failure that never
-    tripped Hermes''s own retry breaker was invisible to recovery.process_failures (which only ever examined
-    blocked cards; its own docstring said so). It now also recovers a ready card whose latest run is auth- or
-    quota-classified, once a 30-second settle window has passed (reusing the existing infra-backoff base; real
-    Hermes''s own DEFAULT_CRASH_GRACE_SECONDS independently agrees at 30s for a comparable judgment),
-    deliberately excluding every other failure kind on a ready card to avoid racing Hermes''s own normal retry
-    cadence. Unit-tested with the exact scenario round 6''s acceptance test found. Earlier note: ROUND 6
-    (2026-09-22, zero quota): Acceptance-proven end to end (22.3): one card walked through all four failure
-    classifications via the real controller.process_recovery -- rate-limit (Hermes retries alone),
-    infrastructure (resumed after backoff), auth (marks the credential unhealthy as a question, answered), and
-    two rounds of capability failures (a fresh-attempt card, then a model-switch card pinned to a declared
-    candidate) which finally succeeds, ending with exactly the right number of cards, no loss or duplication.
-    A REAL GAP surfaced: a card that crashes ONCE with genuinely auth- or quota-shaped error text, short of
-    tripping the retry breaker, can get permanently stuck in ready, respawn-guarded by Hermes itself, and
-    NEVER reach recovery.py at all (which only examines blocked cards) -- worth checking against real Hermes
-    before relying on this failure class being handled. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL
-    (2026-09-22): recovery.py is called from controller.process_recovery every pass: a capability failure
-    becomes a fresh attempt card (fresh worktree, failure bundle attached), the second also pins the next
-    model of the role class on the new card, an infrastructure failure resumes after a backoff, auth, policy
-    and context failures become a question, and a decision the controller could not carry out is redriven from
-    the event log. Not run for real; the provider name for `hermes kanban set-model` on a custom endpoint is
-    unverified.'
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): the quota path of the failure classification ran live (crashed runs whose
+    output named the exhausted free quota were classified quota and parked). The capability path (a fresh
+    attempt with the failure bundle) has not been seen live. Earlier note: ROUND 12 (2026-09-28, zero quota,
+    from a verified adversarial audit, docs/work-orders/r12_audit_findings.md): A gate checkout that cannot be
+    created is now an infrastructure failure (GateCheckoutError, retried) rather than a failed attempt that
+    spends fix-card budget, matching p346: an infrastructure failure says nothing about the model or the task.
+    Earlier note: ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for
+    kanban_specify): A real, previously-documented gap closed: a card stuck ready after an auth- or
+    quota-shaped failure that never tripped Hermes''s own retry breaker was invisible to
+    recovery.process_failures (which only ever examined blocked cards; its own docstring said so). It now also
+    recovers a ready card whose latest run is auth- or quota-classified, once a 30-second settle window has
+    passed (reusing the existing infra-backoff base; real Hermes''s own DEFAULT_CRASH_GRACE_SECONDS
+    independently agrees at 30s for a comparable judgment), deliberately excluding every other failure kind on
+    a ready card to avoid racing Hermes''s own normal retry cadence. Unit-tested with the exact scenario round
+    6''s acceptance test found. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end
+    (22.3): one card walked through all four failure classifications via the real controller.process_recovery
+    -- rate-limit (Hermes retries alone), infrastructure (resumed after backoff), auth (marks the credential
+    unhealthy as a question, answered), and two rounds of capability failures (a fresh-attempt card, then a
+    model-switch card pinned to a declared candidate) which finally succeeds, ending with exactly the right
+    number of cards, no loss or duplication. A REAL GAP surfaced: a card that crashes ONCE with genuinely
+    auth- or quota-shaped error text, short of tripping the retry breaker, can get permanently stuck in ready,
+    respawn-guarded by Hermes itself, and NEVER reach recovery.py at all (which only examines blocked cards)
+    -- worth checking against real Hermes before relying on this failure class being handled. Earlier note:
+    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): recovery.py is called from controller.process_recovery
+    every pass: a capability failure becomes a fresh attempt card (fresh worktree, failure bundle attached),
+    the second also pins the next model of the role class on the new card, an infrastructure failure resumes
+    after a backoff, auth, policy and context failures become a question, and a decision the controller could
+    not carry out is redriven from the event log. Not run for real; the provider name for `hermes kanban
+    set-model` on a custom endpoint is unverified.'
 - id: ASES-REC-02
   requirement: Review rounds, fix cards and requests are budgeted per plan task lineage
   section: '19.3'
@@ -1401,9 +1432,15 @@ requirements:
   section: '21.3'
   verified_by: '22.10'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): sandbox.py keeps provider keys out of the container argv
-    (no inherited environment, no --env-file, credential-shaped names refused); pull_command only returns argv
-    for a human to approve; the optional egress proxy is not installed.'
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): OWNER-AUTHORISED DECISION (2026-09-28): the optional Hermes egress proxy is
+    NOT installed. In ASES every model call is made by the Hermes agent process on the host, outside the
+    terminal sandbox; nothing that runs inside a container needs a provider key, so there is no credential for
+    a proxy to swap. Revisit only if a tool inside the sandbox ever must call a provider. The
+    keys-outside-the-sandbox half is proven by the round 15 live probes. Earlier note: BUILT AND WIRED, NOT
+    RUN FOR REAL (2026-09-22): sandbox.py keeps provider keys out of the container argv (no inherited
+    environment, no --env-file, credential-shaped names refused); pull_command only returns argv for a human
+    to approve; the optional egress proxy is not installed.'
 - id: ASES-PRV-01
   requirement: A data class per project is enforced before any other routing rule
   section: '21.2'
@@ -1503,53 +1540,62 @@ requirements:
     post-route capability validation
   section: '5.2'
   verified_by: 22.4, 22.5
-  status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.verify_state compares each profile''s model with
-    the pinned one and evals.recommend never proposes a router for the lead, reviewer or debugger; nothing
-    checks a live configuration yet.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): the real profiles are pinned to explicit model IDs (Lead xkiro
+    qwen/qwen3.8-max:free, Reviewer openrouter cohere/north-mini-code:free, coder xkiro
+    qwen/qwen3-coder-plus:free), profiles.verify_state reports no drift, and no router is used for the Lead or
+    the Reviewer. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): profiles.verify_state compares
+    each profile''s model with the pinned one and evals.recommend never proposes a router for the lead,
+    reviewer or debugger; nothing checks a live configuration yet.'
 - id: ASES-GIT-16
   requirement: ASES worktrees start from the exact local integration HEAD; worktree_sync is disabled or
     manual creation is used
   section: '8'
   verified_by: 22.2, 22.5
-  status: in_progress
-  note: 'ROUND 14 (2026-09-28, zero quota, second audit A2-1): a running card whose branch never appears is still
-    never blocked, but after 5 passes a card_base_branch_unverifiable event names it, so the skip is bounded
-    and visible; the merge-queue refusal remains the enforcement. Earlier note: ROUND 12 (2026-09-28, zero
-    quota, from a verified adversarial audit, docs/work-orders/r12_audit_findings.md): The base-commit check
-    no longer blocks a card whose branch Hermes has not created yet (Hermes marks the card running before it
-    runs git worktree add): such a card is re-checked next pass, while an existing branch with a wrong or
-    unreadable base still blocks, and the merge-queue refusal stays the backstop. Earlier note: STAGE A
-    (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and the
-    swarm init --global dry run (docs/stage-a-2026-09-28.md) show core.logAllRefUpdates is on in the real test
-    repository, so the round 10 base-commit check can read branch reflogs there; worktree_sync is still on in
-    the real profiles (swarm init sets it off, pending the owner''s yes), which per the Hermes source only
-    `hermes -w` reads anyway. Earlier note: ROUND 10 (2026-09-27, zero quota): BASECHECK built the check
-    blueprint p169''s last sentence asks for: guards.check_card_base reads a work branch''s creation commit
-    from its reflog (git forced to the C locale so the message is never translated) and requires it to be an
-    integration head ASES itself wrote or adopted, kept in a new integrity_heads history table (schema v9,
-    backfilled), so a card dispatched before a later merge still passes. It runs twice: every pass checks each
-    running card once and blocks a wrong or unverifiable base through the question path, and the merge queue
-    refuses such a branch outright, so a wrong base can never land even if detection missed it. ''Before a
-    worker starts'' is enforced as ''on the first pass that sees it running, and never mergeable'', because
-    Hermes, not ASES, starts the worker. swarm doctor --repo checks core.logAllRefUpdates, which the check
-    needs. Acceptance-tested on the fake board (tests/acceptance/test_r10_basecheck.py); never run against a
-    real dispatch. worktree_sync is pinned false (round 5) and, per the Hermes 0.21.3 source, the Kanban
-    dispatcher never syncs from a remote at all; the remaining gap is only that the check has not run against
-    a real dispatch. Earlier note: ROUND 9 T2B (2026-09-27, zero quota): Read against the installed Hermes
-    0.21.3 source (read only). worktree_sync is already pinned: profiles._config_rows sets worktree_sync:
-    false on every ASES-managed profile (built in round 5, citing this row), and profiles._check_profile
-    reports a live profile that has it on; T2B made swarm doctor tag that drift row with ASES-GIT-16 itself
-    (doctor._extract_requirement_ids), so a drifted value names this requirement. Still partial for two
-    reasons, both honest: the remote-tip case this row guards against has never been exercised (the real test
-    repo has no remote), and the second half of p169, ''Phase 3 MUST verify the actual base commit before a
-    worker starts'', is not built anywhere (listed as a new, separate work item; ASES-GIT-01 is set back to
-    partial for the same reason). Earlier note: Observed on the real 2026-09-19 run: the work-card worktree
-    Hermes created on dispatch was cut at the exact integration tip both times (232e12e for G1, 676628f for G2
-    after G1 merged), and the gate and merge worktrees ASES makes itself are detached at exact SHAs. Left
-    partial: the test repo has no remote, so Hermes''s default of syncing a worktree from the freshly fetched
-    remote tip (the case this requirement guards against) was never exercised, and whether worktree_sync must
-    be turned off explicitly is unverified.'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): worktree_sync is false on the real profiles, and the round 10 base-commit
+    check verified both real cards'' bases (card_base_verified x 2) with the integration heads recorded in
+    integrity_heads; Hermes''s Kanban dispatcher cuts worktrees from the local HEAD, which is what the check
+    confirms. Earlier note: ROUND 14 (2026-09-28, zero quota, second audit A2-1): a running card whose branch
+    never appears is still never blocked, but after 5 passes a card_base_branch_unverifiable event names it,
+    so the skip is bounded and visible; the merge-queue refusal remains the enforcement. Earlier note: ROUND
+    12 (2026-09-28, zero quota, from a verified adversarial audit, docs/work-orders/r12_audit_findings.md):
+    The base-commit check no longer blocks a card whose branch Hermes has not created yet (Hermes marks the
+    card running before it runs git worktree add): such a card is re-checked next pass, while an existing
+    branch with a wrong or unreadable base still blocks, and the merge-queue refusal stays the backstop.
+    Earlier note: STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes
+    0.21.3 install and the swarm init --global dry run (docs/stage-a-2026-09-28.md) show core.logAllRefUpdates
+    is on in the real test repository, so the round 10 base-commit check can read branch reflogs there;
+    worktree_sync is still on in the real profiles (swarm init sets it off, pending the owner''s yes), which
+    per the Hermes source only `hermes -w` reads anyway. Earlier note: ROUND 10 (2026-09-27, zero quota):
+    BASECHECK built the check blueprint p169''s last sentence asks for: guards.check_card_base reads a work
+    branch''s creation commit from its reflog (git forced to the C locale so the message is never translated)
+    and requires it to be an integration head ASES itself wrote or adopted, kept in a new integrity_heads
+    history table (schema v9, backfilled), so a card dispatched before a later merge still passes. It runs
+    twice: every pass checks each running card once and blocks a wrong or unverifiable base through the
+    question path, and the merge queue refuses such a branch outright, so a wrong base can never land even if
+    detection missed it. ''Before a worker starts'' is enforced as ''on the first pass that sees it running,
+    and never mergeable'', because Hermes, not ASES, starts the worker. swarm doctor --repo checks
+    core.logAllRefUpdates, which the check needs. Acceptance-tested on the fake board
+    (tests/acceptance/test_r10_basecheck.py); never run against a real dispatch. worktree_sync is pinned false
+    (round 5) and, per the Hermes 0.21.3 source, the Kanban dispatcher never syncs from a remote at all; the
+    remaining gap is only that the check has not run against a real dispatch. Earlier note: ROUND 9 T2B
+    (2026-09-27, zero quota): Read against the installed Hermes 0.21.3 source (read only). worktree_sync is
+    already pinned: profiles._config_rows sets worktree_sync: false on every ASES-managed profile (built in
+    round 5, citing this row), and profiles._check_profile reports a live profile that has it on; T2B made
+    swarm doctor tag that drift row with ASES-GIT-16 itself (doctor._extract_requirement_ids), so a drifted
+    value names this requirement. Still partial for two reasons, both honest: the remote-tip case this row
+    guards against has never been exercised (the real test repo has no remote), and the second half of p169,
+    ''Phase 3 MUST verify the actual base commit before a worker starts'', is not built anywhere (listed as a
+    new, separate work item; ASES-GIT-01 is set back to partial for the same reason). Earlier note: Observed
+    on the real 2026-09-19 run: the work-card worktree Hermes created on dispatch was cut at the exact
+    integration tip both times (232e12e for G1, 676628f for G2 after G1 merged), and the gate and merge
+    worktrees ASES makes itself are detached at exact SHAs. Left partial: the test repo has no remote, so
+    Hermes''s default of syncing a worktree from the freshly fetched remote tip (the case this requirement
+    guards against) was never exercised, and whether worktree_sync must be turned off explicitly is
+    unverified.'
 - id: ASES-CFG-05
   requirement: UnoRouter custom-endpoint credentials use Hermes custom-endpoint secret handling; do not
     export provider keys into worker shells
@@ -1661,14 +1707,19 @@ requirements:
     are rechecked by swarm doctor
   section: 5.3, Appendix E
   verified_by: '22.1'
-  status: in_progress
-  note: 'STAGE A (2026-09-28, zero provider quota): a real swarm doctor against the real Hermes 0.21.3 install and
-    the swarm init --global dry run (docs/stage-a-2026-09-28.md) show the real doctor displays value, source
-    and checked date as built in round 9: openrouter has its source
-    (https://openrouter.ai/docs/api-reference/limits); xkiro and opencode_free have no source on record, which
-    only the owner can supply. Earlier note: ROUND 9 (2026-09-27, zero quota): DOCTOR: config/models.yaml
-    carries a source field and swarm doctor displays value, source URL and checked date, WARNing where a
-    source is missing. Sources were taken only from blueprint Appendix E or the file''s own comments, never
-    invented: today only openrouter has one (Appendix E [S12]); xkiro and opencode_free WARN until someone
-    records where their numbers came from. Earlier note: config/models.yaml records verified_on per provider
-    and doctor displays it; the source URLs from Appendix E are not yet echoed into the doctor report itself'
+  status: covered
+  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+    docs/stage-c-2026-09-28.md): config/models.yaml now carries a checked source page for every provider
+    (openrouter from Appendix E [S12]; xkiro https://docs.xkiro.com/api/rate-limits/ and opencode_free
+    https://opencode.ai/docs/zen/, checked 2026-09-28, neither publishing numbers), and a real swarm doctor
+    displays value, source and date for all three. Earlier note: STAGE A (2026-09-28, zero provider quota): a
+    real swarm doctor against the real Hermes 0.21.3 install and the swarm init --global dry run
+    (docs/stage-a-2026-09-28.md) show the real doctor displays value, source and checked date as built in
+    round 9: openrouter has its source (https://openrouter.ai/docs/api-reference/limits); xkiro and
+    opencode_free have no source on record, which only the owner can supply. Earlier note: ROUND 9
+    (2026-09-27, zero quota): DOCTOR: config/models.yaml carries a source field and swarm doctor displays
+    value, source URL and checked date, WARNing where a source is missing. Sources were taken only from
+    blueprint Appendix E or the file''s own comments, never invented: today only openrouter has one (Appendix
+    E [S12]); xkiro and opencode_free WARN until someone records where their numbers came from. Earlier note:
+    config/models.yaml records verified_on per provider and doctor displays it; the source URLs from Appendix
+    E are not yet echoed into the doctor report itself'
