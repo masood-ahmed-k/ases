@@ -195,7 +195,7 @@ Two files in `config/`. Both are read on every command, so an edit takes effect 
 | `budgets.review_reserve_requests` | Requests held back for the review pass (section 8). | 20 |
 | `hermes.tested_version` | The Hermes version ASES was last checked against; `swarm doctor` warns on a mismatch. | `0.21.3` |
 | `hermes.native_home` | The Hermes home, where the profiles live. | `C:/Users/masoo/AppData/Local/hermes` |
-| `sandbox.enabled` | Worker sandbox switch. Off until Docker is running and a pinned image is pulled. **Needs your approval** (Docker). Other keys: `terminal_backend` (docker), `network_default` (false), `mount` (`worktree_only`), `forward_env`, `network_exceptions`; optional `image`, `cpu`, `memory_mb`, `pids_limit`, `extra_deny`. A key that is not known is an error. | `false` |
+| `sandbox.enabled` | Worker sandbox switch. On since 2026-09-28 (round 16, `docs/stage-b-2026-09-28.md`): controller gates and the `coder-1` worker profile run through Docker on the pinned image; no real Hermes worker has run inside Docker yet. Other keys: `terminal_backend` (docker), `network_default` (false), `mount` (`worktree_only`), `forward_env`, `network_exceptions`; optional `image`, `cpu`, `memory_mb`, `pids_limit`, `extra_deny`. A key that is not known is an error. | `true` |
 | `retention.logs_days` | Days to keep logs. Whole number, 1 or more. | 30 |
 | `retention.reports_days` | Days to keep reports. Whole number, 1 or more. | 90 |
 

@@ -140,3 +140,23 @@ The owner asked for autonomous work overnight ("keep doing things back to back",
 | `r13_wp_tidy.md` | TIDY: one process-tree kill helper; doctor reports leaked gate worktrees (ASES-GIT-12) | done, independently reviewed |
 | `r14_audit2_findings.md` | a second read-only audit of what rounds 11 and 12 changed: 3 findings confirmed, 0 refuted | done |
 | `r14_wp.md` | RUNSTART2 (the three findings: ASES-REC-04, MOD-02, GIT-16), CLOCK (an injectable ledger clock, ASES-CAP-03) | done, independently reviewed |
+
+## Rounds 15 and 16 (2026-09-28): stage B, the sandbox switched on, and the reviewer's evidence
+
+The owner said "do all" to a list that included stage B (Docker for real) and the open design question of how git
+works inside a worker's Docker sandbox. Round 15's two packages ran in parallel worktrees, each independently
+reviewed. Round 16 followed from stage C's own finding (`docs/stage-c-2026-09-28.md`): the reviewer requested
+changes on a card it could not itself verify.
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| `r15_wp_sandbox.md` | SANDBOXIMG: a pinned sandbox image and the real Docker probes (ASES-SEC-02, SEC-03, SEC-05, QG-04); WORKERGIT: git inside a worker's Docker sandbox (ASES-SEC-03, SEC-02) | done, independently reviewed |
+| (no separate work order; architect-run) | the `ases-sandbox:py311-2` image rebuild (py311-1's git was too old for relative worktrees; dubious ownership; the live checks' own `rmtree` and `GPG_KEY` bugs found and fixed) and the stage B record, `docs/stage-b-2026-09-28.md` | done |
+| `r16_wp_evidence.md` | EVIDENCE: the reviewer sees the controller's own Gate 1 result as a posted card comment (ASES-REV-05, QG-04, TST-02, ROL-03) | done, independently reviewed with a nemotron second opinion |
+| (no separate work order; architect-run) | PROMPTVER: each prompt's version read from its own first line, not one global constant (ASES-ROL-03) | done |
+| (no separate work order; architect-run) | PACKEDREFS: the harmless `packed-refs.lock` line after a sandboxed commit traced and explained, coder prompt version 2 rule 5 (ASES-SEC-03, ROL-03) | done |
+| (no separate work order; architect-run) | SANDBOX ON: `config/swarm.yaml` `sandbox.enabled: true`, applied for real by `swarm init --global --apply --yes`, `swarm doctor` HEALTHY (ASES-SEC-03, CFG-04, QG-04) | done |
+
+See `docs/stage-b-2026-09-28.md` for the full stage B record, with the verbatim PASS lines and the switch-on
+steps, and `builder-findings.md` for what SANDBOXIMG, WORKERGIT and EVIDENCE found that their own work orders did
+not anticipate.

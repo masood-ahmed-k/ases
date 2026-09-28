@@ -1278,6 +1278,51 @@ arithmetic is tested without monkeypatching a private function, with a test on t
 passed their first review. With this, the zero-quota queue is empty: everything left needs the owner (applying `swarm init`,
 Docker for real, a real run, source URLs, two design decisions). Suite: 5,833 passed, 2 skipped, 0 failed.
 
+## Rounds 15 and 16 and stage B: the sandbox for real, then switched on (2026-09-28)
+
+The owner said "do all" to a list that included stage B (Docker for real) and the open design question of how git
+works inside a worker's Docker sandbox. Round 15 built it as two parallel packages, each independently reviewed
+(`docs/work-orders/r15_wp_sandbox.md`): SANDBOXIMG (`docker/sandbox/Dockerfile`, `scripts/sandbox_live_check.py`,
+commit 6954e88) proved the mount-list denial, the default-deny network and a sandboxed gate run against real
+Docker; WORKERGIT (`scripts/workergit_live_check.py`, commit c80827f) proved a worker can commit inside its own
+dispatched worktree, by setting `worktree.useRelativePaths=true` on a repository ASES creates and mounting the
+repository's `.git` read-only with five writable sub-mounts (objects, refs, logs, worktrees), documented in full
+in `sandbox.py`'s own module docstring. Running both checks for real found that the first image, `python:3.11-slim`
+with git 2.47.3, could not open the relative worktrees WORKERGIT's design needs (git 2.48+ marks such a repository
+with `extensions.relativeWorktrees`); the architect replaced it with `ases-sandbox:py311-2` (`python:3.11-alpine`
+pinned by digest, git 2.54.0-r0, `safe.directory /workspace` against a "dubious ownership" refusal on the
+Windows bind mount, commit 5aa88d9), and fixed two bugs the real runs exposed in the live checks themselves: a
+read-only-safe `rmtree` for stale root-owned git objects, and an exclusion for the base image's own `GPG_KEY`
+fingerprint from the credential-name check. The optional Hermes egress proxy stays not installed, an
+owner-authorised decision (`ASES-SEC-06`). Full record, with the verbatim PASS lines: `docs/stage-b-2026-09-28.md`.
+Round 15 full suite: 5,897 passed, 2 skipped.
+
+Round 16 started from stage C's own finding (`docs/stage-c-2026-09-28.md`): the reviewer requested changes on a
+card it could not itself verify, because it cannot run tests and could not see the controller's own gate result.
+EVIDENCE (commit 0373fe7, independently reviewed with a nemotron second opinion) closes it: `review._post_gate_record`
+posts the controller's Gate 1 result on the card as a comment headed "ASES gate record", redacted before
+truncation and posted once per run; reviewer prompt version 2 tells the reviewer where that record is and that a
+missing one means the gate has not run yet, never a reason by itself to request changes. Two more findings
+surfaced while proving the sandbox: PROMPTVER (commit 1b5cb8b) fixed `profiles.prompt_version()`, which had
+reported one global `PROMPT_VERSION` for every prompt regardless of a prompt's own version line, found in the
+`swarm init` dry run before it could install the new reviewer prompt under a stale header; PACKEDREFS (commit
+e7e2ce8) traced the harmless `packed-refs.lock` message a sandboxed commit prints (git's sequencer cleanup after
+a successful commit, needing a lock in the read-only base `.git` mount) and told the coder prompt (version 2,
+rule 5) to expect it. SANDBOX ON (commit 409dc86) then flipped `config/swarm.yaml`'s `sandbox.enabled` to `true`
+for real: the test repository's five card worktrees were made relative (`git worktree repair --relative-paths`),
+`swarm init --global --apply --yes` wrote the Docker terminal block into the real `coder-1` Hermes profile (12
+changes, 0 failed, every changed file backed up), and `swarm doctor` came back `HEALTHY`. Full suite with round
+16 merged: 5,912 passed, 2 skipped (685.9 s).
+
+What this proves and what it does not: gates and the worker profile now run through Docker rather than the local
+backend, on the pinned `ases-sandbox:py311-2` image, and every check above ran against a real container. No real
+Hermes worker has yet run inside Docker: every PASS is a standalone probe script or a throwaway worktree, never
+an actual dispatched card. A zero-quota check driving Hermes's own Docker terminal code directly against the
+real `coder-1` profile is being built in parallel (HERMESDOCKER; result to be added by the architect, see
+`docs/stage-b-2026-09-28.md`). S1 is parked for OpenRouter's daily quota (resets 00:00 UTC); finishing it is the
+first real run with Docker workers and sandboxed gates, and decides whether `ASES-SEC-02`, `SEC-03`, `SEC-05`,
+`SEC-06`, `SEC-07` and `ASES-CFG-04` can move to `covered`.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and
@@ -1355,6 +1400,16 @@ Docker for real, a real run, source URLs, two design decisions). Suite: 5,833 pa
   sandbox, with a self-contained checkout and task-scoped network. The switch (`sandbox: enabled` in
   `config/swarm.yaml`) stays off by default because Docker has never run for real on this machine, so every
   gate still runs on the host in practice, now with round 8's scrubbed environment and round 9's hardened git.
+  Stale, corrected 2026-09-28 (round 16, commit 409dc86, "Sandbox on: workers and gates run in Docker"): the
+  switch is no longer off by default. Round 15 (SANDBOXIMG and WORKERGIT, commits 6954e88 and c80827f; the
+  architect's `ases-sandbox:py311-2` rebuild, commit 5aa88d9) proved the sandboxed gate, the key and `.env`
+  checks, default-deny network, and a worker's own git commit against real Docker (`scripts/sandbox_live_check.py`,
+  `scripts/workergit_live_check.py`; full record `docs/stage-b-2026-09-28.md`), and `config/swarm.yaml`'s
+  `sandbox.enabled` is now `true`, applied to the `coder-1` profile's terminal block and to the controller's own
+  gate calls by `swarm init --global --apply --yes` (12 changes, 0 failed) and confirmed `HEALTHY` by `swarm
+  doctor --repo`. No real Hermes worker has yet run inside Docker: every PASS above is a standalone probe or a
+  throwaway worktree, never an actual dispatched card, so this remains the S1 finish after the 00:00 UTC
+  OpenRouter quota reset (see "Rounds 15 and 16 and stage B" above).
   One accepted limitation: with the sandbox on, a post-merge Gate 3 re-run that cannot start (Docker down)
   keeps the merge and records a `sandbox_infrastructure_error` event rather than reverting. The text below is
   the pre-round-9 state, kept for the record. Partly true, updated 2026-09-27 (was: "Gate 1/3 run directly on
