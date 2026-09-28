@@ -50,11 +50,12 @@ hermes:
 # the mount must be worktree_only, network access is default-deny (network_default: true is refused) and only
 # ever opened by an explicit task-scoped exception. Optional keys: cpu, memory_mb, pids_limit, extra_deny (not
 # set here, so SandboxPolicy's own defaults apply).
-# image (round 15, SANDBOXIMG): ases-sandbox:py311-1, built from docker/sandbox/Dockerfile -- an official
-# python:3.11-slim base pinned by @sha256 digest, git, and pytest==9.1.1 (matching this project's own venv), on a
+# image (round 15, SANDBOXIMG then WORKERGIT): ases-sandbox:py311-2, built from docker/sandbox/Dockerfile -- an
+# official python:3.11-alpine base pinned by @sha256 digest, git 2.54 (worker worktrees use relative gitdir paths,
+# which need git 2.48 or later inside the container; py311-1's Debian git 2.47 could not), and pytest==9.1.1, on a
 # fixed non-root user (see the Dockerfile's own comment for why: docker_run_as_host_user does nothing on native
 # Windows, so this is the closest available substitute for ASES-SEC-03's "the host user"). Pulled and built
-# locally with `docker build -t ases-sandbox:py311-1 -f docker/sandbox/Dockerfile docker/sandbox`; `swarm
+# locally with `docker build -t ases-sandbox:py311-2 -f docker/sandbox/Dockerfile docker/sandbox`; `swarm
 # doctor`'s sandbox_image row now passes once that build has run (it only checks the image is present locally,
 # never builds or pulls it itself).
 sandbox:
@@ -64,7 +65,7 @@ sandbox:
   mount: worktree_only
   forward_env: []
   network_exceptions: explicit_allowlist
-  image: ases-sandbox:py311-1
+  image: ases-sandbox:py311-2
 
 # How long ASES keeps what it writes under ases_home (ASES-OBS-02: "Transcripts and logs stay local under a
 # retention setting"). `swarm retention` applies these (a dry run unless --apply is given). Each is a whole

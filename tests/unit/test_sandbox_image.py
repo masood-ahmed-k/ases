@@ -49,15 +49,26 @@ def test_the_base_image_is_pinned_by_a_full_sha256_digest_not_a_mutable_tag():
 
 def test_git_and_pytest_are_each_pinned_to_an_exact_version():
     text = _dockerfile_text()
-    # apt: "package=version", never a bare "git" (which would float to whatever is current on rebuild). Matched
-    # from an actual RUN line, not a mention of "apt-get install" in a comment above it.
-    apt_install = re.search(r"^RUN apt-get install[^\n]*|^\s+&& apt-get install[^\n]*", text, re.MULTILINE)
-    assert apt_install is not None
-    assert re.search(r"\bgit=\S+", apt_install.group(0)), "git must be pinned with package=version"
+    # The package manager's "git=version", never a bare "git" (which would float to whatever is current on rebuild).
+    # Matched from an actual RUN line (apk on the Alpine base since py311-2), not a mention in a comment.
+    pkg_install = re.search(r"^RUN apk add[^\n]*|^RUN apt-get install[^\n]*|^\s+&& apt-get install[^\n]*",
+                            text, re.MULTILINE)
+    assert pkg_install is not None
+    assert re.search(r"\bgit=\S+", pkg_install.group(0)), "git must be pinned with package=version"
     # pip: "pytest==x.y.z", never a bare "pytest" or a floor ("pytest>="). Matched from an actual RUN line.
     pip_install = re.search(r"^RUN pip install[^\n]*", text, re.MULTILINE)
     assert pip_install is not None
     assert re.search(r"\bpytest==\d+\.\d+(\.\d+)?\b", pip_install.group(0)), "pytest must be pinned with =="
+
+
+def test_the_pinned_git_is_new_enough_for_relative_worktrees():
+    """WORKERGIT gives worker worktrees relative gitdir paths, and git 2.48 marks such a repository with
+    extensions.relativeWorktrees, which older git refuses to open: py311-1's Debian git 2.47.3 could not work in a
+    worker sandbox, which is why py311-2 moved to the Alpine base."""
+    text = _dockerfile_text()
+    pinned = re.search(r"\bgit=(\d+)\.(\d+)", text)
+    assert pinned is not None, "git must be pinned with a numeric version"
+    assert (int(pinned.group(1)), int(pinned.group(2))) >= (2, 48)
 
 
 def test_the_image_tag_used_elsewhere_is_not_latest():

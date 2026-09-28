@@ -32,22 +32,20 @@ repository, never a real Hermes worker, never a real model provider):
    (exactly what guards.check_primary_checkout's expected_head comparison would catch on the controller's very
    next pass).
 
-A real, load-bearing finding this script surfaces on this machine: SANDBOXIMG's own pinned `ases-sandbox:py311-1`
-(docker/sandbox/Dockerfile, Debian 13 "trixie" stable, git 1:2.47.3-0+deb13u1 -- the newest trixie's own apt
-repository offered on 2026-09-28) ships git 2.47.3, and `worktree.useRelativePaths=true` needs git 2.48+ (it
-marks the repository with `extensions.relativeWorktrees = true`, which git < 2.48 refuses outright: "fatal:
-unknown repository extension found: relativeworktrees" on EVERY git command against that repository, not just
-worktree ones). This script checks the pinned image's own git version first and says plainly whether it can run
-this proof at all; when it cannot, it builds one small throwaway image of its own (an official `alpine` base
-plus `apk add git`, git 2.54 as of this run) so the MOUNT MECHANISM itself is still proven for real, and reports
-the incompatibility as a finding rather than silently switching images. See the WORKERGIT report for exactly
-this: it is the architect's call whether SANDBOXIMG bumps its own pinned git (a different source than Debian
-trixie stable, which does not have 2.48 yet) or WORKERGIT's design is reconsidered.
+A real, load-bearing finding this script surfaced on this machine: `worktree.useRelativePaths=true` needs git
+2.48+ inside the container (it marks the repository with `extensions.relativeWorktrees = true`, which git < 2.48
+refuses outright: "fatal: unknown repository extension found: relativeworktrees" on EVERY git command against that
+repository). SANDBOXIMG's first image, ases-sandbox:py311-1 on Debian 13, had git 2.47.3, so the architect moved the
+sandbox image to the Alpine base (ases-sandbox:py311-2, git 2.54.0; see docker/sandbox/Dockerfile). This script
+still checks the pinned image's git version first and says plainly whether it can run this proof; only if it
+cannot does it build a small throwaway alpine image of its own, reported as a finding, never switched silently.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -68,7 +66,7 @@ REPO = WORKDIR / "repo"
 TASK_ID = "workergit-livecheck-task1"
 BRANCH = f"wt/{TASK_ID}"
 
-PINNED_IMAGE = "ases-sandbox:py311-1"
+PINNED_IMAGE = "ases-sandbox:py311-2"
 _MIN_GIT = (2, 48)
 FALLBACK_DOCKERFILE = "FROM alpine:latest\nRUN apk add --no-cache git\n"
 FALLBACK_IMAGE = "ases-workergit-livecheck:alpine-git"
@@ -158,12 +156,32 @@ def choose_image() -> str | None:
     return FALLBACK_IMAGE
 
 
+def _force_rmtree(path: pathlib.Path) -> None:
+    """shutil.rmtree that also removes read-only files: git marks every object file read-only, and on Windows
+    rmtree cannot delete a read-only file, so a plain rmtree(ignore_errors=True) left a previous run's repository
+    half-deleted (found 2026-09-28). The hook clears the read-only bit and retries the failed call once; anything
+    still failing propagates to the caller's own "could not remove" check."""
+    def _clear_and_retry(func, failed_path, _exc_info):
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+    try:
+        shutil.rmtree(path, onerror=_clear_and_retry)
+    except OSError:
+        pass
+
+
 def step1_build_repo_and_worktree() -> pathlib.Path | None:
     """Mirrors controller.ensure_repo_bootstrapped (worktree.useRelativePaths=true before anything else) and
     then Hermes's own kanban_db_workspace._ensure_git_worktree / _anchored_worktree shape: `<repo>/.worktrees/
     <task_id>`, `git worktree add -b <branch> <path> HEAD`."""
     if REPO.exists():
-        shutil.rmtree(REPO, ignore_errors=True)
+        _force_rmtree(REPO)
+    if REPO.exists():
+        # A silent partial cleanup once left root-owned object directories from an earlier run behind, and the
+        # next run's non-root container then failed with "insufficient permission" for a reason unrelated to the
+        # design under test (2026-09-28). Refuse to run on a dirty directory instead of producing a false result.
+        _fail("clean work directory", f"could not remove the previous run's {REPO}; delete it by hand and re-run")
+        return None
     REPO.mkdir(parents=True, exist_ok=True)
     steps = [
         (["init", "-q", "-b", "main"], "init"),
@@ -242,7 +260,10 @@ else
   echo "CONFIG_WRITE_BLOCKED: $(cat /tmp/cfgerr)"
 fi
 echo '--- env (must show no credential-shaped variable) ---'
-if env | grep -iE 'key|token|secret|password' ; then
+# GPG_KEY is set by the official python base image itself: the PUBLIC fingerprint of the Python release manager's
+# signing key, used to verify the CPython download at image build time. Not a secret, and Docker cannot unset an
+# inherited ENV, so exactly that one name is excluded; any other credential-shaped name still fails the check.
+if env | grep -iE 'key|token|secret|password' | grep -v '^GPG_KEY=' ; then
   echo ENVCHECK_LEAK_FOUND
 else
   echo ENVCHECK_CLEAN
@@ -317,7 +338,10 @@ def main() -> int:
           "model provider, never the real test repository.")
     print(f"work directory: {WORKDIR}")
     if WORKDIR.exists():
-        shutil.rmtree(WORKDIR, ignore_errors=True)
+        _force_rmtree(WORKDIR)
+    if WORKDIR.exists():
+        print(f"[FAIL] clean work directory - could not remove {WORKDIR} from a previous run; delete it and re-run")
+        return 1
     WORKDIR.mkdir(parents=True, exist_ok=True)
 
     ok, why = sandbox_mod.docker_available()
