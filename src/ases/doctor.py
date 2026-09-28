@@ -21,12 +21,15 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import inspect
+import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
 from . import config as ases_config
+from . import events as events_mod
 from . import gitexec
 from . import hermes as hermes_mod
 from . import models as models_mod
@@ -160,6 +163,128 @@ def _check_log_all_ref_updates(repo: pathlib.Path | None) -> DoctorCheck:
         "go undetected right along with every legitimate card",
         ("ASES-GIT-01", "ASES-GIT-16"),
     )
+
+
+_WORKTREE_LEAK_KINDS = ("gate_worktree_leak", "merge_worktree_leak")
+_WORKTREE_LEAK_IDS = ("ASES-GIT-12",)
+
+
+def _leaked_worktree_events(conn, project_name: str) -> list[dict]:
+    """Every gate_worktree_leak/merge_worktree_leak event recorded for this project (gates.run_gate's
+    `_report_worktree_leak_if_any`, mergeq.merge_task's `_report_candidate_leak_if_any`, round 12 finding 11):
+    each one names a throwaway gate or merge worktree that `git worktree remove --force` deregistered but a
+    Windows file lock kept from actually being deleted. Project-scoped through events.PROJECT_SCOPE_SQL, the one
+    project-scope filter every reader of the events table uses (round 10 rules), so this sees exactly this
+    project's own rows (plus legacy rows with no project recorded), never another project's."""
+    placeholders = ", ".join("?" for _ in _WORKTREE_LEAK_KINDS)
+    rows = conn.execute(
+        f"SELECT kind, payload FROM events WHERE kind IN ({placeholders}) AND {events_mod.PROJECT_SCOPE_SQL} "
+        "ORDER BY id",
+        (*_WORKTREE_LEAK_KINDS, project_name),
+    ).fetchall()
+    found = []
+    for kind, payload in rows:
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("path"):
+            found.append({"kind": kind, **data})
+    return found
+
+
+def _norm_path(path: str) -> str:
+    """Forward slashes, so a path compares equal whichever way it was spelled: `git worktree list --porcelain`
+    always prints forward slashes, even on Windows (proven against a real repository while building this check),
+    while the leak events store `str(tmp_root)`, native backslashes there. Neither side is wrong, they just do
+    not compare equal as raw strings without this. Also lower-cased on Windows only: its filesystem is
+    case-insensitive, so a leak event's own recorded path and git's own report of the same directory are not
+    guaranteed to agree on case, and a caller here wants "the same directory", not "the same bytes". POSIX stays
+    case-sensitive, matching its filesystem."""
+    normalized = pathlib.PurePath(path).as_posix()
+    return normalized.lower() if os.name == "nt" else normalized
+
+
+def _registered_worktrees(repo: pathlib.Path) -> set[str] | None:
+    """The paths `git worktree list` still has registered for the project repository, normalized with
+    `_norm_path` so they compare equal to a leak event's own (natively-spelled) path, or None when the command
+    could not be read at all (git missing, timeout, `repo` not a repository). None is "unknown", never "nothing
+    registered": a caller must not let a git failure here make a real leak look cleaned up."""
+    try:
+        result = subprocess.run(
+            [*gitexec.GIT, "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=15, env=gitexec.git_env(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return {
+        _norm_path(line[len("worktree "):].strip())
+        for line in result.stdout.splitlines() if line.startswith("worktree ")
+    }
+
+
+def _check_leaked_worktrees(project: ases_config.ProjectConfig, conn, repo: pathlib.Path | None) -> DoctorCheck:
+    """Blueprint p185 (ASES-GIT-12) makes the controller responsible for what sits outside a worker's own
+    worktree. Round 12 (finding 11) started RECORDING a leaked throwaway gate/merge worktree when `git worktree
+    remove --force` deregisters it but a Windows file lock (a hung gate command that still has it as its cwd, or
+    any other process with an open handle inside it) keeps the directory itself from being deleted -- but nothing
+    ever surfaced those records anywhere a person would look. This is that surface.
+
+    One WARN row per distinct leaked path that is STILL present (its directory still exists on disk, and/or `git
+    worktree list` of the project repository still has it registered), never FAIL: a leftover throwaway worktree
+    is disk and hygiene, a leaked test-run byproduct, not a broken gate or a security problem, and it must not
+    turn `swarm doctor`'s overall status red. Read-only, like every other check in this module: this never
+    deletes a directory or runs `git worktree prune` itself, it only names each path and the two commands
+    (`git worktree prune`, then delete the directory if it remains) that clean it up.
+
+    A path recorded once but no longer present anywhere (the operator already cleaned it up) drops out silently:
+    only what is still actually leaked is worth a row. `repo` is optional, exactly like `_check_log_all_ref_updates`
+    (cmd_doctor's `--repo`, round 10): without it, presence is judged from disk existence alone and the row says
+    so, so it never claims a `git worktree list` cross-check it did not make."""
+    leaks = _leaked_worktree_events(conn, project.name)
+    if not leaks:
+        return DoctorCheck(
+            "leaked_worktrees", "pass", "no gate/merge worktree-leak events recorded for this project",
+            _WORKTREE_LEAK_IDS,
+        )
+    registered = _registered_worktrees(repo) if repo is not None else None
+    still_present: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for leak in leaks:
+        path = str(leak["path"])
+        if path in seen:
+            continue
+        seen.add(path)
+        on_disk = pathlib.Path(path).exists()
+        also_registered = registered is not None and _norm_path(path) in registered
+        if not (on_disk or also_registered):
+            continue
+        reasons = []
+        if on_disk:
+            reasons.append("directory still on disk")
+        if also_registered:
+            reasons.append("still registered in `git worktree list`")
+        still_present.append((leak.get("kind", "?"), path, ", ".join(reasons)))
+    if not still_present:
+        return DoctorCheck(
+            "leaked_worktrees", "pass",
+            f"{len(leaks)} worktree-leak event(s) recorded for this project, but none of the leaked path(s) are "
+            "still present (already cleaned up)",
+            _WORKTREE_LEAK_IDS,
+        )
+    detail = f"{len(still_present)} leaked gate/merge worktree(s) still present: " + "; ".join(
+        f"{kind} at {path} ({why}) -- run `git worktree prune` in the project repository, then delete the "
+        "directory if it remains"
+        for kind, path, why in still_present
+    )
+    if repo is None:
+        detail += (
+            " (swarm doctor was not given --repo this time, so `git worktree list` was not cross-checked; "
+            "presence above is from the recorded path's disk existence alone)"
+        )
+    return DoctorCheck("leaked_worktrees", "warn", detail, _WORKTREE_LEAK_IDS)
 
 
 def _check_gitattributes(project: ases_config.ProjectConfig) -> DoctorCheck:
@@ -668,6 +793,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         _check_not_under_onedrive(project),
         _check_git_longpaths(project),
         _check_log_all_ref_updates(repo),
+        _check_leaked_worktrees(project, conn, repo),
         _check_gitattributes(project),
         _check_python_version(),
         _check_git_version(),

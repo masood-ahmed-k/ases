@@ -1,8 +1,16 @@
 """procenv.scrubbed_environ: the one definition of a credential-shaped environment variable name (ASES-CFG-05,
-ASES-SEC-01), shared by hermes._run, evals._run_process and evalkit.codeeval.scrubbed_env."""
-import os
+ASES-SEC-01), shared by hermes._run, evals._run_process and evalkit.codeeval.scrubbed_env.
 
-from ases import procenv
+Also procenv.kill_process_tree (round 13, TIDY): the one "stop a process and everything it started"
+implementation gates.py's and evals.py's own `_kill_process_tree` both delegate to. Their own test files already
+prove the branch logic against fakes (never a real process); this file proves the real-process case once,
+directly, against the shared helper itself."""
+import os
+import subprocess
+import sys
+import time
+
+from ases import procenv, reconcile
 
 WORDS = ("key", "token", "secret", "passw", "credential", "auth", "cookie", "session")
 
@@ -86,3 +94,70 @@ def test_scrubbed_environ_exemption_is_by_exact_name_not_by_substring(monkeypatc
     env = procenv.scrubbed_environ()
 
     assert "GIT_AUTHOR_NAME_EXTRA" not in _names(env)
+
+
+# --- round 13 (TIDY): kill_process_tree, the shared "stop a process and everything it started" ------------------
+
+
+def test_kill_process_tree_kills_a_real_child_and_the_grandchild_it_spawned(tmp_path):
+    """gates.py and evals.py each need this because a single Popen.kill()/terminate() (or, on POSIX, a plain
+    os.kill/os.killpg on the wrong pid) can leave a grandchild running: a shell=True command's real process
+    (gates.py) or a launcher's own model-call child (evals.py). Proves the shared helper really ends both, on
+    whichever platform this suite runs on, rather than only the mocked branch logic each caller's own test file
+    already covers."""
+    grandchild_started = tmp_path / "grandchild-started.txt"
+    child_started = tmp_path / "child-started.txt"
+    grandchild_pid_file = tmp_path / "grandchild-pid.txt"
+
+    grandchild_script = tmp_path / "grandchild.py"
+    grandchild_script.write_text(
+        "import pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).write_text('1')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    child_script = tmp_path / "child.py"
+    child_script.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "pathlib.Path(sys.argv[1]).write_text('1')\n"
+        "gc = subprocess.Popen([sys.executable, sys.argv[3], sys.argv[2]])\n"
+        "pathlib.Path(sys.argv[4]).write_text(str(gc.pid))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+    # Matches gates.py's own _run_commands: on POSIX the child gets its own session, so its pid is also its
+    # process group id and os.killpg(child.pid, ...) (process_group=True below) ends the whole group, the
+    # grandchild included. Nothing extra is needed on Windows: taskkill /T walks the real OS process tree either
+    # way.
+    popen_kwargs = {} if os.name == "nt" else {"start_new_session": True}
+    child = subprocess.Popen(
+        [sys.executable, str(child_script), str(child_started), str(grandchild_started),
+         str(grandchild_script), str(grandchild_pid_file)],
+        **popen_kwargs,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (child_started.exists() and grandchild_started.exists()):
+            time.sleep(0.1)
+        assert child_started.exists() and grandchild_started.exists(), "the child and grandchild never started"
+        grandchild_pid = int(grandchild_pid_file.read_text().strip())
+        assert reconcile.pid_alive(child.pid) is True
+        assert reconcile.pid_alive(grandchild_pid) is True
+
+        procenv.kill_process_tree(child.pid, is_windows=(os.name == "nt"), process_group=True)
+
+        # Polled, not child.wait(timeout=...): a bare wait() would raise TimeoutExpired on a slow machine and
+        # skip the grandchild check entirely, rather than reporting the aliveness this test is actually about.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and reconcile.pid_alive(child.pid):
+            time.sleep(0.1)
+        assert reconcile.pid_alive(child.pid) is False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and reconcile.pid_alive(grandchild_pid):
+            time.sleep(0.1)
+        assert reconcile.pid_alive(grandchild_pid) is False
+        child.wait(timeout=5)  # reap the now-dead child so it does not linger as a zombie
+    finally:
+        if child.poll() is None:
+            child.kill()

@@ -321,16 +321,16 @@ class _Process:
 def _kill_process_tree(pid: int) -> None:
     """Stop a process and everything it started. On Windows `os.kill` does NOT probe a process, it terminates it, so
     it is never used there: `taskkill /PID n /T /F` ends the tree. Best effort, never raises. Every caller takes this as
-    an injectable argument so a test never touches a real process."""
-    try:
-        if _IS_WINDOWS:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
-        else:
-            import signal
+    an injectable argument so a test never touches a real process.
 
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-    except (OSError, subprocess.SubprocessError):
-        pass
+    Round 13 (TIDY): the actual kill is now procenv.kill_process_tree, the one definition this and gates.py's own
+    `_kill_process_tree` both delegate to. `process_group=False` (the default) keeps this caller's own POSIX
+    behaviour exactly: `_run_process` starts the Hermes launcher in the caller's own session, not a new one, so
+    its pid is not, in general, a process group leader, and `os.killpg` (gates.py's own choice, since ITS command
+    runs in its own session) could raise or reach the wrong group here. See procenv.kill_process_tree's docstring
+    for the full story. This thin wrapper stays so `evals._kill_process_tree` keeps working as `_run_process`'s
+    injectable default and a test can still flip `evals._IS_WINDOWS` and see it take effect here."""
+    procenv.kill_process_tree(pid, is_windows=_IS_WINDOWS)
 
 
 def _run_process(
