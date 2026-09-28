@@ -3888,3 +3888,36 @@ the facts file, the review loop failed once, on the comment-posting failure itse
   it is the first real run with Docker workers and sandboxed gates, deciding whether `ASES-SEC-02`, `SEC-03`,
   `SEC-05`, `SEC-06`, `SEC-07` and `ASES-CFG-04` can move to `covered`.
 
+
+## Round 17 (2026-09-29): what the packages found that their specs did not anticipate
+
+Architect-authored summary of the workflow's builder and reviewer reports.
+
+### CONTAINERS
+
+- The spec assumed a worker's container could be found by card id (blueprint p353's own words). Reading Hermes
+  0.21.3's source and running `scripts/hermes_container_labels_check.py` with Hermes's own Python showed it cannot:
+  the task-id label resolves to the literal "default" for a kanban-dispatched worker, and the container name is
+  random. The design moved to the `hermes-profile` label.
+- Review round 1 found the first labels check did not actually pass when run; fixed. Round 2 found the sweep could
+  stop another ASES project's live container if both used the same profile name; answered with a documented hard
+  constraint and the `profile_isolation` doctor row, since no label carries a project id. Round 3 found that
+  `swarm stop`'s own container step still matched card ids and so could never stop a real sandbox (ASES-REC-06,
+  p357); the architect fixed it (step f stops every running container of this project's profiles), proved it with
+  four tests that fail without the change, extended the real-Docker live check, and had nemotron review the diff
+  (nothing wrong found). The reviewer's minor finding (the new doctor rows tagged ASES-CFG-04) was fixed: they now
+  carry ASES-SEC-03, REC-04 and REC-06.
+
+### SCENARIOS
+
+- Two p410 clauses had never been tested at any level: a commit added after approval voiding it, and escalation
+  at the lineage budget. Both work in the product; each new test was shown to fail with its guard removed.
+- The builder had to add `* -text` to the bootstrapped test repository's `.gitattributes`, because this machine's
+  system `core.autocrlf=true` re-normalised files the scenario commits.
+- Reviewer minors, fixed by the architect: the 22.2 publish now includes architecture, contracts and decisions,
+  not only plan.json, and four acceptance docstrings no longer point at the removed `test_scenarios_demo.py`.
+
+### FAKEFIX
+
+- The defect the register described was fixed in round 6 (0e66674); only the register note was stale. The pre-fix
+  logic from commit 8f847be reproduced the old failure, and the current code does not.

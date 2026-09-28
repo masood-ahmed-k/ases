@@ -161,3 +161,14 @@ changes on a card it could not itself verify.
 See `docs/stage-b-2026-09-28.md` for the full stage B record, with the verbatim PASS lines and the switch-on
 steps, and `builder-findings.md` for what SANDBOXIMG, WORKERGIT and EVIDENCE found that their own work orders did
 not anticipate.
+
+## Round 17 (2026-09-29): Tier 1, zero quota
+
+Run as one workflow: a Sonnet builder per package in its own worktree, an independent Sonnet reviewer with a
+nemotron second opinion, and up to two fix rounds. The specs are in the workflow script, not a work-order file.
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| (workflow spec) | CONTAINERS: worker sandboxes found by Hermes profile (Hermes never labels them with a card id), swept before new work, stopped by swarm stop (ASES-REC-04, REC-06, SEC-03) | done; three review rounds; the swarm stop step finished by the architect with before/after and real-Docker proof |
+| (workflow spec) | SCENARIOS: acceptance 22.2 and 22.6 as full scenarios, TST-02 note corrected (ASES-TST-02) | done, reviewed PASS; two minor findings fixed by the architect |
+| (workflow spec) | FAKEFIX: the fail_next defect was already fixed in round 6; last workaround removed, 22.15 strengthened (ASES-REC-03) | done, reviewed PASS |

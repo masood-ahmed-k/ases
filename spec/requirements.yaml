@@ -1380,7 +1380,15 @@ requirements:
   section: '19.4'
   verified_by: '22.7'
   status: in_progress
-  note: 'ROUND 14 (2026-09-28, zero quota, second audit A2-0 and A2-2): every swarm run refusal, including the
+  note: 'ROUND 17 (2026-09-29, zero quota, CONTAINERS, merge 161077e): p353 ("Orphan worker processes from a
+    previous controller session are found by card ID and terminated before new work starts") now covers worker
+    sandboxes too: ases.containers.sweep_orphan_containers runs in reconcile-on-start and in the per-pass
+    provisioning step, stopping a running Hermes container of this project''s profiles when no card runs under
+    that profile. By profile, not card id, because Hermes never labels a container with its card id (see
+    ASES-REC-06). A profile with live work is left alone; Docker absent or the board unreadable is a no-op.
+    swarm doctor has orphan_containers and profile_isolation rows (profile names must be unique per machine).
+    Proven on real Docker (scripts/orphan_sweep_live_check.py). Not yet exercised in a real run. Earlier note:
+    ROUND 14 (2026-09-28, zero quota, second audit A2-0 and A2-2): every swarm run refusal, including the
     ASES-MOD-02 model pre-flight, now happens before the project is marked running, and the state is re-read
     right before starting, so a pause that lands during reconcile is refused (exit 4) instead of being flipped
     back to running. Earlier note: ROUND 12 (2026-09-28, zero quota, from a verified adversarial audit,
@@ -1432,7 +1440,14 @@ requirements:
   section: '19.6'
   verified_by: '22.13'
   status: covered
-  note: 'swarm stop: hermes pause (halts new dispatch) + reclaim every running card, event-logged. Verified
+  note: 'ROUND 17 (2026-09-29, zero quota, CONTAINERS, merge 161077e): with the sandbox on since 2026-09-28,
+    p357''s "terminate worker process trees and sandboxes" was not met for sandboxes: step f matched card ids,
+    and Hermes labels a real worker container hermes-task-id="default" (never the card id; proven with Hermes''s
+    own Python against real Docker, scripts/hermes_container_labels_check.py). Step f now also stops every
+    running Hermes container of this project''s profiles, live work included; cli.cmd_stop passes the
+    profiles. Proven on real Docker (scripts/orphan_sweep_live_check.py, twice): the card-id listing finds
+    nothing, the profile listing finds the running card''s container and stops it, another profile''s container
+    is never touched. Status stays covered. Earlier note: swarm stop: hermes pause (halts new dispatch) + reclaim every running card, event-logged. Verified
     for real (0 running cards, clean pause/resume cycle). Deliberately does not hunt/kill arbitrary hermes.exe
     processes -- no reliable way to distinguish an ASES worker''s PID from an unrelated Hermes chat session
     the user has open; pause+reclaim already gives the real safety property per Hermes''s own reclaim
@@ -1479,7 +1494,10 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'HERMESDOCKER (2026-09-28, zero quota, merge 5bd81bf): scripts/hermes_docker_terminal_check.py drove
+  note: 'ROUND 17 (2026-09-29, zero quota, CONTAINERS, merge 161077e): a worker container left running by a
+    timeout is now stopped before new work starts (the orphan sweep, see ASES-REC-04) and swarm stop stops
+    every sandbox of this project''s profiles (see ASES-REC-06), both proven on real Docker. Earlier note:
+    HERMESDOCKER (2026-09-28, zero quota, merge 5bd81bf): scripts/hermes_docker_terminal_check.py drove
     Hermes 0.21.3''s own Docker terminal code with a copy of the real coder-1 profile config and found every
     worker command would have failed (Hermes runs commands as bash -c; the Alpine image had no bash).
     ases-sandbox:py311-3 adds a pinned bash; on it, through Hermes''s own execute: pwd /workspace, uid 1000, git

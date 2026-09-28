@@ -1323,6 +1323,39 @@ command as `bash -c` while the Alpine image had no bash: every worker command wo
 first real run with Docker workers and sandboxed gates, and decides whether `ASES-SEC-02`, `SEC-03`, `SEC-05`,
 `SEC-06`, `SEC-07` and `ASES-CFG-04` can move to `covered`.
 
+## Round 17: worker sandboxes found by profile, and the reduced scenarios made full (2026-09-29)
+
+Tier 1 of the "what's left" list: zero quota, no owner decisions. Three packages in parallel worktrees, each built
+by a Sonnet builder and independently reviewed (a Sonnet reviewer plus a nemotron second opinion) with up to two
+fix rounds, run as one workflow.
+
+- **CONTAINERS** (merge 161077e; ASES-REC-04, REC-06, SEC-03). The package set out to find worker sandboxes by
+  card id (blueprint p353) and found that impossible: Hermes 0.21.3 labels a dispatched worker's container
+  `hermes-agent=1`, `hermes-profile=<profile>`, `hermes-task-id="default"` (never the card id, because a kanban
+  worker runs without a session key) and gives it a random name. `scripts/hermes_container_labels_check.py` proves
+  it with Hermes's own Python against real Docker; `src/ases/containers.py`'s docstring has the file:line trail.
+  So `ases.containers` finds sandboxes by PROFILE: a running Hermes container of one of this project's profiles,
+  with no card running under that profile, is an orphan and is stopped in reconcile-on-start and in the per-pass
+  provisioning step. A profile with live work is left alone. The reviewers' last open finding was the kill switch:
+  `swarm stop`'s container step still matched card ids, so with the sandbox on it could never stop a real sandbox
+  (p357). The architect finished it: step f now also stops every running Hermes container of this project's
+  profiles, live work included, with a before/after proof (four new tests fail without it) and a real-Docker proof
+  added to `scripts/orphan_sweep_live_check.py`. The price, stated as a hard constraint and checked by the new
+  `profile_isolation` doctor row: Hermes profile names must be unique per machine across ASES projects, since a
+  container carries no project id.
+- **SCENARIOS** (merge 173641b; ASES-TST-02). 22.2 and 22.6 are full scenarios now (`test_22_2_end_to_end.py`,
+  `test_22_6_review.py`): an empty repository through Gate 0, Gate P and the publish of architecture, contracts,
+  decisions and plan.json before any card exists; the question through `swarm questions` and `swarm answer`; a
+  commit after approval voiding it; repeated violation escalating at the lineage budget. The last two had never
+  been tested at any level; each test was shown to fail with its guard removed. No product bug was found. TST-02
+  stays partial (22.11's real-Docker network clause is unit-level only); its stale claim about 22.4 is corrected.
+- **FAKEFIX** (merge 5e365dd; ASES-REC-03). The register said `FakeHermes.fail_next` could not be armed after
+  `install()`; that was fixed in round 6 and the note never updated. The last workaround is gone and 22.15 gained
+  a crash in the middle of card creation, repeated with no duplicate cards.
+- Housekeeping: the merged round branches `r9` to `r14` and the images `py311-1` and `py311-2` removed.
+
+Full suite after the merges: 5980 passed, 2 skipped. `swarm doctor` HEALTHY, both new container rows PASS.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and
