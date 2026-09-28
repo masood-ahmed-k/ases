@@ -11,11 +11,15 @@ afforded. "Never probes the provider" is implicit throughout: this file never st
 HTTP server), so a network call anywhere in the code under test would hang or error the whole suite, not silently
 pass.
 
-ledger.py has NO injectable "today": ledger._today() always reads datetime.now(timezone.utc) directly (read
-2026-09-22; grepped the whole module for a now/date parameter and there is none). run_pass's own `now` (which the
-World/FakeHermes clock supplies) is never consulted by ledger.py at all -- process_budget_gate, can_afford and
-record_usage all go straight to the real wall clock. So "simulate the reset" here means monkeypatching
-ases.ledger._today itself, exactly as r6_wp_ac_a.md anticipated might be necessary; there is nothing to inject.
+ledger.py now has an injectable clock (round 14, package CLOCK): every public function that reads "today" takes
+its own `now` keyword (record_usage, usage_today, usage_today_for_provider, remaining_today, can_afford), and
+`ledger.default_now` is the one public, documented fallback they resolve to when a call gives no `now` of its
+own. run_pass's own `now` (which the World/FakeHermes clock supplies) still is not threaded into
+process_budget_gate/process_unpark (only into process_recovery/process_bounds/process_finalize; that wiring is
+controller.py's, outside this package's files), so "simulate the reset" here still means pointing ledger's clock
+at a fixed day for the whole pass loop -- but now that is `monkeypatch.setattr(ledger, "default_now", ...)`, a
+public attribute meant to be replaced this way, never `ledger._today` itself, which is a private implementation
+detail and no longer touched by this file at all.
 """
 from __future__ import annotations
 
@@ -76,9 +80,13 @@ def test_22_9_a_card_over_the_daily_budget_is_parked_shown_and_resumes_after_the
     world_factory, run_until, git, monkeypatch,
 ):
     """Blueprint 22.9 ([p415]/[p416]). ASES-CAP-03."""
-    day_one = "2026-01-15"
-    day_two = "2026-01-16"   # the simulated reset: the next UTC day, a fresh ledger row, nothing carried over
-    monkeypatch.setattr(ledger, "_today", lambda: day_one)
+    # day_two is the simulated reset: the next UTC day, a fresh ledger row, nothing carried over from day_one.
+    day_one_moment = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    day_two_moment = datetime(2026, 1, 16, 12, 0, tzinfo=timezone.utc)
+    # ledger.default_now (public, documented, meant to be replaced this way) is the fallback every ledger call
+    # below resolves to when it is not given its own `now` -- this is what points the WHOLE pass loop (which
+    # never threads its own `now` into process_budget_gate) at a simulated day, without touching ledger._today.
+    monkeypatch.setattr(ledger, "default_now", lambda: day_one_moment)
 
     world = world_factory(plan_raw=QUOTA_PLAN, budgets=BUDGETS, models_config=MODELS_CONFIG)
     conn = world.conn
@@ -116,11 +124,11 @@ def test_22_9_a_card_over_the_daily_budget_is_parked_shown_and_resumes_after_the
     # code could have reached even if it tried -- the absence of that fixture IS the proof.
 
     # --- show the reset time: the report the person would read names it explicitly. `now` is the report's own
-    # clock (report.py: "the day used for ... the next reset"), independent of ledger._today, so it is given
-    # explicitly here to land on day_one rather than the real wall clock.
+    # clock (report.py: "the day used for ... the next reset"), passed explicitly here so it reads day_one
+    # regardless of the real wall clock; report.py now hands this same `now` to ledger.usage_today_for_provider
+    # too (round 14, package CLOCK), so the report's own budget numbers agree with it as well, not just the date.
     rep = report.build_report(
-        world.board, world.plan, world.project, world.models_config, conn,
-        now=datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc),
+        world.board, world.plan, world.project, world.models_config, conn, now=day_one_moment,
     )
     assert rep["budget"]["next_reset"] == "2026-01-16T00:00:00+00:00"
     parked_in_report = [row for row in rep["budget"]["parked"] if row["task_key"] == "T1"]
@@ -135,7 +143,7 @@ def test_22_9_a_card_over_the_daily_budget_is_parked_shown_and_resumes_after_the
         assert word not in blob
 
     # --- simulate the reset: the next UTC day, a fresh ledger row (nothing carried over from day_one's usage).
-    monkeypatch.setattr(ledger, "_today", lambda: day_two)
+    monkeypatch.setattr(ledger, "default_now", lambda: day_two_moment)
     assert ledger.usage_today_for_provider(conn, CAPPED_PROVIDER) == 0   # the day rolled over, as the ledger sees it
 
     run_until(world, lambda w: w.card(t1.work_card_id)["status"] != "scheduled")
@@ -160,7 +168,7 @@ def test_22_9_process_budget_gate_never_parks_a_card_that_is_not_ready(world_fac
     """A narrower check of the same mechanism: process_budget_gate only ever inspects the 'ready' lane
     (hermes.kanban_list(board, status="ready")), so a card that is already scheduled, blocked or running is never
     a candidate for a SECOND park event, which is the real reason 22.9's idle loop above never thrashes."""
-    monkeypatch.setattr(ledger, "_today", lambda: "2026-02-01")
+    monkeypatch.setattr(ledger, "default_now", lambda: datetime(2026, 2, 1, 12, 0, tzinfo=timezone.utc))
     world = world_factory(
         plan_raw={**QUOTA_PLAN, "tasks": QUOTA_PLAN["tasks"][:1]}, budgets=BUDGETS, models_config=MODELS_CONFIG,
     )

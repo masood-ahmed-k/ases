@@ -197,7 +197,8 @@ def build_report(
 
     `now` is the report's clock (generated_at, the wall-clock bound, the day used for "requests today by model"
     and the next reset); None means the real time. The provider totals come from ledger.usage_today_for_provider,
-    which always reads the real UTC day, so in production the two are the same day.
+    which is handed this same `now` (round 14, package CLOCK), so the two can never disagree about which day it
+    is, even when a test points the whole report at a simulated moment.
 
     Cards are read from Hermes (kanban_show for each task's current work card and its merge card, kanban_list for
     the parked ones) and everything else from the ASES database. A card Hermes cannot show is reported with status
@@ -393,7 +394,10 @@ def _budget_panel(
     permissive number than the gate that actually parks cards. An explicit 0 still means 0.
 
     A provider with no known daily cap has limit, remaining and reserve None: the report never invents a number
-    for it. `next_reset` is the next UTC midnight, when the ledger's day rolls over."""
+    for it. `next_reset` is the next UTC midnight, when the ledger's day rolls over. `now` is passed to every
+    ledger read below (round 14, package CLOCK) so "used"/"remaining" and the "requests today by model" query a
+    few lines down always agree on which UTC day is "today", instead of the ledger silently reading the real
+    wall clock while the rest of the report reads a simulated one."""
     providers = models_config.get("providers", {})
     reserve_percent = project.budgets.get("daily_reserve_percent", ledger.DEFAULT_DAILY_RESERVE_PERCENT)
     rows = []
@@ -402,8 +406,8 @@ def _budget_panel(
         rows.append({
             "provider": name,
             "limit": limit,
-            "used": ledger.usage_today_for_provider(conn, name),
-            "remaining": ledger.remaining_today(conn, providers, name),
+            "used": ledger.usage_today_for_provider(conn, name, now=now),
+            "remaining": ledger.remaining_today(conn, providers, name, now=now),
             "reserve": None if limit is None else int(limit * reserve_percent / 100),
             "status": entry.get("status"),
         })
