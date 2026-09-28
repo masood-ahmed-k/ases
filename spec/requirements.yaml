@@ -811,7 +811,11 @@ requirements:
   section: '10.2'
   verified_by: '22.10'
   status: in_progress
-  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): scripts/sandbox_live_check.py''s key_visibility_test (commit
+  note: 'HERMESDOCKER (2026-09-28, zero quota, merge 5bd81bf): scripts/hermes_docker_terminal_check.py drove
+    Hermes 0.21.3''s own Docker terminal code (apply_terminal_config_to_env, ensure_task_env, DockerEnvironment,
+    execute) with a copy of the real coder-1 profile config: env inside showed no credential-shaped name and not
+    the planted secret, and Hermes''s docker argv carried no -e flag at all (docs/stage-b-2026-09-28.md). Still
+    not a real dispatched card. Earlier note: ROUND 15 and STAGE B (2026-09-28, zero quota): scripts/sandbox_live_check.py''s key_visibility_test (commit
     6954e88) and scripts/workergit_live_check.py''s no-credential-shaped-env-var check (commit c80827f)
     proved no provider key is visible inside a real Docker terminal on ases-sandbox:py311-2
     (docs/stage-b-2026-09-28.md). The Docker sandbox the earlier note said this needed is now switched on
@@ -1426,7 +1430,13 @@ requirements:
   section: '21.3'
   verified_by: '22.11'
   status: in_progress
-  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): WORKERGIT (commit c80827f) proved a worker can commit inside
+  note: 'HERMESDOCKER (2026-09-28, zero quota, merge 5bd81bf): scripts/hermes_docker_terminal_check.py drove
+    Hermes 0.21.3''s own Docker terminal code with a copy of the real coder-1 profile config and found every
+    worker command would have failed (Hermes runs commands as bash -c; the Alpine image had no bash).
+    ases-sandbox:py311-3 adds a pinned bash; on it, through Hermes''s own execute: pwd /workspace, uid 1000, git
+    status and commit work, /.git hooks and config read-only, network blocked, --network=none, the five
+    WORKERGIT mounts expanded correctly, container removed afterwards (docs/stage-b-2026-09-28.md). Still not a
+    real dispatched card: the S1 finish is. Earlier note: ROUND 15 and STAGE B (2026-09-28, zero quota): WORKERGIT (commit c80827f) proved a worker can commit inside
     its own dispatched worktree in real Docker: scripts/workergit_live_check.py passed the worktree cut, the
     relative gitdir, blocked hooks and config writes, and commit-visible-from-host, against
     ases-sandbox:py311-2 (git 2.54, commit 5aa88d9) with worktree.useRelativePaths=true and the
