@@ -3781,6 +3781,58 @@ def test_run_startup_does_not_start_the_wall_clock_when_reconcile_refuses(world,
     assert bounds.get_state(world.conn, "t3")["status"] == "running"
 
 
+def test_run_startup_does_not_start_the_wall_clock_when_a_pinned_model_is_rejected(world, monkeypatch, capsys):
+    """Finding A2-0 (round 14, RUNSTART2, ASES-MOD-02/ASES-CTL-01): reintroduces finding 8's own bug through the
+    model pre-flight added in round 12, a few lines after that fix's own reordering. _first_model_rejection is a
+    pure function of plan.tasks and models_config with no conn or project_state dependency, so like reconcile it
+    must run before _start_project_or_refuse. Before this fix, a rejected pinned model still left project_state
+    'running' with a real started_at that a later, successful run could never correct (bounds.start_project's own
+    "nothing to fill" shortcut leaves an existing started_at untouched)."""
+    passes = _real_startup(world, monkeypatch)
+    monkeypatch.setattr(cli, "_load_models_config", lambda: {
+        "providers": {"xkiro": {"limits": {}}},
+        "models": [{"provider": "xkiro", "model": "coder-model", "role_class": "coder", "pinned": True,
+                    "context_length": 16000},
+                   {"provider": "openrouter", "model": "review-model", "role_class": "reviewer", "pinned": True}],
+    })
+
+    assert cli.main(_run_argv(world)) == 1
+
+    assert passes == []
+    assert bounds.get_state(world.conn, "t3") is None  # rejected before start_project ever ran
+    err = _console(capsys)[1]
+    assert "REFUSED (ASES-MOD-02)" in err and "coder" in err and "16000" in err
+
+    monkeypatch.setattr(cli, "_load_models_config", lambda: copy.deepcopy(MODELS_CONFIG))  # the model is fixed
+    assert cli.main(_run_argv(world)) == 0
+    assert bounds.get_state(world.conn, "t3")["status"] == "running"  # a fresh started_at, not one from the refusal
+
+
+def test_run_startup_refuses_a_pause_that_lands_during_reconcile_instead_of_flipping_it_back_to_running(
+    world, monkeypatch, capsys,
+):
+    """Finding A2-2 (round 14, RUNSTART2, ASES-CTL-01): the finding-8 reordering put a full reconcile-on-start
+    pass between _refuse_unless_startable's read of project_state and _start_project_or_refuse's write.
+    bounds.start_project treats 'paused' as startable by design (the ordinary swarm-resume case), so a pause that
+    lands in that widened window used to be silently flipped back to 'running' with no error, defeating the
+    operator's own pause instead of being refused the way a pause seen earlier already is."""
+    passes = _real_startup(world, monkeypatch)
+    real_reconcile = reconcile.reconcile
+
+    def _pause_lands_during_reconcile(*a, **kw):
+        bounds.set_status(world.conn, "t3", "paused", "a bound was reached")  # lands mid-reconcile: no row existed
+        return real_reconcile(*a, **kw)                                       # yet, so this both creates and pauses
+
+    monkeypatch.setattr(cli.reconcile_mod, "reconcile", _pause_lands_during_reconcile)
+
+    assert cli.main(_run_argv(world)) == 4
+
+    assert passes == []
+    assert bounds.get_state(world.conn, "t3")["status"] == "paused"  # never silently flipped back to running
+    err = _console(capsys)[1]
+    assert "project t3 is paused" in err and "swarm resume" in err
+
+
 def test_run_startup_refuses_a_restart_whose_head_moved_since_the_last_adopted_one(world, monkeypatch, capsys):
     """Finding 2 (round 12, RUNSTART, ASES-GIT-12): swarm run's own docstring promises Ctrl-C plus a re-run is a
     supported way to continue. Between two runs, a HEAD moved by something other than ASES (a stray write into

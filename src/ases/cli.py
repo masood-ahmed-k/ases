@@ -977,7 +977,21 @@ def _start_project_or_refuse(conn, plan) -> int | None:
     (ASES-REC-04) have both had their say and neither refused. bounds.start_project's own StateError is still
     caught here as a backstop for the narrow race _refuse_unless_startable's read cannot close on its own (a stop
     landing between that read and this write): "the refusal is part of the write statement, so a stop that lands
-    between our read and our write still wins" (bounds.start_project's own docstring)."""
+    between our read and our write still wins" (bounds.start_project's own docstring).
+
+    Round 14 (RUNSTART2, finding A2-2): that write-time backstop does not cover 'paused' -- bounds.start_project
+    treats it as startable on purpose (WHERE status IN ('planning', 'running', 'paused')), for the ordinary
+    swarm-resume-then-run case -- so a pause landing between _refuse_unless_startable's read and this call would
+    otherwise be silently flipped back to 'running' with no error, defeating the operator's own pause. The
+    reconcile-on-start pass now runs in that window (finding 8), so it is no longer the single-statement gap it
+    was; re-reading project_state right here, immediately before the write, shrinks the window back down and
+    refuses a pause seen this late exactly the way _refuse_unless_startable already refuses one seen earlier."""
+    state = bounds_mod.get_state(conn, plan.project) or {}
+    if state.get("status") == "paused":
+        why = state.get("stop_reason") or "a bound was reached or a final gate failed"
+        _err(f"swarm run REFUSED: project {plan.project} is paused ({why}). "
+             f"swarm status shows why; swarm resume [--extend-minutes N] lifts the pause.")
+        return 4
     try:
         bounds_mod.start_project(conn, plan.project)
     except bounds_mod.StateError:
@@ -1144,10 +1158,20 @@ def _run_loop(args: argparse.Namespace) -> int:
 
     # ASES-REC-04, ASES-CTL-01 (round 12, RUNSTART, finding 8): reconcile-on-start gets its say BEFORE the
     # project's wall clock starts, so a run reconcile refuses never marks the project running or stamps a
-    # started_at it never earned.
+    # started_at it never earned. Round 14 (RUNSTART2, finding A2-0): the ASES-MOD-02 model pre-flight is the
+    # same kind of refusal -- a pure function of plan.tasks and models_config, no conn or project_state
+    # dependency at all -- so it moves up here too, before _start_project_or_refuse, for the identical reason:
+    # a rejected pinned model must never stamp a started_at that a later, successful run can then never
+    # correct (bounds.start_project's own "nothing to fill" shortcut leaves an existing started_at untouched
+    # once status is already 'running').
     refused = _refuse_unless_startable(conn, plan)
     if refused is not None:
         return refused
+    models_config = _load_models_config()
+    rejected = _first_model_rejection(plan, models_config)
+    if rejected:
+        _err(f"swarm run REFUSED (ASES-MOD-02): {rejected}")
+        return 1
     refused = _reconcile_on_start(project, repo, plan, conn, bool(getattr(args, "ignore_reconcile", False)))
     if refused is not None:
         return refused
@@ -1155,11 +1179,6 @@ def _run_loop(args: argparse.Namespace) -> int:
     if refused is not None:
         return refused
 
-    models_config = _load_models_config()
-    rejected = _first_model_rejection(plan, models_config)
-    if rejected:
-        _err(f"swarm run REFUSED (ASES-MOD-02): {rejected}")
-        return 1
     consecutive_errors = 0
     for i in range(args.max_iterations):
         number = i + 1
