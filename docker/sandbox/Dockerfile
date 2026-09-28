@@ -1,4 +1,4 @@
-# ases-sandbox:py311-2 (round 15, SANDBOXIMG then WORKERGIT; ASES-SEC-03 p385, ASES-QG-04 p279)
+# ases-sandbox:py311-3 (round 15, SANDBOXIMG then WORKERGIT; round 16, HERMESDOCKER; ASES-SEC-03 p385, ASES-QG-04 p279)
 #
 # The image the controller's own sandboxed gate runs (sandbox.docker_run_argv, gates.resolve_runner) and a worker's
 # own Docker terminal backend use once a worker profile's terminal block names it. Small on purpose: git, a pinned
@@ -13,20 +13,27 @@
 # 2.54.0 and the same Python 3.11.16. Trade-off, stated plainly: Alpine uses musl, not glibc, so a project whose
 # tests need glibc-only binary wheels would need a different image; pure-Python gates (this project's) are unaffected.
 #
+# Why py311-3 replaced py311-2 (2026-09-28): Hermes 0.21.3 runs every command of a Docker terminal as `bash -c ...`
+# (hermes-agent tools/environments/remote_common.py bash_argv, hard-coded, no config key), and the Alpine base has
+# only busybox sh, so every worker command failed with 'exec: "bash": executable file not found in $PATH' (exit
+# 127). Found at zero quota by scripts/hermes_docker_terminal_check.py, which drives Hermes's own Docker terminal
+# code with the real coder-1 profile. ASES's own sandboxed gate runs use sh and were never affected.
+#
 # Base pinned by content digest, not a mutable tag (sandbox._unpinned_reason and doctor's sandbox image check require
 # a tag other than latest or an @sha256 digest). Digest read on 2026-09-28 with:
 #   docker pull python:3.11-alpine
 #   docker inspect python:3.11-alpine --format "{{json .RepoDigests}}"
 # which returned python@sha256:cd04730b8511def3fbf14204d66a0c1536f290b8e896ed5a94cd64cb15ac1356.
 FROM python:3.11-alpine@sha256:cd04730b8511def3fbf14204d66a0c1536f290b8e896ed5a94cd64cb15ac1356
-# git pinned to the exact version apk policy showed for this base's Alpine 3.24 main repository on 2026-09-28.
+# git and bash pinned to the exact versions apk policy showed for this base's Alpine 3.24 main repository on
+# 2026-09-28 (bash for Hermes's Docker terminal, see above).
 # --no-cache keeps no package index in the layer. safe.directory: the worktree is bind-mounted at /workspace and is
 # owned by a different user than the container's `sandbox` user, so git's "dubious ownership" guard refused every
 # command there (found by scripts/workergit_live_check.py on 2026-09-28: "fatal: detected dubious ownership in
 # repository at '/workspace'", exit 128). The guard protects a user from a repository planted by someone else; inside
 # the sandbox the worker IS the untrusted party and the repository's .git/config is mounted read-only (WORKERGIT), so
 # it protects nothing here. Exactly /workspace is trusted, not '*'.
-RUN apk add --no-cache git=2.54.0-r0 \
+RUN apk add --no-cache git=2.54.0-r0 bash=5.3.9-r1 \
     && git config --system --add safe.directory /workspace
 # pytest pinned to this project's own venv version.
 RUN pip install --no-cache-dir --no-compile pytest==9.1.1

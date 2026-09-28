@@ -71,6 +71,16 @@ def test_the_pinned_git_is_new_enough_for_relative_worktrees():
     assert (int(pinned.group(1)), int(pinned.group(2))) >= (2, 48)
 
 
+def test_the_image_installs_a_pinned_bash_for_hermes_docker_terminal():
+    """Round 16 (HERMESDOCKER): Hermes 0.21.3 runs every Docker terminal command as `bash -c` (hermes-agent
+    tools/environments/remote_common.py bash_argv, no config key), and the Alpine base has only busybox sh, so a
+    worker's every command failed with exit 127 on py311-2. bash must be installed, pinned like git."""
+    text = _dockerfile_text()
+    pkg_install = re.search(r"^RUN apk add[^\n]*", text, re.MULTILINE)
+    assert pkg_install is not None
+    assert re.search(r"\bbash=\S+", pkg_install.group(0)), "bash must be installed and pinned with package=version"
+
+
 def test_the_image_tag_used_elsewhere_is_not_latest():
     """Matches sandbox._unpinned_reason's own rule (a tag other than latest, or an @sha256 digest, counts as
     pinned): the tag this Dockerfile is built as, and that config/swarm.yaml names, must not be 'latest'."""
