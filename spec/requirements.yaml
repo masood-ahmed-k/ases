@@ -1313,19 +1313,34 @@ requirements:
   section: '19.4'
   verified_by: '22.15'
   status: in_progress
-  note: 'ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): The
-    idempotent-card-creation half strengthened: see ASES-CAP-03''s note for the fix/retry-card recovery fix,
-    which is the concrete case this requirement''s own acceptance test (22.15) checks. Earlier note: ROUND 6
-    (2026-09-22, zero quota): Acceptance-proven end to end (22.7, all three named crash points): a crash
-    during a running card, during a candidate build, and between the fast-forward and merge-card completion
-    are each faithfully simulated (with the exact mechanism justified in each test''s docstring) and each
-    recovers with no duplicate cards, no orphan workers, no half-merged state, every repair logged once, and a
-    second dry-run reconcile finding nothing new. A working bug in the acceptance rig itself was found along
-    the way (FakeHermes.fail_next cannot be armed after install(), hit independently by two different round
-    builders) and worked around, not yet fixed. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
+  note: 'ROUND 17 (2026-09-28, zero quota): Checked the source before fixing anything, per the architect-loop rule: the
+    fail_next "cannot be armed after install()" defect this note names was already fixed at ROUND 6 (commit 0e66674,
+    src/ases/fakes/board.py''s _HERMES_PUBLIC_NAMES, captured at import time instead of a live
+    inspect.isfunction(hermes.<name>) check), eleven rounds before this one; the note was simply never updated to
+    say so. Confirmed both ways: the pre-round-6 check (commit 8f847be) still rejects every name once a fake is
+    installed, today''s does not (tests/unit/test_fakes.py''s test_fail_next_can_still_be_armed_after_install,
+    already passing, unchanged). The one gap nothing had proven, a card_id-filtered arm after install, is now
+    covered too (new test test_fail_next_card_id_filter_also_survives_install), which let the one real workaround it
+    left behind simplify: tests/acceptance/test_22_7_crash_recovery.py''s crash point 3 now arms
+    fail_next("kanban_complete", card_id=...) directly instead of monkeypatching hermes.kanban_complete by hand,
+    same assertions, same intent. 22.15 itself had only ever repeated a FULLY successful creation (twice, then once
+    more after deleting the database); test_22_15_a_crash_mid_creation_is_safely_repeated_with_no_duplicate_cards
+    adds a real injected failure mid-task (kanban_link armed to fail: T1''s two cards made, unlinked, no bookkeeping
+    written, T2 never started) and proves the repeat finishes clean with no duplicate card anywhere. Status left
+    in_progress, unchanged: the note below still leans on ASES-CAP-03''s row for the fix/retry-card recovery half,
+    not independently re-verified this round. Earlier note: ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes
+    call authorized only for kanban_specify): The idempotent-card-creation half strengthened: see ASES-CAP-03''s
+    note for the fix/retry-card recovery fix, which is the concrete case this requirement''s own acceptance test
+    (22.15) checks. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.7, all three
+    named crash points): a crash during a running card, during a candidate build, and between the fast-forward and
+    merge-card completion are each faithfully simulated (with the exact mechanism justified in each test''s
+    docstring) and each recovers with no duplicate cards, no orphan workers, no half-merged state, every repair
+    logged once, and a second dry-run reconcile finding nothing new. A working bug in the acceptance rig itself was
+    found along the way (FakeHermes.fail_next cannot be armed after install(), hit independently by two different
+    round builders) and worked around, not yet fixed. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
     intents.py records are written around card creation, candidate build with Gate 3, fast-forward, merge-card
-    completion and revert (not around a gate run) and closed by reconcile. Card creation passes idempotency
-    keys; it has not been repeated twice against a real board or after deleting the database (test 22.15).'
+    completion and revert (not around a gate run) and closed by reconcile. Card creation passes idempotency keys; it
+    has not been repeated twice against a real board or after deleting the database (test 22.15).'
 - id: ASES-REC-04
   requirement: Reconcile-on-start repairs what is safe and blocks the rest
   section: '19.4'

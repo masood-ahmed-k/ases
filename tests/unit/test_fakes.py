@@ -1594,6 +1594,25 @@ def test_fail_next_can_still_be_armed_after_install(monkeypatch):
         fake.fail_next("card")  # a real method of the fake, but not a hermes-module function: must still be rejected
 
 
+def test_fail_next_card_id_filter_also_survives_install(monkeypatch):
+    """The card_id filter, not just the bare name, must keep working once fail_next is armed after install()
+    too: this is the exact shape tests/acceptance/test_22_7_crash_recovery.py's crash point 3 needs (fail one
+    specific merge card's kanban_complete, every other card's calls untouched), which that test used to have
+    to get by monkeypatching hermes.kanban_complete directly instead of fail_next, before this round found the
+    validation fix (test_fail_next_can_still_be_armed_after_install, above) already covered this case too."""
+    fake = new_fake().install(monkeypatch)
+    card_a = hermes.kanban_create(BOARD, "T1: work")
+    card_b = hermes.kanban_create(BOARD, "T2: work")
+
+    fake.fail_next("kanban_show", card_id=card_a["id"],
+                   error=HermesCommandError(["kanban", "show"], 1, "simulated crash"))
+
+    assert hermes.kanban_show(BOARD, card_b["id"])["id"] == card_b["id"]  # a different card: passes through
+    with pytest.raises(HermesCommandError, match="simulated crash"):
+        hermes.kanban_show(BOARD, card_a["id"])                          # the named card: fails
+    assert hermes.kanban_show(BOARD, card_a["id"])["id"] == card_a["id"]  # armed once, not forever
+
+
 def test_install_fails_loudly_for_a_hermes_wrapper_the_fake_does_not_have(monkeypatch):
     def kanban_future(board):
         """A wrapper added to hermes.py later."""
