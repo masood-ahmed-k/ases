@@ -45,8 +45,8 @@ providers:
     verified_on: "2026-09-17"
     # ASES-VER-01 (5.3, Appendix E): the page the limits above were read from, so swarm doctor can show it.
     # Blueprint Appendix E, [S12]: "OpenRouter API limits: free-model request caps, account-wide limits, key
-    # endpoint". Only the rpm/per_day numbers above have a page like this; do not add a source anywhere else
-    # in this file unless it is really either an Appendix E URL or a URL already written in a comment here.
+    # endpoint". A source is always a real page someone checked, with the date in verified_on and what the page
+    # says in a comment: never a URL guessed to fill the field.
     source: "https://openrouter.ai/docs/api-reference/limits"
 
   xkiro:
@@ -74,7 +74,13 @@ providers:
                                                # routed model actually checked end-to-end.
     # data_policy_verified_at: "2026-09-19"    # ASES-PRV-04 shape, not a live value (see the openrouter block
     # data_policy_source: "<url or note>"      # above for what these two fields mean).
-    verified_on: "2026-09-19"
+    verified_on: "2026-09-28"
+    # ASES-VER-01: xKiro's own rate-limits reference page, checked 2026-09-28 at the owner's request. It
+    # documents the kinds of limit (requests per minute, free tokens per day, spending windows, concurrent
+    # jobs) and says free-model requests past a limit get a 429, but gives no numbers ("per plan"), which is
+    # why `limits` above stays {}. A promotional page (https://xkiro.com/deals) quotes 500,000 free tokens a
+    # day; that is marketing, not a reference, so it is not used as the limit.
+    source: "https://docs.xkiro.com/api/rate-limits/"
 
   opencode_free:
     type: hermes_provider
@@ -84,7 +90,13 @@ providers:
     data_policy: unknown
     # data_policy_verified_at: "2026-09-17"    # ASES-PRV-04 shape, not a live value (see the openrouter block
     # data_policy_source: "<url or note>"      # above for what these two fields mean).
-    verified_on: "2026-09-17"
+    verified_on: "2026-09-28"
+    # ASES-VER-01: OpenCode's own Zen docs, checked 2026-09-28. It lists the current free models ("free on
+    # OpenCode for a limited time") and publishes no request limits. The blueprint's own citation for this
+    # provider ([S11], https://opencode.ai/docs/providers) does not discuss the free tier at all, so this page
+    # is the better source. The client-only restriction behind `status: blocked` below is not documented by
+    # OpenCode; it was found empirically. The installed Hermes 0.21.3's opencode-free plugin directory is empty.
+    source: "https://opencode.ai/docs/zen/"
     status: blocked                 # 2026-09-18: HTTP 403 "OpenCode's free tier can only be used
                                      # from within OpenCode" -- confirmed against nemotron-3-ultra-free.
                                      # Server-side client check, not a per-model issue; do not retry

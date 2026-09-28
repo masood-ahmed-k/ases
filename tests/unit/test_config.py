@@ -221,9 +221,13 @@ def test_the_shipped_models_yaml_openrouter_source_is_a_real_appendix_e_url(tmp_
     raw = config.load_models_config(path)
 
     assert raw["providers"]["openrouter"]["source"] == "https://openrouter.ai/docs/api-reference/limits"
-    # xkiro's limits are documented as genuinely unpublished (see the provider's own comment): no source
-    # invented for it just to fill the field.
-    assert raw["providers"]["xkiro"].get("source") is None
+    # xkiro and opencode_free publish no numeric limits; their sources (checked 2026-09-28, see each provider's
+    # comment) are the providers' own pages saying so, and `limits` stays {} rather than a number read off a
+    # promotional page.
+    assert raw["providers"]["xkiro"]["source"] == "https://docs.xkiro.com/api/rate-limits/"
+    assert raw["providers"]["xkiro"]["limits"] == {}
+    assert raw["providers"]["opencode_free"]["source"] == "https://opencode.ai/docs/zen/"
+    assert raw["providers"]["opencode_free"]["limits"] == {}
 
 
 def test_db_path_is_ases_db_under_ases_home(tmp_path):
