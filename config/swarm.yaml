@@ -37,6 +37,11 @@ budgets:                           # section 9.3 global bounds
   card_runtime_minutes: 45
   daily_reserve_percent: 10        # ASES-CAP-03: never plan to use the last 10% of a day's quota
   review_reserve_requests: 20      # requests held back for the review pass on every card
+  # allow_paid_models (round 19, package STOPGATES; ASES-DOC-04, stop condition category 1 'spends money'):
+  # default false. A models.yaml row with `paid: true` (see the two lead_unfunded rows there) is refused by
+  # the budget gate, Gate P and recovery.next_model unless this is explicitly true -- the owner's own
+  # written decision to let ASES call a billed model, never inferred from a pinned row alone.
+  allow_paid_models: false
 
 hermes:
   tested_version: "0.21.3"

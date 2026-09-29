@@ -1080,6 +1080,36 @@ def test_next_model_never_leaves_the_data_class_when_it_is_given_one():
     assert recovery.next_model(unverified, "coder", "x", "current", data_class="private") is None
 
 
+def test_next_model_never_borrows_the_providers_verified_at_for_a_row_level_policy():
+    """PROVIDERS.md finding (round 19, package STOPGATES): a model row's own data_policy is a claim distinct
+    from its provider's; a human verifying the PROVIDER's (here unsafe) policy on some date must never stand
+    in for a verification of the ROW's own (here safe) policy that never happened. Before the fix, next_model
+    built `declared` and `verified_at` independently with `row.get(...) or provider.get(...)`, so a row with a
+    safe data_policy but no verified_at of its own silently borrowed the provider's date and was wrongly
+    accepted."""
+    models = {
+        "providers": {"x": {"data_policy": "some_free_endpoints_train", "data_policy_verified_at": "2026-09-01"}},
+        "models": [
+            {"provider": "x", "model": "current", "role_class": "coder", "pinned": True},
+            {"provider": "x", "model": "candidate", "role_class": "coder_candidate", "data_policy": "no_training"},
+        ],
+    }
+    assert recovery.next_model(models, "coder", "x", "current", data_class="private") is None
+
+
+def test_next_model_skips_a_paid_candidate_unless_allow_paid_models_is_set():
+    """STOPDOC.md item 8 (ASES-DOC-04, stop condition category 1, 'spends money'): a switch after a second
+    capability failure must never move a card onto a billed model unless the project's own swarm.yaml opts
+    in with budgets.allow_paid_models: true."""
+    models = copy.deepcopy(MODELS)
+    paid_row = next(m for m in models["models"] if m["model"] == CANDIDATE_1)
+    paid_row["paid"] = True
+
+    assert recovery.next_model(models, "coder", "xkiro", CODER_MODEL) == ("xkiro", CANDIDATE_2)
+    assert recovery.next_model(models, "coder", "xkiro", CODER_MODEL, allow_paid_models=True) == (
+        "xkiro", CANDIDATE_1)
+
+
 def test_unhealthy_credentials_reads_the_event_log_and_a_restore_clears_a_provider(conn):
     assert recovery.unhealthy_credentials(conn) == set()
     events.record(conn, "credential_unhealthy", {"provider": "xkiro", "model": CODER_MODEL})

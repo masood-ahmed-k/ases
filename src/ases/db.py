@@ -440,6 +440,17 @@ def _apply_v7(conn: sqlite3.Connection) -> None:
     _run_script(conn, _V7_SQL)
 
 
+def _apply_v10(conn: sqlite3.Connection) -> None:
+    """STOPDOC.md item 7 (round 19, package STOPGATES): models.sync_from_config used to DELETE a
+    model_registry row the moment config/models.yaml stopped declaring it, taking a real recorded smoke test
+    with it. `declared` distinguishes "config still names this row" from "a human or an evaluation once
+    recorded facts about it": sync_from_config now only flips it to 0 (and models.list_models filters it out,
+    so a person still sees exactly the rows config declares), never deletes. DEFAULT 1 on the ALTER TABLE
+    means every row an upgraded database already has (by definition still declared, since the old code would
+    already have deleted anything that was not) starts out correctly marked."""
+    _add_column(conn, "model_registry", "declared", "INTEGER NOT NULL DEFAULT 1")
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: schema_migrations, requests_ledger, model_registry, events", _V1_SQL),
     Migration(2, "phase 3: plan_tasks, gate_runs, merge_records", _V2_SQL),
@@ -452,6 +463,9 @@ MIGRATIONS: list[Migration] = [
                  "plan_tasks where unambiguous", _apply_v8),
     Migration(9, "integrity_heads: the full history of primary-checkout HEADs ASES has written, for the "
                  "base-commit check (ASES-GIT-01, ASES-GIT-16), backfilled from integrity_state", _apply_v9),
+    Migration(10, "model_registry.declared: sync_from_config hides an undeclared row instead of deleting it, "
+                  "so a recorded smoke test survives a model briefly dropping out of config (ASES-DOC-04)",
+              _apply_v10),
 ]
 
 

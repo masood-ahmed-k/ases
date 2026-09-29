@@ -58,7 +58,11 @@ class CardPair:
     merge_card_id: str
 
 
-_BOOTSTRAP_GITIGNORE = "__pycache__/\n*.pyc\n.venv/\nnode_modules/\n"
+# STOPDOC.md item 6 (ASES-DOC-04, section 16 STOP CONDITION): a repository holding a .env before ASES ever
+# bootstraps it must never have that file swept into the first commit; excluding it (and any .env.<suffix>
+# variant, e.g. .env.local) here means the enumerate-and-add step below (never `git add -A`) skips it the
+# same way it skips __pycache__ or node_modules, because both read this same file before staging anything.
+_BOOTSTRAP_GITIGNORE = "__pycache__/\n*.pyc\n.venv/\nnode_modules/\n.env\n.env.*\n"
 
 
 def _bootstrap_git(repo: pathlib.Path, args: list[str]) -> subprocess.CompletedProcess:
@@ -111,13 +115,22 @@ def ensure_repo_bootstrapped(repo: pathlib.Path, integration_branch: str, *, con
     idempotent whether or not the branch already exists or is already checked out, confirmed empirically, and
     is safe to repeat if an earlier bootstrap attempt got this far and failed on a later step).
 
-    The commit carries whatever is already on disk (`git add -A`, not just the files below): a repository is
-    "empty" here purely by git history, and any file already sitting in the working tree before this ran would
-    otherwise show up as an untracked change the moment the primary-checkout guard (ASES-GIT-12) next looks at
-    it. This function writes at minimum a .gitignore and a one-line README.md of its own, but never a
-    pyproject.toml or similar (that is the plan's own scaffold task's job, ASES-GIT-11, part B) -- and only
-    when a file of that name is not already there, so a repository that already had one before bootstrapping
-    keeps it.
+    The commit carries whatever is already on disk (every untracked file `.gitignore` does not exclude, not
+    just the files below): a repository is "empty" here purely by git history, and any file already sitting
+    in the working tree before this ran would otherwise show up as an untracked change the moment the
+    primary-checkout guard (ASES-GIT-12) next looks at it. This function writes at minimum a .gitignore and a
+    one-line README.md of its own, but never a pyproject.toml or similar (that is the plan's own scaffold
+    task's job, ASES-GIT-11, part B) -- and only when a file of that name is not already there, so a
+    repository that already had one before bootstrapping keeps it.
+
+    Round 19 (package STOPGATES, STOPDOC.md item 6, ASES-DOC-04 stop condition): staging used to be a blanket
+    `git add -A`, so a pre-existing `.env` sitting in the tree (nothing had told git to ignore it yet) would be
+    swept into ASES's own first commit right along with everything else. The gitignore written just above now
+    excludes `.env`/`.env.*`, and staging itself is `git ls-files --others --exclude-standard` (every untracked
+    path .gitignore does NOT exclude) followed by `git add --` those exact paths -- same practical effect on a
+    freshly unborn tree (nothing tracked yet to modify or delete, so "every non-ignored untracked file" is all
+    `-A` ever added here anyway), but never the blanket flag, and a file the fresh .gitignore excludes is never
+    even listed, let alone staged.
 
     Never writes IDENTITY into git config (the standing hard rule): the commit's author and committer are given
     with a `-c user.name=... -c user.email=...` pair scoped to that one git invocation, the same
@@ -190,11 +203,18 @@ def ensure_repo_bootstrapped(repo: pathlib.Path, integration_branch: str, *, con
                           step="worktree_relative_paths", detail=_clean(f"{relpaths.stdout}{relpaths.stderr}", 300))
         return False
 
-    add = _bootstrap_git(repo, ["add", "-A"])
-    if add.returncode != 0:
+    listing = _bootstrap_git(repo, ["ls-files", "--others", "--exclude-standard"])
+    if listing.returncode != 0:
         _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
-                          step="add", detail=_clean(f"{add.stdout}{add.stderr}", 300))
+                          step="list_untracked", detail=_clean(f"{listing.stdout}{listing.stderr}", 300))
         return False
+    untracked = [line for line in listing.stdout.splitlines() if line.strip()]
+    if untracked:
+        add = _bootstrap_git(repo, ["add", "--", *untracked])
+        if add.returncode != 0:
+            _bootstrap_event(conn, "repo_bootstrap_error", repo, integration_branch,
+                              step="add", detail=_clean(f"{add.stdout}{add.stderr}", 300))
+            return False
 
     commit = _bootstrap_git(repo, [
         "-c", "user.name=ASES bootstrap", "-c", "user.email=ases-bootstrap@example.invalid",
@@ -711,12 +731,17 @@ def _affordable_now(
     plan-approval time, so a provider that becomes (or, on a mis-approved plan, always was) unsafe for the
     project's data_class was never re-checked once a card was actually about to run -- confirmed empirically by
     round 6's ASES-PRV-01 finding: process_budget_gate called only policy.check_budget, never check_data_class.
-    When `project` is given this now asks policy.check_data_class the same way cmd_approve does, building
-    provider_policies/provider_verified_at from models_config["providers"] inline (the same
-    {name: p.get("data_policy")} / {name: p.get("data_policy_verified_at")} cmd_approve's own _estimate_lines
-    builds; models_config is already a parameter here, so no new one is threaded through just for this). A
+    When `project` is given this now asks policy.check_data_class, resolving the policy/verified_at pair with
+    policy.effective_policy (round 19, package STOPGATES) rather than reading models_config["providers"] alone,
+    so a model row's own declared data_policy is honoured, never mixed with a different level's verified_at. A
     DataPolicyViolation never raises past this function: it parks, exactly like an ordinary budget shortfall
     does, through the same (bool, reason) shape the caller already handles.
+
+    Round 19 (package STOPGATES, STOPDOC.md/PROVIDERS.md item 2, finding 3): a task whose role is in
+    `_COMMITTING_ROLES` will always be reviewed once it merges, so its card is only really affordable when the
+    REVIEWER's provider is ALSO safe for the project's data_class -- not just checked for budget, as below. A
+    project with, say, a safe coder provider but an unverified reviewer must park every coder card too, or a
+    private diff would still end up sent to the reviewer the moment the coder's work is done.
 
     Shared by process_budget_gate (park a ready card) and process_unpark (release a parked one): one rule, so the
     two can never disagree about the same card on the same ledger. `project` is the same optional parameter
@@ -726,15 +751,29 @@ def _affordable_now(
     if pp is None:
         return True, ""
     if project is not None:
-        providers = models_config.get("providers", {})
-        provider_data_policy = (providers.get(pp.provider) or {}).get("data_policy")
-        provider_verified_at = (providers.get(pp.provider) or {}).get("data_policy_verified_at")
+        provider_data_policy, provider_verified_at = policy.effective_policy(models_config, pp.provider, pp.model)
         try:
             policy.check_data_class(
                 project.data_class, pp.provider, provider_data_policy, verified_at=provider_verified_at,
             )
         except policy.DataPolicyViolation as exc:
             return False, f"data class: {exc}"
+        if task.role in _COMMITTING_ROLES:
+            reviewer_pp = policy.profile_provider("reviewer", models_config)
+            if reviewer_pp is not None:
+                rev_policy, rev_verified_at = policy.effective_policy(
+                    models_config, reviewer_pp.provider, reviewer_pp.model)
+                try:
+                    policy.check_data_class(
+                        project.data_class, reviewer_pp.provider, rev_policy, verified_at=rev_verified_at,
+                    )
+                except policy.DataPolicyViolation as exc:
+                    return False, f"data class: {exc}"
+    if policy.is_paid_model(models_config, pp.provider, pp.model) and not budgets.get("allow_paid_models", False):
+        # STOPDOC.md item 8 (ASES-DOC-04, stop condition category 1 'spends money'): a paid row is refused here
+        # the same way an unsafe data class is -- deliberately not a "budget:"-prefixed reason (see
+        # _PARK_PREFIXES above), so a paid park is never auto-resumed by process_unpark either.
+        return False, f"paid model: {pp.provider}/{pp.model} is billed and budgets.allow_paid_models is not true"
     afford = policy.check_budget(
         conn, models_config["providers"], pp.provider, task.estimated_requests, budgets=budgets,
     )

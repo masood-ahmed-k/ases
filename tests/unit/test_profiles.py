@@ -1705,6 +1705,9 @@ def test_verify_state_two_custom_profiles_on_different_endpoints_are_different_p
 @pytest.mark.parametrize("model_id, family", [
     ("qwen/qwen3.8-max:free", "qwen"), ("openai/gpt-5.6-terra", "openai"), ("xkiro/openai/gpt-5.6-terra", "openai"),
     ("cohere/north-mini-code:free", "cohere"), ("gpt-5", "gpt"), ("", None), (None, None),
+    # PROVIDERS.md finding (round 19, package STOPGATES): a Cloudflare Workers AI or Hugging Face vendor-tag
+    # prefix must not itself read as the family -- "@cf/qwen/..." is the same qwen family as "qwen/...".
+    ("@cf/qwen/qwen3-30b-a3b-fp8", "qwen"), ("@hf/cohere/north-mini-code", "cohere"), ("@cf/glm-4.7-flash", "glm"),
 ])
 def test_model_family(model_id, family):
     assert profiles._family(model_id) == family

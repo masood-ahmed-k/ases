@@ -163,6 +163,34 @@ def test_a_non_string_verification_source_is_a_config_error(tmp_path):
         config.load_models_config(p)
 
 
+# --- models[].paid (ASES-DOC-04, round 19 package STOPGATES) -------------------------------------------
+
+
+def test_paid_field_parses_when_present_and_is_absent_safe(tmp_path):
+    p = _write(tmp_path / "models.yaml", (
+        "providers: {}\nmodels:\n"
+        "  - {provider: a, model: m1, paid: true}\n"
+        "  - {provider: a, model: m2}\n"
+    ))
+
+    raw = config.load_models_config(p)
+
+    assert raw["models"][0]["paid"] is True
+    assert raw["models"][1].get("paid") is None
+
+
+def test_a_non_bool_paid_value_is_a_config_error_naming_the_model(tmp_path):
+    """A YAML typo like `paid: "false"` parses as a non-empty string, which a plain bool() cast (every real
+    caller's own reading of this field) would misread as True -- refused at load time instead."""
+    p = _write(tmp_path / "models.yaml", (
+        'providers: {}\nmodels:\n  - {provider: a, model: m1, paid: "false"}\n'
+    ))
+
+    with pytest.raises(config.ConfigError, match="models\\[\\].paid") as caught:
+        config.load_models_config(p)
+    assert "a/m1" in str(caught.value)
+
+
 # --- providers.<name>.source (ASES-VER-01) -------------------------------------------------------
 
 

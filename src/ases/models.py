@@ -129,18 +129,23 @@ class ModelRecord:
 
 
 def sync_from_config(conn: sqlite3.Connection, models_config: dict) -> None:
-    """Upsert config/models.yaml's declared models into model_registry, then drop any row for a
-    (provider, model) pair no longer declared anywhere in config.
+    """Upsert config/models.yaml's declared models into model_registry, then mark any row for a
+    (provider, model) pair no longer declared anywhere in config as undeclared (hidden, never deleted).
 
     Declared fields (context_length, tool_calling, role_class, data_policy, pinned) are refreshed from
     config every time -- config is the source of truth for those. Smoke-test columns are left alone if
     the row already exists, so re-running this never erases a previously recorded smoke test.
 
-    The delete step is real, not defensive: renaming/retiring a model (e.g. lead moving from
-    openai/gpt-5.6-terra to xkiro/openai/gpt-5.6-terra) used to leave the old row behind forever, so
-    `swarm models`/`swarm doctor` kept showing two "pinned, role=lead" rows -- caught by actually running
-    `swarm models` after a real provider swap, not by a unit test (a fake config that always matches
-    what's asserted has no way to exercise "a row that used to be there isn't anymore").
+    Renaming/retiring a model (e.g. lead moving from openai/gpt-5.6-terra to xkiro/openai/gpt-5.6-terra) must
+    not leave the old row showing up forever as a phantom "pinned, role=lead" row in `swarm models`/`swarm
+    doctor` -- caught by actually running `swarm models` after a real provider swap, not by a unit test (a
+    fake config that always matches what's asserted has no way to exercise "a row that used to be there
+    isn't anymore"). Round 19 (package STOPGATES, STOPDOC.md item 7, ASES-DOC-04 stop condition category 2
+    'deletes user data'): this used to be a real DELETE, which took a real recorded smoke test with it the
+    moment a model briefly dropped out of config (a provider swap, a typo, a rebase mid-edit). `declared`
+    (schema migration 10) now marks an undeclared row 0 instead: list_models filters it out, so it is exactly
+    as invisible as a deleted row would have been, but record_smoke_test's own history on it survives and
+    comes back if the model is re-declared later.
     """
     providers = models_config.get("providers", {})
     declared: set[tuple[str, str]] = set()
@@ -152,14 +157,15 @@ def sync_from_config(conn: sqlite3.Connection, models_config: dict) -> None:
         conn.execute(
             """
             INSERT INTO model_registry (provider, model, context_length, tool_calling, role_class,
-                                         data_policy, pinned)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                         data_policy, pinned, declared)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(provider, model) DO UPDATE SET
                 context_length = excluded.context_length,
                 tool_calling   = excluded.tool_calling,
                 role_class     = excluded.role_class,
                 data_policy    = excluded.data_policy,
-                pinned         = excluded.pinned
+                pinned         = excluded.pinned,
+                declared       = 1
             """,
             (
                 provider,
@@ -174,13 +180,19 @@ def sync_from_config(conn: sqlite3.Connection, models_config: dict) -> None:
 
     existing = {(r["provider"], r["model"]) for r in conn.execute("SELECT provider, model FROM model_registry")}
     for provider, model in existing - declared:
-        conn.execute("DELETE FROM model_registry WHERE provider = ? AND model = ?", (provider, model))
+        conn.execute(
+            "UPDATE model_registry SET declared = 0 WHERE provider = ? AND model = ?", (provider, model)
+        )
 
 
 def list_models(conn: sqlite3.Connection) -> list[ModelRecord]:
+    """Every currently DECLARED model (config/models.yaml still names it, `declared = 1`): a row
+    sync_from_config marked undeclared stays in the table for its smoke-test history, but is hidden here
+    exactly as if it had been deleted (round 19, package STOPGATES)."""
     rows = conn.execute(
         "SELECT provider, model, context_length, tool_calling, role_class, data_policy, pinned, "
-        "smoke_test_at, smoke_test_result, smoke_test_detail FROM model_registry ORDER BY provider, model"
+        "smoke_test_at, smoke_test_result, smoke_test_detail FROM model_registry WHERE declared = 1 "
+        "ORDER BY provider, model"
     ).fetchall()
     return [
         ModelRecord(

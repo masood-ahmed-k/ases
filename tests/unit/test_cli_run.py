@@ -147,6 +147,47 @@ def test_run_refuses_before_any_pass_when_a_pinned_role_model_is_rejected(wired,
     assert "coder" in err and "xkiro/undeclared-model" in err and "rejected unknown" in err
 
 
+def test_run_refuses_before_any_pass_when_the_sandbox_image_is_not_present_locally(wired, monkeypatch, capsys):
+    """STOPDOC.md item 3 (ASES-SEC-03, stop-condition category 4): Hermes starts a worker container with
+    Docker's own default --pull missing, so ASES must refuse before the first dispatch rather than let
+    Hermes silently download a pinned image nobody has approved."""
+    project = types.SimpleNamespace(
+        board="b", roles={"coder": "coder-1", "reviewer": "reviewer"}, budgets={}, sandbox_enabled=True,
+        sandbox_policy_config=lambda: {"sandbox": {"image": "ases-sandbox:py311-3"}},
+    )
+    monkeypatch.setattr(cli, "_load_project", lambda: project)
+    monkeypatch.setattr(cli.sandbox_mod, "image_present", lambda image, *a, **kw: False)
+    calls = _scripted_run_pass(monkeypatch, [_DONE])  # never reached if the refusal works
+
+    assert cli.cmd_run(wired.args) == 1
+
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "swarm run REFUSED" in err and "ases-sandbox:py311-3" in err
+    assert "docker pull ases-sandbox:py311-3" in err
+
+
+def test_run_proceeds_past_the_sandbox_check_when_the_image_is_already_present(wired, monkeypatch):
+    project = types.SimpleNamespace(
+        board="b", roles={"coder": "coder-1", "reviewer": "reviewer"}, budgets={}, sandbox_enabled=True,
+        sandbox_policy_config=lambda: {"sandbox": {"image": "ases-sandbox:py311-3"}},
+    )
+    monkeypatch.setattr(cli, "_load_project", lambda: project)
+    monkeypatch.setattr(cli.sandbox_mod, "image_present", lambda image, *a, **kw: True)
+    _scripted_run_pass(monkeypatch, [_DONE])
+
+    assert cli.cmd_run(wired.args) == 0
+
+
+def test_run_skips_the_sandbox_check_when_it_is_not_enabled(wired, monkeypatch):
+    """The plain `wired` project (a SimpleNamespace with no sandbox_enabled attribute at all) must still run
+    every existing pass exactly as before: getattr's own default keeps a lightweight test double working."""
+    monkeypatch.setattr(cli.sandbox_mod, "image_present", lambda *a, **kw: pytest.fail("must not be asked"))
+    _scripted_run_pass(monkeypatch, [_DONE])
+
+    assert cli.cmd_run(wired.args) == 0
+
+
 def test_run_adopts_the_checkouts_head_only_after_the_guard_passes(wired, monkeypatch):
     adopted = []
     monkeypatch.setattr(cli.guards_mod, "adopt_current_head", lambda conn, project, repo: adopted.append(project) or "abc")

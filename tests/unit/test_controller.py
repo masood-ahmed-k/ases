@@ -2685,7 +2685,9 @@ def test_ensure_repo_bootstrapped_never_sets_worktree_use_relative_paths_on_an_e
 def test_ensure_repo_bootstrapped_keeps_a_pre_existing_readme_and_gitignore(tmp_path):
     """A file already on disk before ASES ever looked at this repository (someone started adding source before
     running git init) is kept, not clobbered by the bootstrap's own README/.gitignore -- but is still swept
-    into the one commit (git add -A), so it is not left as an untracked change for the next guard to trip on."""
+    into the one commit (every untracked, non-ignored path, enumerated and staged one by one, never a blanket
+    `git add -A`, round 19 package STOPGATES), so it is not left as an untracked change for the next guard to
+    trip on."""
     repo = tmp_path / "pre_seeded"
     repo.mkdir()
     (repo / "README.md").write_text("the real readme\n", encoding="utf-8")
@@ -2698,6 +2700,37 @@ def test_ensure_repo_bootstrapped_keeps_a_pre_existing_readme_and_gitignore(tmp_
     assert _git_ok("status", "--porcelain", cwd=repo).stdout == ""
     tracked = _git_ok("ls-files", cwd=repo).stdout.split()
     assert "app.py" in tracked and "README.md" in tracked
+
+
+def test_ensure_repo_bootstrapped_gitignore_excludes_dotenv(tmp_path):
+    """STOPDOC.md item 6 (ASES-DOC-04, section 16 STOP CONDITION)."""
+    repo = tmp_path / "brand_new"
+
+    assert controller.ensure_repo_bootstrapped(repo, "integration") is True
+
+    lines = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".env" in lines and ".env.*" in lines
+
+
+def test_ensure_repo_bootstrapped_never_commits_a_pre_existing_env_file(tmp_path):
+    """STOPDOC.md item 6: the old, blanket `git add -A` would have committed a pre-existing .env the moment
+    it ran, since the .gitignore at the time did not exclude it either. Both are fixed together: the file
+    stays untracked and untouched, while an ordinary pre-existing file right next to it is still committed
+    (the guarantee test_ensure_repo_bootstrapped_keeps_a_pre_existing_readme_and_gitignore already proves)."""
+    repo = tmp_path / "pre_seeded_secret"
+    repo.mkdir()
+    (repo / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    (repo / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8")
+
+    created = controller.ensure_repo_bootstrapped(repo, "integration")
+
+    assert created is True
+    tracked = _git_ok("ls-files", cwd=repo).stdout.split()
+    assert "app.py" in tracked and ".env" not in tracked
+    # .gitignore now excludes .env, so a clean (not just an untracked-but-shown) `git status` is the proof:
+    # git itself no longer considers .env a change to report at all, ignored or staged.
+    assert _git_ok("status", "--porcelain", cwd=repo).stdout == ""
+    assert (repo / ".env").read_text(encoding="utf-8") == "API_KEY=super-secret\n"
 
 
 def test_ensure_repo_bootstrapped_records_an_event_only_on_success(tmp_path):

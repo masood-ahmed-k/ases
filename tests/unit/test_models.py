@@ -150,6 +150,30 @@ def test_classify_declared_model_looks_up_context_and_provider_type_from_a_raw_c
     assert models.classify_declared_model({"providers": {}, "models": []}, "nobody", "nothing").accepted is True
 
 
+def test_resync_hides_but_never_deletes_a_smoke_tested_model_no_longer_declared(tmp_path):
+    """STOPDOC.md item 7 (round 19, package STOPGATES, ASES-DOC-04 stop condition category 2 'deletes user
+    data'): a real recorded smoke test must survive a model briefly dropping out of config/models.yaml (a
+    provider swap, a typo, a rebase mid-edit), even though the model is correctly hidden from list_models the
+    whole time it is undeclared (the same visible behaviour test_resync_drops_rows_no_longer_declared proves)."""
+    conn = _conn(tmp_path)
+    models.record_smoke_test(conn, "unorouter", "glm-5.3-thinking:free", "pass", "tool call ok")
+    dropped = {"providers": CONFIG["providers"], "models": [CONFIG["models"][1]]}  # the lead row is gone
+
+    models.sync_from_config(conn, dropped)
+
+    assert ("unorouter", "glm-5.3-thinking:free") not in {(m.provider, m.model) for m in models.list_models(conn)}
+    row = conn.execute(
+        "SELECT smoke_test_result, declared FROM model_registry WHERE provider = ? AND model = ?",
+        ("unorouter", "glm-5.3-thinking:free"),
+    ).fetchone()
+    assert row is not None, "the row must survive, not be deleted"
+    assert row["smoke_test_result"] == "pass" and row["declared"] == 0
+
+    models.sync_from_config(conn, CONFIG)  # the model comes back into config...
+    by_model = {m.model: m for m in models.list_models(conn)}
+    assert by_model["glm-5.3-thinking:free"].smoke_tested is True  # ...and its old smoke test is still there
+
+
 def test_resync_drops_rows_no_longer_declared(tmp_path):
     """A model swapped out of config.yaml (e.g. a role moving to a different provider) must not
     linger in the registry forever as a phantom pinned row -- real bug, found by actually running

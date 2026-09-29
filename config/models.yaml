@@ -117,6 +117,10 @@ models:
                                       # the xKiro wallet actually has a balance -- gpt-5.6-terra is still
                                       # the better pick for reliability than any free model here.
     pinned: false
+    paid: true                        # round 19, package STOPGATES (ASES-DOC-04, stop condition category 1
+                                      # 'spends money'): the real HTTP 403 above IS the fact this field
+                                      # records. Refused at the budget gate, Gate P and recovery.next_model
+                                      # unless config/swarm.yaml sets budgets.allow_paid_models: true.
     data_policy: no_training          # see the discussion this had when it was still the pinned row,
                                       # preserved in git history / docs/architecture.md.
 
@@ -127,6 +131,7 @@ models:
     role_class: lead_unfunded          # not a different problem. Revive alongside gpt-5.6-terra above
     pinned: false                      # once funded, and compare which is actually more reliable for
                                         # real -- this file isn't claiming one beats the other yet.
+    paid: true                         # round 19, package STOPGATES: same fact as the row above.
 
   - provider: xkiro
     model: "qwen/qwen3.8-max:free"
