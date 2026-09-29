@@ -887,16 +887,43 @@ def _lsp_install_summary(lsp_dir: pathlib.Path) -> str:
     return ", ".join(entries) if entries else "(empty)"
 
 
-def _check_lsp_installed(project: ases_config.ProjectConfig) -> DoctorCheck:
+def _check_lsp_installed(
+    project: ases_config.ProjectConfig, models_config: dict | None = None, profiles_mod=None,
+) -> DoctorCheck:
     """ASES-DOC-04 (section 16 STOP CONDITION, category 4): Hermes's own lsp.install_strategy default ("auto")
     may already have put language-server files on disk for a profile before swarm init ever set
     install_strategy to "manual" (round 19, package PROFILEGUARDS; a real example: pyright auto-installed into
     coder-1 and reviewer, STOPDOC.md topic A item 1). Removing an already-installed server is a deletion this
     module never performs on its own: a WARN names what a profile's lsp/ directory already holds, so a person can
-    decide whether to keep or remove it. A profile with no lsp/ directory, or an empty one, is silently fine."""
+    decide whether to keep or remove it. A profile with no lsp/ directory, or an empty one, is silently fine.
+
+    Round 19 (package MERGEGUARD, PROFILEGUARDS review minor): scans the FULL ASES profile roster
+    `profiles.desired_profiles(project, models_config)` knows (lead, every coder, reviewer, tester, any
+    specialisation -- active or not), the same convention `profiles.verify_state` itself already uses for the
+    config-level lsp.install_strategy check (that check's own docstring: "per profile (an active one, or any
+    that exists on disk)"), instead of only the names config/swarm.yaml's `roles:` map happens to mention today.
+    Before this fix a manually created coder-2/coder-3, a tester created before being wired into `roles:`, or any
+    specialisation profile that already had a populated lsp/ directory on disk was silently never scanned or
+    WARNed about. `models_config`/`profiles_mod` are optional and default to None so every existing caller (this
+    function's own direct unit tests included) keeps working unchanged, falling back to the old `roles:`-only
+    scan; `doctor.run` passes both. A `desired_profiles` call that raises (a stale or broken profiles module)
+    never crashes this row -- like every other row in this module -- it falls back the same way, noting why in
+    the detail text rather than pretending the fuller roster was checked."""
     profiles_root = project.hermes_native_home / "profiles"
+    names: set[str] = set()
+    fallback_note = ""
+    if profiles_mod is not None and models_config is not None:
+        try:
+            names = {spec.name for spec in profiles_mod.desired_profiles(project, models_config)}
+        except Exception as exc:  # noqa: BLE001 - a doctor row never crashes the doctor; fall back below
+            fallback_note = (
+                f" (could not compute the full profile roster, falling back to config/swarm.yaml's roles: "
+                f"{type(exc).__name__}: {exc})"
+            )
+    if not names:
+        names = {str(name) for name in (getattr(project, "roles", None) or {}).values() if name}
     found: list[str] = []
-    for profile in sorted({str(name) for name in (getattr(project, "roles", None) or {}).values() if name}):
+    for profile in sorted(names):
         lsp_dir = profiles_root / profile / "lsp"
         try:
             populated = lsp_dir.is_dir() and any(lsp_dir.iterdir())
@@ -907,12 +934,13 @@ def _check_lsp_installed(project: ases_config.ProjectConfig) -> DoctorCheck:
     if not found:
         return DoctorCheck(
             "lsp_install", "pass",
-            "no ASES profile has a populated lsp/ directory (nothing Hermes auto-installed there)", _LSP_IDS,
+            "no ASES profile has a populated lsp/ directory (nothing Hermes auto-installed there)" + fallback_note,
+            _LSP_IDS,
         )
     return DoctorCheck(
         "lsp_install", "warn",
         "Hermes already installed language-server files (lsp.install_strategy defaults to 'auto'); swarm init "
-        "never removes them, that stays a person's decision: " + "; ".join(found),
+        "never removes them, that stays a person's decision: " + "; ".join(found) + fallback_note,
         _LSP_IDS,
     )
 
@@ -1136,7 +1164,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         *_check_model_registry(conn, models_config),
         _check_role_profiles(project),
         _check_reviewer_diversity(project),
-        _check_lsp_installed(project),
+        _check_lsp_installed(project, models_config, profiles_mod),
         _check_reviewer_hooks(project, models_config, profiles_mod),
         _check_hermes_safe_mode(),
         *([profiles_unavailable] if profiles_unavailable is not None

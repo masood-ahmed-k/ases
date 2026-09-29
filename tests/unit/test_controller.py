@@ -916,6 +916,142 @@ def _one_coder_task_ready_to_merge(tmp_path, monkeypatch, repo):
     return plan, conn, project, pair, created
 
 
+# --- round 19 (package MERGEGUARD, ASES-ROL-05, fix D3): the merge queue's belt-and-braces independence check,
+# judging the completing reviewer run's ACTUAL model/provider (usage_ingested), not just its profile name ------
+
+# A pinned Lead (family "qwen", provider "xkiro") and reviewer role, so _merge_queue_independence has something
+# to compare a completing run's own ledger attribution against.
+LEAD_AND_REVIEWER_MODELS = {
+    "providers": {"xkiro": {}, "openrouter": {}},
+    "models": [
+        {"provider": "xkiro", "model": "qwen/qwen3.8-max:free", "role_class": "lead", "pinned": True},
+        {"provider": "openrouter", "model": "cohere/north-mini-code:free", "role_class": "reviewer", "pinned": True},
+    ],
+}
+
+
+def _insert_usage_ingested(conn, *, board, run_id, model, billing_provider, session_id="s1", provider=None):
+    conn.execute(
+        "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+        "output_tokens, ingested_at, board, run_id, billing_provider) VALUES "
+        "(?, 'reviewer', ?, ?, 1, 0, 0, datetime('now'), ?, ?, ?)",
+        (session_id, provider or billing_provider, model, board, run_id, billing_provider),
+    )
+
+
+def test_merge_queue_proceeds_when_the_completing_reviewer_run_is_independent_of_the_lead(tmp_path, monkeypatch):
+    """The common case: the ledger's own session attribution names a model/provider that differs from the
+    Lead's in both family and provider, so the belt-and-braces check is a no-op and the merge proceeds exactly
+    as it did before this check existed."""
+    repo = _repo_with_one_commit_on_a_work_branch(tmp_path)
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    run = {**REVIEWER_COMPLETED, "id": 601}
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [run]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
+    ))
+    completed = []
+    monkeypatch.setattr(hermes, "kanban_complete", lambda board, cid, **kw: completed.append(cid))
+    _insert_usage_ingested(
+        conn, board="b", run_id=601, model="cohere/north-mini-code:free", billing_provider="openrouter",
+    )
+
+    merged = controller.process_merge_queue(
+        "b", repo, plan, project, conn=conn, models_config=LEAD_AND_REVIEWER_MODELS,
+    )
+
+    assert merged == ["T1"]
+    assert completed == [pair.merge_card_id]
+
+
+def test_merge_queue_refuses_and_reopens_review_when_the_run_actually_used_the_leads_provider(
+    tmp_path, monkeypatch,
+):
+    """D3: a per-card model override pinned for a coder's replacement card is lane-blind and can leak into that
+    same card's reviewer run (research report finding D3/F3) -- the reviewer PROFILE completed the card and
+    gave a PASS verdict, but its run's ACTUAL provider is the Lead's own. The merge is refused and review is
+    reopened without ever reaching Gate 1 or mergeq -- never merged, and nothing sent to a model."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    run = {**REVIEWER_COMPLETED, "id": 602}
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [run]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
+    ))
+    actions = _record_card_actions(monkeypatch)
+    _insert_usage_ingested(conn, board="b", run_id=602, model="some/other-model:free", billing_provider="xkiro")
+
+    merged = controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, models_config=LEAD_AND_REVIEWER_MODELS,
+    )
+
+    assert merged == []
+    assert actions["complete"] == []
+    assert len(actions["reopen_review"]) == 1
+    cid, reason = actions["reopen_review"][0]
+    assert cid == pair.work_card_id
+    assert "xkiro" in reason and "not independent" in reason
+    (event,) = _refusals(conn, "merge_refused_not_independent")
+    assert event["task_key"] == "T1" and event["card_id"] == pair.work_card_id and event["run_id"] == 602
+    assert event["provider"] == "xkiro" and event["lead_provider"] == "xkiro"
+
+
+def test_merge_queue_refuses_when_the_run_shares_the_leads_model_family_on_a_different_provider(
+    tmp_path, monkeypatch,
+):
+    """ASES-ROL-05 is "a different model family AND provider": a different provider alone (here, openrouter,
+    not the Lead's xkiro) is not enough independence if the vendor family (qwen) is the same one the Lead uses."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    run = {**REVIEWER_COMPLETED, "id": 603}
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [run]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
+    ))
+    actions = _record_card_actions(monkeypatch)
+    _insert_usage_ingested(
+        conn, board="b", run_id=603, model="qwen/qwen3-72b-instruct:free", billing_provider="openrouter",
+    )
+
+    merged = controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, models_config=LEAD_AND_REVIEWER_MODELS,
+    )
+
+    assert merged == []
+    assert actions["complete"] == [] and len(actions["reopen_review"]) == 1
+    (event,) = _refusals(conn, "merge_refused_not_independent")
+    assert event["provider"] == "openrouter" and event["lead_family"] == "qwen"
+
+
+def test_merge_queue_waits_then_asks_once_when_the_completing_run_has_no_ledger_session_yet(tmp_path, monkeypatch):
+    """Unknown is never assumed independent: the merge queue WAITS (never refuses, never merges) while the
+    completing run's session has not yet been ingested, up to budgets.merge_reviewer_session_wait_passes
+    passes, then asks the owner ONE question -- and never asks again on later passes for the same run."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    run = {**REVIEWER_COMPLETED, "id": 604}
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, cid: (
+        {"id": cid, "status": "done", "branch_name": "swarm/T1-coder", "_runs": [run]}
+        if cid == pair.work_card_id else {"id": cid, "status": "blocked"}
+    ))
+    actions = _record_card_actions(monkeypatch)
+    # No usage_ingested row at all for run_id 604: the session has not been ingested yet.
+
+    for _ in range(3):
+        merged = controller.process_merge_queue(
+            "b", tmp_path / "repo", plan, project, conn=conn, models_config=LEAD_AND_REVIEWER_MODELS,
+        )
+        assert merged == []
+    assert actions["complete"] == [] and actions["reopen_review"] == []
+    waits = _refusals(conn, "merge_reviewer_session_unknown")
+    assert len(waits) == 3  # once per pass: the count itself is the bound
+    assert len(actions["ask"]) == 1
+    assert actions["ask"][0][0] == pair.merge_card_id
+
+    # A further pass never asks again for the same run, and still never merges.
+    controller.process_merge_queue(
+        "b", tmp_path / "repo", plan, project, conn=conn, models_config=LEAD_AND_REVIEWER_MODELS,
+    )
+    assert len(actions["ask"]) == 1
+
+
 # --- round 9 (ASES-QG-04, ASES-SEC-03): an infrastructure failure at any of the three merge-queue gate calls is
 # recorded and holds the merge, never a red gate and never a silently completed merge on the host instead --------
 

@@ -1612,6 +1612,15 @@ def _family(model_id: str | None) -> str | None:
     return letters.group(0) if letters else parts[0]
 
 
+def model_family(model_id: str | None) -> str | None:
+    """Public wrapper around `_family`, for callers in another module (round 19, package MERGEGUARD: the merge
+    queue's ASES-ROL-05 belt-and-braces check, controller.process_merge_queue) that need the same vendor-family
+    heuristic doctor's own reviewer/Lead diversity check (`_check_diversity`) already uses, without reaching
+    into a private, module-internal helper across a module boundary (no other module in this codebase does
+    that; see e.g. doctor.py's own `profiles_mod.verify_state` for the established public-wrapper pattern)."""
+    return _family(model_id)
+
+
 def _provider_identity(cfg: dict) -> str | None:
     """Who serves the profile's model: the endpoint when one is configured (two `custom` profiles on different URLs are
     different providers), else the provider name."""

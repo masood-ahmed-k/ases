@@ -578,3 +578,75 @@ def test_a_session_that_never_ends_settles_after_a_stable_count_past_the_deadlin
     usage.settle_open_sessions(project, MODELS, conn=conn, now=pass_3)
     assert conn.execute("SELECT settled FROM usage_ingested WHERE session_id='2234bb'").fetchone()["settled"] == 1
     assert ledger.usage_today_for_provider(conn, "xkiro", now=_dt(1790561300)) == 14   # the one top-up, never repeated
+
+
+# =============================================================================================================
+# reviewer_run_identities (round 19, package MERGEGUARD: the merge queue's ASES-ROL-05 belt-and-braces check
+# at merge, controller.process_merge_queue, fix D3 of REVIEWER.md design (a) "Belt and braces at merge")
+# =============================================================================================================
+
+
+def test_reviewer_run_identities_is_none_when_the_run_has_not_been_ingested_yet(conn):
+    assert usage.reviewer_run_identities(conn, BOARD, 999) is None
+
+
+def test_reviewer_run_identities_prefers_billing_provider_over_the_attributed_provider(conn):
+    conn.execute(
+        "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+        "output_tokens, ingested_at, board, run_id, billing_provider) VALUES "
+        "('s1', 'reviewer', 'xkiro', ?, 1, 0, 0, datetime('now'), ?, 42, 'openrouter')",
+        (REVIEWER_MODEL, BOARD),
+    )
+    # provider='xkiro' is usage.py's own attribution (e.g. a router-model mismatch guess); billing_provider
+    # 'openrouter' is what Hermes's own session export actually named, and is what this function must prefer.
+    assert usage.reviewer_run_identities(conn, BOARD, 42) == [(REVIEWER_MODEL, "openrouter")]
+
+
+def test_reviewer_run_identities_falls_back_to_the_attributed_provider_when_billing_provider_is_null(conn):
+    conn.execute(
+        "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+        "output_tokens, ingested_at, board, run_id) VALUES "
+        "('s1', 'reviewer', 'openrouter', ?, 1, 0, 0, datetime('now'), ?, 43)",
+        (REVIEWER_MODEL, BOARD),
+    )
+    assert usage.reviewer_run_identities(conn, BOARD, 43) == [(REVIEWER_MODEL, "openrouter")]
+
+
+def test_reviewer_run_identities_is_unknown_when_a_row_has_no_model(conn):
+    """Round 19 architect fix (MERGEGUARD review finding): a session recorded with no model (the column is NOT NULL,
+    but an empty string can still arrive) cannot show its family differs from the Lead's, so the run is UNKNOWN
+    (the merge waits), never read as independent."""
+    conn.execute(
+        "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+        "output_tokens, ingested_at, board, run_id, billing_provider) VALUES "
+        "('s1', 'reviewer', 'openrouter', '', 1, 0, 0, datetime('now'), ?, 45, 'openrouter')",
+        (BOARD,),
+    )
+    assert usage.reviewer_run_identities(conn, BOARD, 45) is None
+
+
+def test_reviewer_run_identities_is_scoped_to_the_board(conn):
+    """The same run_id on a DIFFERENT board is never mistaken for this one -- run ids are only unique per board."""
+    conn.execute(
+        "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+        "output_tokens, ingested_at, board, run_id, billing_provider) VALUES "
+        "('s1', 'reviewer', 'openrouter', ?, 1, 0, 0, datetime('now'), 'other-board', 44, 'openrouter')",
+        (REVIEWER_MODEL,),
+    )
+    assert usage.reviewer_run_identities(conn, BOARD, 44) is None
+
+
+def test_reviewer_run_identities_returns_every_row_for_an_ambiguous_run(conn):
+    """A run with more than one non-lineage counted session (usage_mapping_ambiguous, _maybe_record_ambiguity)
+    still hands back every (model, provider) pair -- the caller (belt-and-braces at merge) must judge them all,
+    never pick just one and hope."""
+    for session_id, model, billing_provider in (("s1", REVIEWER_MODEL, "openrouter"), ("s2", CODER_MODEL, "xkiro")):
+        conn.execute(
+            "INSERT INTO usage_ingested (session_id, profile, provider, model, requests, input_tokens, "
+            "output_tokens, ingested_at, board, run_id, billing_provider) VALUES "
+            "(?, 'reviewer', ?, ?, 1, 0, 0, datetime('now'), ?, 45, ?)",
+            (session_id, billing_provider, model, BOARD, billing_provider),
+        )
+    assert sorted(usage.reviewer_run_identities(conn, BOARD, 45)) == sorted(
+        [(REVIEWER_MODEL, "openrouter"), (CODER_MODEL, "xkiro")]
+    )

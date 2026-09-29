@@ -2817,6 +2817,30 @@ def test_affordable_now_refuses_a_paid_model_unless_allow_paid_models_is_set(tmp
     assert ok is True
 
 
+def test_affordable_now_refuses_a_committing_task_when_only_the_reviewer_is_paid(tmp_path, monkeypatch):
+    """Round 19 (package MERGEGUARD, STOPGATES review minor, ASES-DOC-04): _affordable_now already re-checks
+    the REVIEWER's data class for a committing task
+    (test_affordable_now_parks_a_committing_task_when_only_the_reviewer_is_data_class_unsafe above, same
+    STOPDOC.md item); the reviewer's PAID status needs the identical re-check, with the same "paid model: ..."
+    reason style as the task's own paid-model refusal just above -- a committing task always ends up reviewed,
+    so a coder pinned to a perfectly free provider is still not affordable if the reviewer it hands off to is a
+    paid model and budgets.allow_paid_models is not set."""
+    w = make_world(tmp_path, monkeypatch)
+    models = {
+        "providers": MODELS["providers"],
+        "models": [
+            {"provider": "xkiro", "model": "coder-m", "role_class": "coder", "pinned": True},
+            {"provider": "openrouter", "model": "rev-m", "role_class": "reviewer", "pinned": True, "paid": True},
+        ],
+    }
+
+    ok, reason = controller._affordable_now(w.conn, coder_task(w), models, {})
+    assert ok is False and reason.startswith("paid model: ") and "rev-m" in reason
+
+    ok, reason = controller._affordable_now(w.conn, coder_task(w), models, {"allow_paid_models": True})
+    assert ok is True
+
+
 # =============================================================================================================
 # process_bounds and pause_and_report
 # =============================================================================================================
