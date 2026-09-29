@@ -3921,3 +3921,17 @@ Architect-authored summary of the workflow's builder and reviewer reports.
 
 - The defect the register described was fixed in round 6 (0e66674); only the register note was stale. The pre-fix
   logic from commit 8f847be reproduced the old failure, and the current code does not.
+
+## Round 18 (2026-09-29): the S1 finish's findings
+
+Architect-authored summary.
+
+- UNPARK was found by the real run, not by review: 30 idle passes after the reset. The acceptance builder drove the
+  scenario through the respawn-guarded ready path (one quota crash, not three), the real S1 card's shape, and pinned the fake
+  clock to a fixed moment so the midnight crossing is deterministic. The reviewer reproduced the failure against the unfixed
+  source in a copy; nemotron agreed after walking the day boundary.
+- REVIEWPATH: the builder kept the prompt short on purpose (the free reviewer model follows short rules best). The reviewer's
+  one minor finding, a tamper check that could not run being logged as a failed Gate 1, was fixed by the architect to match
+  `gate_before_review`. Nemotron also claimed an event-name mismatch, which the reviewer verified false.
+- The real run then showed that prompt v3 alone does not change this model's behaviour: it blocked word for word as before.
+  The prompt is now right for a model that follows it; the model choice is the owner's.

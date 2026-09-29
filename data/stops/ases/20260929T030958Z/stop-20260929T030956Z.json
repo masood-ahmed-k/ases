@@ -1,0 +1,14 @@
+{
+  "started_at": "2026-09-29T03:09:56+00:00",
+  "finished_at": "2026-09-29T03:09:58+00:00",
+  "seconds": 2.047,
+  "paused": true,
+  "reclaimed": [],
+  "reclaim_errors": [],
+  "killed": [],
+  "unverified": [],
+  "containers_stopped": [],
+  "flag_set": true,
+  "within_deadline": true,
+  "notes": []
+}

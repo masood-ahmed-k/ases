@@ -1356,6 +1356,31 @@ fix rounds, run as one workflow.
 
 Full suite after the merges: 5980 passed, 2 skipped. `swarm doctor` HEALTHY, both new container rows PASS.
 
+## Round 18: what the S1 finish found for real, and two fixes (2026-09-29)
+
+The S1 finish (the first real run with the sandbox on; `docs/stage-c-2026-09-28.md`, addendum) found three real problems the
+fake rig had never exercised. Two are fixed; the third is the reviewer model itself.
+
+- **UNPARK** (merge 3808612; ASES-CAP-03, REC-01). Recovery parks a card whose worker failed with quota text, but
+  `process_unpark` only released the budget gate's own `budget:` parks, so a quota park was never released and S1 stayed
+  parked through the reset. Now a card whose reason starts with `recovery.QUOTA_PARK_PREFIX` is released once
+  `recovery.quota_reset_passed` says the UTC day of its park is over, and only when `_affordable_now` agrees; never on the
+  same day. Proven for real the same night: `card_unparked` on the first pass.
+- **REVIEWPATH** (merge 91fb430; ASES-REV-05, ROL-03). A released card kept the reviewer as its assignee, so the gateway
+  dispatched the reviewer at once, bypassing the review lane: no Gate 1 re-check, no gate record. `process_unpark` now runs
+  `review.record_gate1` (check plus posted record, no send-back) before releasing a card assigned to the reviewer. Reviewer
+  prompt version 3 closes a loophole: v2 forbade requesting changes over tests the reviewer cannot run, so the model blocked
+  instead; v3 forbids both and keeps BLOCKED for human decisions about requirements or design.
+- **Not fixed by code: the reviewer model.** OpenRouter's `cohere/north-mini-code:free` blocked S1 again, word for word, under
+  prompt v3 with a sandboxed PASS gate record on the card (Gate 1 ran in a real `py311-3` container: the first sandboxed gate
+  on a real card). Hermes moved S1 to triage. Changing the reviewer model or provider is the owner's call.
+- **Open, found by the same run: the request ledger undercounts.** Only runs that end through a normal hand-off carry a
+  `worker_session_id`, and `usage.ingest_run_usage` counts only those; crashed, blocked and changes-requested runs are
+  invisible, which is how the budget gate let S1 run into OpenRouter's quota on 2026-09-28 (ASES-CAP-03, RTE-01).
+
+Both fixes went through a builder or the architect, an independent Sonnet reviewer and a nemotron second opinion, each with a
+before/after proof. Full suite after both: 6002 passed, 2 skipped.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and

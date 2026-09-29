@@ -172,3 +172,12 @@ nemotron second opinion, and up to two fix rounds. The specs are in the workflow
 | (workflow spec) | CONTAINERS: worker sandboxes found by Hermes profile (Hermes never labels them with a card id), swept before new work, stopped by swarm stop (ASES-REC-04, REC-06, SEC-03) | done; three review rounds; the swarm stop step finished by the architect with before/after and real-Docker proof |
 | (workflow spec) | SCENARIOS: acceptance 22.2 and 22.6 as full scenarios, TST-02 note corrected (ASES-TST-02) | done, reviewed PASS; two minor findings fixed by the architect |
 | (workflow spec) | FAKEFIX: the fail_next defect was already fixed in round 6; last workaround removed, 22.15 strengthened (ASES-REC-03) | done, reviewed PASS |
+
+## Round 18 (2026-09-29): what the S1 finish found for real
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| (architect-built; workflow for the acceptance test and review) | UNPARK: a quota-parked card is released after the UTC reset (ASES-CAP-03, REC-01) | done, reviewed PASS; proven for real on S1 |
+| (workflow spec) | REVIEWPATH: reviewer prompt v3; Gate 1 re-run and recorded before a parked review card is released (ASES-REV-05, ROL-03) | done, reviewed PASS; one minor fixed by the architect |
+| (open) | the request ledger counts only runs with a worker_session_id (ASES-CAP-03, RTE-01) | found, not yet built |
+| (owner decision) | the reviewer model cannot follow the reviewer contract (ASES-ROL-05) | waiting for the owner |

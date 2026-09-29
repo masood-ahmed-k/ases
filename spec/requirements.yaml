@@ -223,7 +223,13 @@ requirements:
   section: '4.2'
   verified_by: 22.1, 22.6
   status: partial
-  note: 'ROUND 10 (2026-09-27, zero quota): Owner decision (2026-09-27): the reviewer keeping the combined file
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the reviewer
+    model (OpenRouter cohere/north-mini-code:free) cannot follow the reviewer contract: it asked for test evidence
+    three times across two days (a request for changes on 2026-09-28, then two word-for-word identical blocks on
+    2026-09-29, the second under reviewer prompt version 3, which forbids exactly that, with a sandboxed PASS gate
+    record on the card). Hermes moved S1 to triage on the block loop. Choosing another reviewer model or provider
+    (different family and provider from the Lead) is the owner''s decision. Status unchanged. Earlier note: ROUND 10
+    (2026-09-27, zero quota): Owner decision (2026-09-27): the reviewer keeping the combined file
     toolset is accepted as a documented residual risk until the Docker sandbox''s read-only mount closes it;
     no interim guard. CALLERS made the risk visible: profiles.residual_risks() is printed by swarm init and
     shown as INFO rows by swarm doctor. Earlier note: doctor.reviewer_diversity fails closed if lead and
@@ -365,7 +371,15 @@ requirements:
   section: '5.4'
   verified_by: '22.9'
   status: partial
-  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): two real
+    findings. (1) Recovery''s QUOTA park was never released: process_unpark only knew the budget gate''s own
+    reasons, so S1 sat parked through the reset for 30 passes; fixed in round 18 (merge 3808612) and proven for
+    real, card_unparked on the first pass after the fix. (2) Open: the request ledger undercounts.
+    usage.ingest_run_usage counts a run only when its metadata carries a worker_session_id, which only a normal
+    hand-off writes; runs that end in changes requested, a crash or a block are never counted. On 2026-09-28 the
+    ledger showed 30 OpenRouter requests while OpenRouter had counted 50, which is why the budget gate let the card
+    run into the provider''s quota. Status unchanged. Earlier note: STAGE A APPLIED and STAGE C (2026-09-28, real
+    Hermes, real providers, owner''''s ''''do all'''';
     docs/stage-c-2026-09-28.md): a real provider really ran out: OpenRouter''s free daily quota was used up
     mid-review and ASES recovery classified the failure as quota and parked the card until the next UTC
     midnight instead of retrying. The pre-dispatch half (a card never made ready without budget plus the
@@ -838,7 +852,10 @@ requirements:
   section: '11.2'
   verified_by: '22.3'
   status: in_progress
-  note: 'BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): usage.py records a model_mismatch event when a worker
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the provider
+    and model a run used are recorded only for runs whose metadata carries a worker_session_id (a normal hand-off);
+    crashed, blocked and changes-requested runs record nothing (see ASES-CAP-03). Status unchanged. Earlier note:
+    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): usage.py records a model_mismatch event when a worker
     session ran on a model other than the one pinned for its profile (detection only, no card is failed) and
     every ingested session records the provider and model actually used. Not run against a live session; the
     ledger probably under-counts worker sessions because Hermes keeps auxiliary calls in separate rows.'
@@ -974,7 +991,13 @@ requirements:
   section: '13.2'
   verified_by: 22.6, 22.12
   status: partial
-  note: 'ROUND 16 (2026-09-28, zero quota): EVIDENCE (commit 0373fe7) closed the gap stage C''s reviewer hit:
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): a card
+    released from a park went straight to the reviewer without passing through the review lane, so Gate 1 was never
+    re-run for it; round 18b (merge 91fb430) makes process_unpark re-run Gate 1 and post the record before releasing
+    a card assigned to the reviewer. For S1 itself the architect ran review.record_gate1 once: Gate 1 ran in a real
+    ases-sandbox:py311-3 container on e10cb2b (PASS, 37 passed) and was posted. The send-back path has still not
+    fired in a real run. Status unchanged. Earlier note: ROUND 16 (2026-09-28, zero quota): EVIDENCE (commit
+    0373fe7) closed the gap stage C''''s reviewer hit:
     review._post_gate_record now posts the controller''s Gate 1 result as a card comment headed ''ASES gate
     record'' (GATE_RECORD_HEADER), redacted before truncation, deduplicated by a gate1_record_posted event,
     and a posting failure never breaks the review pass; prompts/reviewer.md version 2 tells the reviewer
@@ -1092,7 +1115,11 @@ requirements:
   section: '14.3'
   verified_by: '22.12'
   status: covered
-  note: 'ROUND 15 and STAGE B (2026-09-28, zero quota): the sandbox switch this row depends on is proven against real
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the first
+    sandboxed gate on a real project card: Gate 1 for S1 ran in a real ases-sandbox:py311-3 container (Docker
+    create/start/die/destroy at 02:38:57-02:38:59 UTC) on commit e10cb2b, PASS, 37 passed. Status unchanged
+    (covered). Earlier note: ROUND 15 and STAGE B (2026-09-28, zero quota): the sandbox switch this row depends on
+    is proven against real
     Docker (scripts/sandbox_live_check.py, commit 6954e88; docs/stage-b-2026-09-28.md) and is now on:
     config/swarm.yaml''s sandbox.enabled is true (SANDBOX ON, commit 409dc86), applied to the coder-1
     profile and to the controller''s own gate calls by swarm init --global --apply --yes (12 changes, 0
@@ -1301,7 +1328,10 @@ requirements:
   section: '19.2'
   verified_by: 22.3, 22.6
   status: in_progress
-  note: 'STAGE A APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the quota
+    half is now proven end to end for real: a quota failure parked S1 (2026-09-28) and, after the round 18 fix, the
+    next pass after the UTC reset released it (card_unparked at 01:16:24). Status unchanged. Earlier note: STAGE A
+    APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''''s ''''do all'''';
     docs/stage-c-2026-09-28.md): the quota path of the failure classification ran live (crashed runs whose
     output named the exhausted free quota were classified quota and parked). The capability path (a fresh
     attempt with the failure bundle) has not been seen live. Earlier note: ROUND 12 (2026-09-28, zero quota,
@@ -1440,7 +1470,11 @@ requirements:
   section: '19.6'
   verified_by: '22.13'
   status: covered
-  note: 'ROUND 17 (2026-09-29, zero quota, CONTAINERS, merge 161077e): with the sandbox on since 2026-09-28,
+  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): swarm stop
+    used for real twice with the sandbox on (01:47 and 03:09 UTC): paused, flag set, 2.06 s and 2.05 s, a running
+    swarm run exited on the flag both times (exit 4). No worker container was running, so the new container step had
+    nothing to stop. Status unchanged (covered). Earlier note: ROUND 17 (2026-09-29, zero quota, CONTAINERS, merge
+    161077e): with the sandbox on since 2026-09-28,
     p357''s "terminate worker process trees and sandboxes" was not met for sandboxes: step f matched card ids,
     and Hermes labels a real worker container hermes-task-id="default" (never the card id; proven with Hermes''s
     own Python against real Docker, scripts/hermes_container_labels_check.py). Step f now also stops every
