@@ -1181,14 +1181,19 @@ def _merge_cards_not_done(board: str, plan, conn: sqlite3.Connection) -> str | N
     return None
 
 
-def _green_gate(conn: sqlite3.Connection, gate: str, head: str) -> GateOutcome | None:
+def _green_gate(conn: sqlite3.Connection, gate: str, head: str, *, project: str | None = None) -> GateOutcome | None:
     """The outcome of a gate that already PASSED on exactly `head` (the latest row for that commit wins, the same
-    rule as bounds.final_gates_green), rebuilt from its gate_runs row; None when it did not."""
-    if gates.last_gate_result(conn, FINAL_TASK_KEY, gate, head) != "pass":
+    rule as bounds.final_gates_green), rebuilt from its gate_runs row; None when it did not.
+
+    `project` (round 19, package GIT12; ASES-GIT-12) is passed to gates.last_gate_result and used to scope the
+    detail read the same NULL-tolerant way: this project's own row, or a legacy row with no project recorded,
+    never a different project's "__final__" row (the pseudo task key every project's Gates 4/5 share)."""
+    if gates.last_gate_result(conn, FINAL_TASK_KEY, gate, head, project=project) != "pass":
         return None
     row = conn.execute(
-        "SELECT detail FROM gate_runs WHERE task_key = ? AND gate = ? AND commit_sha = ? ORDER BY id DESC LIMIT 1",
-        (FINAL_TASK_KEY, gate, head),
+        "SELECT detail FROM gate_runs WHERE task_key = ? AND gate = ? AND commit_sha = ? "
+        "AND (project IS NULL OR project = ?) ORDER BY id DESC LIMIT 1",
+        (FINAL_TASK_KEY, gate, head, project),
     ).fetchone()
     return GateOutcome(
         gate, head, True, (row["detail"] or "") if row is not None else "",
@@ -1340,14 +1345,15 @@ def finalize(
         if bounds.finish_project(board, plan, head, conn=conn, now=moment):
             events.record(conn, "project_finished", {"project": plan.project, "commit_sha": head, "report_path": ""})
         return FinalizeResult(
-            STATUS_FINISHED, _green_gate(conn, GATE4, head), _green_gate(conn, GATE5, head),
+            STATUS_FINISHED, _green_gate(conn, GATE4, head, project=plan.project),
+            _green_gate(conn, GATE5, head, project=plan.project),
             _last_report_path(conn, plan.project),
             f"Gates 4 and 5 are already green on {head[:10]} and the release report is written",
         )
 
     outcomes: dict[str, GateOutcome] = {}
     for gate, run in ((GATE4, run4), (GATE5, run5)):
-        skipped = _green_gate(conn, gate, head)
+        skipped = _green_gate(conn, gate, head, project=plan.project)
         if skipped is not None:
             outcomes[gate] = skipped
             continue

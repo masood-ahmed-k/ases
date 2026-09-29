@@ -358,6 +358,49 @@ def test_a_partial_retention_block_keeps_the_other_default(tmp_path):
     assert (cfg.logs_days, cfg.reports_days) == (7, 90)
 
 
+# --- the integrity: block (ASES-GIT-12, round 19, package GIT12) -----------------------------------------------
+
+
+def test_integrity_takes_a_safe_default_when_the_file_has_none(tmp_path):
+    cfg = _load(tmp_path)
+
+    assert cfg.integrity == {"enforce_attribution": False}
+    assert cfg.integrity_enforce_attribution is False
+
+
+def test_an_empty_integrity_block_means_the_default(tmp_path):
+    cfg = _load(tmp_path, "integrity:\n")
+
+    assert cfg.integrity == config.DEFAULT_INTEGRITY
+
+
+def test_the_integrity_default_is_a_copy_so_one_config_cannot_change_another(tmp_path):
+    first = _load(tmp_path)
+    first.integrity["enforce_attribution"] = True
+
+    second = _load(tmp_path)
+
+    assert second.integrity["enforce_attribution"] is False
+    assert config.DEFAULT_INTEGRITY["enforce_attribution"] is False
+
+
+def test_integrity_enforce_attribution_can_be_turned_on(tmp_path):
+    cfg = _load(tmp_path, "integrity:\n  enforce_attribution: true\n")
+
+    assert cfg.integrity_enforce_attribution is True
+
+
+@pytest.mark.parametrize("block, message", [
+    ("integrity: yes\n", "integrity must be a mapping"),
+    ("integrity:\n  enforce_attributionn: true\n", "unknown integrity key"),
+    ("integrity:\n  enforce_attribution: 'true'\n", "enforce_attribution must be true or false"),
+    ("integrity:\n  enforce_attribution: 1\n", "enforce_attribution must be true or false"),
+])
+def test_a_bad_integrity_block_is_refused_not_ignored(tmp_path, block, message):
+    with pytest.raises(config.ConfigError, match=message):
+        _load(tmp_path, block)
+
+
 def test_a_project_config_built_by_hand_still_gets_both_blocks():
     """The tests of other modules build ProjectConfig with the twelve original fields; the new two must default."""
     cfg = config.ProjectConfig(

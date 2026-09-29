@@ -21,15 +21,22 @@ This module only reports: what a violation does (halt the run, raise a security 
 decision. The checks never raise and are read-only: every git call runs with --no-optional-locks, so it cannot
 take index.lock away from a real git operation, and a git that fails or hangs is reported as a problem, never
 as a clean checkout.
+
+Round 19 (package GIT12): observe_worktrees is a THIRD, separate mechanism for the other worktrees, additive to
+check_idle_worktrees above (which keeps running exactly as before): a per-poll bracketing baseline (its own
+integrity_baselines table, never worktree_snapshots) that never deletes a subject's row just because its owner
+is running, so a between-polls change is caught instead of silently explained away. See its own docstring.
 """
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import hashlib
 import os
 import pathlib
 import sqlite3
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -702,3 +709,157 @@ def check_card_base(repo: pathlib.Path, branch: str, allowed_heads: Iterable[str
             f"branch {branch!r} was created from {base[:12]}, which is not a commit ASES itself wrote or adopted",
         )
     return CardBaseResult(True, base, "")
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-poll bracketing baselines (round 19, package GIT12; ASES-GIT-12, report mode)
+# ---------------------------------------------------------------------------------------------
+#
+# observe_worktrees is ADDITIVE to check_idle_worktrees above, not a replacement (architect decision, round 19:
+# "keep process_idle_worktrees' current warnings working until the new observer fully covers them"). It keeps its
+# OWN baseline in the schema-v12 `integrity_baselines` table, never `worktree_snapshots`: the two mechanisms
+# disagree about deletion (check_idle_worktrees deletes a running card's row; this NEVER deletes a subject's row
+# while it can still be told apart from one that has genuinely disappeared -- r19/GIT12.md design A1/A4, "a
+# baseline that is NEVER deleted"), so sharing one table would make each corrupt the other's state. This module
+# only collects the git state and classifies it (blueprint table 15: "guards.py collects the git state"); the
+# candidate-run lookup is hermes.board_runs and the verdict is integrity.attribute, both called by the
+# controller, which also decides what a finding means.
+
+# gates.py's `ases-gate-*` (mkdtemp) and mergeq.py's `ases-merge-*` (mkdtemp) throwaway checkouts: created and
+# torn down inside one pass, never a security question (design A4's "ases_temp: ... Ignored entirely").
+_ASES_TEMP_PARENT_PATTERNS = ("ases-gate-*", "ases-merge-*")
+
+
+def _is_ases_temp(path: pathlib.Path) -> bool:
+    """True for a worktree gates.run_gate or mergeq's candidate build made: both put the actual worktree one
+    level under their own `tempfile.mkdtemp(prefix="ases-gate-"/"ases-merge-")` directory (`tmp_root / "wt"` and
+    `tmp_root / "candidate"` respectively), so this checks the PARENT directory's name against the two prefixes
+    and that ITS OWN parent is the OS temp directory -- never guessing from the worktree's own leaf name, which
+    differs between the two callers and is never guaranteed stable."""
+    parent = path.parent
+    if not any(fnmatch.fnmatch(parent.name, pattern) for pattern in _ASES_TEMP_PARENT_PATTERNS):
+        return False
+    try:
+        return _path_key(parent.parent) == _path_key(tempfile.gettempdir())
+    except OSError:
+        return False
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeObservation:
+    """One worktree whose baseline (observe_worktrees) shows a real change since the pass that last confirmed
+    it, or that has disappeared. `path` is its path key (_path_key); `kind` is "card" when it matches a watched
+    card's own workspace_path, else "foreign". `owner_card` is that card's Hermes id for "card", else None.
+    `disappeared` is True when the worktree (or its directory) is gone; `before`/`after` are each (head,
+    status_hash), `("", "")` for `after` when disappeared. `confirmed_begin` is epoch seconds of the LAST pass
+    that still confirmed the `before` state (the stored baseline's own confirmed_end column), never the pass
+    that first established the baseline (its confirmed_begin column). Round 19 fix round 1 (major finding): a
+    subject that sits unchanged for many passes before this one must still get a TIGHT interval, bounded by the
+    most recent pass that actually read the old state -- not one that grows for as long as the subject stayed
+    dormant. An unbounded interval could span a long-stale, already-reaped run that has nothing to do with the
+    real change, either silently swallowing the owner's own security_event (a false "own" verdict) or
+    misattributing a foreign write to the wrong candidate card. `read_end` is when THIS pass's read finished --
+    together the interval integrity.attribute needs, before its own skew pad."""
+    path: str
+    kind: str
+    owner_card: str | None
+    disappeared: bool
+    before: tuple[str, str]
+    after: tuple[str, str]
+    confirmed_begin: float
+    read_end: float
+
+
+def _integrity_baseline_row(conn: sqlite3.Connection, project: str, subject: str):
+    return conn.execute(
+        "SELECT head, status_hash, confirmed_begin, confirmed_end FROM integrity_baselines "
+        "WHERE project = ? AND subject = ?",
+        (project, subject),
+    ).fetchone()
+
+
+def _upsert_integrity_baseline(
+    conn: sqlite3.Connection, project: str, subject: str, kind: str, owner_card: str | None, head: str,
+    status_hash: str, confirmed_begin: float, confirmed_end: float,
+) -> None:
+    conn.execute(
+        "INSERT INTO integrity_baselines "
+        "(project, subject, kind, owner_card, head, status_hash, confirmed_begin, confirmed_end, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(project, subject) DO UPDATE SET kind=excluded.kind, owner_card=excluded.owner_card, "
+        "head=excluded.head, status_hash=excluded.status_hash, confirmed_begin=excluded.confirmed_begin, "
+        "confirmed_end=excluded.confirmed_end, updated_at=excluded.updated_at",
+        (project, subject, kind, owner_card, head, status_hash, confirmed_begin, confirmed_end,
+         datetime.now(timezone.utc).isoformat(timespec="seconds")),
+    )
+
+
+def _delete_integrity_baseline(conn: sqlite3.Connection, project: str, subject: str) -> None:
+    conn.execute("DELETE FROM integrity_baselines WHERE project = ? AND subject = ?", (project, subject))
+
+
+def observe_worktrees(
+    conn: sqlite3.Connection, project: str, repo: pathlib.Path, cards: Iterable[dict], *, now: float,
+) -> list[WorktreeObservation]:
+    """ASES-GIT-12 (r19/GIT12.md design A1, A4): the per-poll bracketing baseline for every worktree of `repo`
+    other than the primary checkout. Returns only the subjects that actually CHANGED or DISAPPEARED this pass
+    (an unchanged or first-seen subject is not returned: there is nothing for the caller to attribute).
+
+    `cards` is this pass's `hermes.kanban_list(board)` result (or any iterable of dicts with at least "id" and
+    "workspace_path"): every entry with a workspace_path names a CARD worktree, owned by that card id, whatever
+    its current status -- a done or archived card's worktree can still be watched (design A5(a) treats a
+    disappeared worktree of a done/archived owner as explained by Hermes's own cleanup, which is the CALLER's
+    decision, not this function's: this function reports the disappearance either way).
+
+    Never raises for git: a worktree list that cannot be read at all returns no observations (the old baselines
+    are left exactly as they are, so a change made during the outage is still caught once git recovers)."""
+    repo = pathlib.Path(repo)
+    worktrees, _why = _worktrees(repo)
+    if worktrees is None:
+        return []
+    owners: dict[str, str] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        workspace_path, card_id = card.get("workspace_path"), card.get("id")
+        if workspace_path and card_id:
+            owners[_path_key(workspace_path)] = card_id
+
+    seen: set[str] = set()
+    observations: list[WorktreeObservation] = []
+    for key, worktree in _other_worktrees(worktrees, repo):
+        if _is_ases_temp(worktree.path):
+            continue
+        seen.add(key)
+        owner_card = owners.get(key)
+        kind = "card" if owner_card is not None else "foreign"
+        row = _integrity_baseline_row(conn, project, key)
+        if worktree.prunable or not worktree.path.is_dir():
+            if row is not None:
+                observations.append(WorktreeObservation(
+                    key, kind, owner_card, True, (row["head"], row["status_hash"]), ("", ""),
+                    row["confirmed_end"], now,
+                ))
+                _delete_integrity_baseline(conn, project, key)
+            continue
+        head, status_hash = snapshot_worktree(worktree.path)
+        if not head:
+            continue  # could not be read this pass; any old baseline is left exactly as it was
+        if row is None:
+            _upsert_integrity_baseline(conn, project, key, kind, owner_card, head, status_hash, now, now)
+            continue
+        if (row["head"], row["status_hash"]) == (head, status_hash):
+            _upsert_integrity_baseline(conn, project, key, kind, owner_card, head, status_hash,
+                                        row["confirmed_begin"], now)
+            continue
+        observations.append(WorktreeObservation(
+            key, kind, owner_card, False, (row["head"], row["status_hash"]), (head, status_hash),
+            row["confirmed_end"], now,
+        ))
+        _upsert_integrity_baseline(conn, project, key, kind, owner_card, head, status_hash, now, now)
+    for (stored,) in conn.execute(
+        "SELECT subject FROM integrity_baselines WHERE project = ?", (project,),
+    ).fetchall():
+        if stored not in seen:
+            _delete_integrity_baseline(conn, project, stored)
+    return observations

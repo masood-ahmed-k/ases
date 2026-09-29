@@ -85,6 +85,19 @@ retention:
   logs_days: 30
   reports_days: 90
 
+# ASES-GIT-12 (round 19, package GIT12): the per-poll bracketing attribution engine (guards.observe_worktrees,
+# hermes.board_runs, integrity.attribute) always RECORDS a security_event for a worktree that changed with a
+# unique or ambiguous attribution -- this key does not switch that off. It switches off ACTING on one: failing
+# the attributed card, quarantining every candidate, or pausing the project (blueprint p185's "fails the card and
+# raises a security event", table 31's "pause if it repeats"). False (the default, and what this round ships) is
+# report mode: read `swarm status`/`swarm report`'s health and quality panels for what it found. The primary
+# checkout guard (a violation halts the run) and the base-commit check (guards.check_card_base) are unaffected by
+# this key either way; only the new attribution engine's own enforcement is gated by it. Turn this on only after
+# a report-mode run's false-positive rate is known: see the round 19 GIT12 research report for the design and
+# its own limits (parallel work often makes attribution ambiguous, not unique, worth reading before flipping this).
+integrity:
+  enforce_attribution: false
+
 # Gate 4's built-in tree scan allowlist (ASES-TSK-04, section 18.2) is NOT a key of this file. It lives on the
 # approved PLAN as a top-level "gate4_allowlist" field (a list of path globs, docs/ases/plan.json), because it is
 # a plan-author decision published and reviewed at Gate P by the critic and the user, table 34's "gates the agent

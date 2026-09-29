@@ -2408,6 +2408,37 @@ class FakeHermes:
         )
         return [s["id"] for s in matches[:limit]]
 
+    @_controller_call
+    def board_runs(
+        self, native_home, board: str, since_epoch: float, *, tested_version: str,
+    ) -> "_hermes.BoardRunsResult":
+        """hermes.board_runs (round 19, package GIT12; ASES-GIT-12), built straight from this fake's own `_runs`
+        and `_events`: no file, no version gate -- the fake board always behaves as the pinned, tested version,
+        so `native_home`/`tested_version` are accepted only to match the real signature and never consulted.
+        `since_epoch` applies exactly hermes.board_runs's own filter (open, ended in-window, or worker_pid still
+        set); reaped_at comes from this fake's own `terminal_worker_reaped` events (_reap_terminal_workers)."""
+        reaped: dict[int, int] = {}
+        for events_of_task in self._events.values():
+            for event in events_of_task:
+                if event.kind == "terminal_worker_reaped" and event.run_id is not None:
+                    reaped[event.run_id] = event.created_at
+        runs = []
+        for run_list in self._runs.values():
+            for run in run_list:
+                if not (run.ended_at is None or run.ended_at >= since_epoch or run.worker_pid is not None):
+                    continue
+                task = self._tasks.get(run.task_id)
+                runs.append(_hermes.RunWindow(
+                    run_id=run.id, task_id=run.task_id, profile=run.profile, started_at=run.started_at,
+                    ended_at=run.ended_at, outcome=run.outcome, worker_pid=run.worker_pid,
+                    workspace_path=task.workspace_path if task else None,
+                    branch_name=task.branch_name if task else None,
+                    task_status=task.status if task else None,
+                    reaped_at=reaped.get(run.id),
+                ))
+        runs.sort(key=lambda r: r.run_id)
+        return _hermes.BoardRunsResult(True, tuple(runs), "")
+
     # ---------------------------------------------------------------------------------------
     # The worker side: what a dispatched worker's kanban tools do (tools/kanban_tools.py). A worker names its own
     # run with run_id, like HERMES_KANBAN_RUN_ID, so a worker whose run was reclaimed cannot act on its successor's.

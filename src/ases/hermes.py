@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import pathlib
 import re
 import shutil
+import sqlite3
 import subprocess
 from datetime import datetime, timezone
 
@@ -572,3 +574,119 @@ def session_usage(profile: str, session_id: str, timeout: int = 60) -> dict | No
             del summary["source"], summary["end_reason"]
             return summary
     return None
+
+
+# ---------------------------------------------------------------------------------------------
+# The board's own run records (round 19, package GIT12; ASES-GIT-12). Option R1 of r19/GIT12.md's design: one
+# read-only SQLite query of the board's kanban.db, never the `hermes` CLI (no command exists for this, and a
+# query per pass would be one process spawn per pass). This reads Hermes's PRIVATE schema, which is why it is
+# gated on the pinned version (blueprint table 15's "version pinning" is named as this module's own job).
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RunWindow:
+    """One task_runs row, joined with its task's own workspace fields, exactly as ASES-GIT-12's attribution
+    needs it (r19/GIT12.md design A2). started_at/ended_at are epoch seconds on the host clock -- the same clock
+    ASES's own `now` is read from. worker_pid is Hermes's own liveness signal: kanban_db._end_run keeps it on the
+    row after ended_at is set, until the reaper confirms the process is gone, so a worker can outlive its own
+    run's end. reaped_at is the created_at of that run's `terminal_worker_reaped` task_event, or None when no
+    such event was found in the window this query read (never seen reaped, or reaped before `since_epoch`)."""
+    run_id: int
+    task_id: str
+    profile: str | None
+    started_at: int
+    ended_at: int | None
+    outcome: str | None
+    worker_pid: int | None
+    workspace_path: str | None
+    branch_name: str | None
+    task_status: str | None
+    reaped_at: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class BoardRunsResult:
+    """board_runs's own result. `ok` False means "unknown, attribute nothing" (the architect's own words, round
+    19): the pinned Hermes version did not match what is installed, or the board's database could not be opened
+    or read at all. `runs` is then always empty and must never be trusted as a partial answer; the caller
+    records exactly one event for the whole pass and treats every subject as having no candidate this pass,
+    rather than guess from a partial read. `reason` is "" exactly when `ok` is True."""
+    ok: bool
+    runs: tuple[RunWindow, ...]
+    reason: str
+
+
+def _board_db_path(native_home: pathlib.Path, board: str) -> pathlib.Path:
+    """Hermes's own resolution of a board's database file (hermes_cli/kanban_db.py:405-408, 502-505, read only
+    from its source, never from any documented public contract): the `default` board's DB stays at
+    `<root>/kanban.db` for back-compat; every other board slug lives under
+    `<root>/kanban/boards/<slug>/kanban.db`. `native_home` is config/swarm.yaml's hermes.native_home, ASES's own
+    name for the same root Hermes calls kanban_home()."""
+    if board == "default":
+        return native_home / "kanban.db"
+    return native_home / "kanban" / "boards" / board / "kanban.db"
+
+
+_BOARD_RUNS_SQL = (
+    "SELECT r.id, r.task_id, r.profile, r.started_at, r.ended_at, r.outcome, r.worker_pid, "
+    "t.workspace_path, t.branch_name, t.status "
+    "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+    "WHERE r.ended_at IS NULL OR r.ended_at >= :since OR r.worker_pid IS NOT NULL"
+)
+_REAPED_EVENTS_SQL = (
+    "SELECT run_id, created_at FROM task_events WHERE kind = 'terminal_worker_reaped' AND created_at >= :since"
+)
+
+
+def board_runs(
+    native_home: pathlib.Path, board: str, since_epoch: float, *, tested_version: str,
+) -> BoardRunsResult:
+    """ASES-GIT-12's run source (r19/GIT12.md design A2, option R1): every Hermes task_runs row that could still
+    explain a change in a pass's interval -- open, ended inside `[since_epoch, now]`, or whose worker_pid Hermes
+    has not yet cleared (kept past ended_at until the reaper confirms the process is gone). One read-only SQLite
+    connection to the BOARD's OWN kanban.db, opened as a `file:...?mode=ro` URI: this process must never write to
+    Hermes's database, and mode=ro is enforced by SQLite itself, not by convention.
+
+    This reads Hermes 0.21.3's PRIVATE schema (task_runs, task_events, tasks: hermes_cli/kanban_db.py, not a
+    documented interface), which is exactly why it is gated on the pinned version: `tested_version`
+    (config/swarm.yaml hermes.tested_version) must match the Hermes actually installed (hermes_version(), the
+    same subprocess check doctor.py already makes) before a single byte of the file is trusted. A version
+    mismatch, a missing `hermes`, a missing board database, or any error opening or reading the file all fall
+    back the SAME way: ok=False, no runs -- "unknown, attribute nothing" (the architect's own words for this
+    round): the caller must record exactly one event for the whole pass rather than guess from a partial read."""
+    installed = hermes_version()
+    if installed != tested_version:
+        return BoardRunsResult(
+            False, (),
+            f"installed hermes version {installed!r} does not match the pinned hermes.tested_version "
+            f"{tested_version!r}",
+        )
+    db_path = _board_db_path(native_home, board)
+    if not db_path.is_file():
+        return BoardRunsResult(False, (), f"board database not found: {db_path}")
+    try:
+        uri = db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+    except (sqlite3.Error, ValueError, OSError) as exc:
+        return BoardRunsResult(False, (), f"could not open {db_path} read-only: {exc}")
+    try:
+        conn.row_factory = sqlite3.Row
+        reaped: dict[int, int] = {}
+        for row in conn.execute(_REAPED_EVENTS_SQL, {"since": since_epoch}):
+            if row["run_id"] is not None:
+                reaped[row["run_id"]] = row["created_at"]
+        runs = tuple(
+            RunWindow(
+                run_id=row["id"], task_id=row["task_id"], profile=row["profile"], started_at=row["started_at"],
+                ended_at=row["ended_at"], outcome=row["outcome"], worker_pid=row["worker_pid"],
+                workspace_path=row["workspace_path"], branch_name=row["branch_name"], task_status=row["status"],
+                reaped_at=reaped.get(row["id"]),
+            )
+            for row in conn.execute(_BOARD_RUNS_SQL, {"since": since_epoch})
+        )
+    except sqlite3.Error as exc:
+        return BoardRunsResult(False, (), f"could not read {db_path}: {exc}")
+    finally:
+        conn.close()
+    return BoardRunsResult(True, runs, "")

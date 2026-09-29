@@ -182,10 +182,11 @@ def _raw_event(conn, ts, kind, raw):
     conn.execute("INSERT INTO events (ts, kind, payload) VALUES (?, ?, ?)", (ts, kind, raw))
 
 
-def _gate_run(conn, task_key, gate, sha, result, ran_at):
+def _gate_run(conn, task_key, gate, sha, result, ran_at, project=None):
     conn.execute(
-        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_key, gate, sha, result, "GATE-DETAIL-TEXT", ran_at),
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_key, gate, sha, result, "GATE-DETAIL-TEXT", ran_at, project),
     )
 
 
@@ -1179,6 +1180,22 @@ def test_cards_of_another_project_sharing_the_board_are_never_read(scenario):
 # --- Quality --------------------------------------------------------------------------------------------------
 
 
+def test_quality_panels_gate_runs_omits_another_projects_row_sharing_a_task_key(conn, tmp_path, monkeypatch):
+    """Round 19, package GIT12 (ASES-GIT-12, design test B9): PLAN.project is "p1"; a gate_runs row stamped
+    "p2" for the SAME task key T1 must never show up in p1's own quality panel, although a legacy NULL row still
+    does (report.py used to have no project predicate here at all: any project's row for a shared task key
+    leaked into every other project's own panel)."""
+    _fake_hermes(monkeypatch, {})
+    _gate_run(conn, "T1", "gate1", "a" * 10, "pass", "2026-09-19T10:00:00+00:00", project="p1")
+    _gate_run(conn, "T1", "gate1", "b" * 10, "pass", "2026-09-19T10:01:00+00:00", project="p2")
+    _gate_run(conn, "T1", "gate1", "c" * 10, "pass", "2026-09-19T10:02:00+00:00", project=None)
+
+    quality = _build(conn, tmp_path)["quality"]
+
+    shown_shas = {row["commit_sha"] for row in quality["gate_runs"]}
+    assert shown_shas == {"a" * 10, "c" * 10}  # p1's own row and the legacy NULL row; never p2's
+
+
 def test_quality_panel_contents_and_order(scenario_report):
     quality = scenario_report["quality"]
     assert quality["gate_runs"] == [
@@ -1302,7 +1319,7 @@ def test_health_counts_newest_time_and_message_per_kind(scenario_report):
 ALL_HEALTH_KINDS = [
     "pass_error", "usage_ingest_error", "merge_failed", "merge_race_retrying", "card_parked_for_budget",
     "integrity_violation", "fix_card_created", "fix_card_budget_exhausted", "model_mismatch", "should_stop_error",
-    "tamper_check_error", "tamper_blocked",
+    "tamper_check_error", "tamper_blocked", "security_event",
 ]
 
 

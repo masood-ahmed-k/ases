@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from ases import db, gitexec, guards
+from ases import db, gitexec, guards, integrity
 
 
 def _git(*args, cwd):
@@ -1525,3 +1525,266 @@ def test_refresh_snapshots_uses_the_same_ignore_prefixes_as_the_check(conn, repo
     guards.refresh_snapshots(conn, "proj", repo, set(), ignore_prefixes=(".cache/",))
 
     assert _idle(conn, repo, ignore_prefixes=(".cache/",)) == []
+
+
+# --- observe_worktrees: the per-poll bracketing baseline (round 19, package GIT12; ASES-GIT-12) ----------------
+#
+# A SEPARATE baseline from check_idle_worktrees' own worktree_snapshots table (architect decision: the two must
+# coexist without corrupting each other's state), so every test here reads/writes integrity_baselines, never
+# worktree_snapshots, and never passes a `running` set at all: unlike check_idle_worktrees, observe_worktrees
+# tracks a worktree the SAME way whether or not a card is currently running in it (design test 11: "running
+# worktrees keep their baseline: no row is deleted while the owner runs").
+
+def _baseline_rows(conn, project="proj"):
+    cur = conn.execute(
+        "SELECT subject, kind, owner_card, head, status_hash, confirmed_begin, confirmed_end "
+        "FROM integrity_baselines WHERE project = ?", (project,),
+    )
+    return {row["subject"]: dict(row) for row in cur.fetchall()}
+
+
+def _observe(conn, repo, cards=(), project="proj", now=1000.0):
+    return guards.observe_worktrees(conn, project, repo, cards, now=now)
+
+
+def test_first_sight_of_a_worktree_stores_a_baseline_and_reports_nothing(conn, repo):
+    wt = _worktree(repo, "t1")
+
+    found = _observe(conn, repo, now=100.0)
+
+    assert found == []
+    rows = _baseline_rows(conn)
+    assert set(rows) == {_key(wt)}
+    assert (rows[_key(wt)]["confirmed_begin"], rows[_key(wt)]["confirmed_end"]) == (100.0, 100.0)
+    assert rows[_key(wt)]["kind"] == "foreign" and rows[_key(wt)]["owner_card"] is None
+
+
+def test_an_unchanged_worktree_reports_nothing_and_keeps_its_confirmed_begin(conn, repo):
+    wt = _worktree(repo, "t1")
+    _observe(conn, repo, now=100.0)
+
+    found = _observe(conn, repo, now=500.0)
+
+    assert found == []
+    row = _baseline_rows(conn)[_key(wt)]
+    assert (row["confirmed_begin"], row["confirmed_end"]) == (100.0, 500.0)  # begin never moved; end advanced
+
+
+def test_a_changed_foreign_worktree_is_reported_and_its_baseline_resets(conn, repo):
+    wt = _worktree(repo, "t1")
+    _observe(conn, repo, now=100.0)
+    before_head = _head(repo)  # every worktree of one repo shares HEAD until a worktree commits its own
+    _write(wt, "surprise.txt")
+
+    found = _observe(conn, repo, now=500.0)
+
+    assert len(found) == 1
+    obs = found[0]
+    assert (obs.path, obs.kind, obs.owner_card, obs.disappeared) == (_key(wt), "foreign", None, False)
+    assert obs.confirmed_begin == 100.0 and obs.read_end == 500.0
+    assert obs.before[0] == before_head  # HEAD did not move, only the status hash
+    assert obs.after != obs.before
+    row = _baseline_rows(conn)[_key(wt)]
+    assert (row["confirmed_begin"], row["confirmed_end"]) == (500.0, 500.0)  # the change becomes the new baseline
+    assert (row["head"], row["status_hash"]) == obs.after
+
+
+# --- round 19 fix round 1 (major finding): confirmed_begin must not freeze at first sight ----------------------
+#
+# guards.observe_worktrees refreshed the DB row's confirmed_end on every unchanged pass but, once a change was
+# finally seen, handed integrity.attribute the row's ORIGINAL confirmed_begin (frozen since first sight) instead
+# of that refreshed confirmed_end. For a subject that sat unchanged for a long time, that stretched the interval
+# integrity.attribute searches back over the whole dormant period, so a long-stale, already-reaped run with
+# nothing to do with the real change could still overlap it: a false "own" verdict that silently swallows the
+# ASES-GIT-12 security_event the blueprint requires, or a misattribution to the wrong foreign card. The two
+# tests immediately below (a) pin the corrected value observe_worktrees now reports and (b) reproduce, end to
+# end with a real repo and the real integrity.attribute, the exact false-"own" scenario the finding described.
+
+def test_a_worktree_dormant_for_many_unchanged_passes_then_changed_uses_the_last_confirmed_pass_not_first_sight(
+    conn, repo,
+):
+    wt = _worktree(repo, "t1")
+    _observe(conn, repo, now=100.0)
+    for t in (200.0, 300.0, 400.0, 1000.0, 3000.0, 4900.0):
+        assert _observe(conn, repo, now=t) == []  # confirmed unchanged, every one of these passes
+
+    _write(wt, "surprise.txt")
+    found = _observe(conn, repo, now=5000.0)
+
+    assert len(found) == 1
+    obs = found[0]
+    assert obs.confirmed_begin == 4900.0  # the LAST confirmed pass, not the first-sight time (100.0)
+    assert obs.read_end == 5000.0
+
+
+def test_a_dormant_subjects_change_is_not_falsely_attributed_to_a_long_stale_reaped_run_of_the_owner(conn, repo):
+    """The finding's own pure-attribute repro: RunCandidate(started_at=490.0, ended_at=980.0, worker_pid=None)
+    with owner_card='C1' and an interval built from a confirmed_begin frozen at first sight returned "own",
+    silently swallowing the security_event a real intrusion into a long-dormant worktree should raise. With
+    confirmed_begin correctly bounded to the last CONFIRMED pass, the same stale run no longer overlaps at all."""
+    wt = _worktree(repo, "t1")
+    cards = [{"id": "C1", "workspace_path": str(wt)}]
+    _observe(conn, repo, cards, now=100.0)
+    for t in (1000.0, 3000.0, 4900.0):
+        assert _observe(conn, repo, cards, now=t) == []
+
+    _write(wt, "surprise.txt")
+    found = _observe(conn, repo, cards, now=5000.0)
+
+    assert len(found) == 1
+    obs = found[0]
+    stale_owner_run = integrity.RunCandidate(
+        run_id=1, task_id="C1", started_at=490.0, ended_at=980.0, worker_pid=None,
+    )
+    interval = (obs.confirmed_begin - integrity.DEFAULT_SKEW_SECONDS, obs.read_end + integrity.DEFAULT_SKEW_SECONDS)
+
+    result = integrity.attribute([stale_owner_run], interval, owner_card="C1", now=5000.0)
+
+    assert result.verdict == integrity.ATTRIBUTION_NONE  # not "own": that run ended at t=980, long before t=4900
+
+
+def test_a_worktree_dormant_for_many_passes_then_disappearing_uses_the_last_confirmed_pass_too(conn, repo):
+    """The same fix, for guards.py's OTHER WorktreeObservation construction site (the disappeared branch)."""
+    wt = _worktree(repo, "gone1")
+    _observe(conn, repo, now=100.0)
+    for t in (1000.0, 3000.0, 4900.0):
+        assert _observe(conn, repo, now=t) == []
+
+    shutil.rmtree(wt)
+    found = _observe(conn, repo, now=5000.0)
+
+    assert len(found) == 1
+    obs = found[0]
+    assert (obs.disappeared, obs.confirmed_begin, obs.read_end) == (True, 4900.0, 5000.0)
+
+
+def test_a_changed_worktree_matching_a_cards_workspace_path_is_kind_card(conn, repo):
+    wt = _worktree(repo, "t1")
+    cards = [{"id": "t_card1", "workspace_path": str(wt)}]
+    _observe(conn, repo, cards, now=100.0)
+    _write(wt, "surprise.txt")
+
+    found = _observe(conn, repo, cards, now=500.0)
+
+    assert len(found) == 1
+    assert (found[0].kind, found[0].owner_card) == ("card", "t_card1")
+    assert _baseline_rows(conn)[_key(wt)]["owner_card"] == "t_card1"
+
+
+def test_a_worktree_that_changes_while_its_own_card_is_running_is_still_reported(conn, repo):
+    """The whole point of this mechanism over check_idle_worktrees (design test 11): a running card's own worktree
+    is tracked exactly like any other. observe_worktrees takes no `running` set at all -- the CONTROLLER decides
+    what a change means (own/unique/ambiguous/none, via hermes.board_runs + integrity.attribute), not this
+    function."""
+    wt = _worktree(repo, "t1")
+    cards = [{"id": "t_card1", "workspace_path": str(wt), "status": "running"}]
+    _observe(conn, repo, cards, now=100.0)
+    _write(wt, "written-by-the-live-worker.txt")
+
+    found = _observe(conn, repo, cards, now=200.0)
+
+    assert len(found) == 1 and found[0].owner_card == "t_card1"
+
+
+def test_a_disappeared_worktree_with_a_prior_baseline_is_reported_and_the_baseline_is_dropped(conn, repo):
+    wt = _worktree(repo, "gone1")
+    _observe(conn, repo, now=100.0)
+    shutil.rmtree(wt)
+
+    found = _observe(conn, repo, now=200.0)
+
+    assert len(found) == 1
+    obs = found[0]
+    assert (obs.disappeared, obs.after) == (True, ("", ""))
+    assert obs.confirmed_begin == 100.0 and obs.read_end == 200.0
+    assert _baseline_rows(conn) == {}  # the dead subject's row is gone: nothing left to compare next time
+
+
+def test_a_worktree_gone_before_it_was_ever_baselined_is_never_reported(conn, repo):
+    wt = _worktree(repo, "gone1")
+    shutil.rmtree(wt)  # never seen while it existed: observe_worktrees has no "before" to compare
+
+    found = _observe(conn, repo, now=100.0)
+
+    assert found == []
+    assert _baseline_rows(conn) == {}
+
+
+def test_an_ases_gate_temp_checkout_is_never_baselined_or_reported(conn, repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(guards.tempfile, "gettempdir", lambda: str(tmp_path))
+    real_worktree_path = tmp_path / "ases-gate-abc123" / "wt"
+    real_worktree_path.parent.mkdir()
+    _git("worktree", "add", "-q", "--detach", str(real_worktree_path), cwd=repo)
+
+    found = _observe(conn, repo, now=100.0)
+
+    assert found == []
+    assert _baseline_rows(conn) == {}  # not even a first-sight baseline for it
+
+
+def test_an_ases_merge_temp_checkout_is_never_baselined_either(conn, repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(guards.tempfile, "gettempdir", lambda: str(tmp_path))
+    real_worktree_path = tmp_path / "ases-merge-xyz789" / "candidate"
+    real_worktree_path.parent.mkdir()
+    _git("worktree", "add", "-q", "--detach", str(real_worktree_path), cwd=repo)
+
+    assert _observe(conn, repo, now=100.0) == []
+    assert _baseline_rows(conn) == {}
+
+
+def test_a_worktree_git_cannot_read_keeps_its_old_baseline_and_is_not_reported(conn, repo, monkeypatch):
+    wt = _worktree(repo, "t1")
+    _observe(conn, repo, now=100.0)
+    _write(wt, "surprise.txt")
+    monkeypatch.setattr(guards, "snapshot_worktree", lambda path, **kwargs: ("", ""))
+
+    found = _observe(conn, repo, now=500.0)
+
+    assert found == []
+    row = _baseline_rows(conn)[_key(wt)]
+    assert (row["confirmed_begin"], row["confirmed_end"]) == (100.0, 100.0)  # untouched: the read failed
+
+
+def test_observe_worktrees_never_raises_when_git_cannot_list_worktrees(conn, repo, monkeypatch):
+    def fail(cmd, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(guards.subprocess, "run", fail)
+
+    assert _observe(conn, repo, now=100.0) == []
+
+
+def test_observe_worktrees_ignores_the_primary_checkout(conn, repo):
+    _write(repo, "dirty.txt")  # a dirty PRIMARY checkout: check_primary_checkout's own job, not this one's
+
+    assert _observe(conn, repo, now=100.0) == []
+    assert _baseline_rows(conn) == {}
+
+
+# --- _is_ases_temp (round 19, package GIT12) -----------------------------------------------------
+
+def test_is_ases_temp_matches_a_gate_and_a_merge_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(guards.tempfile, "gettempdir", lambda: str(tmp_path))
+    gate = tmp_path / "ases-gate-abc" / "wt"
+    merge = tmp_path / "ases-merge-xyz" / "candidate"
+    for p in (gate, merge):
+        p.mkdir(parents=True)
+
+    assert guards._is_ases_temp(gate) is True
+    assert guards._is_ases_temp(merge) is True
+
+
+def test_is_ases_temp_rejects_a_look_alike_name_or_the_wrong_parent(tmp_path, monkeypatch):
+    monkeypatch.setattr(guards.tempfile, "gettempdir", lambda: str(tmp_path))
+    not_under_temp = tmp_path / "elsewhere" / "ases-gate-abc" / "wt"
+    not_under_temp.mkdir(parents=True)
+    wrong_name = tmp_path / "not-ases-gate-abc" / "wt"
+    wrong_name.mkdir(parents=True)
+
+    assert guards._is_ases_temp(not_under_temp) is False
+    assert guards._is_ases_temp(wrong_name) is False
+
+
+def test_is_ases_temp_rejects_an_ordinary_worktree(repo):
+    wt = _worktree(repo, "t1")
+    assert guards._is_ases_temp(wt) is False

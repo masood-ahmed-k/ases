@@ -3358,6 +3358,224 @@ def test_the_merge_time_check_gets_the_tasks_allow_gate_config_changes_marker(tm
     assert seen[0]["allow_gate_config_changes"] is True
 
 
+def test_the_merge_time_check_gets_the_plans_own_project(tmp_path, monkeypatch):
+    """Round 19, package GIT12 (ASES-GIT-12, design test B7): process_merge_queue must pass project=plan.project
+    to review.check_branch_for_merge, so its gate_runs reads (and any fresh Gate 1 run) are scoped to this
+    project, not left to reuse or write an unscoped row (the bug this package fixes)."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    _board_state(monkeypatch, pair)
+    _record_card_actions(monkeypatch)
+    _script_merge_task(monkeypatch, _MERGED)
+    seen = _stub_check(monkeypatch, review_mod.BranchCheck(True, "ok", "fine", "abc123def456"))
+
+    controller.process_merge_queue("b", tmp_path / "repo", plan, project, conn=conn)
+
+    assert len(seen) == 1
+    assert seen[0]["project"] == plan.project
+
+
+def test_last_gate_detail_is_strictly_scoped_to_the_project(tmp_path):
+    """Round 19, package GIT12 (ASES-GIT-12, design test B8): _last_gate_detail's text goes straight into a
+    retry card body a worker reads (_start_fresh_attempt), so it must never return another project's gate
+    output for a task key two projects happen to share -- strict `project = ?`, not NULL-tolerant."""
+    conn = db.connect(tmp_path / "ases.db")
+    conn.execute(
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("T1", "gate1", "a" * 10, "fail", "project A output", "2026-09-19T10:00:00+00:00", "A"),
+    )
+
+    assert controller._last_gate_detail(conn, "T1", "B") == ""  # only project A's row exists: never leaked
+    assert controller._last_gate_detail(conn, "T1", "A") == "project A output"
+
+
+# ---------------------------------------------------------------------------------------------
+# process_git12_attribution (round 19, package GIT12; ASES-GIT-12, report mode). Direct, unit-level tests: each
+# stubs guards.observe_worktrees and hermes.board_runs so the orchestration decision is under test, never git or
+# a real board -- guards' and hermes' own suites already cover collecting the git state and reading the run
+# source. Report mode (the architect's own binding decision, round 19) is the DEFAULT everywhere except the two
+# tests that explicitly turn integrity.enforce_attribution on.
+# ---------------------------------------------------------------------------------------------
+
+
+def _git12_project(tmp_path, *, enforce=False):
+    return config.ProjectConfig(
+        name="t3", environment="native", data_class="public", workspace_root=tmp_path / "ws",
+        ases_home=tmp_path / "home", board="b", integration_branch="integration", roles=ROLES,
+        concurrency={}, budgets={}, hermes_tested_version="0.21.3", hermes_native_home=tmp_path / "hermes",
+        integrity={"enforce_attribution": enforce},
+    )
+
+
+def _git12_plan(project="t3"):
+    raw = dict(PLAN_RAW)
+    raw["project"] = project
+    return plan_mod.parse_and_validate(raw, known_roles=set(ROLES), max_cards=40)
+
+
+def _observation(path="wt1", kind="foreign", owner_card=None, disappeared=False, before=("a", "s1"),
+                  after=("b", "s2"), confirmed_begin=100.0, read_end=200.0):
+    return guards_mod.WorktreeObservation(path, kind, owner_card, disappeared, before, after, confirmed_begin,
+                                          read_end)
+
+
+def _run_window(run_id, task_id, started_at=0.0, ended_at=None, worker_pid=None):
+    return hermes.RunWindow(run_id, task_id, "coder-1", started_at, ended_at, "completed", worker_pid,
+                            None, None, None, None)
+
+
+def test_git12_returns_nothing_and_calls_no_board_runs_when_nothing_changed(tmp_path, monkeypatch):
+    """kanban_list is always called (observe_worktrees needs the card list to classify a worktree as "card" or
+    "foreign"), the same way process_idle_worktrees already calls it every pass; board_runs is the one call
+    genuinely skippable when there is nothing to attribute, and this is what must not happen for nothing."""
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [])
+
+    def forbidden(*a, **kw):
+        raise AssertionError("board_runs must not be called when there is nothing to attribute")
+
+    monkeypatch.setattr(hermes, "board_runs", forbidden)
+
+    assert controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn) == []
+    assert events.recent(conn) == []
+
+
+def test_git12_skips_a_disappeared_worktree_of_a_done_or_archived_owner(tmp_path, monkeypatch):
+    """Design A5(a): Hermes's own cleanup of a done/archived card's worktree needs no run-source lookup and no
+    event at all."""
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [
+        _observation(owner_card="w1", disappeared=True, after=("", "")),
+    ])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [{"id": "w1", "status": "done"}])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("board_runs must not be called: the owner is done, nothing to attribute")))
+
+    assert controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn) == []
+    assert events.recent(conn) == []
+
+
+def test_git12_records_one_unknown_event_when_the_run_source_is_unavailable(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [_observation(path="wt1")])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: hermes.BoardRunsResult(False, (), "version mismatch"))
+
+    warnings = controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn)
+
+    assert len(warnings) == 1 and "version mismatch" in warnings[0]
+    (event,) = events.recent(conn)
+    assert event["kind"] == "security_event"
+    payload = json.loads(event["payload"])
+    assert payload["attribution"] == "unknown" and payload["reason"] == "version mismatch"
+
+
+def test_git12_records_nothing_for_an_own_attribution(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [
+        _observation(path="wt1", kind="card", owner_card="w1", confirmed_begin=100.0, read_end=100.0),
+    ])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [{"id": "w1", "status": "running"}])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: hermes.BoardRunsResult(
+        True, (_run_window(1, "w1", started_at=90.0, ended_at=None),), "",
+    ))
+
+    assert controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn) == []
+    assert events.recent(conn) == []
+
+
+def test_git12_records_a_unique_finding_and_does_not_enforce_by_default(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path, enforce=False), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [
+        _observation(path="wt1", kind="foreign", owner_card=None, confirmed_begin=100.0, read_end=100.0),
+    ])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: hermes.BoardRunsResult(
+        True, (_run_window(1, "other_card", started_at=90.0, ended_at=None),), "",
+    ))
+    asked = []
+    monkeypatch.setattr(questions_mod, "ask_user", lambda *a, **kw: asked.append(a) or "blocked")
+
+    warnings = controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn)
+
+    assert len(warnings) == 1 and "attribution=unique" in warnings[0]
+    (event,) = events.recent(conn)
+    payload = json.loads(event["payload"])
+    assert payload["attribution"] == "unique" and payload["enforced"] is False
+    assert payload["candidates"] == [{"task_id": "other_card", "run_id": 1}]
+    assert asked == []  # report mode: nothing is blocked
+
+
+def test_git12_enforces_a_unique_finding_by_blocking_the_one_candidate_card(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path, enforce=True), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [
+        _observation(path="wt1", owner_card=None, confirmed_begin=100.0, read_end=100.0),
+    ])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: hermes.BoardRunsResult(
+        True, (_run_window(1, "other_card", started_at=90.0, ended_at=None),), "",
+    ))
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, card_id: {"id": card_id, "status": "running"})
+    asked = []
+    monkeypatch.setattr(questions_mod, "ask_user", lambda board, card, text, **kw: asked.append(card["id"]))
+    paused = []
+    monkeypatch.setattr(controller, "pause_and_report", lambda *a, **kw: paused.append(1))
+
+    controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn)
+
+    assert asked == ["other_card"]
+    assert paused == []  # design A5(c): a unique finding blocks its one card, it does not by itself pause
+
+
+def test_git12_enforces_an_ambiguous_finding_by_blocking_every_candidate_and_pausing(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path, enforce=True), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [
+        _observation(path="wt1", owner_card=None, confirmed_begin=100.0, read_end=100.0),
+    ])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: hermes.BoardRunsResult(True, (
+        _run_window(1, "card_a", started_at=90.0, ended_at=None),
+        _run_window(2, "card_b", started_at=90.0, ended_at=None),
+    ), ""))
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, card_id: {"id": card_id, "status": "running"})
+    asked = []
+    monkeypatch.setattr(questions_mod, "ask_user", lambda board, card, text, **kw: asked.append(card["id"]))
+    paused = []
+    monkeypatch.setattr(controller, "pause_and_report", lambda *a, **kw: paused.append(1))
+
+    controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn)
+
+    assert sorted(asked) == ["card_a", "card_b"]
+    assert paused == [1]
+
+
+def test_git12_enforces_a_none_finding_by_pausing_with_no_card_blocked(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "ases.db")
+    project, plan = _git12_project(tmp_path, enforce=True), _git12_plan()
+    monkeypatch.setattr(guards_mod, "observe_worktrees", lambda *a, **kw: [
+        _observation(path="wt1", owner_card="w1", confirmed_begin=100.0, read_end=100.0),
+    ])
+    monkeypatch.setattr(hermes, "kanban_list", lambda board: [{"id": "w1", "status": "running"}])
+    monkeypatch.setattr(hermes, "board_runs", lambda *a, **kw: hermes.BoardRunsResult(True, (), ""))
+    asked = []
+    monkeypatch.setattr(questions_mod, "ask_user", lambda *a, **kw: asked.append(1))
+    paused = []
+    monkeypatch.setattr(controller, "pause_and_report", lambda *a, **kw: paused.append(1))
+
+    warnings = controller.process_git12_attribution("b", tmp_path, plan, project, {}, conn=conn)
+
+    assert "attribution=none" in warnings[0]
+    assert asked == [] and paused == [1]
+
+
 def test_merge_task_is_told_the_exact_commit_that_was_checked(tmp_path, monkeypatch):
     """The time-of-check gap: a commit pushed after the check must not ride in unchecked."""
     plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)

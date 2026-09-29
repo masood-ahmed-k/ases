@@ -38,6 +38,7 @@ from . import gates as gates_mod
 from . import gitexec
 from . import guards as guards_mod
 from . import hermes as hermes_mod
+from . import integrity as integrity_mod
 from . import intents as intents_mod
 from . import leases as leases_mod
 from . import mergeq
@@ -1089,7 +1090,7 @@ def process_merge_queue(
                     require_binding=True,
                     reviewed_commit=verdict.commit or _handoff_commit(work_card, frozenset({reviewer_profile})),
                     allow_gate_config_changes=task.allow_gate_config_changes,
-                    project_config=project, task=task,
+                    project_config=project, task=task, project=plan.project,
                 )
             except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
                 # Round 9 (ASES-QG-04, ASES-SEC-03): the sandbox is enabled but this task's Gate 1 re-check could
@@ -1715,12 +1716,18 @@ def _branch_diff(repo, integration_branch: str, old_card: dict, task: plan_mod.P
     return diff.stdout[:_DIFF_READ_LIMIT] if diff.returncode == 0 else ""
 
 
-def _last_gate_detail(conn, task_key: str) -> str:
-    """The detail of the newest gate_runs row of this task (any gate), redacted; "" when it never ran a gate. The gate
-    output is command output, so it can carry a secret. (gate_runs has no project column, so two projects that reuse a
-    task key share this lookup: known, and only a hint on a card.)"""
+def _last_gate_detail(conn, task_key: str, project: str) -> str:
+    """The detail of the newest gate_runs row of this task (any gate) for THIS project, redacted; "" when it
+    never ran a gate. The gate output is command output, so it can carry a secret.
+
+    `project` (round 19, package GIT12; ASES-GIT-12) is STRICT (`project = ?`, not NULL-tolerant): this text goes
+    straight into a retry card body a worker reads (_start_fresh_attempt), so another project's gate output, or a
+    legacy NULL row that might be either, must never leak into it just because two projects reuse a task key
+    (controller.py's swarm/<key>-<role> branch naming). Before this package, gate_runs had no project scoping at
+    all here and two projects reusing a task key shared this lookup."""
     row = conn.execute(
-        "SELECT detail FROM gate_runs WHERE task_key = ? ORDER BY id DESC LIMIT 1", (task_key,),
+        "SELECT detail FROM gate_runs WHERE task_key = ? AND project = ? ORDER BY id DESC LIMIT 1",
+        (task_key, project),
     ).fetchone()
     return events.redact_text(row["detail"] or "") if row else ""
 
@@ -1780,7 +1787,7 @@ def _start_fresh_attempt(
         body = _work_card_body(task, _reviewer_profile(project)) + "\n\n" + recovery_mod.failure_bundle(
             old_card, criteria=list(task.acceptance),
             diff_text=_branch_diff(repo, plan.integration_branch, old_card, task),
-            gate_output=_last_gate_detail(conn, key), reviewer_findings=_findings_text(old_card),
+            gate_output=_last_gate_detail(conn, key, plan.project), reviewer_findings=_findings_text(old_card),
         )
         parents = [p for p in old_card.get("_parents") or [] if isinstance(p, str) and p]
         number = _next_retry_number(conn, plan.project, key)
@@ -2674,6 +2681,167 @@ def process_provision(
     return list(provisioned)
 
 
+_GIT12_SKEW_SECONDS = integrity_mod.DEFAULT_SKEW_SECONDS
+_GIT12_TAIL_SECONDS = integrity_mod.DEFAULT_REAP_TAIL_SECONDS
+
+
+def _git12_change_text(obs) -> str:
+    """"HEAD a..b", "status changed", or both, for a guards.WorktreeObservation -- the same shape
+    guards._describe_change gives check_idle_worktrees' own warnings, so a person reading either finding recognises
+    the format. "disappeared" on its own when the worktree is simply gone."""
+    if obs.disappeared:
+        return "worktree disappeared"
+    before_head, before_status = obs.before
+    after_head, after_status = obs.after
+    changes = []
+    if before_head != after_head:
+        changes.append(f"HEAD {before_head[:12]}..{after_head[:12]}")
+    if before_status != after_status:
+        changes.append("status changed")
+    return "; ".join(changes) or "changed"
+
+
+def _enforce_git12_finding(
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, models_config: dict,
+    obs, result: "integrity_mod.Attribution", *, conn,
+) -> None:
+    """ASES-GIT-12's enforcement (r19/GIT12.md design A5(c)), called ONLY when config/swarm.yaml's
+    integrity.enforce_attribution is true (architect decision, round 19: off by default, this round ships report
+    mode). "unique": the one candidate card is blocked with the security reason (questions.ask_user, the same
+    mechanism process_card_base_checks already uses for a base-commit violation), never an automatic retry.
+    "ambiguous": every distinct candidate card is blocked the same way, and the project is paused.
+    "none": the project is paused; no card is blocked, because there is nothing to attribute it to.
+
+    Not implemented from the design (left for the round that turns this on): a security-count-based escalation
+    that only pauses after a SECOND unique violation (design A5(c)'s "pause if it repeats") -- every unique
+    violation here blocks its one card but does not by itself pause the project. Noted as a deferred decision,
+    since this whole function is inert while the flag stays at its documented default."""
+    change = _git12_change_text(obs)
+    if result.verdict == integrity_mod.ATTRIBUTION_UNIQUE:
+        card_id = result.candidates[0][0]
+        try:
+            card = hermes_mod.kanban_show(board, card_id)
+        except hermes_mod.HermesCommandError:
+            return  # the card is already gone (archived, reclaimed): nothing left to block
+        questions_mod.ask_user(
+            board, card,
+            f"ASES-GIT-12 security event: {obs.kind} worktree {obs.path} changed ({change}) during a run of "
+            f"this card, with no run of the worktree's own owner overlapping the interval. Confirm this was "
+            f"expected before the card continues.",
+            conn=conn,
+        )
+        return
+    if result.verdict == integrity_mod.ATTRIBUTION_AMBIGUOUS:
+        for card_id, _run_id in result.candidates:
+            try:
+                card = hermes_mod.kanban_show(board, card_id)
+            except hermes_mod.HermesCommandError:
+                continue
+            questions_mod.ask_user(
+                board, card,
+                f"ASES-GIT-12 security event: {obs.kind} worktree {obs.path} changed ({change}) during this "
+                f"card's run, and at least one OTHER card's run also overlapped the interval, so the writer "
+                f"cannot be told apart. Confirm this was expected before the card continues.",
+                conn=conn,
+            )
+    pause_and_report(
+        board, repo, plan, project, models_config,
+        f"ASES-GIT-12 security event: {obs.kind} worktree {obs.path} changed ({change}) with "
+        f"attribution={result.verdict}; see the security_event in swarm report for the candidates.",
+        conn=conn,
+    )
+
+
+def process_git12_attribution(
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, models_config: dict,
+    *, conn, now=None,
+) -> list[str]:
+    """ASES-GIT-12 (r19/GIT12.md design; round 19, package GIT12, report mode): the per-poll bracketing
+    attribution engine. ADDITIVE to process_idle_worktrees (architect decision: its own warnings keep working
+    exactly as before; this is a separate, additional pass step, on a separate baseline table). Always records a
+    security_event for a worktree that changed with a unique, ambiguous or none attribution (never for "own",
+    which is exactly the false positive the register documented and this design closes); only ACTS on one --
+    blocking a card, pausing the project -- when project.integrity_enforce_attribution is true (the default is
+    false: report mode, nothing here is failed or paused this round).
+
+    1. hermes.kanban_list(board) gives the current cards (workspace_path and status), so guards.observe_worktrees
+       can tell a card's own worktree from a foreign one and this function can tell a done/archived owner from a
+       live one.
+    2. guards.observe_worktrees(conn, plan.project, repo, cards, now=...) returns only the subjects that changed
+       or disappeared this pass; nothing else needs the run source at all.
+    3. A disappeared subject whose owner is done or archived is Hermes's own cleanup (design A5(a)): skipped,
+       no event, no run-source lookup. So is a disappeared subject with no recognised owner card at all: Hermes's
+       default kanban_list leaves archived cards out, so "no owner" is also what an archived card's cleaned-up
+       worktree looks like (report mode; revisit before enforcement). Every other observation calls
+       hermes.board_runs ONCE for the whole pass (since = the earliest changed baseline's own confirmed_begin,
+       minus the reap tail and the clock-skew pad) and, if it could not be
+       trusted at all (a version mismatch, a missing or unreadable board database), records exactly ONE
+       security_event for the pass with attribution "unknown" and returns: "unknown, attribute nothing" (the
+       architect's own words), never a per-subject guess from a partial read.
+    4. Otherwise integrity.attribute decides each observation's own verdict from the SAME candidate list; "own"
+       is silent, everything else is a security_event, and, only when the flag is on, is also enforced."""
+    epoch_now = _as_epoch(now) or time.time()
+    cards = hermes_mod.kanban_list(board)
+    card_status = {c["id"]: c.get("status") for c in cards if isinstance(c, dict) and c.get("id")}
+    observations = guards_mod.observe_worktrees(conn, plan.project, repo, cards, now=epoch_now)
+    if not observations:
+        return []
+
+    actionable = [
+        obs for obs in observations
+        if not (obs.disappeared and (
+            obs.owner_card is None or card_status.get(obs.owner_card) in ("done", "archived")
+        ))
+    ]
+    if not actionable:
+        return []
+
+    since = min(obs.confirmed_begin for obs in actionable) - _GIT12_TAIL_SECONDS - _GIT12_SKEW_SECONDS
+    board_result = hermes_mod.board_runs(
+        project.hermes_native_home, board, since, tested_version=project.hermes_tested_version,
+    )
+    if not board_result.ok:
+        events.record(conn, "security_event", {
+            "rule": "ASES-GIT-12", "attribution": "unknown", "reason": board_result.reason,
+            "subjects": [obs.path for obs in actionable],
+        }, project=plan.project)
+        return [f"git12: the Hermes run source was unavailable this pass ({board_result.reason}); "
+                f"{len(actionable)} changed worktree(s) could not be attributed"]
+
+    candidates = [
+        integrity_mod.RunCandidate(r.run_id, r.task_id, r.started_at, r.ended_at, r.worker_pid)
+        for r in board_result.runs
+    ]
+    warnings: list[str] = []
+    for obs in actionable:
+        interval = (obs.confirmed_begin - _GIT12_SKEW_SECONDS, obs.read_end + _GIT12_SKEW_SECONDS)
+        result = integrity_mod.attribute(candidates, interval, owner_card=obs.owner_card, now=epoch_now)
+        if result.verdict == integrity_mod.ATTRIBUTION_OWN:
+            continue
+        change = _git12_change_text(obs)
+        reason = (
+            f"{obs.kind} worktree {obs.path} changed ({change}) outside its own run: attribution={result.verdict}"
+            + (f" candidates={result.candidates}" if result.candidates else "")
+        )
+        events.record(conn, "security_event", {
+            "rule": "ASES-GIT-12", "subject": obs.path, "kind": obs.kind, "owner_card": obs.owner_card,
+            "change": change, "interval": [interval[0], interval[1]], "attribution": result.verdict,
+            "candidates": [{"task_id": task_id, "run_id": run_id} for task_id, run_id in result.candidates],
+            "enforced": bool(project.integrity_enforce_attribution),
+            # "reason" (report._MESSAGE_FIELDS) so the health/quality panels render a real sentence for this
+            # finding instead of falling back to a raw JSON dump of the payload.
+            "reason": reason,
+        }, project=plan.project)
+        warnings.append(
+            f"git12: {obs.kind} worktree {obs.path} changed outside its own run ({change}); "
+            f"attribution={result.verdict}"
+            + (f", candidates={result.candidates}" if result.candidates else "")
+        )
+        if project.integrity_enforce_attribution:
+            _enforce_git12_finding(board, repo, plan, project, models_config, obs, result, conn=conn)
+    return warnings
+
+
 def process_idle_worktrees(board: str, repo: pathlib.Path, plan: plan_mod.Plan, *, conn) -> list[str]:
     """ASES-GIT-12 (blueprint 8.4: "Before a worker starts and after it stops, the controller snapshots git status
     --porcelain and HEAD of the primary checkout and of every other active worktree. Any change outside the worker's own
@@ -2938,7 +3106,9 @@ def run_pass(
 
       0. halted (a stopped or paused project): return at once, `stopped` True, doing nothing else
       1. the primary-checkout guard (ASES-GIT-12): a violation returns with `integrity` set
-      2. idle worktrees (warnings)                    3. usage ingest into the ledger (ASES-CAP-03)
+      2. idle worktrees (warnings), then the per-poll bracketing attribution engine (ASES-GIT-12, round 19
+         package GIT12, warnings: report mode by default, never fails a card or pauses the project from here)
+      3. usage ingest into the ledger (ASES-CAP-03)
       4. failure recovery and spent budgets,          5. bounds: a project-stopping bound pauses and returns
          then the reviewer contract ladder
       6. the budget gate, then unpark                 7. review-lane policing (Gate 1 re-check)
@@ -2990,6 +3160,15 @@ def run_pass(
 
     summary["warnings"].extend(_isolated(
         conn, summary, "idle_worktrees", lambda: process_idle_worktrees(board, repo, plan, conn=conn), [],
+        plan.project,
+    ))
+    # ASES-GIT-12 (round 19, package GIT12): the per-poll bracketing attribution engine, additive to
+    # idle_worktrees above (its own warnings are unaffected). Isolated like every other non-safety-critical step:
+    # a bug in this still-new mechanism must never stop dispatch or the merge queue, and report mode (the
+    # default) never fails a card or pauses the project from here regardless.
+    summary["warnings"].extend(_isolated(
+        conn, summary, "git12_attribution",
+        lambda: process_git12_attribution(board, repo, plan, project, models_config, conn=conn, now=now), [],
         plan.project,
     ))
 
