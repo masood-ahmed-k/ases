@@ -38,10 +38,19 @@ providers:
     quota_endpoint: /api/v1/key
     require_parameters: true
     data_policy: some_free_endpoints_train
-    # data_policy_verified_at: "2026-09-17"    # ASES-PRV-04 shape, not a live value: set only once a human
-    # data_policy_source: "<url or note>"      # has actually re-checked the data_policy line above and can
-    #                                           # cite where (this provider is not yet safe for
-    #                                           # private/confidential regardless: see policy._SAFE_FOR_PRIVATE).
+    # data_policy_verified_at: "2026-09-29"    # ASES-PRV-04 shape, not a live value: set only once a human
+    # data_policy_source: "https://openrouter.ai/docs/guides/privacy/provider-logging"  # has actually re-checked
+    #                                           # the data_policy line above and can cite where (this provider
+    #                                           # is not yet safe for private/confidential regardless: see
+    #                                           # policy._SAFE_FOR_PRIVATE). Researched 2026-09-29 (PROVIDERS.md,
+    #                                           # read-only, no provider called): the account-level policy above
+    #                                           # still holds ("separate settings for paid and free models";
+    #                                           # opting out stops routing to training providers). OpenRouter's
+    #                                           # own per-endpoint page for the pinned reviewer model
+    #                                           # (cohere/north-mini-code:free) shows a more favorable, model-
+    #                                           # level policy -- see that model's own row under models: below,
+    #                                           # kept separate on purpose (a row-level claim needs its own
+    #                                           # verification, never borrowed from the provider's, ASES-PRV-04).
     verified_on: "2026-09-17"
     # ASES-VER-01 (5.3, Appendix E): the page the limits above were read from, so swarm doctor can show it.
     # Blueprint Appendix E, [S12]: "OpenRouter API limits: free-model request caps, account-wide limits, key
@@ -72,8 +81,17 @@ providers:
                                                # forwards_to_upstreams_that_may_train) -- see the
                                                # gpt-5.6-terra model row below for the one specific
                                                # routed model actually checked end-to-end.
-    # data_policy_verified_at: "2026-09-19"    # ASES-PRV-04 shape, not a live value (see the openrouter block
-    # data_policy_source: "<url or note>"      # above for what these two fields mean).
+    # data_policy_verified_at: "2026-09-29"    # ASES-PRV-04 shape, not a live value (see the openrouter block
+    # data_policy_source: "https://xkiro.com/privacy; https://docs.xkiro.com/guides/overview/"  # above for what
+    #                                           # these two fields mean. Researched 2026-09-29 (PROVIDERS.md,
+    #                                           # read-only, no provider called): xKiro's privacy policy (last
+    #                                           # updated 2026-07-06) still addresses only xKiro's OWN handling,
+    #                                           # never training, and names no legal entity or jurisdiction --
+    #                                           # the same gap the blueprint flagged for the retired UnoRouter.
+    #                                           # xKiro's own docs overview says a request "names a model, not a
+    #                                           # provider" and is reached "through another route" invisibly, so
+    #                                           # this provider cannot honestly be recorded as private-safe on
+    #                                           # current documentation, however this date is filled in.
     verified_on: "2026-09-28"
     # ASES-VER-01: xKiro's own rate-limits reference page, checked 2026-09-28 at the owner's request. It
     # documents the kinds of limit (requests per minute, free tokens per day, spending windows, concurrent
@@ -87,9 +105,17 @@ providers:
     provider_id: opencode-free
     key_env: null                   # served anonymously: no key, no credential pool
     limits: {}
-    data_policy: unknown
-    # data_policy_verified_at: "2026-09-17"    # ASES-PRV-04 shape, not a live value (see the openrouter block
-    # data_policy_source: "<url or note>"      # above for what these two fields mean).
+    data_policy: free_models_may_train        # was `unknown` until researched 2026-09-29 (PROVIDERS.md,
+                                               # read-only, no provider called): OpenCode's own Zen docs
+                                               # (Privacy section) say "Our providers follow a zero-retention
+                                               # policy" WITH EXCEPTIONS, naming several specific free models
+                                               # (including two NVIDIA trial endpoints) whose "collected data
+                                               # may be used to improve the model". Still not a
+                                               # _SAFE_FOR_PRIVATE label, same as `unknown` was -- this
+                                               # provider stays `status: blocked` below regardless.
+    # data_policy_verified_at: "2026-09-29"    # ASES-PRV-04 shape, not a live value (see the openrouter block
+    # data_policy_source: "https://opencode.ai/docs/zen/ (Privacy section)"  # above for what these two fields
+    #                                           # mean.
     verified_on: "2026-09-28"
     # ASES-VER-01: OpenCode's own Zen docs, checked 2026-09-28. It lists the current free models ("free on
     # OpenCode for a limited time") and publishes no request limits. The blueprint's own citation for this
@@ -117,8 +143,14 @@ models:
                                       # the xKiro wallet actually has a balance -- gpt-5.6-terra is still
                                       # the better pick for reliability than any free model here.
     pinned: false
-    data_policy: no_training          # see the discussion this had when it was still the pinned row,
-                                      # preserved in git history / docs/architecture.md.
+    data_policy: router_ztr_upstream_varies   # was `no_training` until corrected 2026-09-29 (PROVIDERS.md,
+                                      # read-only, no provider called): this is a routed model, and xKiro's own
+                                      # zero-retention promise covers xKiro's OWN handling, never what its 16
+                                      # different upstream vendors do once a request reaches them (the same
+                                      # caveat the provider block above already carries for every xkiro row).
+                                      # Harmless while this row stays lead_unfunded and unpinned, but the old
+                                      # label was misleading on its own terms; see the discussion this had when
+                                      # it was still the pinned row, preserved in git history / docs/architecture.md.
 
   - provider: xkiro
     model: "qwen/qwen3.8-max"         # the PAID tier of the model actually in use below -- also hit
@@ -202,7 +234,18 @@ models:
     tool_calling: true               # verified 2026-09-18
     role_class: reviewer
     pinned: true
-    data_policy: some_free_endpoints_train
+    data_policy: some_free_endpoints_train    # the provider-level default above, kept live here on purpose:
+    # data_policy_verified_at: "2026-09-29"   # see below -- not made a live override without the owner's own
+    # data_policy_source: "https://openrouter.ai/cohere/north-mini-code:free/providers"  # ASES-PRV-04 confirmation.
+    # Researched 2026-09-29 (PROVIDERS.md, read-only, no provider called): OpenRouter's own per-endpoint data
+    # for THIS specific model shows a more favorable, model-level policy than the provider default above --
+    # {training: false, retainsPrompts: true, retentionDays: 30} on its Cohere endpoint, which is `no_training`
+    # in this file's vocabulary (30-day retention noted, since policy.py's _SAFE_FOR_PRIVATE checks the label
+    # only, not retention length). Not promoted to a live data_policy/data_policy_verified_at pair by this
+    # package: ASES-PRV-04 requires an explicitly human-verified date, the same rule the two commented lines
+    # above already carry, and this row's data_policy stays the conservative provider default until the owner
+    # reads the cited page and decides to uncomment it. Doing so would also need provider_routing.data_collection:
+    # deny set in the real reviewer Hermes profile before it means anything end to end (PROVIDERS.md finding 5).
     # First real reviews, 2026-09-19 (greet-e2e): it completed two review runs correctly through the Kanban
     # tools. G1 (a coder diff): read both changed files, tried to run the tests, could not (the reviewer has
     # no terminal tool, by design), and approved anyway with review_outcome metadata; 5 API calls, 92,785

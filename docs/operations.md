@@ -3,7 +3,9 @@
 How to run a project with the ASES swarm controller, day to day. This guide describes the code as it is: every command,
 file name, key and exit code below was read from the source (`src/ases/cli.py` and the modules it calls). When a
 failure needs a diagnosis, go to `docs/runbook.md` (symptom, cause, action). The design and the reasons are in
-`docs/architecture.md`.
+`docs/architecture.md`. Which blueprint phase (section 22's exit tests) the project is in, and the estimated real-provider
+cost of closing out whichever phases still need one, is `docs/phase-exit-plan.md` (a plan for the owner to approve, not a
+report of anything run).
 
 Contents: 1 the parts, 2 a normal project, 3 command reference, 4 what `swarm run` does, 5 exit codes, 6 files and
 directories, 7 configuration, 8 the request ledger and parking, 9 the database, 10 retention and cleanup.

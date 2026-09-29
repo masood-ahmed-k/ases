@@ -176,6 +176,195 @@ get around a provider's limits or abuse controls (ASES-CFG-03) is never somethin
 something to do on the user's behalf even when asked to move faster -- the user creates the account, the
 user hands over the key.
 
+## Reviewer candidates (researched 2026-09-29)
+
+Step 1 (discovery) and part of Step 3 (data-policy check), already done for three concrete reviewer
+candidates, from a read-only research pass (`C:/Users/masoo/ases-wt/_research/r19/PROVIDERS.md`; ASES-PRV-04,
+ASES-CAP-06). This exists because the currently pinned reviewer (`cohere/north-mini-code:free` on OpenRouter)
+has failed the reviewer contract live twice (`docs/stage-c-2026-09-28.md` addendum), so a documented,
+already-researched replacement short list is worth having ready.
+
+**Nothing below is active.** Every stub has `role_class: reviewer_candidate` and `pinned: false`, and ASES
+never creates an account or a key for you -- Step 2 (the smoke test) and "After the four steps: promoting the
+result" above still apply exactly as written before any candidate here actually reviews a real card.
+
+### 1. Google AI Studio: gemini-3.8-flash (fallback gemini-3.7-flash)
+
+- Context / tool calling: gemini-3.7-flash is documented at 1,048,576 input / 65,536 output tokens, function
+  calling Supported (`https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash`, read 2026-09-29);
+  re-read the 3.8-flash model page for its own numbers before pinning it.
+- Limits: no longer published for the free tier. Google's own docs say "View your active rate limits in AI
+  Studio" and that limits are "applied per project, not per API key"
+  (`https://ai.google.dev/gemini-api/docs/rate-limits`, read 2026-09-29). Treat as unknown until the owner
+  reads their own project's limits page.
+- Data policy: `free_tier_trains` -- the free tier's own pricing page says "Used to improve our products:
+  Yes", and the terms say "human reviewers may read, annotate, and process your API input and output"
+  (`https://ai.google.dev/gemini-api/docs/pricing`; `https://ai.google.dev/gemini-api/terms`, effective
+  2026-03-23; both read 2026-09-29). Exception: if the owner is in the EEA, Switzerland or the UK, the
+  paid-service data terms apply even to the free tier, and Google does not use those prompts to improve
+  products -- record `no_training` only once the owner confirms which of those applies (an open question
+  this package does not decide).
+- Owner must do: a Google account, then create an API key in AI Studio. No billing needed for the free tier.
+  ASES never creates the account or the key.
+
+```yaml
+# NOT ACTIVE. Paste under providers: and models: in config/models.yaml, then:
+#   1. the owner creates a Google account and an AI Studio API key (ASES never does this)
+#   2. the key goes into the reviewer Hermes profile's own .env as GEMINI_API_KEY (or GOOGLE_API_KEY)
+#   3. run the smoke test (Step 2 above) through the real reviewer profile before pinned ever becomes true
+providers:
+  google_ai_studio:
+    type: hermes_provider
+    provider_id: gemini
+    key_env: GEMINI_API_KEY
+    limits: {}                        # unpublished for the free tier; read the owner's own AI Studio limits
+                                       # page before relying on this for capacity planning
+    quota_endpoint: null
+    data_policy: free_tier_trains      # or no_training if the owner is in the EEA, Switzerland or the UK --
+                                       # see the note above; do not guess, ask the owner first
+    verified_on: "2026-09-29"
+    source: "https://ai.google.dev/gemini-api/docs/pricing ; https://ai.google.dev/gemini-api/terms"
+
+models:
+  - provider: google_ai_studio
+    model: "gemini-3.8-flash"          # re-read this model's own docs page for context/output before pinning;
+                                       # the numbers below are gemini-3.7-flash's, the documented fallback
+    context_length: 1048576
+    tool_calling: true                 # gemini-3.7-flash's own docs page: Function calling Supported
+    role_class: reviewer_candidate
+    pinned: false
+```
+
+### 2. NVIDIA API catalog: deepseek-ai/deepseek-v4-pro (second candidate: moonshotai/kimi-k2-thinking)
+
+- Context / tool calling: deepseek-v4-pro 262,144 (Hermes's own pin, `agent/model_metadata.py:606`);
+  kimi-k2-thinking 256,000, with "stable tool-use across 200-300 sequential calls"
+  (`https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k2-thinking`, read 2026-09-29).
+- Limits: reported as "up to 40 requests per minute (RPM) for most models, with no per-token billing", from a
+  script-rendered page and forum threads, not independently confirmed by this research -- treat as unverified
+  until the owner checks the build.nvidia.com deployment page directly. No daily cap is published.
+- Data policy: `trains_on_inputs`. The NVIDIA API Trial Terms of Service
+  (`https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf`,
+  read 2026-09-29) section 1.4 restricts use to "internal testing and evaluation purposes" (not production),
+  section 2.6(a) forbids "confidential information", and section 3.3 says NVIDIA "collect[s] User Content and
+  Generated Content to improve NVIDIA products and services, including AI models." Public projects only.
+- Owner must do: nothing new -- the owner already has an NVIDIA account and key (the same one the `nemotron`
+  MCP tools use). That is also the caveat: pinning this reviewer shares that SAME account's 40 RPM with
+  whatever the nemotron tools are doing at the same time, not extra capacity on top of it.
+
+```yaml
+# NOT ACTIVE. Paste under providers: and models: in config/models.yaml, then run the smoke test (Step 2)
+# through the real reviewer profile before pinned ever becomes true. The owner's existing NVIDIA_API_KEY
+# (already used by the nemotron MCP tools) works here too -- see the shared-quota caveat above before pinning.
+providers:
+  nvidia:
+    type: hermes_provider
+    provider_id: nvidia
+    key_env: NVIDIA_API_KEY
+    limits:
+      rpm: 40                          # unverified: read from a script-rendered page and forum threads, not
+                                       # confirmed directly against build.nvidia.com; no daily cap published
+    quota_endpoint: null
+    data_policy: trains_on_inputs       # public projects only -- see the Trial Terms citation above
+    verified_on: "2026-09-29"
+    source: "https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf"
+
+models:
+  - provider: nvidia
+    model: "deepseek-ai/deepseek-v4-pro"
+    context_length: 262144
+    tool_calling: true
+    role_class: reviewer_candidate
+    pinned: false
+
+  - provider: nvidia
+    model: "moonshotai/kimi-k2-thinking"  # second candidate: strong stated multi-call tool-use reliability
+    context_length: 256000
+    tool_calling: true
+    role_class: reviewer_candidate
+    pinned: false
+```
+
+### 3. Cloudflare Workers AI: @cf/zai-org/glm-4.7-flash (alternative @cf/google/gemma-4-26b-a4b-it)
+
+- Context / tool calling: glm-4.7-flash 131,072 context, function calling Yes; gemma-4-26b-a4b-it 256,000,
+  also Yes (Cloudflare's own model pages, read 2026-09-29).
+- Limits: 10,000 Neurons a day at no charge, reset 00:00 UTC; 300 requests a minute for text generation
+  (`https://developers.cloudflare.com/workers-ai/platform/limits/`;
+  `https://developers.cloudflare.com/workers-ai/platform/pricing/`, both read 2026-09-29). glm-4.7-flash costs
+  5,500 Neurons per million input tokens, about 1.8M input tokens a day, or roughly 19 reviews at this
+  project's own measured ~18.5K input tokens per review (`config/models.yaml`'s reviewer row comment: 92,785
+  tokens over 5 calls).
+- Data policy: `no_training` -- "Cloudflare does not use your Customer Content to (1) train any AI models"
+  (`https://developers.cloudflare.com/workers-ai/privacy/`, last updated 2026-04-21, read 2026-09-29). This is
+  the one candidate here whose provider-level policy already sits in `policy._SAFE_FOR_PRIVATE`, so it is the
+  one worth a proper Step 3 if a private-class reviewer is ever needed -- see the caveat below first.
+- Caveat: its model IDs are prefixed `@cf/...`, which today confuses ASES's own model-family heuristic
+  (`profiles._family` strips only `xkiro`/`openrouter`/`unorouter` prefixes, so `@cf/zai-org/glm-4.7-flash`
+  reads as family `@cf` instead of `z-ai`), so `swarm doctor`'s reviewer-diversity check may not compare
+  families correctly until that is fixed elsewhere. Not something this docs-only package touches; flagged
+  here so it is not pinned blind.
+- Owner must do: a free Cloudflare account, its account ID, and an API token with Workers AI permission.
+
+```yaml
+# NOT ACTIVE. Paste under providers: and models: in config/models.yaml, replace <ACCOUNT_ID> with the
+# owner's real Cloudflare account id, then run the smoke test (Step 2) through the real reviewer profile
+# before pinned ever becomes true. See the @cf/ model-family caveat above before actually pinning this.
+providers:
+  cloudflare_ai:
+    type: openai_compatible
+    base_url: https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1
+    key_env: CLOUDFLARE_API_TOKEN
+    limits:
+      rpm: 300                        # text generation; see the 10,000-Neurons-a-day note above for the
+                                       # real daily budget, which is not a request count
+    quota_endpoint: null
+    data_policy: no_training
+    verified_on: "2026-09-29"
+    source: "https://developers.cloudflare.com/workers-ai/privacy/"
+
+models:
+  - provider: cloudflare_ai
+    model: "@cf/zai-org/glm-4.7-flash"
+    context_length: 131072
+    tool_calling: true
+    role_class: reviewer_candidate
+    pinned: false
+
+  - provider: cloudflare_ai
+    model: "@cf/google/gemma-4-26b-a4b-it"   # alternative: larger context, smaller daily input budget
+    context_length: 256000
+    tool_calling: true
+    role_class: reviewer_candidate
+    pinned: false
+```
+
+### Excluded
+
+- **Groq**: free `openai/gpt-oss-120b` allows only 8,000 tokens per minute
+  (`https://console.groq.com/docs/rate-limits`, read 2026-09-29); a single Hermes review already averages
+  about 18,500 input tokens (`config/models.yaml`'s own reviewer row comment), so one review alone would not
+  fit inside a minute's cap regardless of the daily allowance. Its data policy is otherwise excellent (no
+  retention by default, no training).
+- **Cerebras**: its free access is a time- and credit-bounded trial ("$5 in free credits after adding a
+  verified payment method", 30 days -- `https://inference-docs.cerebras.ai/support/rate-limits`, read
+  2026-09-29), not a permanent free tier.
+- **GitHub Models**: "As of July 30, 2026, GitHub Models has been fully retired."
+  (`https://docs.github.com/en/github-models`, read 2026-09-29).
+- **Hugging Face Inference Providers**: "Free Users $0.10, subject to change" a month
+  (`https://huggingface.co/docs/inference-providers/pricing`, read 2026-09-29) -- negligible.
+
+Not chosen as one of the top three, but not disqualified either: **Ollama Cloud** (the strongest stated data
+policy seen here, "never logged or trained on", but the free tier's size is unpublished and it allows only one
+concurrent request) and **Mistral**'s free mode (training is opt-out rather than off by default, and its own
+limits page only shows numbers once an account exists). Either is worth a second look if all three above
+prove unworkable.
+
+**No-new-account option**: keep the reviewer on OpenRouter and swap only the model to
+`google/gemma-4-31b-it:free` (its own OpenRouter endpoint: no training, 55-day retention, 262,144 context,
+tool calling) -- needs no new account or key, but stays inside the same 50-requests-a-day OpenRouter account
+cap the current reviewer already shares.
+
 ## Copy-paste `config/models.yaml` stub, every field commented
 
 ```yaml
