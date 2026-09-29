@@ -584,6 +584,86 @@ def test_refresh_review_rounds_counts_changes_requested_and_review_reopened_only
     assert recovery.load_lineage(conn, "p1", "T1").review_rounds == 2
 
 
+_EVIDENCE_TEXT = (
+    "I cannot run the test suite myself to verify these changes work. Please provide test evidence or "
+    "execution output showing the tests pass."
+)
+_REAL_FINDING_TEXT = "CHANGES REQUESTED: the empty-list branch is untested; please add a case for it."
+
+
+def test_refresh_review_rounds_excludes_an_evidence_changes_requested_but_not_a_real_finding(conn, board):
+    """Round 19, package REVIEWLADDER, fix D5: a reviewer's changes-request that only asks the controller to run
+    tests (ASES-REV-05: that is the controller's job) is not a review round; an ordinary changes-request with a
+    real code finding still is, even on the exact same card. Without `reviewer_profiles` (every OTHER test in
+    this module) nothing is excluded: the pre-fix behaviour is unchanged."""
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card(
+        "w1",
+        [_run(11, outcome="changes_requested", profile="reviewer", summary=_EVIDENCE_TEXT),
+         _run(12, outcome="changes_requested", profile="reviewer", summary=_REAL_FINDING_TEXT)],
+        status="ready",
+        _events=[
+            {"kind": "changes_requested", "payload": {"reason": _EVIDENCE_TEXT}, "created_at": 1, "run_id": 11},
+            {"kind": "changes_requested", "payload": {"reason": _REAL_FINDING_TEXT}, "created_at": 2, "run_id": 12},
+        ],
+    )
+
+    # No reviewer_profiles given at all: both count, exactly as before this fix.
+    assert recovery.refresh_review_rounds("b", PLAN, conn=conn) == {"T1": 2}
+
+    _seed_task(conn, "T2", "w2")
+    board.cards["w2"] = _card(
+        "w2",
+        [_run(21, outcome="changes_requested", profile="reviewer", summary=_EVIDENCE_TEXT),
+         _run(22, outcome="changes_requested", profile="reviewer", summary=_REAL_FINDING_TEXT)],
+        status="ready",
+        _events=[
+            {"kind": "changes_requested", "payload": {"reason": _EVIDENCE_TEXT}, "created_at": 1, "run_id": 21},
+            {"kind": "changes_requested", "payload": {"reason": _REAL_FINDING_TEXT}, "created_at": 2, "run_id": 22},
+        ],
+    )
+    # WITH reviewer_profiles: T1's already-counted 2 stay put (never retroactively removed; the exclusion only
+    # ever stops a round being counted, it does not un-count one already added), but T2 (fresh) counts only 1.
+    assert recovery.refresh_review_rounds(
+        "b", PLAN, conn=conn, reviewer_profiles=frozenset({"reviewer"}),
+    ) == {"T1": 0, "T2": 1}
+    assert recovery.load_lineage(conn, "p1", "T1").review_rounds == 2
+    assert recovery.load_lineage(conn, "p1", "T2").review_rounds == 1
+
+    # A changes_requested by a NON-reviewer profile (a coder cannot even call this tool for real, but the
+    # classifier only ever matches a profile IN reviewer_profiles) is never excluded, evidence-shaped text or not.
+    _seed_task(conn, "T3", "w3")
+    board.cards["w3"] = _card(
+        "w3", [_run(31, outcome="changes_requested", profile="coder-1", summary=_EVIDENCE_TEXT)],
+        status="ready",
+        _events=[{"kind": "changes_requested", "payload": {"reason": _EVIDENCE_TEXT}, "created_at": 1, "run_id": 31}],
+    )
+    assert recovery.refresh_review_rounds(
+        "b", PLAN, conn=conn, reviewer_profiles=frozenset({"reviewer"}),
+    ) == {"T1": 0, "T2": 0, "T3": 1}
+    assert recovery.load_lineage(conn, "p1", "T3").review_rounds == 1
+
+
+def test_refresh_review_rounds_excludes_an_evidence_changes_requested_even_when_the_run_id_types_differ(conn, board):
+    """Round 19 fix round 2 (reviewer finding, minor): the D5 exclusion must not depend on a run's own `id` field
+    and an event's `run_id` field surviving the same JSON round trip as the same numeric/string type --
+    controller._event_for_run's own docstring already makes exactly this point for its own run_id comparison, and
+    this is the same comparison. Without the str() normalisation, `"11" in frozenset({11})` is False, so an
+    evidence-only changes_requested with a run_id typed differently from the run's own id would silently go back
+    to counting as a review round, with no error or warning."""
+    _seed_task(conn, "T1", "w1")
+    board.cards["w1"] = _card(
+        "w1", [_run(11, outcome="changes_requested", profile="reviewer", summary=_EVIDENCE_TEXT)],
+        status="ready",
+        _events=[{"kind": "changes_requested", "payload": {"reason": _EVIDENCE_TEXT},
+                  "created_at": 1, "run_id": "11"}],
+    )
+
+    assert recovery.refresh_review_rounds(
+        "b", PLAN, conn=conn, reviewer_profiles=frozenset({"reviewer"}),
+    ) == {"T1": 0}
+
+
 def test_refresh_review_rounds_is_idempotent_and_only_adds_what_is_new(conn, board):
     _seed_task(conn, "T1", "w1")
     board.cards["w1"] = _card("w1", [], status="review", _events=_review_events("changes_requested"))

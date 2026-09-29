@@ -2122,6 +2122,23 @@ def test_run_prints_warnings_recovery_decisions_and_unparked_cards_one_per_line(
     assert out.isascii() and err == ""  # a warning never halts and is not an error
 
 
+def test_run_prints_one_line_per_reviewer_contract_stop_but_not_for_already_decided(runw, capsys):
+    """Round 19, package REVIEWLADDER."""
+    runw.passes = [_pass(
+        reviewer_contract=[
+            {"task_key": "T1", "card_id": "w1", "kind": "PROTOCOL", "action": "protocol", "answered": "commented"},
+            {"task_key": "T1", "card_id": "w1", "kind": "EVIDENCE", "action": "already_decided"},
+        ],
+    ), _pass(finished=True)]
+
+    assert cli.main(runw.argv()) == 0
+
+    out, _err = _console(capsys)
+    assert "reviewer_contract=2" in [ln for ln in out.splitlines() if "[pass 1]" in ln and "finished=" in ln][0]
+    assert "[pass 1] reviewer_contract: T1 PROTOCOL protocol (card w1)" in out
+    assert "already_decided" not in out
+
+
 def test_run_works_with_the_old_summary_shape_that_lacks_the_new_keys(runw, capsys):
     runw.passes = [{"parked": [], "merged": ["T1"], "sent_back": [], "finished": True}]
 

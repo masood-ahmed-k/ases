@@ -917,6 +917,70 @@ def _check_lsp_installed(project: ases_config.ProjectConfig) -> DoctorCheck:
     )
 
 
+_REVIEWER_HOOK_IDS = ("ASES-ROL-05", "ASES-ROL-06", "ASES-REV-05")
+
+
+def _check_reviewer_hooks(project: ases_config.ProjectConfig, models_config: dict, profiles_mod) -> DoctorCheck:
+    """ASES-ROL-05 / ASES-ROL-06 / ASES-REV-05 (round 19, package REVIEWLADDER): a dedicated row -- unlike the
+    generic profile_state rows, which only appear when something is wrong -- confirming the reviewer's two
+    pre_tool_call hooks (R1 deny_tool, R2 reviewer_evidence_guard) are actually installed for every active
+    kanban_lifecycle_only profile. PENDING when the profiles module or this function is not part of the build
+    yet (profile_state's own row already explains why) or no such profile exists on disk yet; never a FAIL,
+    matching every other profile_state-shaped row in this module (a machine that has not had `swarm init
+    --apply` run on it is still usable)."""
+    if profiles_mod is None:
+        return DoctorCheck(
+            "reviewer_hooks", "pending", "the profiles module is not available; see profile_state",
+            _REVIEWER_HOOK_IDS,
+        )
+    fn = getattr(profiles_mod, "reviewer_hook_problems", None)
+    if fn is None:
+        return DoctorCheck(
+            "reviewer_hooks", "pending",
+            "this build's profiles module has no reviewer_hook_problems yet, so the reviewer hooks were not "
+            "verified",
+            _REVIEWER_HOOK_IDS,
+        )
+    try:
+        by_profile = fn(project, models_config, project.hermes_native_home)
+    except Exception as exc:  # noqa: BLE001 - a doctor row never crashes the doctor
+        return DoctorCheck(
+            "reviewer_hooks", "warn", f"could not check the reviewer hooks: {type(exc).__name__}: {exc}",
+            _REVIEWER_HOOK_IDS,
+        )
+    if not by_profile:
+        return DoctorCheck(
+            "reviewer_hooks", "pending", "no active reviewer-role profile exists on disk yet", _REVIEWER_HOOK_IDS,
+        )
+    problems = [f"{name}: {problem}" for name, probs in by_profile.items() for problem in probs]
+    if problems:
+        return DoctorCheck("reviewer_hooks", "warn", "; ".join(problems), _REVIEWER_HOOK_IDS)
+    return DoctorCheck(
+        "reviewer_hooks", "pass",
+        f"the reviewer pre_tool_call hooks (R1 deny_tool, R2 reviewer_evidence_guard) are present for "
+        f"{', '.join(sorted(by_profile))}",
+        _REVIEWER_HOOK_IDS,
+    )
+
+
+def _check_hermes_safe_mode() -> DoctorCheck:
+    """ASES-ROL-05 (round 19, package REVIEWLADDER): WARN when HERMES_SAFE_MODE is set anywhere in the
+    controller's own environment. agent/shell_hooks.py:147-149 skips ALL shell-hook registration under it,
+    before `hooks:` is even parsed, so the reviewer's R1/R2 hooks (and any other profile's hooks) silently stop
+    protecting anything for as long as it is set. A live, doctor-time environment read, not a profile config
+    fact: whether config.yaml itself is correct is reviewer_hooks' job, not this row's."""
+    value = os.environ.get("HERMES_SAFE_MODE")
+    if value:
+        return DoctorCheck(
+            "hermes_safe_mode", "warn",
+            f"HERMES_SAFE_MODE={value!r} is set in the environment: Hermes skips ALL shell-hook registration "
+            "while this is set (agent/shell_hooks.py), so the reviewer's pre_tool_call hooks are not protecting "
+            "anything right now, whatever reviewer_hooks says",
+            ("ASES-ROL-05",),
+        )
+    return DoctorCheck("hermes_safe_mode", "pass", "HERMES_SAFE_MODE is not set", ("ASES-ROL-05",))
+
+
 def _check_limits_table(models_config: dict) -> DoctorCheck:
     """ASES-CAP-01 / ASES-VER-01 (5.3, Appendix E): "swarm doctor MUST display the value it is using, the
     source URL and the checked date." The value and date were already shown; this also shows `source` (a
@@ -1073,6 +1137,8 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         _check_role_profiles(project),
         _check_reviewer_diversity(project),
         _check_lsp_installed(project),
+        _check_reviewer_hooks(project, models_config, profiles_mod),
+        _check_hermes_safe_mode(),
         *([profiles_unavailable] if profiles_unavailable is not None
           else _check_profile_state(project, models_config, profiles_mod)),
         *(_check_residual_risks(profiles_mod) if profiles_unavailable is None else []),

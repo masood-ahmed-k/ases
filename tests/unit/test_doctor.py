@@ -72,6 +72,11 @@ class _World:
         self.verify_calls = []
         self.specs = []
         self.residual_risks = []
+        # Round 19, package REVIEWLADDER: {} by default (no active reviewer-role profile -> "pending"; see
+        # test_reviewer_hooks_pending_when_the_stub_predates_the_function for the OLDER-build absence case,
+        # which every OTHER test in this file already exercises by never touching this attribute at all).
+        self.reviewer_hook_problems = {}
+        self.reviewer_hook_calls = []
         # CONTAINERS (round 17): docker_available True and no orphans by default, so every existing test in
         # this file keeps its "no test here reaches a real Docker daemon" guarantee; a test of
         # _check_orphan_containers itself overrides one or both.
@@ -109,6 +114,12 @@ def world(monkeypatch):
     stub.verify_state = fake_verify
     stub.desired_profiles = lambda project, models_config: list(state.specs)
     stub.residual_risks = lambda: list(state.residual_risks)
+
+    def fake_reviewer_hook_problems(project, models_config, home):
+        state.reviewer_hook_calls.append((project, models_config, home))
+        return {name: list(problems) for name, problems in state.reviewer_hook_problems.items()}
+
+    stub.reviewer_hook_problems = fake_reviewer_hook_problems
     monkeypatch.setitem(sys.modules, "ases.profiles", stub)
     state.profiles = stub
     return state
@@ -375,6 +386,66 @@ def test_lsp_install_summary_falls_back_to_entry_names_when_package_json_is_inva
     (lsp_dir / "package.json").write_text("{not valid json", encoding="utf-8")
     (lsp_dir / "pyright").mkdir()
     assert doctor._lsp_install_summary(lsp_dir) == "package.json, pyright"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# reviewer_hooks / hermes_safe_mode (round 19, package REVIEWLADDER; ASES-ROL-05, ASES-ROL-06, ASES-REV-05)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_reviewer_hooks_passes_when_profiles_reports_no_problems(tmp_path, monkeypatch, world):
+    world.reviewer_hook_problems = {"reviewer": []}
+    project, _report, by_name = _run(tmp_path, monkeypatch)
+    assert by_name["reviewer_hooks"].status == "pass"
+    assert "reviewer" in by_name["reviewer_hooks"].detail
+    assert world.reviewer_hook_calls and world.reviewer_hook_calls[0][0] is project
+
+
+def test_reviewer_hooks_warns_with_the_exact_problem_when_one_is_reported(tmp_path, monkeypatch, world):
+    world.reviewer_hook_problems = {"reviewer": ["profile reviewer is missing its R1 (deny_tool) pre_tool_call hook"]}
+    _project_obj, _report, by_name = _run(tmp_path, monkeypatch)
+    row = by_name["reviewer_hooks"]
+    assert row.status == "warn"
+    assert "missing its R1" in row.detail
+    assert set(row.requirement_ids) >= {"ASES-ROL-05", "ASES-ROL-06", "ASES-REV-05"}
+
+
+def test_reviewer_hooks_is_pending_with_no_active_reviewer_profile_on_disk(tmp_path, monkeypatch, world):
+    world.reviewer_hook_problems = {}  # the fixture's own default: no profile directory exists yet
+    _project_obj, _report, by_name = _run(tmp_path, monkeypatch)
+    assert by_name["reviewer_hooks"].status == "pending"  # pending never fails the run on its own
+
+
+def test_reviewer_hooks_is_pending_when_the_stub_predates_the_function(tmp_path, monkeypatch):
+    """An older build's profiles module (or the test stub above, before this attribute existed) has no
+    reviewer_hook_problems: doctor.py must say so, never crash and never claim a pass it cannot back up."""
+    _stub_hermes(monkeypatch)
+    stub = types.ModuleType("ases.profiles")
+    stub.verify_state = lambda *a, **k: []
+    stub.desired_profiles = lambda *a, **k: []
+    stub.residual_risks = lambda: []
+    monkeypatch.setitem(sys.modules, "ases.profiles", stub)
+    project = _project(tmp_path)
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+    report = doctor.run(project, MODELS_CONFIG, conn)
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["reviewer_hooks"].status == "pending"
+    assert "no reviewer_hook_problems" in by_name["reviewer_hooks"].detail
+
+
+def test_hermes_safe_mode_warns_when_set(tmp_path, monkeypatch, world):
+    monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+    _project_obj, _report, by_name = _run(tmp_path, monkeypatch)
+    row = by_name["hermes_safe_mode"]
+    assert row.status == "warn"
+    assert "HERMES_SAFE_MODE" in row.detail and "ASES-ROL-05" in row.requirement_ids
+
+
+def test_hermes_safe_mode_passes_when_unset(tmp_path, monkeypatch, world):
+    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
+    _project_obj, _report, by_name = _run(tmp_path, monkeypatch)
+    assert by_name["hermes_safe_mode"].status == "pass"
 
 
 def test_report_fails_when_hermes_doctor_is_unhealthy(tmp_path, monkeypatch):

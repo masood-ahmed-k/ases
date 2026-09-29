@@ -9,6 +9,7 @@ from ases import config, controller, db, events, hermes, mergeq, plan as plan_mo
 from ases import gates as gates_mod
 from ases import guards as guards_mod
 from ases import questions as questions_mod
+from ases import reviewcontract as reviewcontract_mod
 from ases import sandbox as sandbox_mod
 from ases import usage as usage_mod
 
@@ -1539,6 +1540,33 @@ def test_review_lane_passes_the_tasks_allow_gate_config_changes_marker_to_the_ga
     controller.process_review_lane("b", tmp_path / "repo", plan, conn=conn)
 
     assert [c["allow_gate_config_changes"] for c in gate_calls] == [True]
+
+
+def test_review_lane_skips_a_provenance_broken_card_never_reruns_gate1_or_reopens(tmp_path, monkeypatch):
+    """Round 19 fix round 1 (reviewer finding, blocker): a card controller._protocol_stop marked
+    provenance_broken (a reviewer profile called kanban_request_review, D6) is stuck in "review" forever --
+    Hermes's own block_task accepts only "ready"/"running" (research report finding F2), so ASES can never
+    Hermes-block it either -- and design step 6 says such a card is "never unblocked or reopened by ASES".
+    Before this fix process_review_lane re-ran Gate 1 on it like any other "review" card on every single pass
+    and, on a red result, would have called hermes.kanban_reopen_review -- routing the card straight back to
+    the reviewer profile as implementer, the exact D6 corruption the reviewer contract ladder exists to stop."""
+    plan, conn, project, pair, created = _setup_one_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes, "kanban_list", lambda b, status=None, assignee=None: (
+        [{"id": pair.work_card_id, "status": "review", "branch_name": "swarm/T1-coder"}]
+        if status == "review" else []
+    ))
+    gate_calls = _record_gate_calls(monkeypatch)
+    reopen_calls = []
+    monkeypatch.setattr(hermes, "kanban_reopen_review", lambda board, cid, reason: reopen_calls.append((cid, reason)))
+    events.record(conn, reviewcontract_mod.EVENT_PROVENANCE_BROKEN, {
+        "project": plan.project, "task_key": "T1", "card_id": pair.work_card_id, "run_id": 99,
+    }, project=plan.project)
+
+    sent_back = controller.process_review_lane("b", tmp_path / "repo", plan, conn=conn)
+
+    assert sent_back == []
+    assert gate_calls == []      # Gate 1 was never even called
+    assert reopen_calls == []    # and the card was never reopened for review
 
 
 def test_review_lane_passes_the_project_and_task_to_gate_before_review(tmp_path, monkeypatch):

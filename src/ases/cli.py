@@ -1145,7 +1145,7 @@ def _pass_line(number: int, summary: dict) -> str:
         line += f" usage_sessions={summary['usage_sessions']}"
     if summary.get("unparked"):
         line += f" unparked={summary['unparked']}"
-    for name in ("recovery", "warnings", "provisioned"):
+    for name in ("recovery", "reviewer_contract", "warnings", "provisioned"):
         if summary.get(name):
             line += f" {name}={len(summary[name])}"
     if summary.get("final"):
@@ -1164,6 +1164,12 @@ def _print_pass_details(number: int, summary: dict) -> None:
                  f"(kind {decision.get('kind')})")
         else:
             _out(f"[pass {number}] recovery: {decision}")
+    # Round 19, package REVIEWLADDER: one line per reviewer-contract stop this pass acted on (never one for an
+    # "already_decided" row -- that is dedup working silently, not new activity to report).
+    for row in summary.get("reviewer_contract") or []:
+        if isinstance(row, dict) and row.get("action") != "already_decided":
+            _out(f"[pass {number}] reviewer_contract: {row.get('task_key')} {row.get('kind')} "
+                 f"{row.get('action')} (card {row.get('card_id')})")
     if summary.get("unparked"):
         _out(f"[pass {number}] unparked: {', '.join(str(key) for key in summary['unparked'])}")
 

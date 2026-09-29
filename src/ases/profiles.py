@@ -77,8 +77,10 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import sqlite3
+import sys
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -88,6 +90,7 @@ import yaml
 from . import events as events_mod
 from . import hermes as hermes_mod
 from . import policy as policy_mod
+from . import reviewcontract as reviewcontract_mod
 from . import sandbox as sandbox_mod
 
 if TYPE_CHECKING:
@@ -152,14 +155,16 @@ _LSP_MANUAL_VALUES = frozenset({"manual", "off"})
 
 RESIDUAL_RISKS = (
     "Reviewer file access: Hermes 0.21.3 has one combined file toolset (read_file, write_file, patch, "
-    "search_files), no read-only file toolset, and agent.disabled_toolsets only removes whole toolsets, so "
-    "write_file and patch stay in the schema Hermes offers the Reviewer (ASES-ROL-05). A fail-closed "
-    "pre_tool_call shell hook on the reviewer profile denies both tools before they run instead. Residual: the "
-    "hook is skipped when HERMES_SAFE_MODE is set (agent/shell_hooks.py:147-149), or fails open if Hermes's own "
-    "hook dispatcher raises instead of returning a verdict (model_tools.py:779-780); the schema still lists "
-    "write_file and patch either way, so the model can still see and attempt them. The Reviewer has no terminal, "
-    "so it cannot commit; the merge queue believes only the controller's own gate records and the commit it "
-    "re-checks, not the worktree the Reviewer sees.",
+    "search_files), no read-only file toolset, and agent.disabled_toolsets only removes whole toolsets, so the "
+    "schema still offers the Reviewer write_file and patch (ASES-ROL-05). A fail-closed pre_tool_call shell hook "
+    "(round 19, package REVIEWLADDER; src/ases/hooks/deny_tool.py) denies them in-run instead. Residual: the hook "
+    "is skipped when HERMES_SAFE_MODE is set (agent/shell_hooks.py:147-149; swarm doctor warns when it is), and "
+    "fails open if Hermes's own hook dispatcher raises instead of returning a verdict (model_tools.py:779-780); "
+    "the schema still lists write_file and patch either way, so the model can still see and attempt them. "
+    "Worktree-write detection for a reviewer run that gets past the hook (an integrity fingerprint of the "
+    "reviewer's worktree, quarantine and restore) is not built yet; the merge queue still believes only the "
+    "controller's own gate records and the commit it re-checks, never the worktree the Reviewer saw, so a write "
+    "that slipped through cannot itself pass a card.",
     "Kanban toolset: Hermes appends the lifecycle tools to every dispatcher-spawned worker whatever a profile "
     "lists, and a profile that lists `kanban` also gives its non-dispatched sessions the orchestrator tools "
     "(kanban_list, kanban_unblock).",
@@ -167,6 +172,12 @@ RESIDUAL_RISKS = (
     "so the base commit of a card's worktree is still the controller's to verify (ASES-GIT-16).",
     "hermes profile create writes a wrapper script into ~/.local/bin unless --no-alias is given, and seeds a fresh "
     "profile's model block from the launch profile.",
+    "Reviewer contract ladder (round 19, package REVIEWLADDER): when a reviewer-profile run stops instead of "
+    "giving a verdict, the controller can post an ANSWER once and unblock, or ask the owner a question; it "
+    "cannot yet switch the reviewer to a different model (kanban set-model or a second reviewer profile) or "
+    "run the archive-and-recreate replacement route, both DEFERRED by the architect pending an eligible second "
+    "reviewer model (config/models.yaml today pins only one, on the Lead's own provider family). Until one is "
+    "configured, every stop that is not answered once ends in a single owner question, never a retry.",
 )
 
 
@@ -341,7 +352,7 @@ _CODER_WHY = (
 )
 _REVIEWER_WHY = (
     "ASES-ROL-05: read plus verdict tools only, never terminal, code_execution, browser, computer_use, delegation or "
-    "memory (file still carries write tools: a residual risk)"
+    "memory (file still carries write tools, refused in-run by a pre_tool_call hook instead: a residual risk)"
 )
 
 _LEAD_TOOLSETS = ("file", "kanban", "session_search", "skills", "todo")
@@ -900,6 +911,86 @@ def _terminal_rows(
     return rows, problems
 
 
+# ASES-ROL-05 / ASES-ROL-06 / ASES-REV-05 (round 19, package REVIEWLADDER): the two pre_tool_call hooks a
+# kanban_lifecycle_only profile's config.yaml must carry. reviewcontract.py owns the matcher strings, the denied
+# tool list and the messages, so profiles.py (this writer), doctor.py (the checker) and the hook scripts
+# themselves (src/ases/hooks/) can never quietly drift apart on what "the reviewer hooks" means. The script
+# FILENAMES (not the matcher, which a hand-edit could narrow, and not the full command, which a moved checkout
+# changes) are what identifies "the R1/R2 entry" when checking an existing config.yaml -- see
+# _check_reviewer_hook_entry.
+_DENY_SCRIPT = "deny_tool.py"
+_EVIDENCE_SCRIPT = "reviewer_evidence_guard.py"
+
+
+def _reviewer_hooks_dir() -> pathlib.Path:
+    """src/ases/hooks, resolved from THIS installed copy of profiles.py -- so a worktree checkout, a different
+    clone or a real install each write the command line that points at their OWN hook scripts, never another
+    one's."""
+    return pathlib.Path(__file__).resolve().parent / "hooks"
+
+
+def _reviewer_hook_entries() -> list[dict]:
+    """The two desired `hooks.pre_tool_call` entries (design (a)/(b)). `command` names sys.executable (the
+    interpreter running THIS swarm init/doctor process; normally the ASES venv's own python) and the absolute
+    path of the matching script, each double-quoted: Hermes's own command-line splitter for a `hooks:` command
+    strips exactly one layer of matching quotes per token and is Windows-backslash-safe, so a path with spaces or
+    backslashes survives. Neither hook script actually depends on which interpreter this names -- both resolve
+    their own import of `ases.reviewcontract` from their own file path on disk (see deny_tool.py's module
+    docstring) -- sys.executable is simply a concrete, always-present Python on this machine."""
+    hooks_dir = _reviewer_hooks_dir()
+    python = sys.executable
+    return [
+        {
+            "matcher": reviewcontract_mod.DENY_MATCHER,
+            "command": f'"{python}" "{hooks_dir / _DENY_SCRIPT}"',
+            "timeout": reviewcontract_mod.HOOK_TIMEOUT_SECONDS,
+            "fail_closed": True,
+        },
+        {
+            "matcher": reviewcontract_mod.EVIDENCE_MATCHER,
+            "command": f'"{python}" "{hooks_dir / _EVIDENCE_SCRIPT}"',
+            "timeout": reviewcontract_mod.HOOK_TIMEOUT_SECONDS,
+            "fail_closed": False,
+        },
+    ]
+
+
+def _is_managed_hook_entry(entry: object) -> bool:
+    """True when `entry` is one of ASES's own two reviewer hooks -- identified by its command's script FILENAME
+    (_DENY_SCRIPT / _EVIDENCE_SCRIPT), the same identification _check_reviewer_hook_entry uses, so a hand-edited
+    matcher or a stale absolute path (an old checkout location) is still recognised as "ours to replace" rather
+    than preserved alongside a freshly written correct copy."""
+    if not isinstance(entry, dict):
+        return False
+    path = _hook_command_script_path(entry.get("command"))
+    return path is not None and path.name in (_DENY_SCRIPT, _EVIDENCE_SCRIPT)
+
+
+def _reviewer_hook_rows(cfg: dict) -> list[tuple[str, Any, Any, str]]:
+    """(target, before, after, why) rows that bring a kanban_lifecycle_only profile's hooks to the desired state.
+    Any OTHER pre_tool_call entry already on the profile is preserved and appended after ASES's own two (the same
+    reasoning as _terminal_rows' docker_volumes handling): only an entry _is_managed_hook_entry recognises as
+    ASES's own R1 or R2 hook is replaced."""
+    why = (
+        "ASES-ROL-05/ASES-ROL-06/ASES-REV-05 (design (a)/(b)): pre_tool_call hooks veto the reviewer's write and "
+        "hand-off tools (R1) and evidence-stalling blocks/changes-requests (R2)"
+    )
+    current = _get(cfg, "hooks.pre_tool_call")
+    current_list = current if isinstance(current, list) else []
+    extra = [entry for entry in current_list if not _is_managed_hook_entry(entry)]
+    desired = _reviewer_hook_entries() + extra
+    rows: list[tuple[str, Any, Any, str]] = []
+    if not _strict_equal(current_list, desired):
+        rows.append(("hooks.pre_tool_call", current if isinstance(current, list) else None, desired, why))
+    if _get(cfg, "hooks_auto_accept") is not True:
+        rows.append((
+            "hooks_auto_accept", _get(cfg, "hooks_auto_accept"), True,
+            "covers a non-dispatched `hermes -p reviewer -z` critic run (a dispatcher-spawned worker already "
+            "gets --accept-hooks, agent/shell_hooks.py research report finding F4)",
+        ))
+    return rows
+
+
 def _toolset_reason(spec: ProfileSpec) -> str:
     return ROLE_TABLE[spec.role].why
 
@@ -909,7 +1000,7 @@ def _config_rows(
     policy: sandbox_mod.SandboxPolicy | None,
 ) -> list[Change]:
     """Every set_config row and configuration warning for one profile, in a fixed order: toolsets, memory, model,
-    LSP install strategy, OpenRouter provider routing, worktree_sync, terminal."""
+    LSP install strategy, OpenRouter provider routing, worktree_sync, terminal, hooks."""
     out: list[Change] = []
 
     def row(target: str, before: Any, after: Any, why: str) -> None:
@@ -963,6 +1054,10 @@ def _config_rows(
             row(target, before, after, why)
         for problem in problems:
             out.append(Change(spec.name, "warning", "terminal", None, None, f"ASES-SEC-03: {problem}"))
+
+    if spec.kanban_lifecycle_only:
+        for target, before, after, why in _reviewer_hook_rows(cfg):
+            row(target, before, after, why)
     return out
 
 
@@ -1552,6 +1647,132 @@ def _check_toolsets(spec: ProfileSpec, cfg: dict) -> list[str]:
     return problems
 
 
+def _check_reviewer_hook_entry(
+    name: str, script_name: str, label: str, tools: tuple[str, ...], entries: list, *, fail_closed: bool,
+) -> list[str]:
+    """The problems with the ONE hook entry whose `command` names a script called `script_name` (R1's
+    deny_tool.py or R2's reviewer_evidence_guard.py). Identified by the script's FILENAME, not by its matcher (a
+    hand-edited, narrowed matcher must be reported as WRONG, not read as "this entry does not exist and the hook
+    is simply missing") and not by the full command path (a moved checkout's stale absolute path is exactly the
+    "command does not point at an existing script" problem below, not a reason to call the whole hook missing).
+
+    Problems: missing entirely, a matcher that does not fullmatch every one of `tools` (compiled the same way
+    Hermes itself compiles it, agent/shell_hooks.py:109-110, so a `.` a person hand-edited into the regex is
+    caught here exactly as Hermes would refuse to honour it), `fail_closed` not the exact bool this hook needs,
+    or a `command` whose script does not exist on disk."""
+    entry = None
+    for candidate in entries:
+        if not isinstance(candidate, dict):
+            continue
+        path = _hook_command_script_path(candidate.get("command"))
+        if path is not None and path.name == script_name:
+            entry = candidate
+            break
+    if entry is None:
+        return [f"profile {name} is missing its {label} pre_tool_call hook (ASES-ROL-05, ASES-ROL-06)"]
+    problems = []
+    matcher = entry.get("matcher")
+    try:
+        compiled = re.compile(matcher) if isinstance(matcher, str) else None
+        covered = compiled is not None and all(compiled.fullmatch(tool) for tool in tools)
+    except re.error:
+        covered = False
+    if not covered:
+        problems.append(f"profile {name}'s {label} hook matcher does not cover every tool it must veto")
+    if entry.get("fail_closed") is not fail_closed:
+        problems.append(f"profile {name}'s {label} hook has fail_closed={entry.get('fail_closed')!r}, not {fail_closed}")
+    script_path = _hook_command_script_path(entry.get("command"))
+    if script_path is None or not script_path.is_file():
+        problems.append(f"profile {name}'s {label} hook command does not point at an existing script")
+    return problems
+
+
+def _hook_command_script_path(command: object) -> pathlib.Path | None:
+    """The .py path a hook `command` string names, as split.py the same way agent/shell_hooks.py's own
+    split_command_line does on Windows (shlex.split(posix=False), one layer of matching quotes stripped per
+    token) -- so this check reads the command exactly as Hermes will run it, not as a naive whitespace split
+    would. None when `command` is not a string, splits to nothing, or names no .py file."""
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        tokens = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"') else t
+                  for t in shlex.split(command, posix=False)]
+    except ValueError:
+        return None
+    for token in reversed(tokens):
+        if token.lower().endswith(".py"):
+            return pathlib.Path(token)
+    return None
+
+
+def _check_reviewer_hooks(spec: ProfileSpec, cfg: dict) -> list[str]:
+    """ASES-ROL-05 / ASES-ROL-06 / ASES-REV-05 (round 19, package REVIEWLADDER): problems with a
+    kanban_lifecycle_only profile's pre_tool_call hooks. Never raises; an unreadable `hooks:` block (the wrong
+    type) is reported once and stops here, since neither hook can be found in it."""
+    name = spec.name
+    entries = _get(cfg, "hooks.pre_tool_call")
+    if not isinstance(entries, list):
+        return [f"profile {name} has no hooks.pre_tool_call list, so the reviewer hooks are not installed "
+                "(ASES-ROL-05, ASES-ROL-06)"]
+    problems = _check_reviewer_hook_entry(
+        name, _DENY_SCRIPT, "R1 (deny_tool)", reviewcontract_mod.DENIED_TOOLS, entries, fail_closed=True,
+    )
+    problems += _check_reviewer_hook_entry(
+        name, _EVIDENCE_SCRIPT, "R2 (reviewer_evidence_guard)", reviewcontract_mod.EVIDENCE_TOOLS, entries,
+        fail_closed=False,
+    )
+    if _get(cfg, "hooks_auto_accept") is not True:
+        problems.append(f"profile {name} has hooks_auto_accept off, so a non-dispatched critic run never accepts "
+                        "the reviewer hooks")
+    return problems
+
+
+def reviewer_hook_problems(
+    project: ProjectConfig, models_config: dict, hermes_home: pathlib.Path | str,
+) -> dict[str, list[str]]:
+    """{profile_name: [problem, ...]} for every ACTIVE kanban_lifecycle_only profile that exists on disk (round
+    19, package REVIEWLADDER). A profile with no entry either does not exist yet (verify_state already says so)
+    or has nothing wrong with its hooks -- an empty overall dict means no active reviewer-role profile exists on
+    disk yet, not that everything is fine (a caller wanting "healthy" must check both). Public (unlike
+    _check_reviewer_hooks) so swarm doctor can show a dedicated row confirming the reviewer hooks are present,
+    distinct from verify_state's generic per-problem list, which already includes these same problems among
+    everything else it checks. Never raises: an unreadable config.yaml is skipped, exactly as verify_state skips
+    it (its own row already explains why)."""
+    home = pathlib.Path(hermes_home)
+    out: dict[str, list[str]] = {}
+    for spec in desired_profiles(project, models_config):
+        if not spec.active or not spec.kanban_lifecycle_only:
+            continue
+        snap = _snapshot(home, spec.name)
+        if not snap.exists or snap.config_error:
+            continue
+        out[spec.name] = _check_reviewer_hooks(spec, snap.config)
+    return out
+
+
+def active_reviewer_profiles(project: ProjectConfig, models_config: dict | None = None) -> frozenset[str]:
+    """Every profile name the controller's reviewer-contract ladder (round 19, package REVIEWLADDER: Layer 2 --
+    controller.process_reviewer_contract, controller._handoff_commit's D4 fix, recovery.refresh_review_rounds'
+    D5 fix) must treat as a reviewer-profile run: every ACTIVE, kanban_lifecycle_only profile desired_profiles
+    gives this project (the reviewer role itself, plus any specialisation played by it, such as the built-in
+    "security" role -- RoleDef.played_by) -- the exact same filter reviewer_hook_problems already uses to give
+    Layer 1's hooks to those same profiles, so the two layers can never disagree about which profiles are "the
+    reviewer". `models_config` only ever affects a ProfileSpec's provider/model (never `active` or
+    `kanban_lifecycle_only`, which come from project.roles and ROLE_TABLE alone), so a caller with none on hand
+    may pass None; it is never used to decide activity.
+
+    Round 19 fix round 2 (reviewer finding, major): before this helper existed, every one of the three call sites
+    built its own frozenset({controller._reviewer_profile(project)}), a single literal name -- so a configured
+    "security" specialisation got Layer 1's hook coverage (this function's own filter, via reviewer_hook_
+    problems) but stayed invisible to Layer 2: a security-profile reviewer run that broke the contract was never
+    classified, never answered and never even counted, the same class of gap research report finding D1
+    originally described for the plain reviewer role."""
+    return frozenset(
+        spec.name for spec in desired_profiles(project, models_config or {})
+        if spec.active and spec.kanban_lifecycle_only
+    )
+
+
 def _check_profile(
     spec: ProfileSpec, snap: _Snapshot, project: ProjectConfig, models_config: dict, prompts_dir: pathlib.Path,
     sandbox_enabled: bool, policy: sandbox_mod.SandboxPolicy | None,
@@ -1574,6 +1795,8 @@ def _check_profile(
         return problems
     cfg = snap.config
     problems += _check_toolsets(spec, cfg)
+    if spec.kanban_lifecycle_only:
+        problems += _check_reviewer_hooks(spec, cfg)
     if not spec.memory_enabled:
         for key in ("memory_enabled", "user_profile_enabled"):
             if _get(cfg, f"memory.{key}") is not False:
