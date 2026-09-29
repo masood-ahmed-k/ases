@@ -84,6 +84,34 @@ class BranchCheck:
     head: str
 
 
+def record_gate1(
+    board: str, card_id: str, repo: pathlib.Path, branch: str, integration_branch: str,
+    gate1_commands: list[str], touches: list[str], *, conn, task_key: str,
+    allow_gate_config_changes: bool = False, project_config=None, task=None, project: str | None = None,
+) -> BranchCheck:
+    """Round 18b (ASES-REV-05): the half of gate_before_review that runs Gate 1 and posts the result, with NO
+    send-back -- for a caller that needs the record on the card before a decision that is not "send it back",
+    the way gate_before_review's own send-back is. controller.process_unpark is the one caller today: a card
+    whose ASSIGNEE is already the reviewer (Hermes set that when it went up for review) can be quota- or
+    budget-parked and released again without its Kanban STATUS ever passing back through "review", so
+    process_review_lane (which only acts on a card whose status IS "review") never sees it and Gate 1 is never
+    re-run -- the 2026-09-29 stage-C finding this function closes. process_unpark calls this immediately before
+    such a card is unblocked, so the gate record is already on the card before Hermes's gateway can dispatch the
+    reviewer, and decides for itself what a red result or an infrastructure failure means for the release (there
+    is nothing to "send back" here: the card was never in review to begin with).
+
+    Just check_branch plus _post_gate_record: see their own docstrings, and gate_before_review's, for what the
+    returned BranchCheck's `kind` values mean, why a Hermes failure while posting the comment never raises out of
+    this call, and why sandbox.SandboxInfrastructureError / gates.GateCheckoutError from the gate call is NOT
+    caught here (an infrastructure failure is never a red gate, and the caller decides what it means)."""
+    result = check_branch(
+        repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
+        allow_gate_config_changes=allow_gate_config_changes, project_config=project_config, task=task,
+    )
+    _post_gate_record(board, card_id, result, gate1_commands, conn=conn, task_key=task_key, project=project)
+    return result
+
+
 def gate_before_review(
     board: str, card_id: str, repo: pathlib.Path, branch: str, integration_branch: str,
     gate1_commands: list[str], touches: list[str], *, conn, task_key: str,
@@ -91,7 +119,8 @@ def gate_before_review(
 ) -> bool:
     """ASES-REV-05 (Gate 1 re-check) + ASES-GIT-13 (touches-path check). Returns True if both pass
     (card stays in review for the reviewer), False if it sent the card back (a failed attempt, not a
-    review round). A thin wrapper: check_branch makes the decision, this owns the send-back to Hermes.
+    review round). A thin wrapper: record_gate1 (check_branch plus the gate-record comment) makes the
+    decision, this owns the send-back to Hermes.
 
     `allow_gate_config_changes` is the plan task's own ASES-QG-02 marker (plan.PlanTask), passed straight
     through to check_branch's tamper check.
@@ -133,11 +162,11 @@ def gate_before_review(
     while posting that comment never reaches here: _post_gate_record contains it, records a
     gate_record_post_failed event, and this function still returns the correct pass/fail/not-run outcome for the
     card exactly as if the comment had gone out (see _post_gate_record's own docstring)."""
-    result = check_branch(
-        repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
+    result = record_gate1(
+        board, card_id, repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
         allow_gate_config_changes=allow_gate_config_changes, project_config=project_config, task=task,
+        project=project,
     )
-    _post_gate_record(board, card_id, result, gate1_commands, conn=conn, task_key=task_key, project=project)
     if result.kind == "tamper_check_error":
         events_mod.record(conn, "tamper_check_error", {
             "task_key": task_key, "card_id": card_id, "head": result.head, "reason": result.detail,
