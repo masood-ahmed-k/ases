@@ -22,6 +22,7 @@ from ases import gates as gates_mod
 from ases import plan as plan_mod
 from ases import questions, recovery, report
 from ases import review as review_mod
+from ases import sandbox as sandbox_mod
 from ases import usage as usage_mod
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -1863,10 +1864,10 @@ def park(w, key, reason, *, status="scheduled"):
     w.board.add_event(w.work(key), "scheduled", {"reason": reason})
 
 
-def unpark(w, models=MODELS, *, project=True, budgets=None, now=None):
+def unpark(w, models=MODELS, *, project=True, budgets=None, now=None, repo=None):
     return controller.process_unpark(
         "b", w.plan, models, conn=w.conn, budgets=w.project.budgets if budgets is None else budgets,
-        project=w.project if project else None, now=now)
+        project=w.project if project else None, now=now, repo=repo)
 
 
 # The reason recovery parked the real stage C card S1 with (2026-09-28, verbatim from the Hermes board), and that
@@ -1945,6 +1946,144 @@ def test_quota_reset_passed_is_the_utc_day_boundary():
     assert recovery.quota_reset_passed(datetime(2026, 9, 28, 23, 58, tzinfo=timezone.utc), AFTER_RESET) is True
     assert recovery.quota_reset_passed(None, AFTER_RESET) is False
     assert recovery.quota_reset_passed(S1_PARKED_AT, "garbage") is False
+
+
+# --- round 18b: the pre-unblock Gate 1 re-check for a card still assigned to the reviewer ----------------------
+
+def _stub_check_branch(monkeypatch, result_or_exc):
+    """Replace review.check_branch with a recorder that has its REAL parameter names (so a caller passing the
+    wrong arguments fails loudly), returning `result_or_exc` or raising it when it is an exception. record_gate1
+    itself, and _post_gate_record, run for real, so the fake board's own kanban_comment call log is genuine
+    evidence of what process_unpark actually did, not a stand-in for it."""
+    calls = []
+
+    def fake(repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key,
+              allow_gate_config_changes=False, project_config=None, task=None):
+        calls.append({
+            "repo": repo, "branch": branch, "integration_branch": integration_branch,
+            "gate1_commands": gate1_commands, "touches": touches, "task_key": task_key,
+            "allow_gate_config_changes": allow_gate_config_changes, "project_config": project_config, "task": task,
+        })
+        if isinstance(result_or_exc, BaseException):
+            raise result_or_exc
+        return result_or_exc
+
+    monkeypatch.setattr(review_mod, "check_branch", fake)
+    return calls
+
+
+def test_a_reviewer_assigned_release_runs_gate1_and_posts_the_record_before_unblocking(tmp_path, monkeypatch):
+    """Round 18b (the 2026-09-29 stage-C run, real Hermes): S1's work card kept the reviewer as its Kanban
+    ASSIGNEE (Hermes sets that when a card goes up for review) straight through a quota park and its release,
+    so the gateway dispatched the reviewer the instant kanban_unblock returned it to ready -- with no Gate 1
+    re-check and no "ASES gate record" comment on the card at all, because process_review_lane only ever looks
+    at status "review", and this card's status went scheduled -> ready without ever passing back through it.
+    record_gate1 must now run, and its comment must post, before that unblock."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")
+    w.board.cards[w.work()]["assignee"] = "reviewer"
+    calls = _stub_check_branch(monkeypatch, review_mod.BranchCheck(True, "ok", "Gate 1 green for c0ffee", "c0ffee"))
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET, repo=w.repo) == ["T1"]
+
+    assert calls == [{
+        "repo": w.repo, "branch": "swarm/T1-coder", "integration_branch": "integration",
+        "gate1_commands": ["echo ok"], "touches": ["a.py"], "task_key": "T1",
+        "allow_gate_config_changes": False, "project_config": w.project, "task": w.plan.task("T1"),
+    }]
+    names = [name for name, _, _ in w.board.calls if name in ("kanban_comment", "kanban_unblock")]
+    assert names == ["kanban_comment", "kanban_unblock"]  # the gate record is posted BEFORE the release
+    (comment_args, _) = w.board.calls_of("kanban_comment")[0]
+    assert comment_args[1] == w.work() and review_mod.GATE_RECORD_HEADER in comment_args[2]
+    assert w.board.cards[w.work()]["status"] == "ready"
+    assert payloads(w.conn, "gate1_recheck_failed") == []
+
+
+def test_a_coder_assigned_release_does_not_run_gate1(tmp_path, monkeypatch):
+    """A card still assigned to its coder (an ordinary coder-phase quota or budget park) never went up for
+    review at all: there is no Gate 1 re-check to make here and no gate record to post. This is unpark's own,
+    unrelated release path, and a coder-phase park must not be mistaken for one."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")  # default assignee from create_cards_from_plan is "coder-1" (ROLES["coder"])
+    calls = _stub_check_branch(monkeypatch, review_mod.BranchCheck(True, "ok", "unused", "unused"))
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET, repo=w.repo) == ["T1"]
+
+    assert calls == []  # check_branch (and so record_gate1) was never even called
+    assert [name for name, _, _ in w.board.calls if name == "kanban_comment"] == []
+    assert w.board.cards[w.work()]["status"] == "ready"
+
+
+def test_an_infrastructure_error_before_release_keeps_the_card_parked_and_is_recorded_once(tmp_path, monkeypatch):
+    """Mirrors process_review_lane's own handling of the same two exceptions: Gate 1 could not even run, so this
+    is not a red gate and the card is not released -- it stays parked for a later pass to retry, and a second
+    pass while the outage continues must not flood the events table (the same _record_once reasoning as
+    tamper_check_error and process_review_lane's own sandbox_infrastructure_error)."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")
+    w.board.cards[w.work()]["assignee"] = "reviewer"
+    _stub_check_branch(monkeypatch, sandbox_mod.SandboxInfrastructureError(
+        "the sandbox is enabled but docker CLI not found on PATH"))
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET, repo=w.repo) == []
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET, repo=w.repo) == []  # a second pass: not flooded
+
+    assert w.board.cards[w.work()]["status"] == "scheduled"  # never released
+    assert [name for name, _, _ in w.board.calls if name == "kanban_unblock"] == []
+    rows = payloads(w.conn, "sandbox_infrastructure_error")
+    assert len(rows) == 1
+    assert rows[0]["task_key"] == "T1" and rows[0]["gate"] == "gate1"
+    assert "docker CLI not found" in rows[0]["error"]
+    assert payloads(w.conn, "gate1_recheck_failed") == []
+
+
+def test_a_red_gate1_is_released_anyway_and_recorded_as_gate1_recheck_failed(tmp_path, monkeypatch):
+    """A red Gate 1 does not hold the card back the way it does in the review lane: there is no "send it back"
+    path here, the card was never in review to begin with. It is released with the FAIL record already on it
+    (never say a check passed unless a gate record shows it) and gate1_recheck_failed recorded, exactly as
+    process_review_lane records it for its own red re-checks -- the merge queue re-checks its own gate_runs row
+    before anything can merge, whatever the reviewer ends up doing with a red record in front of it."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")
+    w.board.cards[w.work()]["assignee"] = "reviewer"
+    _stub_check_branch(monkeypatch, review_mod.BranchCheck(
+        False, "gate1_red", "Gate 1 failed on the controller's re-check:\nexit 1", "c0ffee"))
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET, repo=w.repo) == ["T1"]  # still released
+
+    assert w.board.cards[w.work()]["status"] == "ready"
+    assert [name for name, _, _ in w.board.calls if name == "kanban_comment"] != []
+    assert payloads(w.conn, "gate1_recheck_failed") == [{"task_key": "T1"}]
+
+
+def test_a_tamper_check_that_could_not_run_is_not_a_failed_recheck(tmp_path, monkeypatch):
+    """As review.gate_before_review: a tamper_check_error (git could not produce the diff) says nothing about the
+    card, so the release records tamper_check_error, never gate1_recheck_failed (round 18b review finding)."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")
+    w.board.cards[w.work()]["assignee"] = "reviewer"
+    _stub_check_branch(monkeypatch, review_mod.BranchCheck(
+        False, "tamper_check_error", "git diff failed: exit 128", "c0ffee"))
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET, repo=w.repo) == ["T1"]
+
+    assert payloads(w.conn, "gate1_recheck_failed") == []
+    (row,) = payloads(w.conn, "tamper_check_error")
+    assert row == {"task_key": "T1", "card_id": w.work(), "head": "c0ffee", "reason": "git diff failed: exit 128"}
+
+
+def test_process_unpark_with_no_repo_keeps_todays_behaviour(tmp_path, monkeypatch):
+    """`repo` is optional and None by default: an existing caller (or one with no repo to give) releases exactly
+    as it did before this round, with no Gate 1 re-check attempted even for a card assigned to the reviewer."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")
+    w.board.cards[w.work()]["assignee"] = "reviewer"
+    calls = _stub_check_branch(monkeypatch, review_mod.BranchCheck(True, "ok", "unused", "unused"))
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET) == ["T1"]  # repo defaults to None
+
+    assert calls == []
+    assert [name for name, _, _ in w.board.calls if name == "kanban_comment"] == []
 
 
 def test_a_budget_parked_card_is_unparked_once_it_is_affordable_again(tmp_path, monkeypatch):
@@ -2889,9 +3028,10 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
     assert rig.args["budget"] == (("b", rig.plan, rig.models),
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
     # Round 18: the pass clock reaches process_unpark too, which a quota park's reset check reads.
+    # Round 18b: run_pass's own repo reaches it too, for the pre-unblock Gate 1 check.
     assert rig.args["unpark"] == (("b", rig.plan, rig.models),
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project,
-                                   "now": moment})
+                                   "now": moment, "repo": "the-repo"})
     assert rig.args["review"] == (("b", "the-repo", rig.plan, rig.project), {"conn": rig.conn})
     assert rig.args["card_base"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
     assert rig.args["provision"] == (("b", rig.plan, rig.project), {"conn": rig.conn})

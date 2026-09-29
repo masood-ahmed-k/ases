@@ -2238,3 +2238,109 @@ def test_check_branch_for_merge_never_posts_a_gate_record(repo, tmp_path, monkey
     )
 
     assert result.kind == "ok" and posted == []
+
+
+# --- record_gate1 (round 18b): check_branch plus the gate-record comment, with NO send-back --------------------
+#
+# controller.process_unpark is the one caller: a card whose Kanban assignee is already the reviewer can be
+# released with its status never having passed back through "review", so process_review_lane never re-runs
+# Gate 1 for it. record_gate1 is the half of gate_before_review that makes and posts that decision; the other
+# half, the send-back, stays behind in gate_before_review, because there is nothing to send back here.
+
+
+def test_record_gate1_runs_check_branch_and_returns_its_result(repo, tmp_path):
+    """record_gate1 IS check_branch's own decision for the plain pass case: same ok, kind and head."""
+    _branch_with_changes(repo, "swarm/RG1", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    head = _head(repo, "swarm/RG1")
+
+    result = review.record_gate1(
+        "b", "t_1", repo, "swarm/RG1", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RG1",
+    )
+
+    assert (result.ok, result.kind, result.head) == (True, "ok", head)
+
+
+def test_record_gate1_posts_the_pass_gate_record_and_only_once(repo, tmp_path, monkeypatch):
+    """Exactly gate_before_review's own posting behaviour (round 16, ASES-QG-01): the real gate output's tail
+    goes on the card, once, even across a second, identical call on the same, unmoved commit."""
+    _branch_with_changes(repo, "swarm/RG2", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    posted = _posted_comments(monkeypatch)
+    head = _head(repo, "swarm/RG2")
+
+    r1 = review.record_gate1(
+        "b", "t_1", repo, "swarm/RG2", "integration", ["echo gate-output-marker"], ["src/*"],
+        conn=conn, task_key="RG2",
+    )
+    r2 = review.record_gate1(
+        "b", "t_1", repo, "swarm/RG2", "integration", ["echo gate-output-marker"], ["src/*"],
+        conn=conn, task_key="RG2",
+    )
+
+    assert (r1.ok, r2.ok) == (True, True)
+    assert len(posted) == 1  # not reposted on the second, identical pass
+    board, card_id, text = posted[0]
+    assert (board, card_id) == ("b", "t_1")
+    assert text.splitlines()[0] == review.GATE_RECORD_HEADER
+    assert f"commit: {head}" in text and "result: PASS" in text
+    assert "gate-output-marker" in text  # the real gate output's own tail made it into the comment
+
+
+def test_record_gate1_posts_a_fail_gate_record_with_no_send_back(repo, tmp_path, monkeypatch):
+    """The FAIL record goes on the card exactly like gate_before_review's own (round 16); the one thing that is
+    different is that nothing here ever sends the card back."""
+    branch, touches, commands = _scenario(repo, "gate1_red")
+    conn = db.connect(tmp_path / "ases.db")
+    _forbid_review_sendback(monkeypatch)
+    posted = _posted_comments(monkeypatch)
+
+    result = review.record_gate1(
+        "b", "t_2", repo, branch, "integration", commands, touches, conn=conn, task_key="RG5",
+    )
+
+    assert result.ok is False and result.kind == "gate1_red"
+    assert len(posted) == 1
+    text = posted[0][2]
+    assert "result: FAIL" in text and "[exit 1]" in text
+
+
+@pytest.mark.parametrize("kind", ["unresolvable_branch", "no_merge_base", "out_of_scope", "tamper", "gate1_red"])
+def test_record_gate1_never_sends_a_card_back(kind, repo, tmp_path, monkeypatch):
+    """record_gate1 has no send-back at all, for any way a branch can fail: that half of gate_before_review
+    stays there. controller.process_unpark decides for itself what a red or not-run result means for a card
+    that was never in review to begin with."""
+    branch, touches, commands = _scenario(repo, kind)
+    conn = db.connect(tmp_path / "ases.db")
+    _forbid_review_sendback(monkeypatch)
+
+    result = review.record_gate1(
+        "b", "t_g", repo, branch, "integration", commands, touches, conn=conn, task_key="RG3",
+    )
+
+    assert result.kind == kind
+    assert result.ok is (kind == "ok")
+
+
+def test_record_gate1_passes_project_config_and_task_through_to_check_branch(repo, tmp_path, monkeypatch):
+    """Round 9 (ASES-QG-04, ASES-SEC-03/05/07): the same pass-through gate_before_review already has, since
+    controller.process_unpark needs its own card's task and project to reach gates.resolve_runner too."""
+    _branch_with_changes(repo, "swarm/RG7", {"src/a.py": "x=1\n"})
+    conn = db.connect(tmp_path / "ases.db")
+    seen = {}
+
+    def fake_check_branch(repo_arg, branch, integration_branch, commands, touches, *, conn, task_key,
+                           allow_gate_config_changes=False, project_config=None, task=None):
+        seen["project_config"] = project_config
+        seen["task"] = task
+        return review.BranchCheck(True, "ok", "stubbed", "a" * 40)
+
+    monkeypatch.setattr(review, "check_branch", fake_check_branch)
+    project_config, task = _FakeProjectConfig(), _FakeTask()
+
+    review.record_gate1(
+        "b", "card1", repo, "swarm/RG7", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RG7",
+        project_config=project_config, task=task,
+    )
+
+    assert (seen["project_config"], seen["task"]) == (project_config, task)

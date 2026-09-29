@@ -449,6 +449,20 @@ def test_the_reviewer_prompt_says_where_gate_records_live_and_a_missing_one_is_n
     assert "leave pass or fail to the controller's own gates" in text
 
 
+def test_the_reviewer_prompt_forbids_blocking_over_missing_test_evidence():
+    """Round 18b (the real stage C run, 2026-09-29, real Hermes, real OpenRouter reviewer): a reviewer BLOCKED a
+    passing card ("I cannot independently verify that the pytest tests pass ... I cannot approve this task
+    without test verification"), a loophole version 2 left open by naming only CHANGES_REQUIRED as the wrong
+    verdict for a missing gate record. Version 3 rules BLOCKED out too, in so many words, and gives
+    CHANGES_REQUIRED its own legitimate reason instead: a gate record that actually shows FAIL."""
+    text = _prompt("reviewer").decode("ascii")
+    assert "never REQUEST CHANGES and never BLOCK" in text
+    assert "to ask anyone for test evidence" in text
+    assert "never to ask for test evidence or because a gate record is missing" in text
+    assert "A gate record that shows FAIL for the commit under review is a reason for CHANGES_REQUIRED" in text
+    assert "for a human decision about the requirements or the design" in text
+
+
 # The injection phrases Hermes scans context files for (tools/threat_patterns.py in 0.21.3, the "all" and "context"
 # scopes: a SOUL.md hit is only logged for the user's own file, but our text should never trip it).
 _FILLER = r"(?:\w+\s+){0,8}"
@@ -2071,7 +2085,7 @@ def test_apply_result_lines_report_the_copied_names_and_nothing_else_about_crede
 def test_plan_init_the_soul_row_names_the_prompt_and_its_version(tmp_path):
     plan = _plan(_project(tmp_path), tmp_path / "hermes")
     why = next(c.why for c in plan if c.kind == "write_soul" and c.profile == "reviewer")
-    assert why == "ASES-ROL-03: role prompt prompts/reviewer.md (prompt version 2)"
+    assert why == "ASES-ROL-03: role prompt prompts/reviewer.md (prompt version 3)"
 
 
 def test_prompt_version_is_read_from_each_prompts_own_first_line():
@@ -2093,7 +2107,7 @@ def test_render_soul_header_carries_the_reviewer_prompts_own_version(tmp_path):
     project = _project(tmp_path)
     spec = _spec(project, "reviewer")
     soul = profiles.render_soul(spec, (PROMPTS_DIR / "reviewer.md").read_text(encoding="utf-8"), project)
-    assert "prompt version 2" in soul.split("\n\n", 1)[0]
+    assert "prompt version 3" in soul.split("\n\n", 1)[0]
 
 
 # The exact prompts/reviewer.md text before round 16 (git show HEAD:prompts/reviewer.md on the commit this

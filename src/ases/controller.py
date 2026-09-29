@@ -1900,7 +1900,7 @@ def _latest_scheduled_reason(card: dict) -> str | None:
 
 def process_unpark(
     board: str, plan: plan_mod.Plan, models_config: dict, *, conn, budgets: dict,
-    project: ases_config.ProjectConfig | None = None, now=None,
+    project: ases_config.ProjectConfig | None = None, now=None, repo: pathlib.Path | None = None,
 ) -> list[str]:
     """ASES-CAP-03 and Table 17 ("Requests per provider per day: Park cards until the reset"); the loop's
     `for card in board.parked_past_reset(): hermes.unblock(card)`. process_budget_gate parks a card it cannot afford
@@ -1929,8 +1929,24 @@ def process_unpark(
     whatever the ledger thinks is left. It is unblocked with the reason "the provider's daily quota has reset".
     `now` is the pass clock (run_pass's own), the real clock when None.
 
+    Round 18b (the 2026-09-29 stage-C run, real Hermes): a card whose Kanban ASSIGNEE is already the reviewer
+    profile (Hermes sets that when the card goes up for review; the plan task's own role can still be "coder")
+    can be parked and released here with its STATUS never passing back through "review", so process_review_lane
+    (which only acts on a card whose status IS "review") never re-runs Gate 1 for it, and the gateway can
+    dispatch the reviewer within seconds of the unblock with no "ASES gate record" comment on the card at all
+    (ASES-REV-05). So, right before releasing such a card, this now calls review.record_gate1 on its branch,
+    mirroring process_review_lane's own two outcomes: a sandbox.SandboxInfrastructureError or a
+    gates.GateCheckoutError means Gate 1 could not even run, so the card is left parked (recorded once per card
+    as sandbox_infrastructure_error) for a later pass to retry; any other result is posted to the card and the
+    release goes ahead either way -- a red one is recorded as gate1_recheck_failed, same as the review lane,
+    though there is no send-back here (the reviewer sees the red record, and the merge queue re-checks its own
+    gate_runs row before anything can merge regardless). `repo` is optional and None by default, so an existing
+    caller keeps today's behaviour unchanged; run_pass passes its own repo. A card whose assignee is anyone else
+    (an ordinary coder-phase park) is released exactly as before, with no Gate 1 re-check attempted.
+
     A card that cannot be read or unblocked is recorded (unpark_error, once per message) and the rest carry on."""
     review_afford = usage_mod.review_budget(conn, models_config, project) if project is not None else None
+    reviewer_profile = project.roles.get("reviewer") if project is not None else None
     unparked = []
     for card in hermes_mod.kanban_list(board, status="scheduled"):
         row = conn.execute(
@@ -1951,6 +1967,28 @@ def process_unpark(
             ok, _ = _affordable_now(conn, task, models_config, budgets, review_afford, project)
             if not ok:
                 continue
+            if repo is not None and reviewer_profile is not None and card.get("assignee") == reviewer_profile:
+                branch = card.get("branch_name") or f"swarm/{task.key}-{task.role}"
+                try:
+                    result = review_mod.record_gate1(
+                        board, card["id"], repo, branch, plan.integration_branch,
+                        plan.gate_profiles[task.gate_profile], list(task.touches),
+                        conn=conn, task_key=task.key, allow_gate_config_changes=task.allow_gate_config_changes,
+                        project_config=project, task=task, project=plan.project,
+                    )
+                except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
+                    _record_once(conn, "sandbox_infrastructure_error", {
+                        "task_key": task.key, "card_id": card["id"], "gate": "gate1", "error": _clean(str(exc), 300),
+                    }, match=("task_key", "gate"))
+                    continue
+                if result.kind == "tamper_check_error":
+                    # As gate_before_review: a tamper check that could not run says nothing about the card (the
+                    # merge-time check is authoritative and fails closed), so it is not a failed re-check.
+                    events.record(conn, "tamper_check_error", {
+                        "task_key": task.key, "card_id": card["id"], "head": result.head, "reason": result.detail,
+                    }, project=plan.project)
+                elif not result.ok:
+                    events.record(conn, "gate1_recheck_failed", {"task_key": task.key}, project=plan.project)
             hermes_mod.kanban_unblock(board, card["id"], reason=why)
         except Exception as exc:  # noqa: BLE001 - one card must never stop the others
             _record_once(conn, "unpark_error", {
@@ -2455,7 +2493,7 @@ def run_pass(
     summary["unparked"] = _isolated(
         conn, summary, "unpark",
         lambda: process_unpark(
-            board, plan, models_config, conn=conn, budgets=project.budgets, project=project, now=now,
+            board, plan, models_config, conn=conn, budgets=project.budgets, project=project, now=now, repo=repo,
         ), [],
         plan.project,
     )
