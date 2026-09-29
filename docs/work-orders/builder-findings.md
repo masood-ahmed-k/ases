@@ -3935,3 +3935,24 @@ Architect-authored summary.
   `gate_before_review`. Nemotron also claimed an event-name mismatch, which the reviewer verified false.
 - The real run then showed that prompt v3 alone does not change this model's behaviour: it blocked word for word as before.
   The prompt is now right for a model that follows it; the model choice is the owner's.
+
+## Round 19 (2026-09-29): what the research and the packages found
+
+Architect-authored summary; the full research reports are in `C:/Users/masoo/ases-wt/_research/r19/`.
+
+- LEDGER research: every run maps to exactly one session by the worker's first prompt plus the run window (33 of 33 runs on the
+  real board); time windows alone were ambiguous for three real runs. Two more undercounts beyond missing session ids: early
+  ingestion at the hand-off, and the uncounted Gate P critic. OpenRouter on 2026-09-28: ledger 30, Hermes 55.
+- REVIEWER research: Hermes detects a block loop by block kind only (limit 2) and nothing but archive takes a card out of triage
+  at zero quota; `pre_tool_call` hooks can deny single tools, which refuted the old residual-risk text; in stage C the reviewer's
+  `kanban_request_review` made it the card's implementer, so both later blocks happened in the implementation lane.
+- STOPDOC research: eight places the software could act against the stop condition without a gate, the worst two being
+  Hermes's LSP auto-install (already happened twice) and unchecked data classes for the Lead and critic.
+- PROVIDERS research: no configured provider qualifies for private data; the reviewer's own free endpoint does not train
+  (model level only); top reviewer candidates Google AI Studio, NVIDIA API catalog, Cloudflare Workers AI; Groq, Cerebras,
+  GitHub Models (retired) and others excluded with reasons.
+- Merges: LEDGER and STOPGATES both took migration 10 (STOPGATES renumbered to 11, GIT12 took 12); REVIEWLADDER and
+  PROFILEGUARDS both rewrote the reviewer residual-risk text (merged into one that states every pinned fact).
+- The architect also found and repaired a close-out script bug from the S1 record: three register notes (CAP-03, REV-05,
+  REC-01) had apostrophes double-escaped; the round 19 script rebuilds each note from its parsed value and asserts every earlier
+  note survives exactly.

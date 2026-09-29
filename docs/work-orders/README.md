@@ -181,3 +181,17 @@ nemotron second opinion, and up to two fix rounds. The specs are in the workflow
 | (workflow spec) | REVIEWPATH: reviewer prompt v3; Gate 1 re-run and recorded before a parked review card is released (ASES-REV-05, ROL-03) | done, reviewed PASS; one minor fixed by the architect |
 | (open) | the request ledger counts only runs with a worker_session_id (ASES-CAP-03, RTE-01) | found, not yet built |
 | (owner decision) | the reviewer model cannot follow the reviewer contract (ASES-ROL-05) | waiting for the owner |
+
+## Round 19 (2026-09-29): Tier 1 and Tier 3, research first
+
+Specs live in the round's workflow scripts; the five research reports are in `C:/Users/masoo/ases-wt/_research/r19/`.
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| (workflow spec) | LEDGER: the session-as-unit request ledger (ASES-CAP-02, CAP-03, RTE-01), migration 10 | done, reviewed PASS; one minor fixed by the architect |
+| (workflow spec) | REVIEWLADDER: reviewer hooks and the controller's reviewer-contract ladder (ASES-ROL-05, ROL-06, REV-05, REC-05) | done; the last major fixed by the architect with a failing-first test |
+| (workflow spec) | PROFILEGUARDS: no LSP auto-install, --no-alias, no-data-collection routing (ASES-DOC-04, PRV-04) | done, reviewed PASS |
+| (workflow spec) | STOPGATES: stop-condition and data-class gates (ASES-DOC-04, PRV-01 to 04, ROL-06), migration 11 | done, reviewed PASS |
+| (workflow spec) | TESTSDOCS: real-Docker 22.11, phase exit plan, verified policies, reviewer candidates (ASES-TST-02, DOC-03, PRV-04, CAP-06) | done, reviewed PASS |
+| (workflow spec) | GIT12: attribution of changes to runs in report mode, gate_runs project (ASES-GIT-12), migration 12 | done, reviewed PASS; two minors fixed by the architect |
+| (workflow spec) | MERGEGUARD: reviewer independence at merge, paid reviewer at dispatch, LSP roster (ASES-ROL-05, DOC-04) | done, reviewed PASS; one minor fixed by the architect |

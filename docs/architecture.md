@@ -1381,6 +1381,40 @@ fake rig had never exercised. Two are fixed; the third is the reviewer model its
 Both fixes went through a builder or the architect, an independent Sonnet reviewer and a nemotron second opinion, each with a
 before/after proof. Full suite after both: 6002 passed, 2 skipped.
 
+## Round 19: Tier 1 and Tier 3, research first (2026-09-29)
+
+The owner's "Tier 1: do it; Tier 3: do all". Zero quota, no accounts created. Five read-only researchers first
+(reports in `C:/Users/masoo/ases-wt/_research/r19/`: LEDGER, REVIEWER, GIT12, STOPDOC, PROVIDERS), then seven build packages in
+two waves, each built by a Sonnet builder, independently reviewed with a nemotron second opinion, and fixed.
+
+- **LEDGER** (ASES-CAP-02, CAP-03, RTE-01): the ledger's unit is the Hermes session, found through `hermes -p <profile>
+  sessions export --source kanban` and matched to its run by the worker's first prompt and the run window; crashed, blocked
+  and changes-requested runs are now counted, sessions are topped up to their final count, the Gate P critic is counted.
+  Migration 10.
+- **REVIEWLADDER** (ROL-05, ROL-06, REV-05, REC-05): the research found that in stage C the reviewer called
+  `kanban_request_review` and Hermes made it the card's implementer. Reviewer profiles now carry `pre_tool_call` hooks that deny
+  write tools and hand-offs in-run and bounce a stop that only asks for test evidence; the controller answers such a stop once
+  with its Gate 1 record, otherwise asks the owner one question, never loops. Model switching is deferred to the owner's
+  reviewer choice.
+- **PROFILEGUARDS** (DOC-04, PRV-04): no LSP auto-install (Hermes had already npm-installed pyright into two profiles),
+  `--no-alias`, no-data-collection routing for the OpenRouter reviewer.
+- **STOPGATES** (DOC-04, PRV-01 to 04, ROL-06): the data class checked for the Lead, critic and reviewer; the Lead without a
+  terminal; `.env` never committed by the bootstrap; smoke history and report files never silently destroyed; paid models
+  refused unless allowed; no `swarm run` without the pinned image. Migration 11 (it collided with LEDGER's 10 at merge and was
+  renumbered).
+- **TESTSDOCS** (TST-02, DOC-03, PRV-04, CAP-06): 22.11's network clause against real Docker, so ASES-TST-02 is covered;
+  `docs/phase-exit-plan.md`; verified data policies only; three reviewer candidates ready to onboard.
+- **GIT12** (GIT-12): every change outside a worker's worktree is attributed to the runs that could have made it, including runs
+  between two polls, read version-gated from Hermes's board database; report mode, enforcement behind
+  `integrity.enforce_attribution` (off). `gate_runs` now carries its project on every path and every reader is scoped.
+  Migration 12.
+- **MERGEGUARD** (ROL-05, DOC-04): the merge queue refuses a card whose completing reviewer run actually used the Lead's
+  provider or family; the reviewer's paid status re-checked at dispatch; doctor's LSP row covers every profile.
+
+The architect fixed each package's last open finding with a failing-first test (REVIEWLADDER's transient-failure freeze,
+LEDGER's cross-pass ambiguity, MERGEGUARD's missing-model case) and resolved the merges. Full suite: 6248 passed, 2 skipped.
+Register: 60 covered, 32 in progress, 8 partial, 3 not applicable, 0 not covered.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and

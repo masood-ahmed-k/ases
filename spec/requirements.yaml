@@ -223,30 +223,36 @@ requirements:
   section: '4.2'
   verified_by: 22.1, 22.6
   status: partial
-  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the reviewer
-    model (OpenRouter cohere/north-mini-code:free) cannot follow the reviewer contract: it asked for test evidence
-    three times across two days (a request for changes on 2026-09-28, then two word-for-word identical blocks on
-    2026-09-29, the second under reviewer prompt version 3, which forbids exactly that, with a sandboxed PASS gate
-    record on the card). Hermes moved S1 to triage on the block loop. Choosing another reviewer model or provider
-    (different family and provider from the Lead) is the owner''s decision. Status unchanged. Earlier note: ROUND 10
-    (2026-09-27, zero quota): Owner decision (2026-09-27): the reviewer keeping the combined file
-    toolset is accepted as a documented residual risk until the Docker sandbox''s read-only mount closes it;
-    no interim guard. CALLERS made the risk visible: profiles.residual_risks() is printed by swarm init and
-    shown as INFO rows by swarm doctor. Earlier note: doctor.reviewer_diversity fails closed if lead and
-    reviewer share a provider; real check confirmed unorouter vs openrouter on 2026-09-18, and confirms xkiro
-    vs openrouter today (2026-09-19, after lead moved off unorouter entirely per an explicit user decision --
-    see docs/architecture.md). Downgraded from covered after the first real review: the reviewer has no
-    command tool (its terminal call failed with "Tool terminal does not exist"), but its tool list includes
-    write_file and patch, because Hermes toolsets are per group (file is reads and writes together) and this
-    version has no per-tool deny. So "no product-file write" is not enforced by profile configuration; a
-    read-only sandbox mount (Phase 5) is.'
+  note: 'ROUND 19 (2026-09-29, zero quota): REVIEWLADDER (merge 925d2b6): pre_tool_call hooks on reviewer profiles deny
+    write_file, patch, skill_manage, kanban_request_review, kanban_unblock and kanban_link in-run (the hook fails
+    open under HERMES_SAFE_MODE; doctor warns), and turn a stop that only asks for test evidence back into a tool
+    error; MERGEGUARD checks independence at merge from the ledger. Not yet exercised by a real reviewer run, and
+    the configured reviewer model still cannot follow its contract (the owner''s decision). Status unchanged.
+    Earlier note: S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md
+    addendum): the reviewer model (OpenRouter cohere/north-mini-code:free) cannot follow the reviewer contract: it
+    asked for test evidence three times across two days (a request for changes on 2026-09-28, then two word-for-word
+    identical blocks on 2026-09-29, the second under reviewer prompt version 3, which forbids exactly that, with a
+    sandboxed PASS gate record on the card). Hermes moved S1 to triage on the block loop. Choosing another reviewer
+    model or provider (different family and provider from the Lead) is the owner''s decision. Status unchanged.
+    Earlier note: ROUND 10 (2026-09-27, zero quota): Owner decision (2026-09-27): the reviewer keeping the combined
+    file toolset is accepted as a documented residual risk until the Docker sandbox''s read-only mount closes it; no
+    interim guard. CALLERS made the risk visible: profiles.residual_risks() is printed by swarm init and shown as
+    INFO rows by swarm doctor. Earlier note: doctor.reviewer_diversity fails closed if lead and reviewer share a
+    provider; real check confirmed unorouter vs openrouter on 2026-09-18, and confirms xkiro vs openrouter today
+    (2026-09-19, after lead moved off unorouter entirely per an explicit user decision -- see docs/architecture.md).
+    Downgraded from covered after the first real review: the reviewer has no command tool (its terminal call failed
+    with "Tool terminal does not exist"), but its tool list includes write_file and patch, because Hermes toolsets
+    are per group (file is reads and writes together) and this version has no per-tool deny. So "no product-file
+    write" is not enforced by profile configuration; a read-only sandbox mount (Phase 5) is.'
 - id: ASES-ROL-06
   requirement: Least-privilege toolsets per role
   section: '4.2'
   verified_by: 22.6, 22.11
   status: covered
-  note: reviewer's toolset explicitly excludes terminal/code_execution/browser/computer_use; kanban enabled
-    for verdicts only.
+  note: 'ROUND 19 (2026-09-29, zero quota): swarm plan now runs the Lead with file tools only (STOPGATES); the reviewer
+    can no longer call kanban_request_review, which in stage C made it the card''s implementer (REVIEWLADDER hooks).
+    Status unchanged. Earlier note: reviewer''s toolset explicitly excludes
+    terminal/code_execution/browser/computer_use; kanban enabled for verdicts only.'
 - id: ASES-ROL-07
   requirement: Worker memory is disabled or scoped per project
   section: '4.2'
@@ -365,61 +371,66 @@ requirements:
   section: '5.4'
   verified_by: 22.7, 22.9
   status: covered
-  note: ledger.py + requests_ledger table, keyed by provider/model/UTC day; tests/unit/test_ledger.py
+  note: 'ROUND 19 (2026-09-29, zero quota): LEDGER (merge c566c26): the ledger''s unit is now the Hermes session, found
+    through the documented CLI (sessions export --source kanban, sessions list fallback) and matched to its run by
+    the worker''s first prompt and the run window, counted once and topped up to its final count; the Gate P
+    critic''s calls are counted too. Schema migration 10. Earlier note: ledger.py + requests_ledger table, keyed by
+    provider/model/UTC day; tests/unit/test_ledger.py'
 - id: ASES-CAP-03
   requirement: No card becomes ready without budget for it plus a review reserve; otherwise it is parked
   section: '5.4'
   verified_by: '22.9'
   status: partial
-  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): two real
-    findings. (1) Recovery''s QUOTA park was never released: process_unpark only knew the budget gate''s own
-    reasons, so S1 sat parked through the reset for 30 passes; fixed in round 18 (merge 3808612) and proven for
-    real, card_unparked on the first pass after the fix. (2) Open: the request ledger undercounts.
-    usage.ingest_run_usage counts a run only when its metadata carries a worker_session_id, which only a normal
-    hand-off writes; runs that end in changes requested, a crash or a block are never counted. On 2026-09-28 the
-    ledger showed 30 OpenRouter requests while OpenRouter had counted 50, which is why the budget gate let the card
-    run into the provider''s quota. Status unchanged. Earlier note: STAGE A APPLIED and STAGE C (2026-09-28, real
-    Hermes, real providers, owner''''s ''''do all'''';
-    docs/stage-c-2026-09-28.md): a real provider really ran out: OpenRouter''s free daily quota was used up
-    mid-review and ASES recovery classified the failure as quota and parked the card until the next UTC
-    midnight instead of retrying. The pre-dispatch half (a card never made ready without budget plus the
-    review reserve) has not been seen against real exhaustion. Earlier note: ROUND 14 (2026-09-28, zero
-    quota): the ledger''s day is injectable (every function that reads today takes an optional clock,
-    defaulting to the real UTC time), the report''s budget panel uses the report''s own clock, and a test pins
-    the UTC midnight reset; acceptance 22.9 no longer monkeypatches a private function. This closes the
-    test-infrastructure half named below. Still partial: the review-reserve half and the daily reset have not
-    been seen against a real provider. Earlier note: ROUND 10 (2026-09-27, zero quota): BUDGETFIX: the daily
-    reserve now has one default, ledger.DEFAULT_DAILY_RESERVE_PERCENT = 10 (blueprint section 9.3: ''the limit
-    in section 5.3 minus a 10 percent reserve''), used by bounds, policy, report and ledger.can_afford; policy
-    and the report used to fall back to 0 when a project''s budgets omitted the key, so the budget gate, the
-    Gate P estimate and the report could disagree. An explicit 0 still means 0. Earlier note: ROUND 7 wave 1
-    (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real bug fixed this
-    round: create_cards_from_plan used to forget a task''s fix or retry card (or, for a retry card
-    specifically, create a genuine DUPLICATE work card) if the ASES database was deleted and card creation
-    re-run a third time, since both of its ''does a fix/retry card already exist'' signals lived only in that
-    database. It now asks the BOARD directly (the merge card''s own parent lineage, disambiguated by each
-    candidate''s created_at, never by id or list order, since real Hermes card ids are RANDOM and only the
-    fake board''s happen to be sequential -- a subtlety the builder''s report documents precisely, worth
-    reading before anyone builds similar board-native recovery logic). Acceptance-tested for both the fix-card
-    and retry-card case. Earlier note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.9):
-    a card over the daily budget is parked (scheduled, budget: reason), an independent affordable task
-    proceeds normally, several idle passes show exactly one card_parked_for_budget event with no thrashing and
-    the fake provider never started, the report shows the reset time, no purchase language appears anywhere,
-    and after the simulated UTC-midnight reset the card unparks and completes with the other task''s state
-    intact. Left partial: the review-reserve half and the daily-reset arithmetic against a REAL
-    Hermes/provider are still unverified, and ledger.py has no injectable clock (tests must monkeypatch
-    ledger._today directly). Earlier note: Three layers, all unit-tested: cmd_approve checks the whole plan''s
-    budget at Gate P; controller.process_budget_gate re-checks every ready card on every pass and parks it
-    with hermes kanban schedule when the budget is gone; and, since 2026-09-19, the ledger sees REAL usage:
-    usage.ingest_run_usage runs first in every pass and counts each finished worker session once (Hermes
-    session export, api_call_count, idempotent through the usage_ingested table, attributed to the plan task
-    so lineage requests can be summed), and the outgoing card of a fix-card repoint is ingested just before
-    the repoint. The review half of the requirement is applied too: ready coder cards are parked when the
-    REVIEWER''s provider cannot afford the review reserve (the reserve is counted once, not twice). This
-    closes the gap an adversarial review found (record_usage had no production caller; one review really used
-    37 of OpenRouter''s 50 daily free requests unseen). Left partial: a card parked for budget is not yet
-    unparked when the provider''s window resets (a human or cron action today), a backlog is charged to the
-    day it is first ingested, and none of this has run in a real dispatch yet.'
+  note: 'ROUND 19 (2026-09-29, zero quota): the undercount the S1 finish found is fixed: crashed, blocked and
+    changes-requested runs are now counted (LEDGER, merge c566c26; on the real data the research mapped all 33 runs
+    of the board to exactly one session each). Real-run verification of the corrected budget gate is still pending.
+    Status unchanged. Earlier note: S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer,
+    docs/stage-c-2026-09-28.md addendum): two real findings. (1) Recovery''s QUOTA park was never released:
+    process_unpark only knew the budget gate''s own reasons, so S1 sat parked through the reset for 30 passes; fixed
+    in round 18 (merge 3808612) and proven for real, card_unparked on the first pass after the fix. (2) Open: the
+    request ledger undercounts. usage.ingest_run_usage counts a run only when its metadata carries a
+    worker_session_id, which only a normal hand-off writes; runs that end in changes requested, a crash or a block
+    are never counted. On 2026-09-28 the ledger showed 30 OpenRouter requests while OpenRouter had counted 50, which
+    is why the budget gate let the card run into the provider''s quota. Status unchanged. Earlier note: STAGE A
+    APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all''; docs/stage-c-2026-09-28.md):
+    a real provider really ran out: OpenRouter''s free daily quota was used up mid-review and ASES recovery
+    classified the failure as quota and parked the card until the next UTC midnight instead of retrying. The
+    pre-dispatch half (a card never made ready without budget plus the review reserve) has not been seen against
+    real exhaustion. Earlier note: ROUND 14 (2026-09-28, zero quota): the ledger''s day is injectable (every
+    function that reads today takes an optional clock, defaulting to the real UTC time), the report''s budget panel
+    uses the report''s own clock, and a test pins the UTC midnight reset; acceptance 22.9 no longer monkeypatches a
+    private function. This closes the test-infrastructure half named below. Still partial: the review-reserve half
+    and the daily reset have not been seen against a real provider. Earlier note: ROUND 10 (2026-09-27, zero quota):
+    BUDGETFIX: the daily reserve now has one default, ledger.DEFAULT_DAILY_RESERVE_PERCENT = 10 (blueprint section
+    9.3: ''the limit in section 5.3 minus a 10 percent reserve''), used by bounds, policy, report and
+    ledger.can_afford; policy and the report used to fall back to 0 when a project''s budgets omitted the key, so
+    the budget gate, the Gate P estimate and the report could disagree. An explicit 0 still means 0. Earlier note:
+    ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): A real bug
+    fixed this round: create_cards_from_plan used to forget a task''s fix or retry card (or, for a retry card
+    specifically, create a genuine DUPLICATE work card) if the ASES database was deleted and card creation re-run a
+    third time, since both of its ''does a fix/retry card already exist'' signals lived only in that database. It
+    now asks the BOARD directly (the merge card''s own parent lineage, disambiguated by each candidate''s
+    created_at, never by id or list order, since real Hermes card ids are RANDOM and only the fake board''s happen
+    to be sequential -- a subtlety the builder''s report documents precisely, worth reading before anyone builds
+    similar board-native recovery logic). Acceptance-tested for both the fix-card and retry-card case. Earlier note:
+    ROUND 6 (2026-09-22, zero quota): Acceptance-proven end to end (22.9): a card over the daily budget is parked
+    (scheduled, budget: reason), an independent affordable task proceeds normally, several idle passes show exactly
+    one card_parked_for_budget event with no thrashing and the fake provider never started, the report shows the
+    reset time, no purchase language appears anywhere, and after the simulated UTC-midnight reset the card unparks
+    and completes with the other task''s state intact. Left partial: the review-reserve half and the daily-reset
+    arithmetic against a REAL Hermes/provider are still unverified, and ledger.py has no injectable clock (tests
+    must monkeypatch ledger._today directly). Earlier note: Three layers, all unit-tested: cmd_approve checks the
+    whole plan''s budget at Gate P; controller.process_budget_gate re-checks every ready card on every pass and
+    parks it with hermes kanban schedule when the budget is gone; and, since 2026-09-19, the ledger sees REAL usage:
+    usage.ingest_run_usage runs first in every pass and counts each finished worker session once (Hermes session
+    export, api_call_count, idempotent through the usage_ingested table, attributed to the plan task so lineage
+    requests can be summed), and the outgoing card of a fix-card repoint is ingested just before the repoint. The
+    review half of the requirement is applied too: ready coder cards are parked when the REVIEWER''s provider cannot
+    afford the review reserve (the reserve is counted once, not twice). This closes the gap an adversarial review
+    found (record_usage had no production caller; one review really used 37 of OpenRouter''s 50 daily free requests
+    unseen). Left partial: a card parked for budget is not yet unparked when the provider''s window resets (a human
+    or cron action today), a backlog is charged to the day it is first ingested, and none of this has run in a real
+    dispatch yet.'
 - id: ASES-CAP-04
   requirement: Gate P shows estimated requests per provider and the calendar time
   section: '5.4'
@@ -442,23 +453,25 @@ requirements:
   section: '5.4'
   verified_by: Inspection
   status: in_progress
-  note: 'ROUND 9 (2026-09-27, zero quota): CAPDOC: docs/provider-onboarding.md is the repeatable artifact this note
-    said was missing: the four steps as a checklist, each naming the ASES command, config field or check
-    behind it, the same-account-keys warning, and a commented models.yaml stub, linked from
-    docs/operations.md. Point (a) below stands: the quota warning can only be checked against a provider''s
-    own account endpoint, live. Earlier note: The blueprint''s real text (section 5.4) is a 4-step process --
-    discovery, smoke test, data-policy check, evaluation -- plus an explicit warning not to assume extra keys
-    on one account add quota. The data-policy-check step is generic and already covered by
-    policy.check_data_class (ASES-PRV-01/02/03, wired into cmd_approve); the smoke-test step is covered by
-    models.py''s record_smoke_test, already exercised for real (xkiro/qwen/qwen3.8-max:free shows smoke=pass).
-    Real discovery + evaluation happened for real 2026-09-19: xKiro was added and evaluated as a genuine
-    second, independently-accounted provider, and UnoRouter was run for real, found unreliable (an
-    undocumented daily token cap, an output-tokens-per-minute cap, a refused dangerous gate command, recurring
-    transient failures) and dropped entirely -- see docs/architecture.md''s dated D2/D3 sections. Left at
-    in_progress rather than covered because (a) the "don''t assume extra keys share a quota" warning has no
-    code check anywhere and can only be verified by a live call to a provider''s own account/key-info
-    endpoint, and (b) there''s no repeatable artifact (checklist/template) that would make
-    discovery+evaluation hold for the *next* provider addition -- only a one-time real instance exists so far.'
+  note: 'ROUND 19 (2026-09-29, zero quota): docs/provider-onboarding.md lists three researched reviewer candidates
+    (Google AI Studio, NVIDIA API catalog, Cloudflare Workers AI) with official limits, data policies and
+    ready-to-paste blocks, inactive until the owner adds a key and runs the smoke test. Status unchanged. Earlier
+    note: ROUND 9 (2026-09-27, zero quota): CAPDOC: docs/provider-onboarding.md is the repeatable artifact this note
+    said was missing: the four steps as a checklist, each naming the ASES command, config field or check behind it,
+    the same-account-keys warning, and a commented models.yaml stub, linked from docs/operations.md. Point (a) below
+    stands: the quota warning can only be checked against a provider''s own account endpoint, live. Earlier note:
+    The blueprint''s real text (section 5.4) is a 4-step process -- discovery, smoke test, data-policy check,
+    evaluation -- plus an explicit warning not to assume extra keys on one account add quota. The data-policy-check
+    step is generic and already covered by policy.check_data_class (ASES-PRV-01/02/03, wired into cmd_approve); the
+    smoke-test step is covered by models.py''s record_smoke_test, already exercised for real
+    (xkiro/qwen/qwen3.8-max:free shows smoke=pass). Real discovery + evaluation happened for real 2026-09-19: xKiro
+    was added and evaluated as a genuine second, independently-accounted provider, and UnoRouter was run for real,
+    found unreliable (an undocumented daily token cap, an output-tokens-per-minute cap, a refused dangerous gate
+    command, recurring transient failures) and dropped entirely -- see docs/architecture.md''s dated D2/D3 sections.
+    Left at in_progress rather than covered because (a) the "don''t assume extra keys share a quota" warning has no
+    code check anywhere and can only be verified by a live call to a provider''s own account/key-info endpoint, and
+    (b) there''s no repeatable artifact (checklist/template) that would make discovery+evaluation hold for the
+    *next* provider addition -- only a one-time real instance exists so far.'
 - id: ASES-TSK-01
   requirement: Each plan task becomes a work card and a merge card
   section: '7'
@@ -683,39 +696,42 @@ requirements:
   section: '8.4'
   verified_by: 22.5, 22.11
   status: partial
-  note: 'ROUND 13 (2026-09-28, zero quota): swarm doctor gained a read-only WARN row for a throwaway gate or merge
-    worktree recorded as leaked (round 12 records the event when a Windows file lock stops its removal) that
-    still exists on disk or in git worktree list, naming the path and how to clean it; paths are compared with
-    separators and, on Windows, case normalised. Earlier note: ROUND 12 (2026-09-28, zero quota, from a
-    verified adversarial audit, docs/work-orders/r12_audit_findings.md): swarm run used to adopt whatever HEAD
-    the primary checkout had at startup, so a HEAD moved between two runs by anything but ASES was laundered
-    into the base-check allow-list. A restart now compares it with the head ASES last recorded and refuses
-    (exit 3) unless --allow-head-move is given, which prints a loud warning naming both heads; a first-ever
-    run is unchanged. Earlier note: ROUND 9 (2026-09-27, zero quota): IDLEWT fixed the documented false
-    positive (a card re-dispatched into its worktree between two polls) with a one-shot grace pass earned only
-    by a worktree a running card just vacated; reproduced first in a test against the old code. Still a
-    WARNING, not a card failure, on purpose: a reviewer editing during review is still indistinguishable from
-    this function''s inputs (running_paths names only ''running'' cards), and a full dispatch-and-finish cycle
-    entirely between two polls is still invisible. Earlier note: ROUND 6 (2026-09-22, zero quota):
-    Acceptance-proven for the primary-checkout half (22.11): a worker that writes outside its own worktree
-    trips check_primary_checkout end to end, records integrity_violation, halts the run, and the integration
-    branch never moves again. The other-worktree half (check_idle_worktrees) stays partial with its documented
-    false-positive gap unchanged this round. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22):
-    guards.check_idle_worktrees runs every pass and reports changes in worktrees no running card owns as
-    WARNINGS (an idle_worktree_changed event), never a halt: the first version has known false positives (a
-    card re-dispatched into its worktree between two polls). Earlier note: Built 2026-09-19:
-    guards.check_primary_checkout runs at the start of every controller pass and at swarm run start. The
-    primary checkout must be on the integration branch, clean (modified, staged, deleted and untracked files,
-    except Hermes''s .worktrees/), and at the HEAD ASES itself last wrote (adopted at run start, updated after
-    every fast-forward it makes). A violation records an integrity_violation event and halts the run with exit
-    code 3 before anything is dispatched or merged. Two deviations from the blueprint text, on purpose: the
-    check is per pass, not around each spawn (Hermes, not ASES, spawns workers), and it halts the run instead
-    of failing one card (the writer cannot be attributed to a card). Not covered: the other active worktrees
-    (a stray write into another worker''s worktree) and changes outside git entirely; on 2026-09-19 coder-1
-    ran pip install into Hermes''s own virtualenv unnoticed, which only the Docker sandbox (ASES-SEC-03)
-    prevents. integrity.py''s own snapshot() has quirks (non -z porcelain quoting, rename strings, fail-open
-    on a non-repo) that make this note''s earlier claim that it was fully unit-tested overstated; guards.py
-    does not use it.'
+  note: 'ROUND 19 (2026-09-29, zero quota): GIT12 (merge 7ebc34f): every subject keeps a baseline that is never deleted,
+    and a change outside a worker''s worktree is attributed to every run whose window overlaps the interval, read
+    version-gated and read-only from Hermes''s board database, so a run between two polls is no longer invisible.
+    Report mode: a security_event is recorded and shown; failing and pausing sit behind
+    integrity.enforce_attribution, default false. Stays partial until enforcement is switched on after real-run
+    evidence. Earlier note: ROUND 13 (2026-09-28, zero quota): swarm doctor gained a read-only WARN row for a
+    throwaway gate or merge worktree recorded as leaked (round 12 records the event when a Windows file lock stops
+    its removal) that still exists on disk or in git worktree list, naming the path and how to clean it; paths are
+    compared with separators and, on Windows, case normalised. Earlier note: ROUND 12 (2026-09-28, zero quota, from
+    a verified adversarial audit, docs/work-orders/r12_audit_findings.md): swarm run used to adopt whatever HEAD the
+    primary checkout had at startup, so a HEAD moved between two runs by anything but ASES was laundered into the
+    base-check allow-list. A restart now compares it with the head ASES last recorded and refuses (exit 3) unless
+    --allow-head-move is given, which prints a loud warning naming both heads; a first-ever run is unchanged.
+    Earlier note: ROUND 9 (2026-09-27, zero quota): IDLEWT fixed the documented false positive (a card re-dispatched
+    into its worktree between two polls) with a one-shot grace pass earned only by a worktree a running card just
+    vacated; reproduced first in a test against the old code. Still a WARNING, not a card failure, on purpose: a
+    reviewer editing during review is still indistinguishable from this function''s inputs (running_paths names only
+    ''running'' cards), and a full dispatch-and-finish cycle entirely between two polls is still invisible. Earlier
+    note: ROUND 6 (2026-09-22, zero quota): Acceptance-proven for the primary-checkout half (22.11): a worker that
+    writes outside its own worktree trips check_primary_checkout end to end, records integrity_violation, halts the
+    run, and the integration branch never moves again. The other-worktree half (check_idle_worktrees) stays partial
+    with its documented false-positive gap unchanged this round. Earlier note: BUILT AND WIRED, NOT RUN FOR REAL
+    (2026-09-22): guards.check_idle_worktrees runs every pass and reports changes in worktrees no running card owns
+    as WARNINGS (an idle_worktree_changed event), never a halt: the first version has known false positives (a card
+    re-dispatched into its worktree between two polls). Earlier note: Built 2026-09-19:
+    guards.check_primary_checkout runs at the start of every controller pass and at swarm run start. The primary
+    checkout must be on the integration branch, clean (modified, staged, deleted and untracked files, except
+    Hermes''s .worktrees/), and at the HEAD ASES itself last wrote (adopted at run start, updated after every
+    fast-forward it makes). A violation records an integrity_violation event and halts the run with exit code 3
+    before anything is dispatched or merged. Two deviations from the blueprint text, on purpose: the check is per
+    pass, not around each spawn (Hermes, not ASES, spawns workers), and it halts the run instead of failing one card
+    (the writer cannot be attributed to a card). Not covered: the other active worktrees (a stray write into another
+    worker''s worktree) and changes outside git entirely; on 2026-09-19 coder-1 ran pip install into Hermes''s own
+    virtualenv unnoticed, which only the Docker sandbox (ASES-SEC-03) prevents. integrity.py''s own snapshot() has
+    quirks (non -z porcelain quoting, rename strings, fail-open on a non-repo) that make this note''s earlier claim
+    that it was fully unit-tested overstated; guards.py does not use it.'
 - id: ASES-GIT-13
   requirement: Diffs outside the declared touches block review
   section: '8.4'
@@ -852,13 +868,16 @@ requirements:
   section: '11.2'
   verified_by: '22.3'
   status: in_progress
-  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the provider
-    and model a run used are recorded only for runs whose metadata carries a worker_session_id (a normal hand-off);
-    crashed, blocked and changes-requested runs record nothing (see ASES-CAP-03). Status unchanged. Earlier note:
-    BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): usage.py records a model_mismatch event when a worker
-    session ran on a model other than the one pinned for its profile (detection only, no card is failed) and
-    every ingested session records the provider and model actually used. Not run against a live session; the
-    ledger probably under-counts worker sessions because Hermes keeps auxiliary calls in separate rows.'
+  note: 'ROUND 19 (2026-09-29, zero quota): the model and provider actually used are now recorded for every run with a
+    session, not only hand-offs (LEDGER), and the merge queue refuses a card whose completing reviewer run actually
+    used the Lead''s provider or model family (MERGEGUARD, merge 5ccde08). Status unchanged. Earlier note: S1 FINISH
+    (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the provider and model
+    a run used are recorded only for runs whose metadata carries a worker_session_id (a normal hand-off); crashed,
+    blocked and changes-requested runs record nothing (see ASES-CAP-03). Status unchanged. Earlier note: BUILT AND
+    WIRED, NOT RUN FOR REAL (2026-09-22): usage.py records a model_mismatch event when a worker session ran on a
+    model other than the one pinned for its profile (detection only, no card is failed) and every ingested session
+    records the provider and model actually used. Not run against a live session; the ledger probably under-counts
+    worker sessions because Hermes keeps auxiliary calls in separate rows.'
 - id: ASES-LED-01
   requirement: The plan is a schema-validated file checked by Gate 0, with one repair round
   section: '12.4'
@@ -991,29 +1010,31 @@ requirements:
   section: '13.2'
   verified_by: 22.6, 22.12
   status: partial
-  note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): a card
-    released from a park went straight to the reviewer without passing through the review lane, so Gate 1 was never
-    re-run for it; round 18b (merge 91fb430) makes process_unpark re-run Gate 1 and post the record before releasing
-    a card assigned to the reviewer. For S1 itself the architect ran review.record_gate1 once: Gate 1 ran in a real
-    ases-sandbox:py311-3 container on e10cb2b (PASS, 37 passed) and was posted. The send-back path has still not
-    fired in a real run. Status unchanged. Earlier note: ROUND 16 (2026-09-28, zero quota): EVIDENCE (commit
-    0373fe7) closed the gap stage C''''s reviewer hit:
-    review._post_gate_record now posts the controller''s Gate 1 result as a card comment headed ''ASES gate
-    record'' (GATE_RECORD_HEADER), redacted before truncation, deduplicated by a gate1_record_posted event,
-    and a posting failure never breaks the review pass; prompts/reviewer.md version 2 tells the reviewer
-    where the record is and that a missing record is not itself a reason to request changes, while still
-    never saying a check passed without seeing the record. Independently reviewed (a Sonnet reviewer plus a
-    nemotron second opinion); the review loop failed once, on the comment-posting failure itself, then
-    passed. Left partial, unchanged below: the send-back path and the merge-time race have still never fired
-    in a real run. Earlier note: Seen firing in a real review-lane transition on 2026-09-19 (the card
-    entered review at 16:53:45, the controller re-ran Gate 1 in a clean worktree, pass, and the reviewer was
-    spawned one second later). Two real defects were fixed first, both invisible to mocked tests: the
-    send-back used request-changes, which real Hermes rejects for a card that only sits in review (now
-    reopen-review, probed on a scratch board), and run_pass dispatched before policing the review lane.
-    Since then the merge queue re-checks independently, so the gateway-dispatcher race no longer lets an
-    unchecked commit merge. Left partial: the send-back path (red Gate 1, out-of-scope diff) has never fired
-    in a real run, and when Hermes''s dispatcher wins the race the re-check happens at merge time instead of
-    when the card enters review.'
+  note: 'ROUND 19 (2026-09-29, zero quota): controller.process_reviewer_contract: a reviewer stop that asks for test
+    evidence gets the Gate 1 record and one ANSWER under strict conditions, otherwise one owner question, never a
+    loop; the hand-off commit ignores reviewer-profile runs and an evidence change request is not a review round.
+    Status unchanged. Earlier note: S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer,
+    docs/stage-c-2026-09-28.md addendum): a card released from a park went straight to the reviewer without passing
+    through the review lane, so Gate 1 was never re-run for it; round 18b (merge 91fb430) makes process_unpark
+    re-run Gate 1 and post the record before releasing a card assigned to the reviewer. For S1 itself the architect
+    ran review.record_gate1 once: Gate 1 ran in a real ases-sandbox:py311-3 container on e10cb2b (PASS, 37 passed)
+    and was posted. The send-back path has still not fired in a real run. Status unchanged. Earlier note: ROUND 16
+    (2026-09-28, zero quota): EVIDENCE (commit 0373fe7) closed the gap stage C''s reviewer hit:
+    review._post_gate_record now posts the controller''s Gate 1 result as a card comment headed ''ASES gate record''
+    (GATE_RECORD_HEADER), redacted before truncation, deduplicated by a gate1_record_posted event, and a posting
+    failure never breaks the review pass; prompts/reviewer.md version 2 tells the reviewer where the record is and
+    that a missing record is not itself a reason to request changes, while still never saying a check passed without
+    seeing the record. Independently reviewed (a Sonnet reviewer plus a nemotron second opinion); the review loop
+    failed once, on the comment-posting failure itself, then passed. Left partial, unchanged below: the send-back
+    path and the merge-time race have still never fired in a real run. Earlier note: Seen firing in a real
+    review-lane transition on 2026-09-19 (the card entered review at 16:53:45, the controller re-ran Gate 1 in a
+    clean worktree, pass, and the reviewer was spawned one second later). Two real defects were fixed first, both
+    invisible to mocked tests: the send-back used request-changes, which real Hermes rejects for a card that only
+    sits in review (now reopen-review, probed on a scratch board), and run_pass dispatched before policing the
+    review lane. Since then the merge queue re-checks independently, so the gateway-dispatcher race no longer lets
+    an unchecked commit merge. Left partial: the send-back path (red Gate 1, out-of-scope diff) has never fired in a
+    real run, and when Hermes''s dispatcher wins the race the re-check happens at merge time instead of when the
+    card enters review.'
 - id: ASES-REV-06
   requirement: The verdict is a tool call with schema-checked metadata stored by commit
   section: '13.2'
@@ -1186,9 +1207,14 @@ requirements:
   requirement: Acceptance tests 22.1 to 22.16 are repeatable and cost no quota
   section: '22'
   verified_by: Inspection
-  status: partial
-  note: 'ROUND 17 (2026-09-28, zero quota): Built the two full scenarios the ROUND 9 paragraph below still called
-    reduced. tests/acceptance/test_22_2_end_to_end.py replaces test_scenarios_demo.py''s 22.2 half with the whole of
+  status: covered
+  note: 'ROUND 19 (2026-09-29, zero quota): COVERED. Every scenario 22.2 to 22.16 is now a genuine acceptance test that
+    runs repeatably at zero quota: 22.2 and 22.6 became full scenarios in round 17, and 22.11''s last clause (a real
+    sandboxed network block) now runs through ASES''s own sandboxed gate path against real Docker when Docker and
+    the pinned image are present, skipping with a stated reason otherwise, never pulling and never reaching the
+    network (TESTSDOCS, merge 2e9e108). 22.1 is correctly excluded by p398. Earlier note: ROUND 17 (2026-09-28, zero
+    quota): Built the two full scenarios the ROUND 9 paragraph below still called reduced.
+    tests/acceptance/test_22_2_end_to_end.py replaces test_scenarios_demo.py''s 22.2 half with the whole of
     blueprint p402: an empty repository through controller.ensure_repo_bootstrapped, Gate 0
     (plan_mod.load_plan_file), Gate P (critic.run_critique/next_step with a fake invoke), controller.publish_plan
     proven to run and record its commit before any card exists, the two-task merge through Gate 1, Gate 3, one
@@ -1221,35 +1247,33 @@ requirements:
     blueprint text, only three quarters of it. What is missing, precisely: 22.11''s real-Docker
     sandboxed-network-block clause, proven today only by sandbox.py''s own unit tests (tests/unit/test_sandbox.py)
     and an unrun exfiltration probe (this register''s ASES-SEC-05/ASES-SEC-07 rows), never by a live container
-    inside this acceptance suite. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota): Re-checked all sixteen scenarios against
-    tests/acceptance/ and the blueprint''s own text (blueprint.txt p396 to p431). 22.1 is correctly excluded:
-    p398 states real providers are used only in 22.1, the Phase 2 evaluation and 22.17, so 22.1 is the
-    ''unless stated otherwise'' exception p396 itself names, not a gap. Thirteen scenarios exist as genuine
+    inside this acceptance suite. Earlier note: ROUND 9 register hygiene (2026-09-27, zero quota): Re-checked all
+    sixteen scenarios against tests/acceptance/ and the blueprint''s own text (blueprint.txt p396 to p431). 22.1 is
+    correctly excluded: p398 states real providers are used only in 22.1, the Phase 2 evaluation and 22.17, so 22.1
+    is the ''unless stated otherwise'' exception p396 itself names, not a gap. Thirteen scenarios exist as genuine
     acceptance-level tests and run at zero quota, repeatably: 22.3, 22.5, 22.7, 22.8 (new since ROUND 6:
     tests/acceptance/test_22_8_merge_conflict.py, closing the gap the prior note flagged as ''remains to be
     written''), 22.9, 22.10, 22.12, 22.13, 22.14, 22.15, 22.16, plus 22.2 and 22.6 which exist in
     tests/acceptance/test_scenarios_demo.py but only as reduced ''cores only'' scenarios, by that file''s own
-    docstring (''Two demonstration scenarios that prove the acceptance rig (blueprint 22.2 and 22.6, cores
-    only)''). Two are honestly incomplete, not just unconfirmed: 22.4 (context test) has no acceptance-level
-    scenario at all -- test_models.py''s test_context_sufficiency only unit-tests the
-    context_declared_and_sufficient classification, never a controller actually rejecting a card before it
-    starts, because that enforcement is not built (see ASES-MOD-02); Appendix F pairs every requirement with a
-    verifying test, and a test cannot yet verify enforcement that does not exist. 22.11 (prompt injection) is
-    honestly split, exactly as the prior note said: three of its four blueprint clauses are proven end to end
-    through the real controller and guards, the fourth (an actual sandboxed network block) is
-    unit/policy-level only since Docker never runs in this suite by design (a disclosed, Phase-5-scoped
-    boundary, not an oversight) -- this does not block coverage for the clauses that ARE tested, but it does
-    mean 22.11 does not fully verify its own blueprint text yet either. Given 13 of 16 scenarios are genuinely
-    done, 22.1 is a correctly-excluded non-gap, and the remaining two (22.4, 22.11) are precisely and narrowly
-    documented rather than silently missing, status moves from in_progress to partial: closer to true than the
-    ROUND 6 count of ten of sixteen, but not yet the full sixteen the row''s own words claim. Earlier note:
-    ROUND 6 (2026-09-22, zero quota): Same evidence as TST-01: ten of sixteen 22.x scenarios now run at zero
-    quota under tests/acceptance/. 22.11 (prompt injection) is honestly split: three of its four clauses are
-    proven end to end through the real controller and guards, the fourth (a real sandboxed network block) is
-    documented as unit/policy-level only, since Docker never runs anywhere in this suite by design. Earlier
-    note: BUILT AND WIRED, NOT RUN FOR REAL (2026-09-22): tests/acceptance/ has the rig and two demonstration
-    scenarios (22.2 core with a worker question and a controller restart, 22.6 core); scenarios 22.3, 22.5,
-    22.7 to 22.16 are not written yet.'
+    docstring (''Two demonstration scenarios that prove the acceptance rig (blueprint 22.2 and 22.6, cores only)'').
+    Two are honestly incomplete, not just unconfirmed: 22.4 (context test) has no acceptance-level scenario at all
+    -- test_models.py''s test_context_sufficiency only unit-tests the context_declared_and_sufficient
+    classification, never a controller actually rejecting a card before it starts, because that enforcement is not
+    built (see ASES-MOD-02); Appendix F pairs every requirement with a verifying test, and a test cannot yet verify
+    enforcement that does not exist. 22.11 (prompt injection) is honestly split, exactly as the prior note said:
+    three of its four blueprint clauses are proven end to end through the real controller and guards, the fourth (an
+    actual sandboxed network block) is unit/policy-level only since Docker never runs in this suite by design (a
+    disclosed, Phase-5-scoped boundary, not an oversight) -- this does not block coverage for the clauses that ARE
+    tested, but it does mean 22.11 does not fully verify its own blueprint text yet either. Given 13 of 16 scenarios
+    are genuinely done, 22.1 is a correctly-excluded non-gap, and the remaining two (22.4, 22.11) are precisely and
+    narrowly documented rather than silently missing, status moves from in_progress to partial: closer to true than
+    the ROUND 6 count of ten of sixteen, but not yet the full sixteen the row''s own words claim. Earlier note:
+    ROUND 6 (2026-09-22, zero quota): Same evidence as TST-01: ten of sixteen 22.x scenarios now run at zero quota
+    under tests/acceptance/. 22.11 (prompt injection) is honestly split: three of its four clauses are proven end to
+    end through the real controller and guards, the fourth (a real sandboxed network block) is documented as
+    unit/policy-level only, since Docker never runs anywhere in this suite by design. Earlier note: BUILT AND WIRED,
+    NOT RUN FOR REAL (2026-09-22): tests/acceptance/ has the rig and two demonstration scenarios (22.2 core with a
+    worker question and a controller restart, 22.6 core); scenarios 22.3, 22.5, 22.7 to 22.16 are not written yet.'
 - id: ASES-OBS-01
   requirement: The Hermes dashboard is not rebuilt; ASES adds a project report
   section: '15'
@@ -1284,44 +1308,48 @@ requirements:
   section: '16'
   verified_by: Phase changelogs
   status: in_progress
-  note: 'ROUND 7 wave 2 audit (2026-09-23, zero quota): An inspection agent checked all three parts of this
-    requirement (blueprint section 16) against the actual project history and found: changelog discipline is
-    genuinely met (docs/architecture.md has one section per round naming what was built, what broke, and
-    concrete outcomes; stale bullets are struck through rather than deleted so drift stays visible); build
-    order was only partially followed (Phase 0/1/3-start matched the blueprint''s order, but Phase 4 through 9
-    were substantially compressed and parallelized across single rounds, and Phase 6''s own precondition,
-    adding the Tester role only once justified by evaluation per blueprint table 26, was bypassed -- the
-    Tester role was instead wired in as a round 7 bug fix, not a gated Phase 6 evaluation); ''exit tests...
-    pass'' is not yet true in the literal, real sense for phases 4-9, by explicit, disclosed project policy
-    (the zero-quota rule), not by oversight -- every acceptance scenario from Phase 4 onward has been verified
-    only against the fake Hermes rig, with exactly one disclosed exception (hermes.kanban_specify). The audit
-    also found one concrete physical-ordering defect in docs/architecture.md itself: a section dated
-    2026-09-18/19 (''Coder-1''s first real progress...'') had been sitting after several 2026-09-21-through-23
-    round sections, because each new round''s section was inserted before a fixed anchor without ever checking
-    whether that anchor''s own section was already out of chronological place. Fixed directly, same day: the
-    misplaced 64-line block (through its immediate continuation, ''A real finding, not a hypothetical'') was
-    moved to sit right after the section it actually continues from (''First real dispatch attempt
-    (2026-09-18)''), confirmed by a line-count-preserving diff (64 insertions, 64 deletions, same total line
-    count) and by every header now printing in correct chronological order. ''Known gaps'' and ''Running
-    things'', undated reference/appendix sections, were correctly left in place at the end. This closes the
-    mechanical defect the audit found but does not change the honest answer on build order or real exit tests,
-    both genuine, disclosed, partial gaps: stays in_progress.'
+  note: 'ROUND 19 (2026-09-29, zero quota): docs/phase-exit-plan.md: phases 0 to 9, which exit tests pass on the fake rig
+    today and which need real providers, with request estimates, as a plan for the owner to approve (nothing run).
+    Status unchanged. Earlier note: ROUND 7 wave 2 audit (2026-09-23, zero quota): An inspection agent checked all
+    three parts of this requirement (blueprint section 16) against the actual project history and found: changelog
+    discipline is genuinely met (docs/architecture.md has one section per round naming what was built, what broke,
+    and concrete outcomes; stale bullets are struck through rather than deleted so drift stays visible); build order
+    was only partially followed (Phase 0/1/3-start matched the blueprint''s order, but Phase 4 through 9 were
+    substantially compressed and parallelized across single rounds, and Phase 6''s own precondition, adding the
+    Tester role only once justified by evaluation per blueprint table 26, was bypassed -- the Tester role was
+    instead wired in as a round 7 bug fix, not a gated Phase 6 evaluation); ''exit tests... pass'' is not yet true
+    in the literal, real sense for phases 4-9, by explicit, disclosed project policy (the zero-quota rule), not by
+    oversight -- every acceptance scenario from Phase 4 onward has been verified only against the fake Hermes rig,
+    with exactly one disclosed exception (hermes.kanban_specify). The audit also found one concrete
+    physical-ordering defect in docs/architecture.md itself: a section dated 2026-09-18/19 (''Coder-1''s first real
+    progress...'') had been sitting after several 2026-09-21-through-23 round sections, because each new round''s
+    section was inserted before a fixed anchor without ever checking whether that anchor''s own section was already
+    out of chronological place. Fixed directly, same day: the misplaced 64-line block (through its immediate
+    continuation, ''A real finding, not a hypothetical'') was moved to sit right after the section it actually
+    continues from (''First real dispatch attempt (2026-09-18)''), confirmed by a line-count-preserving diff (64
+    insertions, 64 deletions, same total line count) and by every header now printing in correct chronological
+    order. ''Known gaps'' and ''Running things'', undated reference/appendix sections, were correctly left in place
+    at the end. This closes the mechanical defect the audit found but does not change the honest answer on build
+    order or real exit tests, both genuine, disclosed, partial gaps: stays in_progress.'
 - id: ASES-DOC-04
   requirement: The stop condition is honored
   section: '16'
   verified_by: Inspection
   status: partial
-  note: 'This is a rule for whoever builds/operates ASES (Claude Code), not runtime software -- section
-    16''s STOP CONDITION paragraph lists six categories (spends money, deletes user data, overwrites an
-    existing repo/Hermes config, installs new software, sends code to a provider outside the allow-list,
-    needs an unconfigured secret) that require explicit user sign-off before proceeding. Restated
-    verbatim in the new C:\Users\masoo\ases\CLAUDE.md (2026-09-19) so a future session without this
-    conversation''s memory still loads and honors it -- no such artifact existed before. Real, scattered
-    evidence of it already being followed exists in docs/architecture.md''s dated log (secret-scanning
-    the repo before the first GitHub push, only after explicit "you can push"; the lead-role provider
-    moves were both the user''s explicit call), covering roughly 2 of the 6 categories with a real
-    incident; the other 4 have no incident to point to yet, which is why this is partial rather than
-    covered.'
+  note: 'ROUND 19 (2026-09-29, zero quota): the software itself now honours more of the stop condition: no LSP
+    auto-install and --no-alias (PROFILEGUARDS); the data class enforced for the Lead, critic and reviewer, .env
+    never committed by the bootstrap, smoke-test history never deleted, report files never silently overwritten,
+    paid models refused unless allowed, and swarm run refuses to start without the pinned sandbox image (STOPGATES).
+    What stays an operator rule is listed in the STOPDOC research. Status unchanged. Earlier note: This is a rule
+    for whoever builds/operates ASES (Claude Code), not runtime software -- section 16''s STOP CONDITION paragraph
+    lists six categories (spends money, deletes user data, overwrites an existing repo/Hermes config, installs new
+    software, sends code to a provider outside the allow-list, needs an unconfigured secret) that require explicit
+    user sign-off before proceeding. Restated verbatim in the new C:\Users\masoo\ases\CLAUDE.md (2026-09-19) so a
+    future session without this conversation''s memory still loads and honors it -- no such artifact existed before.
+    Real, scattered evidence of it already being followed exists in docs/architecture.md''s dated log
+    (secret-scanning the repo before the first GitHub push, only after explicit "you can push"; the lead-role
+    provider moves were both the user''s explicit call), covering roughly 2 of the 6 categories with a real
+    incident; the other 4 have no incident to point to yet, which is why this is partial rather than covered.'
 - id: ASES-REC-01
   requirement: Infrastructure failures resume; capability failures restart fresh with the failure bundle
     and then a new model
@@ -1331,7 +1359,7 @@ requirements:
   note: 'S1 FINISH (2026-09-29, real Hermes, real OpenRouter reviewer, docs/stage-c-2026-09-28.md addendum): the quota
     half is now proven end to end for real: a quota failure parked S1 (2026-09-28) and, after the round 18 fix, the
     next pass after the UTC reset released it (card_unparked at 01:16:24). Status unchanged. Earlier note: STAGE A
-    APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''''s ''''do all'''';
+    APPLIED and STAGE C (2026-09-28, real Hermes, real providers, owner''s ''do all'';
     docs/stage-c-2026-09-28.md): the quota path of the failure classification ran live (crashed runs whose
     output named the exhausted free quota were classified quota and parked). The capability path (a fresh
     attempt with the failure bundle) has not been seen live. Earlier note: ROUND 12 (2026-09-28, zero quota,
@@ -1455,16 +1483,17 @@ requirements:
   section: '19.5'
   verified_by: '22.2'
   status: in_progress
-  note: 'ROUND 6 (2026-09-22, zero quota): Acceptance-covered indirectly (22.3''s auth-failure question is answered
+  note: 'ROUND 19 (2026-09-29, zero quota): the reviewer-contract ladder asks the owner exactly one question per stop it
+    cannot answer, through questions.ask_user, and never unblocks or retries on its own. Status unchanged. Earlier
+    note: ROUND 6 (2026-09-22, zero quota): Acceptance-covered indirectly (22.3''s auth-failure question is answered
     via questions.answer_question inside a real controller pass); no dedicated 22.2-question-style acceptance
-    scenario was added this round beyond what the existing demo already covers. Earlier note: BUILT AND WIRED,
-    NOT RUN FOR REAL (2026-09-22): questions.py (open_question over four sources: a worker''s block, the
-    dispatcher''s give-up, Hermes''s unblock-loop triage lane and an ASES QUESTION comment; ask_user for the
-    controller; list_questions; answer_question) is used by `swarm questions`, `swarm answer`, the merge queue
-    (a merge card with an open question is not re-processed) and recovery. Real Hermes limit: a second
-    question on a card with the same block kind lands in triage, where swarm answer can only comment. Unit and
-    fake-board tested; the events Hermes writes on each give-up path are read from its source, not probed
-    live.'
+    scenario was added this round beyond what the existing demo already covers. Earlier note: BUILT AND WIRED, NOT
+    RUN FOR REAL (2026-09-22): questions.py (open_question over four sources: a worker''s block, the dispatcher''s
+    give-up, Hermes''s unblock-loop triage lane and an ASES QUESTION comment; ask_user for the controller;
+    list_questions; answer_question) is used by `swarm questions`, `swarm answer`, the merge queue (a merge card
+    with an open question is not re-processed) and recovery. Real Hermes limit: a second question on a card with the
+    same block kind lands in triage, where swarm answer can only comment. Unit and fake-board tested; the events
+    Hermes writes on each give-up path are read from its source, not probed live.'
 - id: ASES-REC-06
   requirement: swarm stop halts everything within 30 seconds
   section: '19.6'
@@ -1867,15 +1896,18 @@ requirements:
   section: '21.2'
   verified_by: '22.16'
   status: in_progress
-  note: 'ROUND 7 wave 1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify):
-    policy.check_data_class gained a required, explicit verified_at for private/confidential (a compatible
-    policy string alone is no longer enough); config.py validates the two new optional provider fields
-    (data_policy_verified_at, data_policy_source); cli.cmd_approve''s Gate P check threads the new field
-    through. Found and fixed the one real regression this caused: recovery.next_model called check_data_class
-    without verified_at, so every switch-model candidate was silently treated as unsafe for
-    private/confidential once the stricter check landed; fixed to thread the same field through, mirroring the
-    existing policy-string fallback. Unit-tested; config/models.yaml documents the new fields as comments, no
-    real dates recorded yet (a human verification decision, not invented here).'
+  note: 'ROUND 19 (2026-09-29, zero quota): config/models.yaml records only data policies verified from official sources
+    with URL and date; no configured provider qualifies for private data. A model-level policy no longer borrows the
+    provider''s verified date, the Lead, critic and reviewer are all checked (STOPGATES), and the OpenRouter
+    reviewer profile refuses data-collecting providers (PROFILEGUARDS). Status unchanged. Earlier note: ROUND 7 wave
+    1 (2026-09-22, zero quota, one real Hermes call authorized only for kanban_specify): policy.check_data_class
+    gained a required, explicit verified_at for private/confidential (a compatible policy string alone is no longer
+    enough); config.py validates the two new optional provider fields (data_policy_verified_at, data_policy_source);
+    cli.cmd_approve''s Gate P check threads the new field through. Found and fixed the one real regression this
+    caused: recovery.next_model called check_data_class without verified_at, so every switch-model candidate was
+    silently treated as unsafe for private/confidential once the stricter check landed; fixed to thread the same
+    field through, mirroring the existing policy-string fallback. Unit-tested; config/models.yaml documents the new
+    fields as comments, no real dates recorded yet (a human verification decision, not invented here).'
 - id: ASES-VER-01
   requirement: Externally changing provider/Hermes facts carry a source URL and verification date and
     are rechecked by swarm doctor
