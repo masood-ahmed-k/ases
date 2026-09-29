@@ -344,6 +344,93 @@ def test_lsp_installed_warns_and_names_what_exists_without_removing_it(tmp_path)
     assert check.requirement_ids == ("ASES-DOC-04",)
 
 
+def test_lsp_installed_scans_the_full_profile_roster_not_only_roles_map(tmp_path):
+    """PROFILEGUARDS review (minor): _check_lsp_installed used to scan only config/swarm.yaml's roles: map
+    (lead, coder-1, reviewer here), so a profile profiles.desired_profiles knows about (ASES-ROL-04's own
+    parallel-coder convention: coder-2, defined the moment coder-1 exists, active or not) but not yet named in
+    roles: was silently never scanned or WARNed about, even with an already-populated lsp/ directory on disk."""
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    lsp_dir = project.hermes_native_home / "profiles" / "coder-2" / "lsp"
+    lsp_dir.mkdir(parents=True)
+    (lsp_dir / "package.json").write_text('{"dependencies": {"pyright": "^1.1.414"}}', encoding="utf-8")
+    assert real_profiles is not None, "this test needs the real profiles module (ases.profiles) importable"
+
+    check = doctor._check_lsp_installed(project, MODELS_CONFIG, real_profiles)
+
+    assert check.status == "warn"
+    assert "coder-2" in check.detail and "pyright" in check.detail
+
+
+def test_lsp_installed_falls_back_to_roles_map_without_a_profiles_module(tmp_path):
+    """Back-compat: a caller that omits models_config/profiles_mod (every direct call in this file predating
+    this fix, and a future caller that has not been updated) keeps the OLD roles:-only scan, so a profile
+    outside roles: is not found -- proving the fuller scan above is genuinely conditioned on being given the
+    roster, not always active regardless of the arguments."""
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    lsp_dir = project.hermes_native_home / "profiles" / "coder-2" / "lsp"
+    lsp_dir.mkdir(parents=True)
+    (lsp_dir / "package.json").write_text('{"dependencies": {"pyright": "^1.1.414"}}', encoding="utf-8")
+
+    check = doctor._check_lsp_installed(project)
+
+    assert check.status == "pass"  # coder-2 is outside roles: and, with no roster given, never scanned
+
+
+def test_lsp_installed_falls_back_when_desired_profiles_raises(tmp_path):
+    """A doctor row never crashes the doctor (this module's own standing rule): a broken/stale profiles module
+    falls back to the roles:-only scan and says so, rather than raising or silently reporting nothing."""
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    lsp_dir = project.hermes_native_home / "profiles" / "reviewer" / "lsp"
+    lsp_dir.mkdir(parents=True)
+    (lsp_dir / "package.json").write_text('{"dependencies": {"pyright": "^1.1.414"}}', encoding="utf-8")
+
+    class _Boom:
+        @staticmethod
+        def desired_profiles(project, models_config):
+            raise RuntimeError("boom")
+
+    check = doctor._check_lsp_installed(project, MODELS_CONFIG, _Boom)
+
+    assert check.status == "warn"
+    assert "reviewer" in check.detail and "pyright" in check.detail  # fell back to roles:, not crashed
+    assert "could not compute the full profile roster" in check.detail and "boom" in check.detail
+
+
+def test_lsp_installed_via_run_catches_a_profile_outside_roles_map(tmp_path, monkeypatch, world):
+    """The `doctor.run` wiring itself now passes models_config/profiles_mod through, not just the function's
+    own default arguments -- this file's autouse `world` fixture stubs `ases.profiles` for every test, so this
+    exercises that stub's own `desired_profiles` (state.specs), proving the call site was updated too."""
+    monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
+    monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))
+    monkeypatch.setattr(hermes, "gateway_status", lambda **_: hermes.GatewayStatus(False, ""))
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    lsp_dir = project.hermes_native_home / "profiles" / "coder-2" / "lsp"
+    lsp_dir.mkdir(parents=True)
+    (lsp_dir / "package.json").write_text('{"dependencies": {"pyright": "^1.1.414"}}', encoding="utf-8")
+    world.specs = [
+        types.SimpleNamespace(name=name)
+        for name in ("lead", "coder-1", "coder-2", "coder-3", "reviewer", "tester")
+    ]
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+
+    report = doctor.run(project, MODELS_CONFIG, conn)
+    by_name = {c.name: c for c in report.checks}
+
+    assert by_name["lsp_install"].status == "warn"
+    assert "coder-2" in by_name["lsp_install"].detail
+
+
 def test_lsp_installed_is_wired_into_the_full_report_as_a_warn_not_a_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
     monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))

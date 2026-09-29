@@ -42,6 +42,13 @@ budgets:                           # section 9.3 global bounds
   # the budget gate, Gate P and recovery.next_model unless this is explicitly true -- the owner's own
   # written decision to let ASES call a billed model, never inferred from a pinned row alone.
   allow_paid_models: false
+  # merge_reviewer_session_wait_passes (round 19, package MERGEGUARD; ASES-ROL-05, REVIEWER.md design (a)
+  # "Belt and braces at merge", fix D3): default 3. process_merge_queue judges the completing reviewer run's
+  # ACTUAL model/provider from the ledger's own session attribution (usage_ingested), which lags the run
+  # itself by however long usage.py's ingest paths take to see the session. For up to this many polling
+  # passes the merge queue WAITS on an unknown session rather than refusing or assuming independence; past it,
+  # the owner is asked once on the merge card.
+  merge_reviewer_session_wait_passes: 3
 
 hermes:
   tested_version: "0.21.3"

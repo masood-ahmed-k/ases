@@ -746,6 +746,40 @@ def lineage_requests(conn: sqlite3.Connection, plan_project: str, task_key: str)
     return int(row["total"])
 
 
+def reviewer_run_identities(conn: sqlite3.Connection, board: str, run_id) -> list[tuple[str | None, str | None]] | None:
+    """The (model, provider) pairs the ledger's own session attribution has recorded for one run, read back
+    from usage_ingested (round 19, package MERGEGUARD: the merge queue's ASES-ROL-05 belt-and-braces check at
+    merge, controller.process_merge_queue, fix D3 of REVIEWER.md design (a) "Belt and braces at merge"). A
+    per-card model_override/provider_override is lane-blind (r19 REVIEWER.md finding F3): a switch pinned for a
+    coder's replacement card can leak into that same card's own reviewer run, so the merge queue must judge the
+    completing reviewer run's ACTUAL model/provider, never the profile name alone.
+
+    None when no usage_ingested row for this run_id exists yet: the session has not been ingested (this
+    module's metadata/window/list paths each run on their own schedule, see the module docstring), which is
+    UNKNOWN, never assumed independent -- the caller must wait, not proceed.
+
+    Otherwise one (model, provider) pair per usage_ingested row this run_id has (ordinarily one; more only in
+    the rare mapping-ambiguity case _maybe_record_ambiguity already flags separately). `provider` prefers the
+    row's own `billing_provider` (carried straight off Hermes's session export, hermes.py:448-461: the provider
+    actually billed for the session) over usage_ingested's own `provider` column (this module's own attribution,
+    _provider_actually_hit's best guess, used elsewhere only to flag a model_mismatch event) -- falling back to
+    it only when a row has no billing_provider at all (that column is never NULL itself: _count_session always
+    fills it, either from the pinned profile or the guessed host)."""
+    rows = conn.execute(
+        "SELECT model, provider, billing_provider FROM usage_ingested WHERE board = ? AND run_id = ?",
+        (board, run_id),
+    ).fetchall()
+    if not rows:
+        return None
+    pairs = [(row["model"], row["billing_provider"] or row["provider"]) for row in rows]
+    if any(not model or not provider for model, provider in pairs):
+        # A row with no model (or no provider) cannot show the family and provider are the Lead's or not: that is
+        # UNKNOWN, exactly like no row at all, never "independent" (round 19 architect fix of the reviewer's
+        # MERGEGUARD finding: _reviewer_run_not_independent would otherwise read a NULL model as a different family).
+        return None
+    return pairs
+
+
 def review_budget(
     conn: sqlite3.Connection, models_config: dict, project: ases_config.ProjectConfig,
 ) -> ledger.Affordability | None:

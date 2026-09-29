@@ -757,6 +757,13 @@ def _affordable_now(
     project with, say, a safe coder provider but an unverified reviewer must park every coder card too, or a
     private diff would still end up sent to the reviewer the moment the coder's work is done.
 
+    Round 19 (package MERGEGUARD, STOPGATES review minor, ASES-DOC-04): the same reasoning re-checks the
+    REVIEWER's PAID status for a committing task, right after the task's own paid-model check below -- a
+    committing task always ends up reviewed, so a coder pinned to a perfectly free provider is still not
+    affordable if the REVIEWER it hands off to is a paid model and budgets.allow_paid_models is not set. Not
+    gated on `project` (paid status is not data-class-dependent): a caller that never passes one still gets
+    this check, exactly like the task's own paid-model check just below it.
+
     Shared by process_budget_gate (park a ready card) and process_unpark (release a parked one): one rule, so the
     two can never disagree about the same card on the same ledger. `project` is the same optional parameter
     process_budget_gate already threads through for the review-budget half; process_unpark now passes it too, so
@@ -788,6 +795,18 @@ def _affordable_now(
         # the same way an unsafe data class is -- deliberately not a "budget:"-prefixed reason (see
         # _PARK_PREFIXES above), so a paid park is never auto-resumed by process_unpark either.
         return False, f"paid model: {pp.provider}/{pp.model} is billed and budgets.allow_paid_models is not true"
+    if task.role in _COMMITTING_ROLES and not budgets.get("allow_paid_models", False):
+        # Round 19 (package MERGEGUARD, STOPGATES review minor, ASES-DOC-04): the same reasoning as the
+        # REVIEWER data-class re-check above -- a committing task always ends up reviewed, so its card is not
+        # really affordable if the REVIEWER's own pinned row is a paid model the project has not opted into,
+        # even when the task's own provider is free. Same reason text as the task's own paid-model refusal
+        # just above, naming the reviewer's provider/model instead of the task's.
+        reviewer_pp = policy.profile_provider("reviewer", models_config)
+        if reviewer_pp is not None and policy.is_paid_model(models_config, reviewer_pp.provider, reviewer_pp.model):
+            return False, (
+                f"paid model: {reviewer_pp.provider}/{reviewer_pp.model} is billed and "
+                "budgets.allow_paid_models is not true"
+            )
     afford = policy.check_budget(
         conn, models_config["providers"], pp.provider, task.estimated_requests, budgets=budgets,
     )
@@ -918,6 +937,105 @@ def _handle_merge_failure(
     )
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# ASES-ROL-05 belt-and-braces at merge (round 19, package MERGEGUARD; REVIEWER.md design (a) "Belt and braces at
+# merge", fix D3). Blueprint p111 [ASES-ROL-05]: "Keep the Reviewer independent: use a different model family and
+# provider from the Lead ...". Doctor's own check (profiles.verify_state -> _check_diversity) reads only the
+# STATIC profile configuration and never sees a per-card override: research report finding D3/F3 is that a coder
+# switch pinned on a replacement card (this module's own set-model call in _start_fresh_attempt) is lane-blind
+# and can leak into that SAME card's reviewer run, putting the reviewer on the Lead's own model or family for
+# exactly the one card that matters. This is the per-run check at the one place ASES can still refuse the
+# consequence: the merge itself, judging the completing reviewer run's ACTUAL model/provider (the ledger's own
+# session attribution, usage.reviewer_run_identities), never the profile name alone.
+# ---------------------------------------------------------------------------------------------------------------
+
+_MERGE_SESSION_UNKNOWN_EVENT = "merge_reviewer_session_unknown"
+_MERGE_SESSION_ESCALATED_EVENT = "merge_reviewer_independence_unknown_escalated"
+
+
+def _reviewer_run_not_independent(model, provider, lead_provider: str, lead_family: str | None) -> bool:
+    """ASES-ROL-05, verbatim: "a different model family AND provider from the Lead". False (independent) only
+    when BOTH differ; sharing either one alone already fails the sentence, so either match here is enough to
+    return True. Provider names are compared case-insensitively, the same vocabulary models.yaml itself uses
+    (usage_ingested.billing_provider/.provider and policy.ProfileProvider.provider are both plain provider-name
+    strings out of that same file, e.g. "xkiro", "openrouter")."""
+    if provider and str(provider).strip().lower() == lead_provider.strip().lower():
+        return True
+    family = profiles_mod.model_family(model)
+    return bool(lead_family and family and family == lead_family)
+
+
+def _merge_queue_independence(
+    board: str, plan: plan_mod.Plan, project: ases_config.ProjectConfig, key: str, work_card: dict,
+    merge_card_id: str, completed_run: dict, models_config: dict, *, conn,
+) -> bool:
+    """True lets process_merge_queue carry on trusting the completing reviewer run as it already did before this
+    check existed; False means this pass must not merge (the caller `continue`s). Sends nothing to a model:
+    every input (usage_ingested, models_config's own pinned Lead row) is already on disk.
+
+    Nothing to compare against: the Lead role has no pinned provider in `models_config` (an unusual project, or
+    a caller mid-setup) -- always True, mirroring _affordable_now's own "a role with no pinned provider has
+    nothing to check" rule.
+
+    Unknown: the completing run's session has not been ingested into usage_ingested yet (`usage_mod.
+    reviewer_run_identities` returns None -- an ingest lag, never evidence of anything). This pass WAITS, never
+    refuses: recorded every pass as `_MERGE_SESSION_UNKNOWN_EVENT` (deliberately not deduped -- the growing count
+    IS the point), so once `budgets.merge_reviewer_session_wait_passes` (default 3) passes have recorded it, the
+    owner is asked ONE question on the merge card, itself deduped on (task_key, card_id, run_id) so a later pass
+    (even one a test harness's own stub never lets `_open_question` suppress) never asks twice for the same run.
+
+    Not independent: refused (`merge_refused_not_independent`, carrying the run's own model/provider and the
+    Lead's) and review is reopened -- the exact shape a CHANGES_REQUIRED verdict already takes a few lines below
+    in process_merge_queue, including NOT deduping the refusal event itself: the card's status leaves `done` the
+    moment reopen-review returns, so the top of that loop's own `work_card["status"] != "done"` check skips this
+    card on every later pass until a NEW run completes it, which already bounds this to one action per
+    completing run_id with no dedup key of its own needed."""
+    lead = policy.profile_provider("lead", models_config)
+    if lead is None:
+        return True
+    identities = usage_mod.reviewer_run_identities(conn, board, completed_run.get("id"))
+    if identities is None:
+        bound = project.budgets.get("merge_reviewer_session_wait_passes", 3)
+        events.record(conn, _MERGE_SESSION_UNKNOWN_EVENT, {
+            "project": plan.project, "task_key": key, "card_id": work_card["id"],
+            "run_id": completed_run.get("id"),
+        }, project=plan.project)
+        waited = conn.execute(
+            f"SELECT COUNT(*) AS n FROM events WHERE kind = ? AND {events.PROJECT_SCOPE_SQL} "
+            "AND json_extract(payload, '$.run_id') IS ?",
+            (_MERGE_SESSION_UNKNOWN_EVENT, plan.project, completed_run.get("id")),
+        ).fetchone()["n"]
+        if waited >= bound and not _event_exists(conn, _MERGE_SESSION_ESCALATED_EVENT, {
+            "task_key": key, "card_id": work_card["id"], "run_id": completed_run.get("id"),
+        }, match=("task_key", "card_id", "run_id")):
+            answer = _ask_about_merge_card(
+                board, merge_card_id,
+                f"{key} (card {work_card['id']}): ASES-ROL-05 independence could not be confirmed for the "
+                f"completing reviewer run (run {completed_run.get('id')}) after {bound} passes -- its Hermes "
+                "session has still not appeared in the usage ledger. Please check that session directly (hermes "
+                "kanban sessions / usage), or say how ASES should proceed.",
+                conn=conn,
+            )
+            events.record(conn, _MERGE_SESSION_ESCALATED_EVENT, {
+                "task_key": key, "card_id": work_card["id"], "run_id": completed_run.get("id"), "asked": answer,
+            }, project=plan.project)
+        return False
+    lead_family = profiles_mod.model_family(lead.model)
+    for model, provider in identities:
+        if _reviewer_run_not_independent(model, provider, lead.provider, lead_family):
+            hermes_mod.kanban_reopen_review(board, work_card["id"], reason=(
+                f"ASES-ROL-05: the completing reviewer run actually used {model!r} via {provider!r}, which is "
+                "not independent of the Lead's own model/provider. Re-review is needed on an independent "
+                "reviewer model."
+            ))
+            events.record(conn, "merge_refused_not_independent", {
+                "task_key": key, "card_id": work_card["id"], "run_id": completed_run.get("id"), "model": model,
+                "provider": provider, "lead_provider": lead.provider, "lead_family": lead_family,
+            }, project=plan.project)
+            return False
+    return True
+
+
 def process_merge_queue(
     board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, *, conn,
     unreviewed: list[str] | None = None, models_config: dict | None = None, integrity: list[str] | None = None,
@@ -1007,7 +1125,15 @@ def process_merge_queue(
         event, and, when the caller passes a list for `integrity` (run_pass does), the problem is appended to it
         and the queue stops for this pass. Callers that do not pass `integrity` see this exactly as an ordinary
         halt of the loop below (no further tasks processed this pass), which is why every existing caller of this
-        function keeps working unchanged: `integrity` is new and optional, the same shape as `unreviewed`."""
+        function keeps working unchanged: `integrity` is new and optional, the same shape as `unreviewed`.
+
+    Round 19 (package MERGEGUARD, ASES-ROL-05, fix D3) adds a belt-and-braces check ahead of the ASES-REV-06
+    verdict check, for a committing task only: the completing reviewer run's ACTUAL model and provider (the
+    ledger's own session attribution, usage.reviewer_run_identities) must differ from the Lead's, exactly like
+    doctor's own static profile check already requires, but per RUN instead of per profile config, so a per-card
+    override that leaked into this one reviewer run (research report finding D3) cannot merge unnoticed. See
+    _merge_queue_independence's own docstring for the wait/refuse/proceed shape; `models_config` is optional and
+    a caller that omits it (or a project with no Lead pinned at all) keeps the old behaviour unchanged."""
     merged = []
     fix_limit = project.budgets.get("fix_cards_per_task", 2)
     attempts = project.budgets.get("attempts_per_card", 3)
@@ -1053,6 +1179,16 @@ def process_merge_queue(
         pre_merge_outcome = None
         expected_head = None
         if task.role in _COMMITTING_ROLES:
+            # ASES-ROL-05 belt-and-braces at merge (round 19, package MERGEGUARD, fix D3): before trusting the
+            # completing reviewer run at all, judge the model/provider it ACTUALLY used. See
+            # _merge_queue_independence's own docstring for the wait/refuse/proceed shape; `models_config` is
+            # optional here (a caller that has not been updated, or one with nothing to check against, keeps
+            # this a no-op exactly like the review-budget check below already does for a missing project).
+            if models_config is not None and not _merge_queue_independence(
+                board, plan, project, key, work_card, row["merge_card_id"], completed_run, models_config,
+                conn=conn,
+            ):
+                continue
             # ASES-REV-06: the verdict is validated against the schema, and it must be a PASS.
             verdict = review_mod.validate_verdict(completed_run.get("metadata"))
             if not verdict.valid:
