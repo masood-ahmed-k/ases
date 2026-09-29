@@ -47,7 +47,8 @@ None of it is guessed:
    is set, but the controller must still verify the base commit of a card's worktree itself.
 5. `hermes profile create` (fresh) seeds config.yaml with the LAUNCH profile's `model` block and, for a custom
    provider, that provider's entry; it also writes a default SOUL.md and a placeholder `.env`, seeds the bundled
-   skills, and (unless --no-alias) writes a wrapper script into ~/.local/bin. So a "fresh" profile has a model but no
+   skills, and (unless --no-alias) writes a wrapper script into ~/.local/bin. This module always passes --no-alias
+   (ASES-DOC-04), so a profile it creates never gets one. So a "fresh" profile has a model but no
    matching key: this module overwrites the model block from config/models.yaml and reports "needs credentials from
    the user".
 6. A named custom provider is a `providers:` entry with `base_url` and `key_env`; `model.provider` names it. That is
@@ -143,12 +144,22 @@ KNOWN_TOOLSETS = frozenset({
 # delegated write paths). `file` is deliberately NOT here: see RESIDUAL_RISKS.
 REVIEWER_FORBIDDEN_TOOLSETS = ("terminal", "code_execution", "browser", "computer_use", "delegation")
 
+# ASES-DOC-04 (section 16 STOP CONDITION, category 4: installs new software without being asked): Hermes 0.21.3
+# installs a missing language-server binary via npm/go/pip on first use whenever lsp.install_strategy is "auto"
+# (the default) or unset (hermes_cli/config_defaults.py:2223-2231). "manual" only uses a binary already on PATH;
+# "off" is Hermes's own alias for "manual", so either already satisfies ASES-DOC-04 and is left alone.
+_LSP_MANUAL_VALUES = frozenset({"manual", "off"})
+
 RESIDUAL_RISKS = (
     "Reviewer file access: Hermes 0.21.3 has one combined file toolset (read_file, write_file, patch, "
-    "search_files), no read-only file toolset, and agent.disabled_toolsets only removes whole toolsets, so the "
-    "Reviewer keeps write tools that its prompt forbids it to use (ASES-ROL-05). It has no terminal, so it cannot "
-    "commit; the merge queue believes only the controller's own gate records and the commit it re-checks, not the "
-    "worktree the Reviewer sees.",
+    "search_files), no read-only file toolset, and agent.disabled_toolsets only removes whole toolsets, so "
+    "write_file and patch stay in the schema Hermes offers the Reviewer (ASES-ROL-05). A fail-closed "
+    "pre_tool_call shell hook on the reviewer profile denies both tools before they run instead. Residual: the "
+    "hook is skipped when HERMES_SAFE_MODE is set (agent/shell_hooks.py:147-149), or fails open if Hermes's own "
+    "hook dispatcher raises instead of returning a verdict (model_tools.py:779-780); the schema still lists "
+    "write_file and patch either way, so the model can still see and attempt them. The Reviewer has no terminal, "
+    "so it cannot commit; the merge queue believes only the controller's own gate records and the commit it "
+    "re-checks, not the worktree the Reviewer sees.",
     "Kanban toolset: Hermes appends the lifecycle tools to every dispatcher-spawned worker whatever a profile "
     "lists, and a profile that lists `kanban` also gives its non-dispatched sessions the orchestrator tools "
     "(kanban_list, kanban_unblock).",
@@ -895,7 +906,7 @@ def _config_rows(
     policy: sandbox_mod.SandboxPolicy | None,
 ) -> list[Change]:
     """Every set_config row and configuration warning for one profile, in a fixed order: toolsets, memory, model,
-    worktree_sync, terminal."""
+    LSP install strategy, OpenRouter provider routing, worktree_sync, terminal."""
     out: list[Change] = []
 
     def row(target: str, before: Any, after: Any, why: str) -> None:
@@ -920,6 +931,22 @@ def _config_rows(
 
     for target, before, after, why in _model_rows(spec, cfg, models_config, is_new):
         row(target, before, after, why)
+
+    current_lsp = _get(cfg, "lsp.install_strategy")
+    if not (isinstance(current_lsp, str) and current_lsp.strip().lower() in _LSP_MANUAL_VALUES):
+        row(
+            "lsp.install_strategy", current_lsp, "manual",
+            "ASES-DOC-04: Hermes's own default ('auto') installs a missing language server via npm/go/pip on "
+            "first use (hermes_cli/config_defaults.py); 'manual' only uses one already on PATH",
+        )
+
+    provider_type = _provider_info(models_config, spec.provider).get("type")
+    if provider_type == "openrouter" and _get(cfg, "provider_routing.data_collection") != "deny":
+        row(
+            "provider_routing.data_collection", _get(cfg, "provider_routing.data_collection"), "deny",
+            "ASES-PRV-04: refuse OpenRouter providers that collect the request data for this profile "
+            "(agent/chat_completion_helpers.py, hermes_cli/tips.py)",
+        )
 
     if cfg.get("worktree_sync") is not False:
         row(
@@ -1120,10 +1147,12 @@ def plan_init(
     coder-3 and the tester get created when the user asks). Read-only: it never writes and never runs anything.
 
     Per profile, in this order: create_profile when the directory is missing, write_soul, then set_config rows for
-    the toolset list, memory off, the model and provider pin, worktree_sync and (only when sandbox_enabled, and only for
-    a worker that has a terminal) the Docker terminal block; then copy_credentials (only with reuse_credentials_from)
-    or the warning "needs credentials from the user" for a new profile. include_global appends the Kanban settings of
-    the global config (set_global_config rows and warnings), because they affect the user's whole Hermes.
+    the toolset list, memory off, the model and provider pin, the LSP install strategy (ASES-DOC-04), OpenRouter
+    provider routing (ASES-PRV-04, only for a profile pinned to an openrouter-type provider), worktree_sync and
+    (only when sandbox_enabled, and only for a worker that has a terminal) the Docker terminal block; then
+    copy_credentials (only with reuse_credentials_from) or the warning "needs credentials from the user" for a new
+    profile. include_global appends the Kanban settings of the global config (set_global_config rows and warnings),
+    because they affect the user's whole Hermes.
 
     A plan can hold warning rows: conditions ASES cannot or must not fix itself (a new profile that needs the user's
     credentials, a terminal setting it does not manage). `pending(plan)` is the rows that would change something, and
@@ -1288,7 +1317,11 @@ class _Applier:
         except hermes_mod.HermesNotFound:
             raise ProfileError("hermes is not on PATH, so the profile cannot be created") from None
         description = _ascii(change.after or f"ASES profile {change.profile}")
-        argv = [hermes, "profile", "create", change.profile, "--description", description]
+        # ASES-DOC-04, research item 5: without --no-alias Hermes writes a wrapper script into ~/.local/bin,
+        # guarded only by check_alias_collision's `where`/`which` PATH lookup, so an existing file that is not on
+        # PATH is silently overwritten (hermes_cli/profile_cmd.py:244-251; hermes_cli/profiles.py:366-420).
+        # ASES never uses the alias: it always runs `hermes -p <name>`.
+        argv = [hermes, "profile", "create", change.profile, "--no-alias", "--description", description]
         result = self.runner(argv, CREATE_TIMEOUT_SECONDS)
         code = getattr(result, "returncode", None)
         if code != 0:
@@ -1382,9 +1415,10 @@ def apply_init(
 
     Missing profiles are created through `runner(argv, timeout)` (default: _hermes_runner, sandbox.default_runner
     with a credential-scrubbed environment, which never raises)
-    with argv [hermes, "profile", "create", name, "--description", description]; never --clone-all, and no cloning at
-    all: a clone copies memory files and static API keys (ASES-ROL-02). Then each change is applied on its own: a
-    failure is recorded with its reason and the rest continue. Files are written next to a backup
+    with argv [hermes, "profile", "create", name, "--no-alias", "--description", description]; never --clone-all,
+    and no cloning at all: a clone copies memory files and static API keys (ASES-ROL-02). --no-alias skips the
+    ~/.local/bin wrapper script Hermes otherwise writes unconditionally (ASES-DOC-04). Then each change is applied
+    on its own: a failure is recorded with its reason and the rest continue. Files are written next to a backup
     (`<file>.ases-bak-<UTC timestamp>`, once per file per call, holding the previous bytes), replaced atomically, and
     read back: a change that did not stick is a failed change. auth.json, auth.lock and .env are never touched, except
     copy_credentials rows, and only when `reuse_credentials_from` names the same source as the row: then the one
@@ -1553,6 +1587,18 @@ def _check_profile(
             problems.append(
                 f"profile {name} runs a router model, and the Lead and the Reviewer must be pinned (ASES-RTE-01)"
             )
+    current_lsp = _get(cfg, "lsp.install_strategy")
+    if not (isinstance(current_lsp, str) and current_lsp.strip().lower() in _LSP_MANUAL_VALUES):
+        problems.append(
+            f"profile {name} has lsp.install_strategy {_show(current_lsp, 40)} (Hermes default is 'auto'): it "
+            "installs a missing language server via npm/go/pip on first use (ASES-DOC-04); swarm init sets 'manual'"
+        )
+    provider_type = _provider_info(models_config, spec.provider).get("type")
+    if provider_type == "openrouter" and _get(cfg, "provider_routing.data_collection") != "deny":
+        problems.append(
+            f"profile {name} is pinned to an OpenRouter provider but provider_routing.data_collection is not "
+            "'deny' (ASES-PRV-04): it can route the request to a provider that collects it"
+        )
     if cfg.get("worktree_sync") is not False:
         problems.append(
             f"profile {name} has worktree_sync on (Hermes default): worktrees would branch from a fetched remote tip "
@@ -1651,12 +1697,13 @@ def verify_state(
     sentences, in a fixed order: per profile (an active one, or any that exists on disk) a missing or stale SOUL.md,
     the toolset list (a worker with the memory toolset, a reviewer with terminal, code_execution, browser,
     computer_use or delegation, anything the role does not need), memory switched on, a model or provider that
-    differs from the pin in config/models.yaml, a router model for the Lead or Reviewer, worktree_sync on and, with
-    sandbox_enabled, the terminal-block problems from sandbox.check_profile_config; then the Lead and Reviewer on the
-    same provider or family; then the global Kanban settings (limits missing, above the hard maximum, a default
-    assignee). It never writes and never reads `.env` or `auth.json`. `policy` defaults to the limits of
-    sandbox.SandboxPolicy and the image the profile itself names. An empty list means nothing to report;
-    RESIDUAL_RISKS are known limits and are not repeated."""
+    differs from the pin in config/models.yaml, a router model for the Lead or Reviewer, lsp.install_strategy not
+    manual or off (ASES-DOC-04), provider_routing.data_collection not deny for a profile pinned to OpenRouter
+    (ASES-PRV-04), worktree_sync on and, with sandbox_enabled, the terminal-block problems from
+    sandbox.check_profile_config; then the Lead and Reviewer on the same provider or family; then the global Kanban
+    settings (limits missing, above the hard maximum, a default assignee). It never writes and never reads `.env` or
+    `auth.json`. `policy` defaults to the limits of sandbox.SandboxPolicy and the image the profile itself names. An
+    empty list means nothing to report; RESIDUAL_RISKS are known limits and are not repeated."""
     home = pathlib.Path(hermes_home)
     prompts = pathlib.Path(prompts_dir)
     specs = desired_profiles(project, models_config)
