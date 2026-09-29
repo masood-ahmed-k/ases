@@ -513,6 +513,53 @@ def _apply_v11(conn: sqlite3.Connection) -> None:
     _add_column(conn, "model_registry", "declared", "INTEGER NOT NULL DEFAULT 1")
 
 
+# Version 12 (round 19, package GIT12; ASES-GIT-12). Additive: `integrity_baselines` is a NEW table for the
+# per-poll bracketing baseline (r19/GIT12.md design A3/A4), one row per project+subject (a worktree's own path
+# key, this round), NEVER deleted while guards.observe_worktrees is the one maintaining it -- deliberately kept
+# separate from the older `worktree_snapshots` table (schema v6) check_idle_worktrees still owns and still
+# deletes rows from every pass a card runs: the two coexist on two different tables so this rollout cannot
+# disturb check_idle_worktrees' own warnings (architect decision, round 19: "keep process_idle_worktrees'
+# current warnings working until the new observer fully covers them").
+#
+# Plus the gate_runs.project backfill the GIT12 research report recommends (modelled on migration 8's own
+# backfill loop, db.py:328-351): gate_runs' project column has been there, nullable, since schema v7, but nothing
+# has ever backfilled it the way merge_records was in migration 8. A task_key that plan_tasks attributes to
+# exactly one project is confidently backfilled to it; a task_key with zero or more than one plan_tasks project
+# (including the bounds.record_final_gate pseudo key "__final__", which by construction can never map to one
+# project) is left NULL rather than guessed, exactly as review.check_branch_for_merge and the other readers this
+# package updates already treat a NULL project: "not attributable", never "safe to guess".
+_V12_SQL = """
+CREATE TABLE IF NOT EXISTS integrity_baselines (
+    project TEXT NOT NULL,
+    subject TEXT NOT NULL,          -- a worktree's own path key (guards._path_key), this round
+    kind TEXT NOT NULL,             -- 'card' | 'foreign'
+    owner_card TEXT,                -- the Hermes card id that owns this subject, else NULL
+    head TEXT NOT NULL,
+    status_hash TEXT NOT NULL,
+    confirmed_begin REAL NOT NULL,  -- epoch seconds: when this baseline was first confirmed (never moves while unchanged)
+    confirmed_end REAL NOT NULL,    -- epoch seconds: the pass that most recently confirmed it
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project, subject)
+);
+"""
+
+
+def _apply_v12(conn: sqlite3.Connection) -> None:
+    _run_script(conn, _V12_SQL)
+    rows = conn.execute("SELECT id, task_key FROM gate_runs WHERE project IS NULL").fetchall()
+    for row in rows:
+        if row["task_key"] == "__final__":
+            continue  # never one project's alone by construction: left NULL, as designed
+        matches = [
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT project FROM plan_tasks WHERE task_key = ?", (row["task_key"],),
+            ).fetchall()
+            if r[0] is not None
+        ]
+        if len(matches) == 1:
+            conn.execute("UPDATE gate_runs SET project = ? WHERE id = ?", (matches[0], row["id"]))
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: schema_migrations, requests_ledger, model_registry, events", _V1_SQL),
     Migration(2, "phase 3: plan_tasks, gate_runs, merge_records", _V2_SQL),
@@ -531,6 +578,10 @@ MIGRATIONS: list[Migration] = [
     Migration(11, "model_registry.declared: sync_from_config hides an undeclared row instead of deleting it, "
                   "so a recorded smoke test survives a model briefly dropping out of config (ASES-DOC-04)",
               _apply_v11),
+    Migration(12, "integrity_baselines: the per-poll bracketing baseline for ASES-GIT-12's attribution engine "
+                  "(guards.observe_worktrees), kept separate from worktree_snapshots; gate_runs.project backfilled "
+                  "from plan_tasks where the task key maps to exactly one project (ASES-GIT-12, round 19)",
+              _apply_v12),
 ]
 
 

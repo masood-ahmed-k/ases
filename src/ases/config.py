@@ -42,6 +42,14 @@ DEFAULT_SANDBOX = {
 # contain source code) are short lived; reports and stop reports are the audit trail, so they live longer.
 DEFAULT_RETENTION = {"logs_days": 30, "reports_days": 90}
 
+# ASES-GIT-12 (round 19, package GIT12; r19/GIT12.md's own architect decision): the per-poll bracketing
+# attribution engine always RECORDS a security_event for a unique or ambiguous finding, whatever this flag says
+# -- it is not a switch for whether ASES notices, only for whether it ACTS. `enforce_attribution` OFF (the
+# default, and this round's shipped behaviour) means report mode: nothing is failed, quarantined or paused on an
+# attribution result. Wired but off, so a later round can turn it on once the report-mode false-positive count is
+# known, without another config-shape change.
+DEFAULT_INTEGRITY = {"enforce_attribution": False}
+
 
 class ConfigError(Exception):
     """A swarm.yaml or models.yaml value is missing, malformed, or fails validation."""
@@ -65,11 +73,19 @@ class ProjectConfig:
     hermes_native_home: pathlib.Path
     sandbox: dict = dataclasses.field(default_factory=lambda: copy.deepcopy(DEFAULT_SANDBOX))
     retention: dict = dataclasses.field(default_factory=lambda: dict(DEFAULT_RETENTION))
+    integrity: dict = dataclasses.field(default_factory=lambda: dict(DEFAULT_INTEGRITY))
 
     @property
     def sandbox_enabled(self) -> bool:
         """True only when config/swarm.yaml says `sandbox: enabled: true`."""
         return bool(self.sandbox.get("enabled", False))
+
+    @property
+    def integrity_enforce_attribution(self) -> bool:
+        """True only when config/swarm.yaml says `integrity: enforce_attribution: true` (ASES-GIT-12, round 19,
+        package GIT12). False (the default) is report mode: a security_event is still always recorded, but
+        nothing is failed, quarantined or paused because of one."""
+        return bool(self.integrity.get("enforce_attribution", False))
 
     @property
     def logs_days(self) -> int:
@@ -148,6 +164,33 @@ def _parse_retention(raw: dict) -> dict:
     return settings
 
 
+def _parse_integrity(raw: dict) -> dict:
+    """The `integrity:` block with its default filled in, or ConfigError. Absent (or an empty `integrity:`) means
+    the safe default: enforce_attribution is False, exactly the "report mode" this round ships (ASES-GIT-12,
+    round 19, package GIT12). A typo here must be an error, never a silently-ignored key: this one flag decides
+    whether an attribution finding can ever fail a card or pause a project, so a misspelled key must never be
+    read as "left at its default" by accident."""
+    block = raw.get("integrity")
+    if block is None:
+        return dict(DEFAULT_INTEGRITY)
+    if not isinstance(block, dict):
+        raise ConfigError("config/swarm.yaml: integrity must be a mapping")
+    unknown = sorted(str(key) for key in block if key not in DEFAULT_INTEGRITY)
+    if unknown:
+        raise ConfigError(
+            f"config/swarm.yaml: unknown integrity key(s) {unknown}; the keys are {sorted(DEFAULT_INTEGRITY)}"
+        )
+    settings = dict(DEFAULT_INTEGRITY)
+    if "enforce_attribution" in block:
+        value = block["enforce_attribution"]
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"config/swarm.yaml: integrity.enforce_attribution must be true or false, got {value!r}"
+            )
+        settings["enforce_attribution"] = value
+    return settings
+
+
 def load_swarm_config(path: str | pathlib.Path) -> ProjectConfig:
     path = pathlib.Path(path)
     if not path.exists():
@@ -190,6 +233,7 @@ def load_swarm_config(path: str | pathlib.Path) -> ProjectConfig:
         hermes_native_home=pathlib.Path(_require(raw, "hermes.native_home")),
         sandbox=_parse_sandbox(raw),
         retention=_parse_retention(raw),
+        integrity=_parse_integrity(raw),
     )
 
 

@@ -1098,15 +1098,18 @@ def test_a_fresh_attempt_builds_the_replacement_card_exactly(tmp_path, monkeypat
     w.board.add_comment(w.work(), "user", "ANSWER: use the other library")
     w.board.add_comment(w.work(), "coder-1", "an ordinary comment that is not a finding")
     w.conn.execute(
-        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES (?, ?, ?, ?, ?, ?)",
-        ("T1", "gate1", "old", "pass", "an older row", "2026-09-21T09:00:00+00:00"))
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("T1", "gate1", "old", "pass", "an older row", "2026-09-21T09:00:00+00:00", "t3"))
     w.conn.execute(
-        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("T1", "gate1", "abc", "fail", f"$ pytest\nFAILED test_a [exit 1]\nOPENAI_KEY={SECRET}",
-         "2026-09-21T10:00:00+00:00"))
+         "2026-09-21T10:00:00+00:00", "t3"))
     w.conn.execute(
-        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES (?, ?, ?, ?, ?, ?)",
-        ("OTHER", "gate1", "zzz", "fail", "another task's gate output", "2026-09-21T11:00:00+00:00"))
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("OTHER", "gate1", "zzz", "fail", "another task's gate output", "2026-09-21T11:00:00+00:00", "t3"))
 
     new_id = start(w)
 
@@ -1464,15 +1467,17 @@ def test_the_branch_diff_is_the_attempt_alone_not_what_integration_gained_since(
 
 def test_the_last_gate_detail_is_the_newest_row_of_the_task_and_redacted(tmp_path):
     conn = db.connect(tmp_path / "ases.db")
-    assert controller._last_gate_detail(conn, "T1") == ""
-    insert = ("INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) "
-              "VALUES (?, ?, 'c', 'fail', ?, 'now')")
+    assert controller._last_gate_detail(conn, "T1", "p1") == ""
+    insert = ("INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+              "VALUES (?, ?, 'c', 'fail', ?, 'now', ?)")
     for gate, detail in (("gate1", "old"), ("gate3", f"new {SECRET}")):
-        conn.execute(insert, ("T1", gate, detail))
-    conn.execute(insert, ("T2", "gate1", None))
+        conn.execute(insert, ("T1", gate, detail, "p1"))
+    conn.execute(insert, ("T2", "gate1", None, "p1"))
 
-    assert controller._last_gate_detail(conn, "T1") == "new [redacted]"
-    assert controller._last_gate_detail(conn, "T2") == ""
+    assert controller._last_gate_detail(conn, "T1", "p1") == "new [redacted]"
+    assert controller._last_gate_detail(conn, "T2", "p1") == ""
+    # round 19, package GIT12 (ASES-GIT-12): strict scoping, not NULL-tolerant, proven in test_controller.py's
+    # test_last_gate_detail_is_strictly_scoped_to_the_project (this text goes straight into a retry card body).
 
 
 def test_findings_are_the_last_three_review_or_answer_comments_oldest_first():
@@ -2444,11 +2449,12 @@ def _stub_check_branch(monkeypatch, result_or_exc):
     calls = []
 
     def fake(repo, branch, integration_branch, gate1_commands, touches, *, conn, task_key,
-              allow_gate_config_changes=False, project_config=None, task=None):
+              allow_gate_config_changes=False, project_config=None, task=None, project=None):
         calls.append({
             "repo": repo, "branch": branch, "integration_branch": integration_branch,
             "gate1_commands": gate1_commands, "touches": touches, "task_key": task_key,
             "allow_gate_config_changes": allow_gate_config_changes, "project_config": project_config, "task": task,
+            "project": project,
         })
         if isinstance(result_or_exc, BaseException):
             raise result_or_exc
@@ -2476,6 +2482,7 @@ def test_a_reviewer_assigned_release_runs_gate1_and_posts_the_record_before_unbl
         "repo": w.repo, "branch": "swarm/T1-coder", "integration_branch": "integration",
         "gate1_commands": ["echo ok"], "touches": ["a.py"], "task_key": "T1",
         "allow_gate_config_changes": False, "project_config": w.project, "task": w.plan.task("T1"),
+        "project": w.plan.project,
     }]
     names = [name for name, _, _ in w.board.calls if name in ("kanban_comment", "kanban_unblock")]
     assert names == ["kanban_comment", "kanban_unblock"]  # the gate record is posted BEFORE the release
@@ -3455,8 +3462,8 @@ def test_the_final_gates_module_is_imported_lazily():
 # run_pass
 # =============================================================================================================
 
-STEPS = ["guard", "idle_worktrees", "usage", "recovery", "reviewer_contract", "bounds", "budget", "unpark", "review",
-         "dispatch", "card_base", "provision", "merge", "finalize"]
+STEPS = ["guard", "idle_worktrees", "git12_attribution", "usage", "recovery", "reviewer_contract", "bounds",
+         "budget", "unpark", "review", "dispatch", "card_base", "provision", "merge", "finalize"]
 SUMMARY_KEYS = {"parked", "dispatch", "sent_back", "merged", "unreviewed", "usage_sessions", "integrity", "warnings",
                 "recovery", "reviewer_contract", "unparked", "provisioned", "stopped", "stop_reason", "final",
                 "finished"}
@@ -3470,10 +3477,10 @@ class PassRig:
         self.order = []
         self.args = {}
         self.raises = {}
-        self.results = {"idle_worktrees": [], "usage": ["s1", "s2"], "recovery": [], "reviewer_contract": [],
-                        "bounds": (False, None), "budget": ["T9"], "unpark": [], "review": [],
-                        "dispatch": {"spawned": 1}, "card_base": [], "provision": [], "merge": ["T1"],
-                        "finalize": None}
+        self.results = {"idle_worktrees": [], "git12_attribution": [], "usage": ["s1", "s2"], "recovery": [],
+                        "reviewer_contract": [], "bounds": (False, None), "budget": ["T9"], "unpark": [],
+                        "review": [], "dispatch": {"spawned": 1}, "card_base": [], "provision": [],
+                        "merge": ["T1"], "finalize": None}
         self.conn = db.connect(tmp_path / "ases.db")
         self.plan = types.SimpleNamespace(project="p", integration_branch="integration")
         self.project = types.SimpleNamespace(budgets={"k": 1})
@@ -3511,7 +3518,9 @@ class PassRig:
             return rig.results["merge"]
 
         monkeypatch.setattr(guards, "check_primary_checkout", guard)
-        for name, target in (("idle_worktrees", "process_idle_worktrees"), ("recovery", "process_recovery"),
+        for name, target in (("idle_worktrees", "process_idle_worktrees"),
+                             ("git12_attribution", "process_git12_attribution"),
+                             ("recovery", "process_recovery"),
                              ("reviewer_contract", "process_reviewer_contract"),
                              ("bounds", "process_bounds"), ("budget", "process_budget_gate"),
                              ("unpark", "process_unpark"), ("review", "process_review_lane"),
@@ -3552,6 +3561,9 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
     everything = ("b", "the-repo", rig.plan, rig.project, rig.models)
     timed = {"conn": rig.conn, "now": moment}
     assert rig.args["idle_worktrees"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
+    # round 19, package GIT12 (ASES-GIT-12): the same five positional args and (conn, now) every other
+    # every-project-and-clock-aware step gets (everything/timed, defined above).
+    assert rig.args["git12_attribution"] == (everything, timed)
     assert rig.args["recovery"] == (everything, timed)
     assert rig.args["bounds"] == (everything, timed)
     assert rig.args["budget"] == (("b", rig.plan, rig.models),
@@ -3606,15 +3618,17 @@ def test_a_bound_that_stops_the_project_ends_the_pass_before_anything_is_dispatc
 
     summary = rig.run()
 
-    assert rig.order == ["guard", "idle_worktrees", "usage", "recovery", "reviewer_contract", "bounds"]
+    assert rig.order == [
+        "guard", "idle_worktrees", "git12_attribution", "usage", "recovery", "reviewer_contract", "bounds",
+    ]
     assert summary["stopped"] is True and summary["stop_reason"].startswith("replans_per_project reached")
     assert set(summary) == SUMMARY_KEYS and summary["usage_sessions"] == 2
     assert summary["recovery"] == rig.results["recovery"]            # what was done before the stop is still reported
     assert summary["dispatch"] == {} and summary["merged"] == []
 
 
-@pytest.mark.parametrize("step", ["idle_worktrees", "usage", "recovery", "bounds", "unpark", "card_base",
-                                   "provision", "finalize"])
+@pytest.mark.parametrize("step", ["idle_worktrees", "git12_attribution", "usage", "recovery", "bounds", "unpark",
+                                   "card_base", "provision", "finalize"])
 def test_a_step_that_is_not_safety_critical_cannot_stop_the_pass(tmp_path, monkeypatch, step):
     """A stale ledger, a failed lease or a final gate that cannot run must not stop the merge queue: the failure is a
     pass_step_error event naming the step, a warning, and every later step still runs."""

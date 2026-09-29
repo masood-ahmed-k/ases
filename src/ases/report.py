@@ -52,7 +52,7 @@ FINAL_GATE_KEY = "__final__"
 HEALTH_KINDS = (
     "pass_error", "usage_ingest_error", "merge_failed", "merge_race_retrying", "card_parked_for_budget",
     "integrity_violation", "fix_card_created", "fix_card_budget_exhausted", "model_mismatch", "should_stop_error",
-    "tamper_check_error", "tamper_blocked",
+    "tamper_check_error", "tamper_blocked", "security_event",
 )
 
 _HEALTH_WINDOW = 200     # at most this many health events are read; counts are over the events read
@@ -527,13 +527,15 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
     the merge records, and the findings the controller recorded as events (a merge refused for want of a review,
     a moved or dirty primary checkout, anything with tamper in its kind).
 
-    gate_runs has no project column, so it is scoped by task key (this plan's keys and the final-gate key).
-    merge_records (schema v8, round 9) IS scoped by project now -- its primary key is (project, task_key), so a
-    task key alone can legitimately name more than one row -- with the same NULL-tolerant read gates.last_gate_
-    result uses: this plan's own rows, or a legacy row with no project recorded, never a different project's row
-    that happens to share one of this plan's task keys. Verdicts are scoped by project. Gate detail text is
-    deliberately left out: it is command output, the likeliest place for a secret, and it stays in gate_runs for
-    whoever needs it."""
+    gate_runs has had a nullable project column since schema v7, backfilled from plan_tasks by migration 12
+    (round 19, package GIT12; ASES-GIT-12) where a task key maps to exactly one project -- this docstring used to
+    say "gate_runs has no project column", stale since v7 (round 19 finding). Scoped by task key (this plan's
+    keys and the final-gate key) AND the same NULL-tolerant project read gates.last_gate_result uses: this plan's
+    own rows, or a legacy/unattributed row, never a different project's row that happens to share one of this
+    plan's task keys. merge_records (schema v8, round 9) IS scoped by project the same way -- its primary key is
+    (project, task_key), so a task key alone can legitimately name more than one row. Verdicts are scoped by
+    project. Gate detail text is deliberately left out: it is command output, the likeliest place for a secret,
+    and it stays in gate_runs for whoever needs it."""
     keys = [task.key for task in plan.tasks]
     scope = [*keys, FINAL_GATE_KEY]
     marks = ",".join("?" * len(scope))
@@ -542,7 +544,8 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
          "result": row["result"], "ran_at": row["ran_at"]}
         for row in conn.execute(
             f"SELECT task_key, gate, commit_sha, result, ran_at FROM gate_runs WHERE task_key IN ({marks}) "
-            "ORDER BY ran_at DESC, id DESC LIMIT ?", (*scope, _GATE_RUN_LIMIT),
+            "AND (project IS NULL OR project = ?) ORDER BY ran_at DESC, id DESC LIMIT ?",
+            (*scope, plan.project, _GATE_RUN_LIMIT),
         )
     ]
     verdicts = [
@@ -595,7 +598,10 @@ def _quality_panel(conn: sqlite3.Connection, plan: plan_mod.Plan) -> dict:
          "message": _event_message(event["payload"])}
         for event in _read_events(
             conn,
-            "WHERE (kind = 'integrity_violation' OR kind GLOB 'merge_refused_*' "
+            # security_event (round 19, package GIT12; ASES-GIT-12): the per-poll bracketing attribution engine's
+            # own finding, always recorded whatever config/swarm.yaml's integrity.enforce_attribution says (report
+            # mode is the default: nothing here is failed or paused because of one, but it must still be visible).
+            "WHERE (kind = 'integrity_violation' OR kind = 'security_event' OR kind GLOB 'merge_refused_*' "
             "OR instr(lower(kind), 'tamper') > 0) "
             f"AND {events_mod.PROJECT_SCOPE_SQL}",
             (plan.project,), _FINDING_LIMIT,

@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from ases import db, gates, hermes, review, tamper
+from ases import db, events, gates, hermes, review, tamper
 
 
 def _git(*args, cwd):
@@ -248,12 +248,24 @@ def _orphan_branch(repo, branch):
     _git("checkout", "-q", "integration", cwd=repo)
 
 
-def _record_gate(conn, task_key, commit_sha, result, gate="gate1"):
-    """Seed a gate_runs row the way gates.run_gate writes one."""
+def _record_gate(conn, task_key, commit_sha, result, gate="gate1", project=None, detail="seeded by the test"):
+    """Seed a gate_runs row the way gates.run_gate writes one. `project` (round 19, package GIT12) defaults to
+    None (a legacy/unattributed row), matching every call site that predates it. `detail` defaults to a fixed
+    marker; a test that seeds more than one row for the same task_key/commit_sha (fix round 1, design test B5)
+    passes a distinct one per row so it can tell which row a read-back actually used."""
     conn.execute(
-        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_key, gate, commit_sha, result, "seeded by the test", "2026-09-19T00:00:00+00:00"),
+        "INSERT INTO gate_runs (task_key, gate, commit_sha, result, detail, ran_at, project) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_key, gate, commit_sha, result, detail, "2026-09-19T00:00:00+00:00", project),
     )
+
+
+def _gate_project(conn, task_key, commit_sha):
+    row = conn.execute(
+        "SELECT project FROM gate_runs WHERE task_key = ? AND commit_sha = ? ORDER BY id DESC LIMIT 1",
+        (task_key, commit_sha),
+    ).fetchone()
+    return row["project"] if row else None
 
 
 def _gate_rows(conn, task_key):
@@ -1968,9 +1980,10 @@ def test_gate_before_review_passes_project_config_and_task_through_to_check_bran
     seen = {}
 
     def fake_check_branch(repo_arg, branch, integration_branch, commands, touches, *, conn, task_key,
-                           allow_gate_config_changes=False, project_config=None, task=None):
+                           allow_gate_config_changes=False, project_config=None, task=None, project=None):
         seen["project_config"] = project_config
         seen["task"] = task
+        seen["project"] = project
         return review.BranchCheck(True, "ok", "stubbed", "a" * 40)
 
     monkeypatch.setattr(review, "check_branch", fake_check_branch)
@@ -1978,10 +1991,13 @@ def test_gate_before_review_passes_project_config_and_task_through_to_check_bran
 
     review.gate_before_review(
         "b", "card1", repo, "swarm/RR5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RR5",
-        project_config=project_config, task=task,
+        project_config=project_config, task=task, project="proj1",
     )
 
     assert (seen["project_config"], seen["task"]) == (project_config, task)
+    # round 19, package GIT12 (ASES-GIT-12): gate_before_review's own `project` now reaches check_branch too,
+    # through record_gate1, not only _post_gate_record's comment (the bug this package fixes).
+    assert seen["project"] == "proj1"
 
 
 # --- gate_before_review: the ASES-QG-01 gate-record comment (round 16) ---------------------------------------
@@ -2330,9 +2346,10 @@ def test_record_gate1_passes_project_config_and_task_through_to_check_branch(rep
     seen = {}
 
     def fake_check_branch(repo_arg, branch, integration_branch, commands, touches, *, conn, task_key,
-                           allow_gate_config_changes=False, project_config=None, task=None):
+                           allow_gate_config_changes=False, project_config=None, task=None, project=None):
         seen["project_config"] = project_config
         seen["task"] = task
+        seen["project"] = project
         return review.BranchCheck(True, "ok", "stubbed", "a" * 40)
 
     monkeypatch.setattr(review, "check_branch", fake_check_branch)
@@ -2340,7 +2357,148 @@ def test_record_gate1_passes_project_config_and_task_through_to_check_branch(rep
 
     review.record_gate1(
         "b", "card1", repo, "swarm/RG7", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="RG7",
-        project_config=project_config, task=task,
+        project_config=project_config, task=task, project="proj1",
     )
 
+    # round 19, package GIT12 (ASES-GIT-12): record_gate1's own `project` now reaches check_branch too, not only
+    # _post_gate_record's comment (the bug this package fixes).
+    assert seen["project"] == "proj1"
+
     assert (seen["project_config"], seen["task"]) == (project_config, task)
+
+
+# --- gate_runs project scoping (round 19, package GIT12; ASES-GIT-12's own "plus the gate_runs project ---------
+# defect"): review._run_gate1 never passed project to gates.run_gate, so every gate_runs row stayed NULL, and
+# the merge queue's own reads had no project predicate at all, so two projects sharing this database (or
+# reusing a task key and role, which collide on the SAME branch name: controller.py's swarm/<key>-<role>) could
+# read or reuse each other's Gate 1 record. r19/GIT12.md design section B, test list B1-B6.
+
+def test_record_gate1_writes_a_gate_runs_row_stamped_with_project(repo, tmp_path):
+    """Design test B1: a real `echo ok` Gate 1 write with project='P' produces a gate_runs row whose project is
+    'P'. This failed before the fix (the row stayed NULL: neither check_branch nor _run_gate1 had a project to
+    give gates.run_gate at all)."""
+    _branch_with_changes(repo, "swarm/GP1", {"src/a.py": "x=1\n"})
+    head = _head(repo, "swarm/GP1")
+    conn = db.connect(tmp_path / "ases.db")
+
+    review.record_gate1(
+        "b", "card1", repo, "swarm/GP1", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GP1",
+        project="P",
+    )
+
+    assert _gate_project(conn, "GP1", head) == "P"
+
+
+def test_check_branch_for_merge_does_not_reuse_another_projects_green_record(repo, tmp_path, monkeypatch):
+    """Design test B2: check_branch_for_merge(project='B') with a seeded green row for project 'A' at the SAME
+    head must still run Gate 1 (never reuse project A's row): a real `echo gate-ok` command proves it actually
+    ran, not merely that the strict SQL predicate excluded the seeded row."""
+    _branch_with_changes(repo, "swarm/GP2", {"src/a.py": "x=1\n"})
+    head = _head(repo, "swarm/GP2")
+    conn = db.connect(tmp_path / "ases.db")
+    _record_gate(conn, "GP2", head, "pass", project="A")
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/GP2", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GP2", project="B",
+    )
+
+    assert (result.ok, result.kind) == (True, "ok")
+    assert "existing controller record" not in result.detail  # a fresh run, not the reused-record message
+    assert _gate_project(conn, "GP2", head) == "B"
+    assert len(_gate_rows(conn, "GP2")) == 2  # project A's seeded row, plus this project's own fresh one
+
+
+def test_check_branch_for_merge_runs_gate1_over_a_legacy_null_project_row(repo, tmp_path):
+    """Design test B3: the same, for a seeded row with project left NULL (a legacy row, or a caller that has not
+    passed one yet): strict scoping excludes NULL too when a project IS given, so Gate 1 still runs."""
+    _branch_with_changes(repo, "swarm/GP3", {"src/a.py": "x=1\n"})
+    head = _head(repo, "swarm/GP3")
+    conn = db.connect(tmp_path / "ases.db")
+    _record_gate(conn, "GP3", head, "pass", project=None)
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/GP3", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GP3", project="B",
+    )
+
+    assert (result.ok, result.kind) == (True, "ok")
+    assert _gate_project(conn, "GP3", head) == "B"
+
+
+def test_check_branch_for_merge_ignores_an_earlier_green_record_of_another_project(repo, tmp_path):
+    """Design test B4: an EARLIER commit's green record for project 'A' must not make project 'B' see the
+    current head as stale_review -- that verdict is reserved for THIS project's own earlier record moving on."""
+    _branch_with_changes(repo, "swarm/GP4", {"src/a.py": "x=1\n"})
+    earlier = _head(repo, "swarm/GP4")
+    conn = db.connect(tmp_path / "ases.db")
+    _record_gate(conn, "GP4", earlier, "pass", project="A")
+    _add_commit(repo, "swarm/GP4", {"src/b.py": "y=2\n"})
+    head = _head(repo, "swarm/GP4")
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/GP4", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GP4", project="B",
+    )
+
+    assert (result.ok, result.kind) != (False, "stale_review")
+    assert (result.ok, result.kind) == (True, "ok")
+    assert _gate_project(conn, "GP4", head) == "B"
+
+
+def test_post_gate_record_reads_back_the_projects_own_row_despite_a_later_foreign_row(
+    repo, tmp_path, monkeypatch,
+):
+    """Design test B5 (fix round 1: the round 19 review found no test for this, though the code already looks
+    correct by inspection). A seeded row for another project ('A'), inserted AFTER the project's own ('B') row
+    for the SAME task_key and head -- so it sorts first under a bare `ORDER BY id DESC LIMIT 1` -- must not
+    change which row _post_gate_record's comment reads back: the `AND project IS ?` predicate (review.py's
+    _post_gate_record) must win over insertion order."""
+    _branch_with_changes(repo, "swarm/GP8", {"src/a.py": "x=1\n"})
+    head = _head(repo, "swarm/GP8")
+    conn = db.connect(tmp_path / "ases.db")
+    _record_gate(conn, "GP8", head, "pass", project="B", detail="project B's own detail")
+    _record_gate(conn, "GP8", head, "pass", project="A", detail="project A's later detail")  # inserted AFTER
+    posted = _posted_comments(monkeypatch)
+
+    review._post_gate_record(
+        "b", "card1", review.BranchCheck(True, "ok", "stubbed", head), ["echo gate-ok"], conn=conn,
+        task_key="GP8", project="B",
+    )
+
+    assert len(posted) == 1
+    assert "project B's own detail" in posted[0][2]
+    assert "project A's later detail" not in posted[0][2]
+
+
+def test_check_branch_for_merge_left_at_the_default_project_is_unscoped_as_before(repo, tmp_path, monkeypatch):
+    """Backward compatibility: a caller that does not pass `project` at all (none exists yet) reuses ANY
+    project's green record for the head, exactly as check_branch_for_merge always did before this package."""
+    _branch_with_changes(repo, "swarm/GP5", {"src/a.py": "x=1\n"})
+    head = _head(repo, "swarm/GP5")
+    conn = db.connect(tmp_path / "ases.db")
+    _record_gate(conn, "GP5", head, "pass", project="A")
+    attempts = _forbid_gate1(monkeypatch)
+
+    result = review.check_branch_for_merge(
+        repo, "swarm/GP5", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GP5",
+    )
+
+    assert (result.ok, result.kind) == (True, "ok")
+    assert attempts == []
+
+
+def test_gate1_record_posted_of_one_project_does_not_suppress_another_projects_post(repo, tmp_path, monkeypatch):
+    """Design test B6: a gate1_record_posted event already recorded for project 'A' must not suppress project
+    'B's own first post of the same (task_key, head, outcome)."""
+    _branch_with_changes(repo, "swarm/GP6", {"src/a.py": "x=1\n"})
+    head = _head(repo, "swarm/GP6")
+    conn = db.connect(tmp_path / "ases.db")
+    events.record(conn, "gate1_record_posted", {
+        "task_key": "GP6", "card_id": "other_card", "head": head, "outcome": "pass",
+    }, project="A")
+    posted = _posted_comments(monkeypatch)
+
+    review.record_gate1(
+        "b", "card1", repo, "swarm/GP6", "integration", ["echo gate-ok"], ["src/*"], conn=conn, task_key="GP6",
+        project="B",
+    )
+
+    assert len(posted) == 1  # project B's own post went out; project A's event did not suppress it

@@ -10,6 +10,7 @@ import contextlib
 import http.client
 import inspect
 import json
+import pathlib
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from ases import db, gates, guards, hermes, integrity, review, tamper
 from ases.fakes import provider as fp
 from ases.fakes import worker as fw
 from ases.fakes.board import (
-    FAKE_PID_BASE, TASK_FIELDS, AgentToolError, FakeHermes,
+    FAKE_PID_BASE, TASK_FIELDS, TERMINAL_WORKER_REAP_GRACE_SECONDS, AgentToolError, FakeHermes,
 )
 from ases.hermes import HermesCommandError
 
@@ -1642,6 +1643,46 @@ def test_every_public_hermes_function_has_a_fake_with_the_same_signature():
         theirs = [(p.name, p.kind, p.default) for p in inspect.signature(function).parameters.values()]
         ours = [(p.name, p.kind, p.default) for p in inspect.signature(getattr(fake, name)).parameters.values()]
         assert ours == theirs, f"FakeHermes.{name} differs from hermes.{name}"
+
+
+def test_board_runs_reflects_open_and_ended_runs_from_real_dispatch_state():
+    """FakeHermes.board_runs (round 19, package GIT12; ASES-GIT-12), against real dispatch state: an open run (a
+    worker still going) is always returned with ended_at None; a closed one carries its ended_at and outcome."""
+    fake = new_fake()
+    fake.register_worker("c", hang)
+    running_card = create(fake, "T1: work", assignee="c")
+    fake.register_worker("d", finish)
+    done_card = create(fake, "T2: work", assignee="d")
+
+    fake.kanban_dispatch(BOARD)
+
+    result = fake.board_runs(pathlib.Path("unused"), BOARD, since_epoch=0, tested_version="0.21.3")
+
+    assert result.ok is True and result.reason == ""
+    by_task = {r.task_id: r for r in result.runs}
+    running_run = by_task[running_card["id"]]
+    assert running_run.profile == "c" and running_run.ended_at is None
+    done_run = by_task[done_card["id"]]
+    assert done_run.profile == "d" and done_run.ended_at is not None and done_run.outcome == "completed"
+
+
+def test_board_runs_reaped_at_comes_from_a_terminal_worker_reaped_event():
+    """board.py's own reap model (_reap_terminal_workers, TERMINAL_WORKER_REAP_GRACE_SECONDS): kanban_block closes
+    the run (kanban_db.block_task) without touching the fake WORKER PROCESS, so a hung worker's process is still
+    "alive" underneath it -- exactly the case the real reaper targets ("the controller blocked or completed the
+    card underneath it"). board_runs must report that reap event's created_at as reaped_at."""
+    fake = new_fake()
+    fake.register_worker("c", hang)
+    card = create(fake, "T1: work", assignee="c")
+    fake.kanban_dispatch(BOARD)
+    fake.kanban_block(BOARD, card["id"], "closing the run under the still-hung worker")
+    fake.now += TERMINAL_WORKER_REAP_GRACE_SECONDS + 1
+
+    fake.kanban_dispatch(BOARD, dry_run=True)  # the reclaim phase runs even in a dry run
+
+    result = fake.board_runs(pathlib.Path("unused"), BOARD, since_epoch=0, tested_version="0.21.3")
+    run = next(r for r in result.runs if r.task_id == card["id"])
+    assert run.reaped_at is not None
 
 
 def test_version_doctor_gateway_and_hermes_path_are_healthy_by_default_and_overridable():

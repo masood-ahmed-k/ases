@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import pathlib
@@ -1082,3 +1083,72 @@ def test_hash_gate_profiles_pinned_task_fields_key_order_does_not_matter():
     a = gates.hash_gate_profiles(profiles, {"T1": t1_fields_forward, "T2": t2_fields})
     b = gates.hash_gate_profiles(profiles, {"T2": t2_fields, "T1": t1_fields_reversed})
     assert a == b
+
+
+# --- static scan: every run_gate call that writes a row also stamps its project (round 19, package GIT12; -----
+# ASES-GIT-12: gate_runs used to have no project scoping at all, so two projects sharing this database, or
+# reusing a task key, could read each other's gate history. Written in the spirit of test_gitexec.py's
+# bare-git-call scanner and test_fakes.py's public-function/fake signature check: a future run_gate call site
+# that forgets `project=` (and does not explicitly opt out with `conn=None`, which writes no row at all) fails
+# this test, naming the file and line, instead of silently reintroducing the bug.
+
+_SRC_ROOT = pathlib.Path(__file__).resolve().parents[2] / "src" / "ases"
+
+
+def _keyword(node: ast.Call, name: str):
+    return next((kw.value for kw in node.keywords if kw.arg == name), None)
+
+
+def _is_run_gate_call(node: ast.Call) -> bool:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "run_gate"
+    return isinstance(func, ast.Attribute) and func.attr == "run_gate"
+
+
+def unscoped_run_gate_call_sites(root: pathlib.Path) -> list[str]:
+    """"path:line" of every `run_gate(...)` call under `root` whose `conn=` is given and is not the literal
+    `None`, but which has no `project=` keyword at all. Skips `gates.py` itself (the definition, not a call) and
+    `fakes/` (no fake re-implements or calls the real run_gate)."""
+    hits = []
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if rel.parts[0] == "fakes" or rel == pathlib.Path("gates.py"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and _is_run_gate_call(node)):
+                continue
+            conn = _keyword(node, "conn")
+            if conn is None or (isinstance(conn, ast.Constant) and conn.value is None):
+                continue  # no `conn=` at all, or explicitly conn=None: writes no gate_runs row either way
+            if _keyword(node, "project") is None:
+                hits.append(f"{rel.as_posix()}:{node.lineno}")
+    return hits
+
+
+def test_every_run_gate_call_that_writes_a_row_also_passes_project():
+    hits = unscoped_run_gate_call_sites(_SRC_ROOT)
+    assert hits == [], f"run_gate call(s) with conn set but no project=, so their row would stay unscoped: {hits}"
+
+
+def test_the_run_gate_scanner_itself_catches_a_planted_unscoped_call(tmp_path):
+    (tmp_path / "planted.py").write_text(
+        "from . import gates as gates_mod\n\n\n"
+        "def f(repo, head, cmds, conn, task_key):\n"
+        "    return gates_mod.run_gate(repo, head, 'gate1', cmds, conn=conn, task_key=task_key)\n",
+        encoding="utf-8",
+    )
+    assert unscoped_run_gate_call_sites(tmp_path) == ["planted.py:5"]
+
+
+def test_the_run_gate_scanner_accepts_conn_none_and_a_project_kwarg(tmp_path):
+    (tmp_path / "planted.py").write_text(
+        "from . import gates as gates_mod\n\n\n"
+        "def f(repo, head, cmds, conn, task_key, project):\n"
+        "    a = gates_mod.run_gate(repo, head, 'gate4', cmds, conn=None, task_key=task_key)\n"
+        "    b = gates_mod.run_gate(repo, head, 'gate1', cmds, conn=conn, task_key=task_key, project=project)\n"
+        "    return a, b\n",
+        encoding="utf-8",
+    )
+    assert unscoped_run_gate_call_sites(tmp_path) == []

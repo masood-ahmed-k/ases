@@ -107,6 +107,7 @@ def record_gate1(
     result = check_branch(
         repo, branch, integration_branch, gate1_commands, touches, conn=conn, task_key=task_key,
         allow_gate_config_changes=allow_gate_config_changes, project_config=project_config, task=task,
+        project=project,
     )
     _post_gate_record(board, card_id, result, gate1_commands, conn=conn, task_key=task_key, project=project)
     return result
@@ -182,18 +183,24 @@ def gate_before_review(
     return True
 
 
-def _gate_record_posted(conn, task_key: str, head: str, outcome: str) -> bool:
+def _gate_record_posted(conn, task_key: str, head: str, outcome: str, *, project: str | None = None) -> bool:
     """True when a gate1_record_posted event already carries this exact (task_key, commit, outcome). A poll that
     re-runs check_branch and reaches the SAME determination for a commit that has not moved (the ordinary case:
     Gate 1 re-runs on every review-lane pass while a card sits waiting for the reviewer to be dispatched) must not
     add a second, identical comment to the card. A DIFFERENT outcome for the SAME commit is not "the same" and is
     not suppressed here -- see _post_gate_record for why that matters (the tamper check's own transient error,
-    retried, can still go on to a real Gate 1 pass or fail for that same commit)."""
+    retried, can still go on to a real Gate 1 pass or fail for that same commit).
+
+    `project` (round 19, package GIT12; ASES-GIT-12) is scoped with events.PROJECT_SCOPE_SQL, the same
+    NULL-tolerant convention every events reader uses: this project's own event, or a legacy/projectless one,
+    counts as "already posted"; another project's own gate1_record_posted event for a task key it happens to
+    share never does, so it can no longer suppress this project's own post (round 19 finding)."""
     return conn.execute(
         "SELECT 1 FROM events WHERE kind = 'gate1_record_posted' "
         "AND json_extract(payload, '$.task_key') = ? AND json_extract(payload, '$.head') = ? "
-        "AND json_extract(payload, '$.outcome') = ? LIMIT 1",
-        (task_key, head, outcome),
+        "AND json_extract(payload, '$.outcome') = ? "
+        f"AND {events_mod.PROJECT_SCOPE_SQL} LIMIT 1",
+        (task_key, head, outcome, project),
     ).fetchone() is not None
 
 
@@ -215,7 +222,9 @@ def _post_gate_record(
     output away on a pass (it is just "Gate 1 green for <head>"), and _run_gate1's docstring already redacted it
     once (events.redact_text, ASES-SEC-01) before it went into gate_runs.detail. gate_runs is a fact this exact
     call just wrote through `conn`, in the same transaction, so the read-back sees it whether or not conn has
-    been committed yet.
+    been committed yet. The read-back is scoped `AND project IS ?` (round 19, package GIT12; ASES-GIT-12): `IS`,
+    not `=`, because `project` can itself be None, and this must find THIS call's own just-written row, never
+    another project's row for the same task key and commit that happens to sort first.
 
     Posted once per (task_key, commit, outcome) -- see _gate_record_posted. A Hermes failure while posting the
     comment (hermes_mod.HermesCommandError: the same exception every other Hermes call site in this codebase
@@ -227,13 +236,13 @@ def _post_gate_record(
     failure is recorded instead (gate_record_post_failed) and _gate_record_posted is left with no entry, so the
     NEXT review-lane pass retries the post exactly as if this one had never been attempted."""
     outcome = _GATE_RECORD_OUTCOME.get(result.kind, "not_run")
-    if _gate_record_posted(conn, task_key, result.head, outcome):
+    if _gate_record_posted(conn, task_key, result.head, outcome, project=project):
         return
     if outcome in ("pass", "fail"):
         row = conn.execute(
             "SELECT detail FROM gate_runs WHERE task_key = ? AND gate = 'gate1' AND commit_sha = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_key, result.head),
+            "AND project IS ? ORDER BY id DESC LIMIT 1",
+            (task_key, result.head, project),
         ).fetchone()
         body = row["detail"] if row is not None else ""
     else:
@@ -274,7 +283,7 @@ def _format_gate_record(head: str, outcome: str, commands: list[str], body: str 
 def check_branch(
     repo: pathlib.Path, branch: str, integration_branch: str, gate1_commands: list[str],
     touches: list[str], *, conn, task_key: str, allow_gate_config_changes: bool = False,
-    project_config=None, task=None,
+    project_config=None, task=None, project: str | None = None,
 ) -> BranchCheck:
     """The decision behind gate_before_review, with no Hermes call: resolve the branch head, find its
     merge-base with the integration branch, hold the diff to the card's touches, run the tamper check over the
@@ -286,7 +295,9 @@ def check_branch(
     not `touches`, is what the tamper check treats as "an explicit plan task that allows it".
 
     `project_config`/`task` (round 9): passed straight through to _run_gate1's gates.resolve_runner call; see
-    gate_before_review's own docstring."""
+    gate_before_review's own docstring. `project` (round 19, package GIT12; ASES-GIT-12) is passed straight
+    through to _run_gate1, so the gate_runs row it inserts is stamped with it, exactly like every other run_gate
+    caller (record_gate1 is the only caller of this function that has one to give)."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope
@@ -295,6 +306,7 @@ def check_branch(
         return tampered
     return _run_gate1(
         repo, scope.head, gate1_commands, conn=conn, task_key=task_key, project_config=project_config, task=task,
+        project=project,
     )
 
 
@@ -302,6 +314,7 @@ def check_branch_for_merge(
     repo: pathlib.Path, branch: str, integration_branch: str, gate1_commands: list[str],
     touches: list[str], *, conn, task_key: str, require_binding: bool = False,
     reviewed_commit: str | None = None, allow_gate_config_changes: bool = False, project_config=None, task=None,
+    project: str | None = None,
 ) -> BranchCheck:
     """The merge queue's own branch check (ASES-GIT-03, ASES-GIT-13, ASES-QG-01). It does not rely on the
     review lane: Hermes's own gateway dispatcher can claim a review card and start the reviewer before
@@ -345,7 +358,16 @@ def check_branch_for_merge(
     above), so this task's own network exception, if it carries one, reaches its Gate 1 re-run just as it does
     the Gate 1 review-lane check. sandbox.SandboxInfrastructureError, or (round 12, finding 0) a
     gates.GateCheckoutError, is NOT caught here: the caller (controller.py's merge loop) decides what an
-    infrastructure failure means for the merge."""
+    infrastructure failure means for the merge.
+
+    `project` (round 19, package GIT12; ASES-GIT-12, the bug this package fixes): given, both the same_head and
+    earlier reads below are scoped `AND project = ?`, STRICT, not the NULL-tolerant `project IS NULL OR project
+    = ?` most other gate_runs readers use -- a record that lets Gate 1 be skipped must be this project's own,
+    never another project's row (including a legacy NULL one) that merely shares this task key and commit,
+    because two projects on one repository can share a branch name (controller.py's swarm/<key>-<role>) when
+    they reuse a task key and role. Left at the default None (every caller before this package), both queries
+    are unscoped, exactly as they always were. Passed on to _run_gate1 either way, so a fresh Gate 1 run here is
+    stamped with it too."""
     scope, base = _check_scope(repo, branch, integration_branch, touches)
     if not scope.ok:
         return scope
@@ -373,19 +395,26 @@ def check_branch_for_merge(
     if tampered is not None:
         return tampered
 
-    same_head = conn.execute(
-        "SELECT 1 FROM gate_runs WHERE task_key = ? AND gate = 'gate1' AND result = 'pass' "
-        "AND commit_sha = ? LIMIT 1",
-        (task_key, head),
-    ).fetchone()
+    same_head_sql = (
+        "SELECT 1 FROM gate_runs WHERE task_key = ? AND gate = 'gate1' AND result = 'pass' AND commit_sha = ?"
+    )
+    same_head_params = [task_key, head]
+    if project is not None:
+        same_head_sql += " AND project = ?"
+        same_head_params.append(project)
+    same_head = conn.execute(same_head_sql + " LIMIT 1", same_head_params).fetchone()
     if same_head:
         return BranchCheck(True, "ok", f"Gate 1 green for {head} (existing controller record, not re-run)", head)
 
-    earlier = conn.execute(
+    earlier_sql = (
         "SELECT commit_sha FROM gate_runs WHERE task_key = ? AND gate = 'gate1' AND result = 'pass' "
-        "AND commit_sha != ? ORDER BY id DESC LIMIT 1",
-        (task_key, head),
-    ).fetchone()
+        "AND commit_sha != ?"
+    )
+    earlier_params = [task_key, head]
+    if project is not None:
+        earlier_sql += " AND project = ?"
+        earlier_params.append(project)
+    earlier = conn.execute(earlier_sql + " ORDER BY id DESC LIMIT 1", earlier_params).fetchone()
     if earlier:
         return BranchCheck(
             False, "stale_review",
@@ -397,6 +426,7 @@ def check_branch_for_merge(
 
     return _run_gate1(
         repo, head, gate1_commands, conn=conn, task_key=task_key, project_config=project_config, task=task,
+        project=project,
     )
 
 
@@ -574,7 +604,7 @@ def _files_at(repo: pathlib.Path, head: str, paths: list[str]) -> list[str]:
 
 def _run_gate1(
     repo: pathlib.Path, head: str, gate1_commands: list[str], *, conn, task_key: str,
-    project_config=None, task=None,
+    project_config=None, task=None, project: str | None = None,
 ) -> BranchCheck:
     """Run Gate 1 on `head` through the gate runner (which records the result in gate_runs) and translate
     it. The red reason text is what gate_before_review has always sent to Hermes for a failed re-check.
@@ -582,10 +612,14 @@ def _run_gate1(
     Round 9 (ASES-QG-04, ASES-SEC-03, ASES-SEC-05, ASES-SEC-07): `project_config`/`task` go through
     gates.resolve_runner, the ONE place that decides whether this Gate 1 run uses the host or a sandbox runner,
     and whether `task`'s own network exception applies. A sandbox.SandboxInfrastructureError from run_gate is
-    NOT caught here: an infrastructure failure is not a red gate, and the caller decides what it means."""
+    NOT caught here: an infrastructure failure is not a red gate, and the caller decides what it means.
+
+    `project` (round 19, package GIT12; ASES-GIT-12) is passed straight through to gates.run_gate, so the
+    gate_runs row it inserts is stamped with it instead of staying NULL (the bug this package fixes: neither
+    check_branch nor check_branch_for_merge used to pass one at all)."""
     choice = gates_mod.resolve_runner(project_config, task)
     result = gates_mod.run_gate(
-        repo, head, "gate1", gate1_commands, conn=conn, task_key=task_key,
+        repo, head, "gate1", gate1_commands, conn=conn, task_key=task_key, project=project,
         runner=choice.runner, self_contained_checkout=choice.self_contained,
     )
     if not result.passed:

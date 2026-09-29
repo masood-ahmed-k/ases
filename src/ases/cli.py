@@ -1197,17 +1197,22 @@ def _halted_between_passes(conn, plan) -> bool:
         return False
 
 
-def _final_gate_question(conn, summary: dict) -> list[str]:
+def _final_gate_question(conn, summary: dict, project: str) -> list[str]:
     """What the user needs to read when a final gate failed (blueprint 9.3: Gates 4 and 5 must be green on the
     integration HEAD before a project is finished). The controller pauses the project with the question as the
     reason (summary["stop_reason"]); when it did not pass one, the newest failed final gate row is read from
-    gate_runs (bounds.record_final_gate stored its detail redacted, and it is redacted again here)."""
+    gate_runs (bounds.record_final_gate stored its detail redacted, and it is redacted again here).
+
+    `project` (round 19, package GIT12; ASES-GIT-12) scopes the read NULL-tolerantly, the same as gates.
+    last_gate_result: this project's own "__final__" row, or a legacy one with no project recorded, never
+    another project's, since every project's Gates 4/5 share that one pseudo task key."""
     reason = summary.get("stop_reason")
     if isinstance(reason, str) and reason.strip():
         return [events_mod.redact_text(reason.strip())]
     row = conn.execute(
         "SELECT gate, commit_sha, detail FROM gate_runs WHERE task_key = ? AND result = 'fail' "
-        "ORDER BY id DESC LIMIT 1", (bounds_mod.FINAL_TASK_KEY,),
+        "AND (project IS NULL OR project = ?) ORDER BY id DESC LIMIT 1",
+        (bounds_mod.FINAL_TASK_KEY, project),
     ).fetchone()
     if row is None:
         return ["a final gate failed (Gate 4 or Gate 5); swarm status has the details"]
@@ -1360,7 +1365,7 @@ def _run_loop(args: argparse.Namespace) -> int:
         final = summary.get("final")
         if final == "gate_failed":
             _out(f"[pass {number}] FINAL GATE FAILED: the project is paused, not finished.")
-            for text in _final_gate_question(conn, summary):
+            for text in _final_gate_question(conn, summary, plan.project):
                 _out(f"  {text}")
             _out("  Fix the cause on the integration branch (or re-plan), then swarm resume and swarm run to run the "
                  "final gates again. swarm status shows the details.")
