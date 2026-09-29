@@ -1863,10 +1863,88 @@ def park(w, key, reason, *, status="scheduled"):
     w.board.add_event(w.work(key), "scheduled", {"reason": reason})
 
 
-def unpark(w, models=MODELS, *, project=True, budgets=None):
+def unpark(w, models=MODELS, *, project=True, budgets=None, now=None):
     return controller.process_unpark(
         "b", w.plan, models, conn=w.conn, budgets=w.project.budgets if budgets is None else budgets,
-        project=w.project if project else None)
+        project=w.project if project else None, now=now)
+
+
+# The reason recovery parked the real stage C card S1 with (2026-09-28, verbatim from the Hermes board), and that
+# park's real time: 2026-09-28T02:14:12Z.
+S1_QUOTA_REASON = ("The provider's daily quota is used up. Park the card until the next UTC midnight, when the "
+                   "quota resets: retrying sooner only burns requests.")
+S1_PARKED_AT = 1790561652
+SAME_DAY_LATE = datetime(2026, 9, 28, 23, 59, 59, tzinfo=timezone.utc)
+AFTER_RESET = datetime(2026, 9, 29, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def quota_park(w, key, *, created_at=S1_PARKED_AT, reason=S1_QUOTA_REASON):
+    card = w.board.cards[w.work(key)]
+    card["status"] = "scheduled"
+    card["_events"].append(
+        {"kind": "scheduled", "payload": {"reason": reason}, "created_at": created_at, "run_id": None})
+
+
+def test_recoverys_quota_park_reason_is_the_one_process_unpark_recognises():
+    """The two halves of a quota park live in two modules: this pins them together. The wording is also the one
+    already on the real board, so a card parked before round 18 is released too."""
+    decision = recovery.decide(recovery.FailureKind.QUOTA, recovery.Lineage("p", "T1"), bounds.Bounds())
+    assert decision.action == recovery.ACTION_PARK
+    assert decision.reason == S1_QUOTA_REASON
+    assert decision.reason.startswith(recovery.QUOTA_PARK_PREFIX)
+    assert not decision.reason.startswith(controller._PARK_PREFIXES)
+
+
+def test_a_quota_parked_card_waits_for_the_utc_reset_and_is_then_released(tmp_path, monkeypatch):
+    """Round 18, found by the real stage C run: recovery's QUOTA park was never released, so S1 sat parked through
+    the reset for 30 passes. Blueprint table 19.1: "Daily quota exhausted ... park the card until the reset time";
+    the loop's `for card in board.parked_past_reset(): hermes.unblock(card)`."""
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1")
+
+    assert unpark(w, CAPPED_MODELS, now=SAME_DAY_LATE) == []   # the provider said no today: never retry today
+    assert w.board.calls_of("kanban_unblock") == [] and w.board.cards[w.work()]["status"] == "scheduled"
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET) == ["T1"]
+
+    assert w.board.calls_of("kanban_unblock") == [
+        (("b", w.work()), {"reason": "the provider's daily quota has reset"})]
+    assert w.board.cards[w.work()]["status"] == "ready"
+    (event,) = payloads(w.conn, "card_unparked")
+    assert event == {"task_key": "T1", "card_id": w.work()}
+
+
+def test_a_quota_parked_card_past_the_reset_still_waits_while_unaffordable(tmp_path, monkeypatch):
+    """Past the reset the same _affordable_now still decides: a card whose provider the ledger shows spent (here,
+    as if other work used the new day's requests first) is not released."""
+    w = make_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(ledger, "default_now", lambda: AFTER_RESET)
+    ledger.record_usage(w.conn, "openrouter", "coder-m", n=50)
+    quota_park(w, "T1")
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET) == []
+    assert w.board.calls_of("kanban_unblock") == []
+
+
+def test_a_quota_park_with_no_readable_time_is_never_released(tmp_path, monkeypatch):
+    w = make_world(tmp_path, monkeypatch)
+    quota_park(w, "T1", created_at=None)
+    quota_park(w, "T2", created_at="not a time")
+
+    assert unpark(w, CAPPED_MODELS, now=AFTER_RESET) == []
+    assert w.board.calls_of("kanban_unblock") == []
+
+
+def test_quota_reset_passed_is_the_utc_day_boundary():
+    parked = datetime(2026, 9, 28, 2, 14, 12, tzinfo=timezone.utc)
+    assert recovery.quota_reset_passed(parked, SAME_DAY_LATE) is False
+    assert recovery.quota_reset_passed(parked, AFTER_RESET) is True
+    assert recovery.quota_reset_passed(S1_PARKED_AT, "2026-09-29T00:00:01+00:00") is True
+    assert recovery.quota_reset_passed(S1_PARKED_AT, S1_PARKED_AT) is False
+    # A park late in the evening is released a few minutes later, at midnight UTC: that is when the quota resets.
+    assert recovery.quota_reset_passed(datetime(2026, 9, 28, 23, 58, tzinfo=timezone.utc), AFTER_RESET) is True
+    assert recovery.quota_reset_passed(None, AFTER_RESET) is False
+    assert recovery.quota_reset_passed(S1_PARKED_AT, "garbage") is False
 
 
 def test_a_budget_parked_card_is_unparked_once_it_is_affordable_again(tmp_path, monkeypatch):
@@ -2810,8 +2888,10 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
     assert rig.args["bounds"] == (everything, timed)
     assert rig.args["budget"] == (("b", rig.plan, rig.models),
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
+    # Round 18: the pass clock reaches process_unpark too, which a quota park's reset check reads.
     assert rig.args["unpark"] == (("b", rig.plan, rig.models),
-                                  {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project})
+                                  {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project,
+                                   "now": moment})
     assert rig.args["review"] == (("b", "the-repo", rig.plan, rig.project), {"conn": rig.conn})
     assert rig.args["card_base"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
     assert rig.args["provision"] == (("b", rig.plan, rig.project), {"conn": rig.conn})

@@ -408,6 +408,15 @@ ACTIONS = frozenset({
     ACTION_BLOCK_FOR_USER, ACTION_MARK_CREDENTIAL_UNHEALTHY,
 })
 
+# How a quota park's reason starts (decide, FailureKind.QUOTA). controller.process_unpark recognises a card this
+# module parked by exactly this prefix and releases it once quota_reset_passed says the provider's day is over
+# (blueprint table 19.1 "Daily quota exhausted ... park the card until the reset time"; the loop's
+# `for card in board.parked_past_reset(): hermes.unblock(card)`). Round 18: before this, nothing released a quota
+# park at all, because process_unpark only knew the budget gate's own reasons, and the real stage C card S1 stayed
+# parked through the reset. The wording is unchanged from before, so a card parked by an older version is released
+# too.
+QUOTA_PARK_PREFIX = "The provider's daily quota is used up."
+
 INFRA_BACKOFF_BASE_SECONDS = 30
 INFRA_BACKOFF_CAP_SECONDS = 900
 
@@ -530,7 +539,7 @@ def decide(
         ))
     if kind is FailureKind.QUOTA:
         return Decision(ACTION_PARK, (
-            f"The provider's daily quota is used up. Park the card until {provider_reset_text}, when the quota "
+            f"{QUOTA_PARK_PREFIX} Park the card until {provider_reset_text}, when the quota "
             "resets: retrying sooner only burns requests."
         ))
     if kind is FailureKind.INFRASTRUCTURE:
@@ -813,6 +822,19 @@ def _epoch(value) -> float | None:
                 return None
         return number if math.isfinite(number) else None
     return None
+
+
+def quota_reset_passed(parked_at, now=None) -> bool:
+    """True once the UTC day in which a card was quota-parked has ended: decide's QUOTA park says "until the next
+    UTC midnight", the day the ledger counts requests in (ledger.py) is the UTC day, and OpenRouter's free daily
+    quota resets at 00:00 UTC. `parked_at` is the time of the card's `scheduled` event and `now` defaults to the
+    real clock; both take whatever _epoch reads. False when either cannot be read, so a park with no readable time
+    is never released early: the budget-gate half of process_unpark and a person (`hermes kanban unblock`) remain."""
+    parked = _epoch(parked_at)
+    current = time.time() if now is None else _epoch(now)
+    if parked is None or current is None:
+        return False
+    return datetime.fromtimestamp(current, timezone.utc).date() > datetime.fromtimestamp(parked, timezone.utc).date()
 
 
 def _squash(value) -> str:
