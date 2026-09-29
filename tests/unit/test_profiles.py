@@ -141,10 +141,13 @@ def _matching_config(name, *, sandbox_on=False):
         "platform_toolsets": {"cli": list(TOOLSETS[name])},
         "memory": {"memory_enabled": False, "user_profile_enabled": False},
         "model": _model_block(name),
+        "lsp": {"install_strategy": "manual"},
         "worktree_sync": False,
     }
     if name != "reviewer":
         cfg["providers"] = {"xkiro": {"base_url": XKIRO_URL, "key_env": "XKIRO_API_KEY"}}
+    else:
+        cfg["provider_routing"] = {"data_collection": "deny"}  # reviewer is the only MODELS row on openrouter
     if sandbox_on and "terminal" in TOOLSETS[name]:
         cfg["terminal"] = sandbox.terminal_block(POLICY)
     return cfg
@@ -340,6 +343,26 @@ def test_the_reviewers_write_capable_file_toolset_is_reported_not_hidden():
     risks = " ".join(profiles.residual_risks())
     assert "write_file" in risks and "read-only" in risks and "Reviewer" in risks
     assert profiles.residual_risks() == list(profiles.RESIDUAL_RISKS)
+
+
+def test_the_reviewer_file_risk_says_a_hook_denies_write_tools_and_names_what_still_remains():
+    # REVIEWER.md (round 19): a pre_tool_call shell hook CAN veto a single tool, so the old claim that Hermes
+    # cannot deny write_file/patch to the reviewer is wrong; this only checks the text, the REVIEWLADDER package
+    # wires the hook itself.
+    risk = profiles.RESIDUAL_RISKS[0]
+    assert "hook" in risk and "denies" in risk
+    assert "HERMES_SAFE_MODE" in risk  # what still remains: the hook fails open under it
+    assert "write_file" in risk and "patch" in risk and "schema" in risk  # the tool schema itself stays visible
+    assert "cannot deny" not in risk.lower()
+
+
+def test_the_reviewer_file_risk_names_both_fail_open_paths_for_the_hook():
+    # REVIEWER.md finding 3: the hook fails open two ways, not one -- HERMES_SAFE_MODE (shell_hooks.py:147-149)
+    # AND Hermes's own hook dispatcher raising (model_tools.py:779-780). Round-1 text only named the first.
+    risk = profiles.RESIDUAL_RISKS[0]
+    assert "HERMES_SAFE_MODE" in risk
+    assert "model_tools.py:779-780" in risk and "raises" in risk
+    assert "shell_hooks.py:147-149" in risk
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -681,15 +704,16 @@ def test_plan_init_on_an_empty_home_creates_every_active_profile_and_no_inactive
         ("set_config", "memory.memory_enabled"), ("set_config", "memory.user_profile_enabled"),
         ("set_config", "model.default"), ("set_config", "providers.xkiro.base_url"),
         ("set_config", "providers.xkiro.key_env"), ("set_config", "model.provider"), ("set_config", "model.base_url"),
-        ("set_config", "worktree_sync"), ("warning", ".env"),
+        ("set_config", "lsp.install_strategy"), ("set_config", "worktree_sync"), ("warning", ".env"),
     }
     for name in ("lead", "coder-1"):
         assert set(_kinds(plan, name)) == {(k, t.format(n=name)) for k, t in expected_xkiro}
     assert set(_kinds(plan, "reviewer")) == {
         ("create_profile", "profiles/reviewer"), ("write_soul", "SOUL.md"), ("set_config", "platform_toolsets.cli"),
         ("set_config", "memory.memory_enabled"), ("set_config", "memory.user_profile_enabled"),
-        ("set_config", "model.default"), ("set_config", "model.provider"), ("set_config", "worktree_sync"),
-        ("warning", ".env"),
+        ("set_config", "model.default"), ("set_config", "model.provider"),
+        ("set_config", "lsp.install_strategy"), ("set_config", "provider_routing.data_collection"),
+        ("set_config", "worktree_sync"), ("warning", ".env"),
     }
     creates = [c for c in plan if c.kind == "create_profile"]
     assert [c.profile for c in creates] == ["lead", "coder-1", "reviewer"]
@@ -819,6 +843,61 @@ def test_plan_init_worktree_sync_on_or_unset_is_a_row(tmp_path):
     assert [(c.profile, c.target, c.before, c.after) for c in rows] == [
         ("coder-1", "worktree_sync", True, False), ("reviewer", "worktree_sync", None, False),
     ]
+
+
+def test_plan_init_lsp_install_strategy_is_a_row_for_every_profile_when_unset_or_auto(tmp_path):
+    # ASES-DOC-04 (section 16 STOP CONDITION, category 4): Hermes auto-installs a missing language server.
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    for name, value in (("lead", None), ("coder-1", "auto"), ("reviewer", "AUTO")):
+        cfg = _matching_config(name)
+        if value is None:
+            del cfg["lsp"]
+        else:
+            cfg["lsp"]["install_strategy"] = value
+        _write_profile(home, name, cfg=cfg)
+    rows = {
+        c.profile: c for c in profiles.pending(profiles.plan_init(project, MODELS, home, PROMPTS_DIR))
+        if c.target == "lsp.install_strategy"
+    }
+    assert set(rows) == {"lead", "coder-1", "reviewer"}  # every ASES profile, not only the reviewer
+    assert (rows["lead"].before, rows["lead"].after) == (None, "manual")
+    assert (rows["coder-1"].before, rows["coder-1"].after) == ("auto", "manual")
+    assert (rows["reviewer"].before, rows["reviewer"].after) == ("AUTO", "manual")
+
+
+def test_plan_init_lsp_install_strategy_already_manual_or_off_is_not_a_row(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("coder-1")
+    cfg["lsp"]["install_strategy"] = "off"  # Hermes's own alias for manual: already safe, never rewritten
+    _write_profile(home, "coder-1", cfg=cfg)
+    assert profiles.pending(profiles.plan_init(project, MODELS, home, PROMPTS_DIR)) == []
+
+
+def test_plan_init_provider_routing_deny_is_a_row_only_for_the_openrouter_profile(tmp_path):
+    # ASES-PRV-04: lead and coder-1 are pinned to xkiro (openai_compatible) in MODELS and must be untouched.
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("reviewer")
+    del cfg["provider_routing"]
+    _write_profile(home, "reviewer", cfg=cfg)
+    rows = profiles.pending(profiles.plan_init(project, MODELS, home, PROMPTS_DIR))
+    routing = {c.profile: c for c in rows if c.target == "provider_routing.data_collection"}
+    assert set(routing) == {"reviewer"}
+    assert (routing["reviewer"].before, routing["reviewer"].after) == (None, "deny")
+
+
+def test_plan_init_provider_routing_deny_replaces_an_allow_value(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("reviewer")
+    cfg["provider_routing"] = {"data_collection": "allow"}
+    _write_profile(home, "reviewer", cfg=cfg)
+    rows = profiles.pending(profiles.plan_init(project, MODELS, home, PROMPTS_DIR))
+    routing = {c.profile: c for c in rows if c.target == "provider_routing.data_collection"}
+    assert set(routing) == {"reviewer"}
+    assert (routing["reviewer"].before, routing["reviewer"].after) == ("allow", "deny")
 
 
 def test_plan_init_wrong_model_and_provider_are_rows_for_a_hermes_native_provider(tmp_path):
@@ -1119,7 +1198,7 @@ def test_apply_init_creates_missing_profiles_through_the_runner_with_the_exact_a
     assert result.ok and not result.failed
     expected = {s.name: s.description for s in profiles.desired_profiles(project, MODELS)}
     assert runner.calls == [
-        ["hermes-test", "profile", "create", name, "--description", expected[name]] for name in ACTIVE
+        ["hermes-test", "profile", "create", name, "--no-alias", "--description", expected[name]] for name in ACTIVE
     ]
     assert all("--clone" not in " ".join(call) and "--clone-all" not in call for call in runner.calls)
     for name in ACTIVE:
@@ -1668,6 +1747,42 @@ def test_verify_state_a_router_model_for_the_lead_or_reviewer(tmp_path):
         assert profiles._is_router_model(bad)
 
 
+def test_verify_state_lsp_install_strategy_not_manual_or_off(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("coder-1")
+    cfg["lsp"]["install_strategy"] = "auto"
+    _write_profile(home, "coder-1", cfg=cfg)
+    assert _has(_verify(project, home), "profile coder-1 has lsp.install_strategy", "auto", "ASES-DOC-04")
+    cfg2 = _matching_config("lead")
+    del cfg2["lsp"]
+    _write_profile(home, "lead", cfg=cfg2)
+    assert _has(_verify(project, home), "profile lead has lsp.install_strategy unset", "ASES-DOC-04")
+
+
+def test_verify_state_lsp_manual_or_off_is_silent(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("coder-1")
+    cfg["lsp"]["install_strategy"] = "off"
+    _write_profile(home, "coder-1", cfg=cfg)
+    assert _verify(project, home) == []
+
+
+def test_verify_state_openrouter_provider_routing_not_deny(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("reviewer")
+    del cfg["provider_routing"]
+    _write_profile(home, "reviewer", cfg=cfg)
+    assert _has(
+        _verify(project, home), "profile reviewer", "provider_routing.data_collection", "not", "deny", "ASES-PRV-04",
+    )
+    # lead and coder-1 are pinned to xkiro, not openrouter: never flagged
+    assert not _has(_verify(project, home), "profile lead", "provider_routing")
+    assert not _has(_verify(project, home), "profile coder-1", "provider_routing")
+
+
 def test_verify_state_the_lead_and_reviewer_must_differ_in_provider_and_family(tmp_path):
     project = _project(tmp_path)
     home = _matching_home(tmp_path, project)
@@ -1916,7 +2031,21 @@ def test_apply_init_a_bare_create_change_still_gets_a_description(tmp_path):
     runner = FakeHermes(home)
     bare = [Change("lead", "create_profile", "profiles/lead")]
     profiles.apply_init(bare, home, PROMPTS_DIR, confirmed=True, runner=runner)
-    assert runner.calls == [["hermes-test", "profile", "create", "lead", "--description", "ASES profile lead"]]
+    assert runner.calls == [
+        ["hermes-test", "profile", "create", "lead", "--no-alias", "--description", "ASES profile lead"]
+    ]
+
+
+def test_apply_init_always_passes_no_alias_to_hermes_profile_create(tmp_path):
+    # ASES-DOC-04, research item 5: without --no-alias Hermes writes a wrapper script into ~/.local/bin, guarded
+    # only by a PATH lookup, so an existing file that is not on PATH would be silently overwritten.
+    home = _home(tmp_path)
+    runner = FakeHermes(home)
+    change = Change("lead", "create_profile", "profiles/lead", None, "a lead profile", "why")
+    profiles.apply_init([change], home, PROMPTS_DIR, confirmed=True, runner=runner)
+    assert runner.calls == [
+        ["hermes-test", "profile", "create", "lead", "--no-alias", "--description", "a lead profile"]
+    ]
 
 
 def test_verify_state_a_boolean_where_the_per_profile_cap_should_be_a_number(tmp_path):
@@ -1958,6 +2087,7 @@ def test_plan_init_orders_the_rows_of_a_profile_and_of_the_global_config_in_a_fi
         ("set_config", "memory.memory_enabled"), ("set_config", "memory.user_profile_enabled"),
         ("set_config", "model.default"), ("set_config", "providers.xkiro.base_url"),
         ("set_config", "providers.xkiro.key_env"), ("set_config", "model.provider"), ("set_config", "model.base_url"),
+        ("set_config", "lsp.install_strategy"),
         ("set_config", "worktree_sync"), *[("set_config", f"terminal.{key}") for key in sandbox.terminal_block(POLICY)],
         ("warning", ".env"),
     ]

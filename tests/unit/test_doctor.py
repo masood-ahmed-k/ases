@@ -301,6 +301,82 @@ def test_reviewer_diversity_passes_when_different_provider(tmp_path, monkeypatch
     assert by_name["reviewer_diversity"].status == "pass"
 
 
+def test_lsp_installed_passes_when_no_profile_has_a_populated_lsp_directory(tmp_path):
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    (project.hermes_native_home / "profiles" / "reviewer" / "lsp").mkdir(parents=True)  # exists but empty
+    check = doctor._check_lsp_installed(project)
+    assert check.status == "pass"
+
+
+def test_lsp_installed_warns_and_names_what_exists_without_removing_it(tmp_path):
+    # ASES-DOC-04 (section 16 STOP CONDITION, category 4): Hermes already auto-installed pyright before swarm
+    # init ever set install_strategy to manual (round 19, STOPDOC.md topic A item 1); removal stays a person's
+    # decision, so this only WARNs and names it, never deletes it.
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    lsp_dir = project.hermes_native_home / "profiles" / "coder-1" / "lsp"
+    lsp_dir.mkdir(parents=True)
+    (lsp_dir / "package.json").write_text('{"dependencies": {"pyright": "^1.1.414"}}', encoding="utf-8")
+    before = sorted(p.name for p in lsp_dir.rglob("*"))
+
+    check = doctor._check_lsp_installed(project)
+
+    assert check.status == "warn"
+    assert "coder-1" in check.detail and "pyright" in check.detail
+    assert "never removes" in check.detail and "person's decision" in check.detail  # named, not fixed
+    assert sorted(p.name for p in lsp_dir.rglob("*")) == before  # nothing was touched, let alone deleted
+    assert check.requirement_ids == ("ASES-DOC-04",)
+
+
+def test_lsp_installed_is_wired_into_the_full_report_as_a_warn_not_a_fail(tmp_path, monkeypatch):
+    monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
+    monkeypatch.setattr(hermes, "run_doctor", lambda **_: hermes.DoctorResult(True, 0, "", (), ()))
+    monkeypatch.setattr(hermes, "gateway_status", lambda **_: hermes.GatewayStatus(False, ""))
+    project = _project(tmp_path)
+    _make_profile(project.hermes_native_home, "lead", "unorouter", "glm-5.3-thinking:free")
+    _make_profile(project.hermes_native_home, "coder-1", "unorouter", "qwen3.8-27b:free")
+    _make_profile(project.hermes_native_home, "reviewer", "openrouter", "cohere/north-mini-code:free")
+    lsp_dir = project.hermes_native_home / "profiles" / "reviewer" / "lsp"
+    lsp_dir.mkdir(parents=True)
+    (lsp_dir / "package.json").write_text('{"dependencies": {"pyright": "^1.1.414"}}', encoding="utf-8")
+    conn = db.connect(config.db_path(project))
+    models.sync_from_config(conn, MODELS_CONFIG)
+
+    report = doctor.run(project, MODELS_CONFIG, conn)
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["lsp_install"].status == "warn"
+    assert report.ok is True  # a WARN row never fails the run (matches doctor.DoctorReport.ok)
+
+
+def test_lsp_install_summary_names_the_directory_unreadable_instead_of_raising(tmp_path, monkeypatch):
+    # _lsp_install_summary's own contract: "Never raises: an unreadable ... package.json falls back to the
+    # entry names." This covers the unreadable-directory half (an OSError from iterdir itself, e.g. a
+    # permissions error), which no doctor test exercised.
+    lsp_dir = tmp_path / "lsp"
+    lsp_dir.mkdir()
+
+    def _raise(self):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", _raise)
+    assert doctor._lsp_install_summary(lsp_dir) == "(could not be listed)"
+
+
+def test_lsp_install_summary_falls_back_to_entry_names_when_package_json_is_invalid(tmp_path):
+    # The other half of the same contract: malformed package.json falls back to the directory's own entry
+    # names instead of raising or silently reporting nothing.
+    lsp_dir = tmp_path / "lsp"
+    lsp_dir.mkdir()
+    (lsp_dir / "package.json").write_text("{not valid json", encoding="utf-8")
+    (lsp_dir / "pyright").mkdir()
+    assert doctor._lsp_install_summary(lsp_dir) == "package.json, pyright"
+
+
 def test_report_fails_when_hermes_doctor_is_unhealthy(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes, "hermes_version", lambda: "0.21.3")
     monkeypatch.setattr(

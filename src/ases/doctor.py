@@ -427,6 +427,7 @@ _PROFILE_IDS = ("ASES-ROL-02", "ASES-ROL-07", "ASES-ARC-08")
 # The roles that are not workers when profiles.desired_profiles cannot say: the lead plans and the reviewer only
 # has the Kanban verdict tools and read access (ASES-ROL-05), so neither runs a worker's shell.
 _NON_WORKER_ROLES = ("lead", "reviewer")
+_LSP_IDS = ("ASES-DOC-04",)
 
 
 def _takes(func, name: str) -> bool:
@@ -865,6 +866,57 @@ def _check_reviewer_diversity(project: ases_config.ProjectConfig) -> DoctorCheck
     )
 
 
+def _lsp_install_summary(lsp_dir: pathlib.Path) -> str:
+    """What a profile's lsp/ directory already holds, for a WARN row that names it without reading anything
+    sensitive: package.json's own dependency names (the npm recipe Hermes's installer uses, agent/lsp/install.py),
+    else the directory's own entry names. Never raises: an unreadable or malformed package.json falls back to the
+    entry names."""
+    try:
+        entries = sorted(p.name for p in lsp_dir.iterdir())
+    except OSError:
+        return "(could not be listed)"
+    package_json = lsp_dir / "package.json"
+    if package_json.is_file():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        deps = data.get("dependencies") if isinstance(data, dict) else None
+        if isinstance(deps, dict) and deps:
+            return ", ".join(sorted(str(k) for k in deps)) + " (from lsp/package.json)"
+    return ", ".join(entries) if entries else "(empty)"
+
+
+def _check_lsp_installed(project: ases_config.ProjectConfig) -> DoctorCheck:
+    """ASES-DOC-04 (section 16 STOP CONDITION, category 4): Hermes's own lsp.install_strategy default ("auto")
+    may already have put language-server files on disk for a profile before swarm init ever set
+    install_strategy to "manual" (round 19, package PROFILEGUARDS; a real example: pyright auto-installed into
+    coder-1 and reviewer, STOPDOC.md topic A item 1). Removing an already-installed server is a deletion this
+    module never performs on its own: a WARN names what a profile's lsp/ directory already holds, so a person can
+    decide whether to keep or remove it. A profile with no lsp/ directory, or an empty one, is silently fine."""
+    profiles_root = project.hermes_native_home / "profiles"
+    found: list[str] = []
+    for profile in sorted({str(name) for name in (getattr(project, "roles", None) or {}).values() if name}):
+        lsp_dir = profiles_root / profile / "lsp"
+        try:
+            populated = lsp_dir.is_dir() and any(lsp_dir.iterdir())
+        except OSError:
+            continue
+        if populated:
+            found.append(f"{profile}: {_lsp_install_summary(lsp_dir)}")
+    if not found:
+        return DoctorCheck(
+            "lsp_install", "pass",
+            "no ASES profile has a populated lsp/ directory (nothing Hermes auto-installed there)", _LSP_IDS,
+        )
+    return DoctorCheck(
+        "lsp_install", "warn",
+        "Hermes already installed language-server files (lsp.install_strategy defaults to 'auto'); swarm init "
+        "never removes them, that stays a person's decision: " + "; ".join(found),
+        _LSP_IDS,
+    )
+
+
 def _check_limits_table(models_config: dict) -> DoctorCheck:
     """ASES-CAP-01 / ASES-VER-01 (5.3, Appendix E): "swarm doctor MUST display the value it is using, the
     source URL and the checked date." The value and date were already shown; this also shows `source` (a
@@ -1020,6 +1072,7 @@ def run(project: ases_config.ProjectConfig, models_config: dict, conn, *, repo: 
         *_check_model_registry(conn, models_config),
         _check_role_profiles(project),
         _check_reviewer_diversity(project),
+        _check_lsp_installed(project),
         *([profiles_unavailable] if profiles_unavailable is not None
           else _check_profile_state(project, models_config, profiles_mod)),
         *(_check_residual_risks(profiles_mod) if profiles_unavailable is None else []),
