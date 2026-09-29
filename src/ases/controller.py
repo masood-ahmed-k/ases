@@ -1348,6 +1348,22 @@ def _as_datetime(now):
     raise ValueError(f"now must be a datetime, epoch seconds or an ISO 8601 string, got {now!r}")
 
 
+def _as_epoch(now) -> float | None:
+    """`now` as epoch seconds, for usage.py's session-as-unit functions (round 19, package LEDGER), which compare
+    it directly against run_started_at/run_ended_at and a session's own timestamps: converted through
+    `_as_datetime` (so the same datetime/epoch-seconds/ISO-8601 shapes run_pass already accepts all work here
+    too), None as None (usage.py then uses the real wall clock, like every other now= in this module). A naive
+    (tzinfo-less) result is normalized to UTC before `.timestamp()` runs, the same way recovery.py's own
+    `_epoch` already does: Python reads a naive datetime's `.timestamp()` in the process's LOCAL timezone, not
+    UTC, though `_as_datetime`'s own docstring says naive means UTC (round 19 fix round 2, reviewer major)."""
+    converted = _as_datetime(now)
+    if converted is None:
+        return None
+    if converted.tzinfo is None:
+        converted = converted.replace(tzinfo=timezone.utc)
+    return converted.timestamp()
+
+
 def _pause_reason(conn, project_name: str) -> str | None:
     """Why a paused project is paused: the reason of the newest `project_paused` event (pause_and_report records it).
     Since round 9 (PAUSEREASON) bounds.set_status also keeps a paused project's reason in project_state.stop_reason;
@@ -2461,10 +2477,20 @@ def run_pass(
 
     # Real usage into the ledger first (ASES-CAP-03), as the blueprint's loop does: the budget gate below is
     # only as honest as the ledger it reads. A failure here (one unreadable card, a Hermes hiccup) costs a
-    # stale ledger for one pass, not the pass.
+    # stale ledger for one pass, not the pass. Round 19 (package LEDGER): the session-as-unit ingest is three
+    # calls in this one step, in order -- ingest_run_usage (this plan's own current cards), resolve_open_runs
+    # (a card process_merge_queue already replaced, whose still-open runs ingest_run_usage will never look at
+    # again), then settle_open_sessions (every not-yet-settled row, regardless of plan_tasks, so it also tops up
+    # the outgoing sessions resolve_open_runs just finished) -- so one Hermes hiccup anywhere in the three is one
+    # usage_ingest_error, not a stale ledger that silently skips settling.
+    epoch_now = _as_epoch(now)
+
     def ingest() -> list:
         try:
-            return usage_mod.ingest_run_usage(board, plan, project, models_config, conn=conn)
+            ingested = usage_mod.ingest_run_usage(board, plan, project, models_config, conn=conn, now=epoch_now)
+            resolved = usage_mod.resolve_open_runs(board, project, models_config, conn=conn, now=epoch_now)
+            settled = usage_mod.settle_open_sessions(project, models_config, conn=conn, now=epoch_now)
+            return [*ingested, *resolved, *settled]
         except Exception as exc:  # noqa: BLE001 - recorded under its own name, then by _isolated as a step error
             events.record(
                 conn, "usage_ingest_error", {"error": f"{type(exc).__name__}: {exc}"[:300]}, project=plan.project,

@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 
 # The environment every hermes subprocess starts with (ASES-CFG-05). Re-exported for the modules that start hermes
 # themselves with `hermes_mod` already in hand (cli, critic, profiles). It is DEFINED in procenv, not here, on purpose:
@@ -401,19 +402,158 @@ def resume(timeout: int = 20) -> None:
         raise HermesCommandError(["resume"], result.returncode, result.stdout + result.stderr)
 
 
+def _utc_iso(ts: float | int) -> str:
+    """An epoch timestamp as the naive-UTC ISO string `hermes sessions export --after/--before` needs: Hermes reads a
+    naive ISO time as LOCAL time (hermes_cli/session_filters.py:34-52), so a caller on any machine must pass an
+    explicit `+00:00` offset rather than a bare `YYYY-MM-DDTHH:MM:SS`, or the filter would be read against the
+    wrong clock. `timespec="seconds"` matches the CLI's own examples (no sub-second precision on the boundary)."""
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
+
+
+def _first_prompt(messages) -> str | None:
+    """The text of the first message with role "user" in a Hermes session export's own "messages" list (kept only
+    long enough to compute this: neither `session_usage` nor `kanban_sessions` returns "messages" to their
+    caller, per this module's "never keeps messages or system_prompt" contract for session data). A string
+    `content` is used as-is; a list `content` (the multipart shape a tool-using turn can have) is the joined text
+    of its "text"-typed parts, an image or other part contributing nothing. None when there is no user message, or
+    its content is neither shape."""
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                part["text"] for part in content
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+            ]
+            return "".join(parts) if parts else None
+        return None
+    return None
+
+
+def _count(value) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _summary(session: dict) -> dict:
+    """One Hermes session-export JSON object (hermes_state_sessions.py's `s.*` row, plus "messages" and timings,
+    per hermes_state_portability.py:279-286), reduced to the fields `kanban_sessions` and `session_usage` share:
+    id, source, started_at, ended_at, last_activity_at, end_reason, model, billing_provider, api_call_count,
+    input_tokens, output_tokens, parent_session_id, first_prompt. `first_prompt` is derived here (see
+    `_first_prompt`); "messages" and "system_prompt" are never in the result. api_call_count/input_tokens/
+    output_tokens are ints, never negative, defaulting to 0 when missing or unreadable; model/source/end_reason/
+    billing_provider default to "" when missing; every other field is passed through as Hermes reported it."""
+    return {
+        "id": session.get("id"),
+        "source": str(session.get("source") or ""),
+        "started_at": session.get("started_at"),
+        "ended_at": session.get("ended_at"),
+        "last_activity_at": session.get("last_activity_at"),
+        "end_reason": str(session.get("end_reason") or ""),
+        "model": str(session.get("model") or ""),
+        "billing_provider": str(session.get("billing_provider") or ""),
+        "api_call_count": _count(session.get("api_call_count")),
+        "input_tokens": _count(session.get("input_tokens")),
+        "output_tokens": _count(session.get("output_tokens")),
+        "parent_session_id": session.get("parent_session_id"),
+        "first_prompt": _first_prompt(session.get("messages")),
+    }
+
+
+def kanban_sessions(
+    profile: str, started_after: int, started_before: int | None = None, timeout: int = 120,
+) -> list[dict] | None:
+    """Every KANBAN worker session that started in `[started_after, started_before)` UTC, on this profile's own
+    session store (ASES-CAP-02, r19 LEDGER.md section A.1): the window-matching path usage.py falls back to when
+    a run's metadata never got its worker_session_id stamped (kanban_block, kanban_request_changes, a crash, or a
+    dispatcher timeout/reclaim never call `_stamp_worker_session_metadata`, hermes tools/kanban_tools.py:179-182,
+    581, 672, 627-655, 704-714).
+
+    Runs `hermes -p <profile> sessions export --source kanban --after <UTC ISO> [--before <UTC ISO>] --format
+    jsonl --redact -`. Any filter flag switches Hermes to `list_prune_candidates` (hermes_cli/sessions_cmd.py:
+    317-348), which returns ONLY ended, unpinned sessions (hermes_state_maintenance.py:187, 199) and includes
+    archived ones; `--after` is `started_at >=` and `--before` is `started_at <` (hermes_state_maintenance.py:
+    54-55). `_utc_iso` never emits a naive timestamp, which Hermes would otherwise read as local time
+    (hermes_cli/session_filters.py:34-52).
+
+    Returns a list of `_summary` dicts (never "messages" or "system_prompt"), `[]` for empty stdout (no sessions
+    in the window), or None -- unknown, write nothing -- when hermes is missing, the call times out or raises
+    OSError, the exit code is non-zero, or any non-empty stdout line does not parse as a JSON object (Hermes
+    prints a bad filter as "Error: ..." on stdout with exit 0, hermes_cli/sessions_cmd.py:320-325, which is
+    exactly such a line)."""
+    args = ["-p", profile, "sessions", "export", "--source", "kanban", "--after", _utc_iso(started_after)]
+    if started_before:
+        args += ["--before", _utc_iso(started_before)]
+    args += ["--format", "jsonl", "--redact", "-"]
+    try:
+        result = _run(args, timeout=timeout)
+    except (HermesNotFound, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    sessions: list[dict] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        sessions.append(_summary(parsed))
+    return sessions
+
+
+def kanban_session_ids(profile: str, limit: int = 100, timeout: int = 60) -> list[str] | None:
+    """The session ids `hermes -p <profile> sessions list --source kanban --limit <limit>` prints, oldest to
+    newest as Hermes lists them: the fallback for a worker that was killed hard, whose session never ends and so
+    never appears in `kanban_sessions`'s export (r19 LEDGER.md section A.3). `sessions list` has no --json
+    (hermes_cli/subcommands/sessions.py:22-27), so this reads the CLI's own text table, whose last column is the
+    id (hermes_cli/sessions_cmd.py:262-313); `re.search(r"(\\d{8}_\\d{6}_[0-9a-f]{6})\\s*$", line)` takes it, which
+    also skips the header row and a line whose id trailer was truncated (that shape never matches the pattern
+    anchored to the end of the line).
+
+    Returns the matched ids, or None -- never raises -- when hermes is missing, the call times out or raises
+    OSError, or the exit code is non-zero. Includes open sessions (this command has no ended-only filter)."""
+    args = ["-p", profile, "sessions", "list", "--source", "kanban", "--limit", str(limit)]
+    try:
+        result = _run(args, timeout=timeout)
+    except (HermesNotFound, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    ids = []
+    for line in result.stdout.splitlines():
+        match = re.search(r"(\d{8}_\d{6}_[0-9a-f]{6})\s*$", line)
+        if match:
+            ids.append(match.group(1))
+    return ids
+
+
 def session_usage(profile: str, session_id: str, timeout: int = 60) -> dict | None:
     """What one Hermes worker session cost, read from `hermes -p <profile> sessions export` (ASES-CAP-03).
 
     Checked against real Hermes 0.21.3 on 2026-09-19: the export prints ONE JSON object per session on one
     line, and that object also carries the whole conversation under "messages", which is never returned here.
     "api_call_count" is the number of model API calls the session made, which is what counts against a
-    provider's daily quota.
+    provider's daily quota. Works for a still-open session (`--session-id` resolves and exports it even while
+    open, hermes_cli/sessions_cmd.py:335-343, unlike the ended-only filter path `kanban_sessions` uses).
 
-    Returns {"id", "model", "api_call_count", "input_tokens", "output_tokens"} with the numbers as ints (a
-    missing or unreadable number is 0, a missing model is ""). Returns None, and never raises, when the
-    command cannot run, exits non-zero, times out, or prints no parseable JSON line for exactly this session
-    id. None means "unknown, ask again later" and never "zero requests": a caller must record nothing for a
-    session it got None for."""
+    Returns a `_summary` dict minus "source" and "end_reason" (round 19, package LEDGER: those two are read only
+    from `kanban_sessions`, since every caller of `session_usage` already knows which session and card it asked
+    about): id, model, api_call_count, input_tokens, output_tokens, started_at, ended_at, last_activity_at,
+    first_prompt, billing_provider, parent_session_id. Returns None, and never raises, when the command cannot
+    run, exits non-zero, times out, or prints no parseable JSON line for exactly this session id. None means
+    "unknown, ask again later" and never "zero requests": a caller must record nothing for a session it got None
+    for."""
     args = ["-p", profile, "sessions", "export", "--session-id", session_id, "--format", "jsonl", "--redact", "-"]
     try:
         result = _run(args, timeout=timeout)
@@ -422,23 +562,13 @@ def session_usage(profile: str, session_id: str, timeout: int = 60) -> dict | No
     if result.returncode != 0:
         return None
 
-    def count(value) -> int:
-        try:
-            return max(int(value or 0), 0)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
     for line in result.stdout.splitlines():
         try:
             session = json.loads(line)
         except ValueError:
             continue
         if isinstance(session, dict) and session.get("id") == session_id:
-            return {
-                "id": session_id,
-                "model": str(session.get("model") or ""),
-                "api_call_count": count(session.get("api_call_count")),
-                "input_tokens": count(session.get("input_tokens")),
-                "output_tokens": count(session.get("output_tokens")),
-            }
+            summary = _summary(session)
+            del summary["source"], summary["end_reason"]
+            return summary
     return None

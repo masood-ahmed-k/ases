@@ -1678,6 +1678,72 @@ def test_session_usage_reports_set_numbers_a_default_for_real_sessions_and_none_
 
 
 # ---------------------------------------------------------------------------------------------
+# add_session, kanban_sessions, kanban_session_ids (r19 LEDGER.md, ASES-CAP-02): the window and list-fallback
+# discovery calls a real worker's session never gets from a plain worker_session_id run.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_kanban_sessions_returns_only_ended_sessions_of_this_profile_in_the_window():
+    fake = new_fake()
+    fake.add_session("reviewer", "s_ended_in", card_id="t_1", started_at=100, ended_at=110, api_call_count=5)
+    fake.add_session("reviewer", "s_ended_before_window", card_id="t_1", started_at=50, ended_at=60, api_call_count=1)
+    fake.add_session("reviewer", "s_still_open", card_id="t_1", started_at=105, ended_at=None, api_call_count=2)
+    fake.add_session("coder-1", "s_other_profile", card_id="t_1", started_at=105, ended_at=115, api_call_count=3)
+
+    result = fake.kanban_sessions("reviewer", 90)
+
+    assert [s["id"] for s in result] == ["s_ended_in"]
+    assert result[0]["api_call_count"] == 5
+    assert result[0]["first_prompt"] == "work kanban task t_1"
+
+
+def test_kanban_sessions_before_excludes_a_session_started_at_or_after_it():
+    fake = new_fake()
+    fake.add_session("reviewer", "s_in", card_id="t_1", started_at=100, ended_at=101)
+    fake.add_session("reviewer", "s_at_before", card_id="t_1", started_at=200, ended_at=201)
+
+    result = fake.kanban_sessions("reviewer", 90, started_before=200)
+
+    assert [s["id"] for s in result] == ["s_in"]
+
+
+def test_kanban_sessions_results_are_ordered_by_start_and_never_include_messages():
+    fake = new_fake()
+    fake.add_session("reviewer", "s_later", card_id="t_1", started_at=200, ended_at=210)
+    fake.add_session("reviewer", "s_earlier", card_id="t_1", started_at=100, ended_at=110)
+
+    result = fake.kanban_sessions("reviewer", 0)
+
+    assert [s["id"] for s in result] == ["s_earlier", "s_later"]
+    for s in result:
+        assert "messages" not in s and "system_prompt" not in s
+
+
+def test_kanban_session_ids_includes_open_sessions_ordered_by_start_and_respects_limit():
+    fake = new_fake()
+    fake.add_session("reviewer", "s_open", card_id="t_1", started_at=50, ended_at=None)
+    fake.add_session("reviewer", "s_ended", card_id="t_1", started_at=10, ended_at=20)
+    fake.add_session("coder-1", "s_other_profile", card_id="t_1", started_at=5, ended_at=6)
+
+    assert fake.kanban_session_ids("reviewer") == ["s_ended", "s_open"]
+    assert fake.kanban_session_ids("reviewer", limit=1) == ["s_ended"]
+
+
+def test_session_usage_finds_an_added_session_whether_open_or_ended():
+    fake = new_fake()
+    fake.add_session("reviewer", "s_open", card_id="t_1", started_at=50, ended_at=None, api_call_count=17)
+
+    result = fake.session_usage("reviewer", "s_open")
+
+    assert result["api_call_count"] == 17 and result["ended_at"] is None and result["started_at"] == 50
+    assert "source" not in result and "end_reason" not in result
+
+    fake.add_session("reviewer", "s_open", card_id="t_1", started_at=50, ended_at=60, api_call_count=22)
+
+    assert fake.session_usage("reviewer", "s_open")["ended_at"] == 60
+
+
+# ---------------------------------------------------------------------------------------------
 # Scripted workers: steps
 # ---------------------------------------------------------------------------------------------
 

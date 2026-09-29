@@ -1,9 +1,14 @@
-"""usage.py: real request usage into the request ledger, and the review reserve (ASES-CAP-03).
+"""usage.py: real request usage into the request ledger, and the review reserve (ASES-CAP-02, ASES-CAP-03).
 
 hermes.kanban_show and hermes.session_usage are faked and the database is a temp sqlite file, so nothing here
-touches a real board, a real session or a provider."""
+touches a real board, a real session or a provider. Round 19, package LEDGER: hermes.kanban_sessions and
+hermes.kanban_session_ids are faked too (an autouse fixture defaults both to "nothing found", so a legacy-style
+test that never mentions them still cannot reach a real `hermes` process; a window-path or list-fallback test
+overrides one or both of its own accord)."""
+import itertools
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
@@ -47,10 +52,37 @@ PLAN = plan_mod.parse_and_validate({
 
 _DEFAULT = object()
 
+# The shared fixture clock (round 19, package LEDGER): every `_run()` below ends at 1789832491 (2026-09-19 UTC)
+# unless told otherwise, and every `_ingest*` call in this file passes `now=LEGACY_NOW`, nine seconds later, so
+# the new session-as-unit machinery (window path, missing-session and settle timers, all compared against
+# `now`) never fires early just because the suite happens to run on some other real-world day: MISSING_AFTER
+# (900s) and SETTLE_AFTER (600s) both dwarf that nine-second gap. `_pinned_clock` below points ledger's own
+# "today" (default_now) at the same moment, so a test's `ledger.usage_today_for_provider(...)` (which never
+# passes its own `now=`) reads the SAME UTC day this module's charge_time falls back to when a fixture's export
+# (the pre-round-19 shape `_export()` still builds) carries no ended_at/last_activity_at of its own.
+LEGACY_NOW = 1789832500.0
+
 
 @pytest.fixture
 def conn(tmp_path):
     return db.connect(tmp_path / "ases.db")
+
+
+@pytest.fixture(autouse=True)
+def _pinned_clock(monkeypatch):
+    monkeypatch.setattr(ledger, "default_now", lambda: datetime.fromtimestamp(LEGACY_NOW, tz=timezone.utc))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_hermes_window_calls(monkeypatch):
+    """Every test drives ingest through fakes only. kanban_sessions/kanban_session_ids must never reach a real
+    `hermes` process: a test that cares about the window path or the list fallback overrides one or both of
+    these with its own monkeypatch, which runs after this fixture and simply replaces it."""
+    monkeypatch.setattr(hermes, "kanban_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(hermes, "kanban_session_ids", lambda *a, **k: [])
+
+
+_run_id_seq = itertools.count(1)
 
 
 def _project(tmp_path, budgets=None):
@@ -70,21 +102,30 @@ def _seed_task(conn, key, work_card_id, project="p1"):
     )
 
 
-def _run(session, profile="coder-1", *, ended_at=1789832491, metadata=_DEFAULT):
-    """One entry of a card's runs list, as hermes.kanban_show returns it under "_runs"."""
+def _run(session, profile="coder-1", *, ended_at=1789832491, metadata=_DEFAULT, run_id=None):
+    """One entry of a card's runs list, as hermes.kanban_show returns it under "_runs". `run_id` defaults to a
+    fresh id from a shared counter (round 19: usage_runs' primary key is (board, run_id), so two runs on one
+    card must never share one; the OLD fixture's hardcoded id=1 for every run only worked before that table
+    existed)."""
     if metadata is _DEFAULT:
         metadata = {"worker_session_id": session}
-    return {"id": 1, "profile": profile, "status": "done", "outcome": "completed", "summary": "", "error": None,
-            "metadata": metadata, "started_at": "1789832318", "ended_at": ended_at, "worker_pid": 4242}
+    return {"id": run_id if run_id is not None else next(_run_id_seq), "profile": profile, "status": "done",
+            "outcome": "completed", "summary": "", "error": None, "metadata": metadata, "started_at": "1789832318",
+            "ended_at": ended_at, "worker_pid": 4242}
 
 
 def _fake_cards(monkeypatch, cards):
-    """hermes.kanban_show over a dict of card id -> runs. Returns the list of card ids it was asked for."""
+    """hermes.kanban_show over a dict of card id -> runs. Returns the list of card ids it was asked for. Round
+    19: also synthesises a `spawned` event per run (kind, run_id), matching real Hermes (every worker run has
+    one, kanban_db_dispatch.py) and step 1's own W membership rule, which every run these fixtures build
+    satisfies."""
     shown = []
 
     def fake_show(board, card_id):
         shown.append(card_id)
-        return {"id": card_id, "status": "done", "_runs": cards[card_id]}
+        runs = cards[card_id]
+        spawned = [{"kind": "spawned", "run_id": r["id"], "payload": {}, "created_at": 0} for r in runs]
+        return {"id": card_id, "status": "done", "_runs": runs, "_events": spawned}
 
     monkeypatch.setattr(hermes, "kanban_show", fake_show)
     return shown
@@ -110,7 +151,7 @@ def _fake_exports(monkeypatch, exports):
 
 
 def _ingest(conn, tmp_path):
-    return usage.ingest_run_usage("b", PLAN, _project(tmp_path), MODELS, conn=conn)
+    return usage.ingest_run_usage("b", PLAN, _project(tmp_path), MODELS, conn=conn, now=LEGACY_NOW)
 
 
 def _rows(conn):
@@ -581,7 +622,7 @@ def _with_models(*extra_rows):
 
 
 def _ingest_with(conn, tmp_path, models):
-    return usage.ingest_run_usage("b", PLAN, _project(tmp_path), models, conn=conn)
+    return usage.ingest_run_usage("b", PLAN, _project(tmp_path), models, conn=conn, now=LEGACY_NOW)
 
 
 def test_a_session_on_another_model_records_exactly_one_model_mismatch_event(conn, tmp_path, monkeypatch):
@@ -807,8 +848,9 @@ def test_a_failing_mismatch_write_rolls_the_whole_session_back_and_it_is_retried
 
 
 def test_a_model_mismatch_only_reads_and_records_it_never_touches_a_card(conn, tmp_path, monkeypatch):
-    """Detection only: no card is blocked, reclaimed, commented on or failed. Any Hermes call other than the two
-    reads this module makes fails the test."""
+    """Detection only: no card is blocked, reclaimed, commented on or failed. Any Hermes call other than the four
+    read-only ones this module makes (kanban_show, session_usage, and, since round 19's session-as-unit ingest,
+    kanban_sessions/kanban_session_ids for the run this session's export leaves open) fails the test."""
     _seed_task(conn, "T1", "w1")
     _fake_cards(monkeypatch, {"w1": [_run("S1", "coder-1")]})
     _fake_exports(monkeypatch, {"S1": _export("S1", "vendor/model-a:free", 3)})
@@ -817,7 +859,7 @@ def test_a_model_mismatch_only_reads_and_records_it_never_touches_a_card(conn, t
         raise AssertionError("a model mismatch must not change anything on the board")
 
     for name in dir(hermes):
-        if name.startswith("kanban_") and name != "kanban_show":
+        if name.startswith("kanban_") and name not in ("kanban_show", "kanban_sessions", "kanban_session_ids"):
             monkeypatch.setattr(hermes, name, boom)
 
     assert _ingest(conn, tmp_path) == ["S1"]
