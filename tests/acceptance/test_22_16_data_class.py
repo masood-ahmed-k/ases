@@ -120,9 +120,16 @@ def test_22_16_confidential_with_only_remote_providers_refuses_at_gate_p_before_
     """ASES-PRV-01: "A data class per project is enforced before any other routing rule". With
     data_class=confidential and no provider declaring itself local_only (policy._SAFE_FOR_CONFIDENTIAL), Gate
     P must refuse. cli._estimate_lines is the real function cmd_approve calls for this (this test calls the
-    pure function directly, per r6_wp_ac_g.md, rather than driving the CLI command): it stops at the first
-    task whose provider is unsafe, so the coder's remote provider alone is enough to refuse the whole plan,
-    before publish_plan or create_cards_from_plan would ever run."""
+    pure function directly, per r6_wp_ac_g.md, rather than driving the CLI command): before this plan's own
+    per-task loop even starts, before publish_plan or create_cards_from_plan would ever run.
+
+    Round 19 (package STOPGATES, STOPDOC.md/PROVIDERS.md item 2): _estimate_lines now checks the lead and
+    reviewer roles' own providers FIRST, ahead of the per-task loop, since a committing task's diff always
+    ends up with the reviewer whether or not "reviewer" also happens to be a plan task's own role (T2 here
+    happens to name it, but that is no longer why this is checked). So it is the reviewer's remote-b that
+    stops the estimate now, not the coder's remote-a the per-task loop would have reached next -- either one
+    alone is still enough to refuse the whole plan, which is the point this test proves; the second half below
+    confirms both are independently unsafe regardless of which one a caller happens to see first."""
     plan = plan_mod.parse_and_validate(CONFIDENTIAL_PLAN, known_roles=KNOWN_ROLES, max_cards=40)
     project = _project(tmp_path, data_class="confidential")
     models_config = {
@@ -140,7 +147,7 @@ def test_22_16_confidential_with_only_remote_providers_refuses_at_gate_p_before_
     estimate = cli_mod._estimate_lines(plan, project, models_config, conn)
 
     assert estimate.policy_violation is not None
-    assert "confidential" in estimate.policy_violation and "remote-a" in estimate.policy_violation
+    assert "confidential" in estimate.policy_violation and "remote-b" in estimate.policy_violation
     assert not estimate.budget_lines and not estimate.calendar_lines  # the estimate stops, nothing to budget
 
     # ASES-PRV-01 says this is enforced for EVERY role's provider, not just the one _estimate_lines happens to

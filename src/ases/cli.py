@@ -410,11 +410,23 @@ class _LeadResult:
 def _run_lead(repo: pathlib.Path, prompt: str) -> _LeadResult:
     """One oneshot call to the Lead profile, shared by `swarm plan` and `swarm critique --auto-replan`.
 
-    Passes -t file,terminal explicitly: -z/--oneshot grants NO toolset by default (confirmed by real use
-    2026-09-18 -- a bare oneshot call to lead reported its own terminal tool as unavailable and correctly said
-    so instead of guessing, which is what surfaced this rather than a silent bad plan). Kanban-dispatched workers
-    (cmd_run's path) are unaffected -- they run under the profile's full configured toolset, not oneshot's
-    default-empty one.
+    Passes -t file explicitly: -z/--oneshot grants NO toolset by default (confirmed by real use 2026-09-18 --
+    a bare oneshot call to lead reported its own terminal tool as unavailable and correctly said so instead of
+    guessing, which is what surfaced this rather than a silent bad plan). Kanban-dispatched workers (cmd_run's
+    path) are unaffected -- they run under the profile's full configured toolset, not oneshot's default-empty
+    one.
+
+    Round 19 (package STOPGATES, STOPDOC.md item 4 / ASES-ROL-06): this used to also pass `terminal`
+    (`-t file,terminal`), which handed the Lead's one-shot call a host shell that profiles.py itself says the
+    Lead role must never have ("The Lead has NO terminal ... ASES-ROL-06", profiles.py:313-317) -- a real
+    worker once pip-installed pytest onto the host through exactly this kind of stray shell access
+    (docs/architecture.md:672). File tools are enough for what a plan or a re-plan writes (docs/ases/plan.json,
+    docs/ases/contracts/, docs/ases/decisions/, AGENTS.md); a terminal was never load-bearing for that. UNVERIFIED
+    against a real Lead run: zero provider quota is available to this dispatch (ASES's own standing rule), so
+    this drops the toolset on paper, matching blueprint's ASES-ROL-06 and profiles.py's own documented contract,
+    but has not been re-confirmed live the way the original `-t file,terminal` choice was on 2026-09-18. The
+    owner's own real `swarm plan`/`swarm critique --auto-replan` run is what proves the Lead still finishes its
+    job on file tools alone.
 
     1800s, not 600s: a multi-turn agentic planning task (inspect, think, write, confirm) can genuinely take
     several minutes per turn on a free provider's request pace -- confirmed by a real timeout at 600s on
@@ -425,7 +437,7 @@ def _run_lead(repo: pathlib.Path, prompt: str) -> _LeadResult:
     `repo` is here for the shape of the call: the prompt already names the absolute repository path, and no
     working directory is passed on purpose (the environment bug from Phase 2)."""
     try:
-        argv = [hermes_mod.hermes_path(), "-p", "lead", "-z", prompt, "-t", "file,terminal"]
+        argv = [hermes_mod.hermes_path(), "-p", "lead", "-z", prompt, "-t", "file"]
     except hermes_mod.HermesNotFound as exc:
         return _LeadResult(False, problem=str(exc))
     if sys.platform == "win32":
@@ -460,11 +472,37 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     Deliberately not --in / cwd-dependent (the environment bug from Phase 2): the prompt names the
     exact absolute repo path and tells the model not to rely on any inherited working directory.
+
+    Round 19 (package STOPGATES, STOPDOC.md/PROVIDERS.md item 2, ASES-PRV-01): the Lead reads the whole
+    repository, yet this used to have NO data-class check at all -- a private or confidential project's
+    source would be handed to the Lead's provider no matter what config/models.yaml declares about it. The
+    check runs first, before ensure_repo_bootstrapped's own side effect (an empty repo would otherwise be
+    bootstrapped even for a plan that is about to be refused) and before the Lead is ever invoked.
+
+    Fix round 1 on package STOPGATES (ASES-DOC-04, section 16 STOP CONDITION): a paid, pinned Lead model was
+    refused nowhere at all -- policy.is_paid_model has no call site that ever resolves 'lead' (the Lead is
+    never a plan.tasks role, so cli._estimate_lines's per-task loop and controller._affordable_now, the two
+    places that do check it, never reach it), so this used to make a real, billed Hermes call with zero
+    refusal. Checked right after the data-class refusal above, same reasoning: before ensure_repo_bootstrapped
+    and before the Lead is ever invoked.
     """
     project = _load_project()
     conn = _open_conn(project)
     repo = pathlib.Path(args.repo).resolve()
     request = args.request
+    models_config = _load_models_config()
+    try:
+        policy_mod.check_roles(project.data_class, models_config, ["lead"])
+    except policy_mod.DataPolicyViolation as exc:
+        _err(f"swarm plan REFUSED (ASES-PRV-01): {exc}")
+        return 1
+    try:
+        policy_mod.check_roles_not_paid(
+            models_config, ["lead"], allow_paid=project.budgets.get("allow_paid_models", False),
+        )
+    except policy_mod.PaidModelViolation as exc:
+        _err(f"swarm plan REFUSED (ASES-DOC-04): {exc}")
+        return 1
 
     # ASES-GIT-10 (section 8.3): a brand new project's repository may have no commits at all yet -- `git
     # worktree add` needs at least one before any card can get its own workspace, and this is the earliest
@@ -542,12 +580,15 @@ class Estimate:
     """What the approve screen shows about cost, and what Gate P decides from it. budget_lines are the per-provider
     request lines (ASES-CAP-03), calendar_lines the pacing estimate (ASES-CAP-04), policy_violation the reason the
     data class refuses a provider (ASES-PRV-01, None when it does not), model_rejected the reason a role's pinned
-    model fails models.classify_model_context (ASES-MOD-02, None when every role's model is accepted), and
-    unaffordable the providers the plan cannot be afforded on today."""
+    model fails models.classify_model_context (ASES-MOD-02, None when every role's model is accepted),
+    paid_model_refused the reason a role's pinned model is billed and not approved (ASES-DOC-04, round 19 package
+    STOPGATES, None when every role's model is free or approved), and unaffordable the providers the plan cannot
+    be afforded on today."""
     budget_lines: tuple[str, ...] = ()
     calendar_lines: tuple[str, ...] = ()
     policy_violation: str | None = None
     model_rejected: str | None = None
+    paid_model_refused: str | None = None
     unaffordable: tuple[str, ...] = ()
 
     @property
@@ -563,6 +604,8 @@ class Estimate:
             rows.insert(0, f"Gate P would REFUSE this plan (data policy, ASES-PRV-01): {self.policy_violation}")
         if self.model_rejected:
             rows.insert(0, f"Gate P would REFUSE this plan (context length, ASES-MOD-02): {self.model_rejected}")
+        if self.paid_model_refused:
+            rows.insert(0, f"Gate P would REFUSE this plan (paid model, ASES-DOC-04): {self.paid_model_refused}")
         if self.unaffordable:
             rows.append(f"Gate P would REFUSE this plan today: it cannot be afforded on {list(self.unaffordable)} "
                         f"(ASES-CAP-03)")
@@ -589,32 +632,54 @@ def _first_model_rejection(plan, models_config: dict) -> str | None:
 
 
 def _estimate_lines(plan, project, models_config: dict, conn) -> Estimate:
-    """ASES-REV-03, ASES-CAP-03, ASES-CAP-04, ASES-PRV-01, ASES-PRV-04, ASES-MOD-02: the request budget and
-    the calendar time of a plan, in the lines the approve screen prints. `swarm critique` hands the same text
-    to the reviewer, so the critic and the user judge the same numbers. A role whose pinned model is rejected
-    (_first_model_rejection) stops the estimate before the data-class/budget loop even starts (ASES-MOD-02:
-    the controller must reject an under-declared model "before any card starts", so this is checked first);
-    the first provider the data class refuses stops it next (there is nothing to budget for a plan that
-    cannot run)."""
+    """ASES-REV-03, ASES-CAP-03, ASES-CAP-04, ASES-PRV-01, ASES-PRV-04, ASES-MOD-02, ASES-DOC-04: the request
+    budget and the calendar time of a plan, in the lines the approve screen prints. `swarm critique` hands the
+    same text to the reviewer, so the critic and the user judge the same numbers. A role whose pinned model is
+    rejected (_first_model_rejection) stops the estimate before the data-class/budget loop even starts
+    (ASES-MOD-02: the controller must reject an under-declared model "before any card starts", so this is
+    checked first); the lead and reviewer roles' own data-class safety is checked next (round 19, package
+    STOPGATES, STOPDOC.md/PROVIDERS.md item 2: every committing task ends up reviewed, and every plan is
+    written by the Lead, so those two roles are checked even when neither appears as a plan.tasks role); the
+    first task-role provider the data class or the paid-model gate refuses stops it after that (there is
+    nothing to budget for a plan that cannot run).
+
+    Fix round 1 on package STOPGATES (ASES-DOC-04): the lead and reviewer roles' own paid status is checked
+    right alongside their data-class safety, for the same reason -- neither is ever a plan.tasks role, so the
+    per-task loop's own paid-model gate below never reaches them. This is what makes Gate P (swarm approve)
+    refuse a paid Lead or Reviewer too, not just a paid task-role model: swarm approve reads this same
+    paid_model_refused field (see cmd_approve)."""
     model_rejected = _first_model_rejection(plan, models_config)
     if model_rejected:
         return Estimate(model_rejected=model_rejected)
+    try:
+        policy_mod.check_roles(project.data_class, models_config, ["lead", "reviewer"])
+    except policy_mod.DataPolicyViolation as exc:
+        return Estimate(policy_violation=str(exc))
+    try:
+        policy_mod.check_roles_not_paid(
+            models_config, ["lead", "reviewer"], allow_paid=project.budgets.get("allow_paid_models", False),
+        )
+    except policy_mod.PaidModelViolation as exc:
+        return Estimate(paid_model_refused=str(exc))
     providers = models_config["providers"]
-    provider_policies = {name: p.get("data_policy") for name, p in providers.items()}
-    provider_verified_at = {name: p.get("data_policy_verified_at") for name, p in providers.items()}
     per_provider: dict[str, int] = {}
     per_model: dict[tuple[str, str], int] = {}
     for task in plan.tasks:
         pp = policy_mod.profile_provider(task.role, models_config)
         if pp is None:
             continue
+        data_policy, verified_at = policy_mod.effective_policy(models_config, pp.provider, pp.model)
         try:
-            policy_mod.check_data_class(
-                project.data_class, pp.provider, provider_policies.get(pp.provider),
-                verified_at=provider_verified_at.get(pp.provider),
-            )
+            policy_mod.check_data_class(project.data_class, pp.provider, data_policy, verified_at=verified_at)
         except policy_mod.DataPolicyViolation as exc:
             return Estimate(policy_violation=str(exc))
+        if policy_mod.is_paid_model(models_config, pp.provider, pp.model) and not project.budgets.get(
+            "allow_paid_models", False
+        ):
+            return Estimate(paid_model_refused=(
+                f"role '{task.role}' resolves to model {pp.provider}/{pp.model}, which is billed "
+                f"(models.yaml paid: true); set budgets.allow_paid_models: true in config/swarm.yaml to allow it"
+            ))
         per_provider[pp.provider] = per_provider.get(pp.provider, 0) + task.estimated_requests
         key = (pp.provider, pp.model)
         per_model[key] = per_model.get(key, 0) + task.estimated_requests
@@ -699,7 +764,17 @@ def cmd_critique(args: argparse.Namespace) -> int:
     critic.next_step then decides what happens next: PASS goes to swarm approve, CHANGES_REQUIRED goes back to the
     Lead at most budgets.replans_per_project times (with --auto-replan this command runs the Lead itself, without
     it the feedback prompt is printed and the command stops), and everything else is a human decision. Exit code
-    0 only for a PASS."""
+    0 only for a PASS.
+
+    Round 19 (package STOPGATES, STOPDOC.md/PROVIDERS.md item 2, ASES-PRV-01/03): a data-class or paid-model
+    refusal from _estimate_lines used to only print a note ("swarm approve would currently refuse this plan")
+    and dispatch the reviewer anyway -- the bug itself: a private or confidential plan still went to a reviewer
+    (or, since _estimate_lines now also checks the lead and reviewer roles directly, a Lead) the data class
+    refuses, before the user ever saw the note. This now refuses outright, before critic_mod.run_critique is
+    ever called, and before any --auto-replan Lead call this same cycle would otherwise make. An ordinary
+    budget shortfall (estimate.unaffordable) is unaffected: that is still only a note, exactly as before, since
+    it is not a stop-condition category and a reviewer reading a budget number it cannot itself spend is not a
+    privacy leak."""
     project = _load_project()
     conn = _open_conn(project)
     repo = pathlib.Path(args.repo).resolve()
@@ -717,7 +792,13 @@ def cmd_critique(args: argparse.Namespace) -> int:
     for _cycle in range(max_rounds + 2):
         plan_hash = critic_mod.plan_hash(plan_path)
         estimate = _estimate_lines(plan, project, models_config, conn)
-        if estimate.policy_violation or estimate.unaffordable:
+        if estimate.policy_violation:
+            _err(f"swarm critique REFUSED (ASES-PRV-01): {estimate.policy_violation}")
+            return 1
+        if estimate.paid_model_refused:
+            _err(f"swarm critique REFUSED (ASES-DOC-04): {estimate.paid_model_refused}")
+            return 1
+        if estimate.unaffordable:
             _out("note: swarm approve would currently refuse this plan; the reviewer is told so.")
         _out(f"Asking the {profile!r} profile to critique the plan (this can take several minutes)...")
         critique = critic_mod.run_critique(
@@ -845,6 +926,15 @@ def cmd_approve(args: argparse.Namespace) -> int:
         return 1
     if estimate.policy_violation:
         _err(f"Gate P REFUSED (ASES-PRV-01): {estimate.policy_violation}")
+        return 1
+    if estimate.paid_model_refused:
+        # Fix round 1 on package STOPGATES (ASES-DOC-04): _estimate_lines has always computed this field
+        # correctly (test_estimate_refuses_a_paid_model_unless_allow_paid_models_is_set), but Gate P itself
+        # never read it -- a paid, pinned coder/tester/reviewer model (or, since _estimate_lines now also
+        # checks them, a paid lead/reviewer) published the plan and created cards here, only to be parked
+        # silently later at dispatch time by controller._affordable_now instead of refused up front, the way
+        # ASES-DOC-04 requires "Gate P" to.
+        _err(f"Gate P REFUSED (ASES-DOC-04): {estimate.paid_model_refused}")
         return 1
     for line in estimate.budget_lines:
         _out(line)
@@ -1133,6 +1223,37 @@ def cmd_run(args: argparse.Namespace) -> int:
         return _INTERRUPTED_EXIT
 
 
+def _refuse_unless_sandbox_image_present(project) -> int | None:
+    """ASES-SEC-03 / STOPDOC.md item 3 (research finding: Hermes starts a worker container with Docker's own
+    default `--pull missing`, and ASES never checked the image was present before dispatch): with the sandbox
+    on, refuse to start rather than let the FIRST `hermes kanban dispatch` silently trigger a download of an
+    image nobody has approved (blueprint section 16, stop-condition category 4 'downloads and installs new
+    software'). sandbox.sandbox_command_runner already refuses a missing image, the same way, for ASES's OWN
+    gate containers (sandbox.py, `check ... raise SandboxInfrastructureError`), but that only runs once a gate
+    call happens; this is the identical check moved in front of the whole run loop, so a missing image is
+    caught before the first pass, not discovered mid-run.
+
+    None when the sandbox is off, or on and the image is already present; otherwise 1, having already printed
+    why. `getattr(project, "sandbox_enabled", False)` (not `project.sandbox_enabled` directly) matches
+    cmd_init's own reading of this same field: a lightweight test double for `project` need not carry every
+    ProjectConfig attribute to exercise the rest of the loop."""
+    if not bool(getattr(project, "sandbox_enabled", False)):
+        return None
+    try:
+        policy = sandbox_mod.SandboxPolicy.from_config(project.sandbox_policy_config())
+    except sandbox_mod.SandboxConfigError:
+        return None  # an invalid sandbox config is swarm doctor's/init's own refusal to make, not run's
+    if not policy.image or sandbox_mod.image_present(policy.image):
+        return None
+    try:
+        pull = " ".join(sandbox_mod.pull_command(policy.image))
+    except sandbox_mod.SandboxConfigError:
+        pull = "(the image name is not a valid reference)"
+    _err(f"swarm run REFUSED: the sandbox is enabled but image {policy.image} is not present locally; "
+         f"a human runs: {pull}")
+    return 1
+
+
 def _run_loop(args: argparse.Namespace) -> int:
     project = _load_project()
     conn = _open_conn(project)
@@ -1184,6 +1305,9 @@ def _run_loop(args: argparse.Namespace) -> int:
     if rejected:
         _err(f"swarm run REFUSED (ASES-MOD-02): {rejected}")
         return 1
+    refused = _refuse_unless_sandbox_image_present(project)
+    if refused is not None:
+        return refused
     refused = _reconcile_on_start(project, repo, plan, conn, bool(getattr(args, "ignore_reconcile", False)))
     if refused is not None:
         return refused
@@ -1328,7 +1452,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     The page and its JSON copy go to --out, or by default to <ases_home>/reports/<project>/<UTC timestamp>, and
     never into the repository: --out inside it is refused, because a new file in the primary checkout would
     trip the ASES-GIT-12 guard on the next pass. Everything is ASCII on the console (report.render_text escapes
-    it) and redacted before it is written."""
+    it) and redacted before it is written.
+
+    Round 19 (package STOPGATES, STOPDOC.md item 7, ASES-DOC-04 stop-condition category 3 'overwrites'): --out
+    onto a directory that already holds a report.html or report.json used to overwrite them silently. The
+    default, timestamped directory is never reused (see _reports_dir), so this only ever bites --out; --force
+    is the explicit opt-in, refused before any report is even built, matching --out-inside-the-repository's own
+    refuse-before-any-work style just above."""
     project = _load_project()
     repo = pathlib.Path(args.repo).resolve()
     out_dir = getattr(args, "out", None)
@@ -1338,6 +1468,12 @@ def cmd_report(args: argparse.Namespace) -> int:
         _err(f"swarm report REFUSED: {directory} is inside the repository {repo}; a report written there would "
              f"dirty the primary checkout. Pick a directory outside it.")
         return 1
+    if wants_files and not bool(getattr(args, "force", False)):
+        existing = [name for name in ("report.html", "report.json") if (directory / name).exists()]
+        if existing:
+            _err(f"swarm report REFUSED: {', '.join(existing)} already exist in {directory}; "
+                 f"re-run with --force to overwrite")
+            return 1
     report = _build_report(project, repo)
     _out(report_mod.render_text(report))
     if wants_files:
@@ -1857,6 +1993,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Write report.html and report.json here (outside the repository)")
     p_report.add_argument("--html", action="store_true",
                           help="Write report.html and report.json under ases_home/reports/<project>/<timestamp>")
+    p_report.add_argument("--force", action="store_true",
+                          help="Overwrite an existing report.html/report.json at --out (refused without this)")
     p_report.set_defaults(func=cmd_report)
 
     p_stop = sub.add_parser("stop", help="Kill switch: stop the whole system within 30 seconds (ASES-REC-06)")

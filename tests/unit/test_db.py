@@ -363,7 +363,7 @@ def test_connection_keeps_autocommit_row_factory_and_foreign_keys(tmp_path):
 
 def test_migrations_are_numbered_from_one_without_gaps_and_the_version_is_derived():
     assert [m.version for m in db.MIGRATIONS] == list(range(1, len(db.MIGRATIONS) + 1))
-    assert db.SCHEMA_VERSION == db.MIGRATIONS[-1].version == db.latest_version() == 10
+    assert db.SCHEMA_VERSION == db.MIGRATIONS[-1].version == db.latest_version() == 11
     for migration in db.MIGRATIONS:
         assert migration.description
         assert isinstance(migration.apply, str) or callable(migration.apply)
@@ -422,8 +422,8 @@ def test_fresh_database_has_every_table_and_ends_at_the_newest_version(tmp_path)
     conn = db.connect(tmp_path / "ases.db")
 
     assert set(_user_tables(conn)) == _ALL_TABLES
-    assert db.current_version(conn) == db.latest_version() == 10
-    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # one row per migration, each stamped
+    assert db.current_version(conn) == db.latest_version() == 11
+    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]  # one row per migration, each stamped
     assert conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE applied_at IS NULL OR applied_at = ''").fetchone()[0] == 0
     assert db.pending(conn) == []
 
@@ -437,7 +437,7 @@ def test_a_new_database_is_not_backed_up_and_a_current_one_is_not_written_or_bac
 
     assert _backups(tmp_path) == []
     assert again.total_changes == 0  # nothing was inserted or updated by reconnecting to a current database
-    assert _versions(again) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert _versions(again) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     again.close()
 
 
@@ -447,7 +447,7 @@ def test_a_zero_byte_file_is_a_new_database_and_gets_no_backup(tmp_path):
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     assert _backups(tmp_path) == []
     conn.close()
 
@@ -458,7 +458,7 @@ def test_connect_works_for_a_path_with_spaces_and_a_non_ascii_directory(tmp_path
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     assert len(_backups(path.parent)) == 1
     conn.close()
 
@@ -480,10 +480,10 @@ def test_pending_lists_the_higher_migrations_oldest_first(tmp_path):
     path = _make_old_database(tmp_path / "ases.db", 5)
     raw = sqlite3.connect(str(path), isolation_level=None)
 
-    assert [m.version for m in db.pending(raw)] == [6, 7, 8, 9, 10]
+    assert [m.version for m in db.pending(raw)] == [6, 7, 8, 9, 10, 11]
     raw.execute("DELETE FROM schema_migrations")
-    assert [m.version for m in db.pending(raw)] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    raw.execute("INSERT INTO schema_migrations VALUES (10, 'x')")
+    assert [m.version for m in db.pending(raw)] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    raw.execute("INSERT INTO schema_migrations VALUES (11, 'x')")
     assert db.pending(raw) == []
     raw.close()
 
@@ -499,7 +499,7 @@ def test_a_database_from_any_earlier_schema_upgrades_in_place_with_its_rows_and_
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     assert set(_user_tables(conn)) == _ALL_TABLES
     after = _snapshot(conn)
     for table, (columns, rows) in before.items():
@@ -512,7 +512,7 @@ def test_a_database_from_any_earlier_schema_upgrades_in_place_with_its_rows_and_
     assert len(_backups(tmp_path)) == 1
     assert f".bak-v{old_version}-" in _backups(tmp_path)[0]
     # the version rows: the old one is kept, and each migration that ran is recorded once
-    assert _versions(conn) == sorted({old_version, *range(old_version + 1, 11)})
+    assert _versions(conn) == sorted({old_version, *range(old_version + 1, 12)})
     conn.close()
 
 
@@ -578,6 +578,10 @@ def test_upgrading_from_the_old_schema_6_changes_nothing_but_the_version_7_8_9_a
             assert [c[0] for c in tables_after[table][-7:]] == [
                 "board", "run_id", "mapped_by", "settled", "last_check_at", "last_check_count", "billing_provider",
             ]  # plus migration 10's own seven (round 19, package LEDGER)
+        elif table == "model_registry":
+            # migration 11 (round 19, package STOPGATES): one more additive column, `declared`.
+            assert tables_after[table][:-1] == columns
+            assert tables_after[table][-1][0] == "declared"
         elif table == "schema_migrations":
             assert tables_after[table] == columns
         else:
@@ -674,7 +678,7 @@ def test_migration_8_backfills_legacy_merge_records_from_plan_tasks_only_when_un
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     rows = {r["task_key"]: dict(r) for r in conn.execute(
         "SELECT task_key, project, candidate_sha, gate3_result, squash_commit, reverted, completed_at "
         "FROM merge_records"
@@ -749,7 +753,7 @@ def test_migration_9_creates_an_empty_integrity_heads_table(tmp_path):
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     assert conn.execute("SELECT COUNT(*) FROM integrity_heads").fetchone()[0] == 0
     conn.close()
 
@@ -814,7 +818,7 @@ def test_migration_10_adds_columns_and_tables_and_marks_legacy_rows_unsettled(tm
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     columns = [r[1] for r in conn.execute("PRAGMA table_info(usage_ingested)")]
     for name in ("board", "run_id", "mapped_by", "settled", "last_check_at", "last_check_count", "billing_provider"):
         assert name in columns
@@ -843,7 +847,7 @@ def test_migration_10_is_idempotent_on_a_reconnect(tmp_path):
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     assert conn.execute("SELECT COUNT(*) FROM usage_ingested").fetchone()[0] == 1
     conn.close()
 
@@ -871,8 +875,8 @@ def test_a_database_whose_version_row_is_missing_is_repaired_by_connecting(tmp_p
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10
-    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert db.current_version(conn) == 11
+    assert _versions(conn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     for table, (columns, rows) in before.items():
         kept = [tuple(r) for r in conn.execute(f"SELECT {', '.join(columns)} FROM {table} ORDER BY rowid")]
         assert kept == rows, table
@@ -889,7 +893,7 @@ def test_a_project_column_that_already_exists_does_not_fail_migration_7(tmp_path
     conn = db.connect(path)
 
     assert [r[1] for r in conn.execute("PRAGMA table_info(gate_runs)")].count("project") == 1
-    assert db.current_version(conn) == 10
+    assert db.current_version(conn) == 11
     conn.close()
 
 
@@ -999,7 +1003,7 @@ def test_a_same_second_backup_another_process_already_made_is_accepted_even_if_t
 
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 10  # the upgrade went ahead: a backup exists
+    assert db.current_version(conn) == 11  # the upgrade went ahead: a backup exists
     assert target.read_bytes() == b"a whole backup made by the other process"  # theirs was left alone
     assert not list(tmp_path.glob("*.tmp"))  # and ours was not left behind
     conn.close()
@@ -1048,18 +1052,18 @@ def _boom(conn):
 def test_a_failing_migration_rolls_back_leaves_the_version_and_raises_naming_it(tmp_path, monkeypatch):
     path = tmp_path / "ases.db"
     db.connect(path).close()
-    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(11, "will fail", _boom)])
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(12, "will fail", _boom)])
 
     with pytest.raises(db.MigrationError) as info:
         db.connect(path)
 
-    assert info.value.version == 11
-    assert "migration 11" in str(info.value) and "boom" in str(info.value) and "version 10" in str(info.value)
+    assert info.value.version == 12
+    assert "migration 12" in str(info.value) and "boom" in str(info.value) and "version 11" in str(info.value)
     assert isinstance(info.value.__cause__, RuntimeError)
     raw = sqlite3.connect(str(path), isolation_level=None)
-    assert db.current_version(raw) == 10  # the version stayed where it was
+    assert db.current_version(raw) == 11  # the version stayed where it was
     assert raw.execute("SELECT name FROM sqlite_master WHERE name = 'half_done'").fetchone() is None  # rolled back
-    assert _versions(raw) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert _versions(raw) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     raw.close()
 
 
@@ -1067,16 +1071,16 @@ def test_a_migration_written_as_sql_is_atomic_across_its_statements(tmp_path, mo
     path = tmp_path / "ases.db"
     db.connect(path).close()
     # the first statement works and the second cannot: the whole migration must vanish
-    broken = db.Migration(11, "sql that fails half way", "CREATE TABLE t_one (a INTEGER); CREATE TABLE t_one (b INTEGER);")
+    broken = db.Migration(12, "sql that fails half way", "CREATE TABLE t_one (a INTEGER); CREATE TABLE t_one (b INTEGER);")
     monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, broken])
 
     with pytest.raises(db.MigrationError) as info:
         db.connect(path)
 
-    assert info.value.version == 11
+    assert info.value.version == 12
     raw = sqlite3.connect(str(path), isolation_level=None)
     assert raw.execute("SELECT name FROM sqlite_master WHERE name = 't_one'").fetchone() is None
-    assert db.current_version(raw) == 10
+    assert db.current_version(raw) == 11
     raw.close()
 
 
@@ -1099,14 +1103,14 @@ def test_a_failed_upgrade_can_be_retried_once_the_migration_is_fixed(tmp_path, m
     path = tmp_path / "ases.db"
     db.connect(path).close()
     good = list(db.MIGRATIONS)
-    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(11, "will fail", _boom)])
+    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(12, "will fail", _boom)])
     with pytest.raises(db.MigrationError):
         db.connect(path)
 
-    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(11, "fixed", "CREATE TABLE half_done (a INTEGER)")])
+    monkeypatch.setattr(db, "MIGRATIONS", [*good, db.Migration(12, "fixed", "CREATE TABLE half_done (a INTEGER)")])
     conn = db.connect(path)
 
-    assert db.current_version(conn) == 11
+    assert db.current_version(conn) == 12
     assert "half_done" in _user_tables(conn)
     conn.close()
 
@@ -1114,7 +1118,7 @@ def test_a_failed_upgrade_can_be_retried_once_the_migration_is_fixed(tmp_path, m
 def test_a_failed_migration_closes_the_connection_so_the_file_can_be_removed(tmp_path, monkeypatch):
     path = tmp_path / "ases.db"
     db.connect(path).close()
-    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(11, "will fail", _boom)])
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, db.Migration(12, "will fail", _boom)])
     with pytest.raises(db.MigrationError):
         db.connect(path)
 
@@ -1164,9 +1168,9 @@ def test_processes_upgrading_the_same_database_at_the_same_time_all_succeed(tmp_
 
     for (out, err), code_ in outputs:
         assert code_ == 0, err
-        assert out.strip() == "10"
+        assert out.strip() == "11"
     raw = sqlite3.connect(str(path), isolation_level=None)
-    assert _versions(raw) == [5, 6, 7, 8, 9, 10]  # applied once each: a double apply would have failed on the primary key
+    assert _versions(raw) == [5, 6, 7, 8, 9, 10, 11]  # applied once each: a double apply would have failed on the primary key
     assert set(_user_tables(raw)) == _ALL_TABLES
     raw.close()
     assert len(_backups(tmp_path)) >= 1
@@ -1205,10 +1209,10 @@ def test_a_database_one_version_ahead_is_refused_and_one_at_the_newest_is_accept
     path = tmp_path / "ases.db"
     db.connect(path).close()
     raw = sqlite3.connect(str(path), isolation_level=None)
-    raw.execute("INSERT INTO schema_migrations VALUES (11, 'x')")
+    raw.execute("INSERT INTO schema_migrations VALUES (12, 'x')")
     raw.close()
 
     with pytest.raises(db.MigrationError) as info:
         db.connect(path)
 
-    assert info.value.version == 11
+    assert info.value.version == 12

@@ -633,6 +633,7 @@ def _unfit_for_agent_role(row: dict, providers: dict) -> bool:
 def next_model(
     models_config: dict, role_class: str, current_provider: str | None, current_model: str | None, *,
     unhealthy: set[tuple[str, str]] | None = None, data_class: str | None = None,
+    allow_paid_models: bool = False,
 ) -> tuple[str, str] | None:
     """The model to switch a card to after its second capability failure, as (provider, model), or None when the
     role class has no other usable candidate (ASES-REC-01: "on the second capability failure switch to the next
@@ -643,7 +644,10 @@ def next_model(
     the current model and is still usable is returned. A row is skipped when its smoke test failed, when it says it
     cannot serve an agent role (tool calling false, declared context under 64K), when its provider is unhealthy,
     or, if `data_class` is given, when its provider's declared data policy does not clear that data class (the data
-    class is enforced before any routing rule and never relaxed to keep work flowing: ASES-PRV-01).
+    class is enforced before any routing rule and never relaxed to keep work flowing: ASES-PRV-01); or, unless
+    `allow_paid_models` is True, when the row declares `paid: true` (STOPDOC.md item 8, ASES-DOC-04 stop condition
+    category 1 'spends money': a failure recovery must never switch a card onto a billed model the project's own
+    swarm.yaml has not opted into with budgets.allow_paid_models).
 
     `unhealthy` holds (provider, model) pairs to skip; (provider, "*") skips every model of that provider, which is
     what a bad credential means (see unhealthy_credentials)."""
@@ -660,14 +664,14 @@ def next_model(
             continue
         if _smoke_failed(row) or _unfit_for_agent_role(row, providers):
             continue
+        if row.get("paid") and not allow_paid_models:
+            continue
         if data_class is not None:
-            declared = row.get("data_policy") or (providers.get(provider) or {}).get("data_policy")
-            # ASES-PRV-04 (round 7, package POLICY): check_data_class now requires an explicit, non-empty
-            # verified_at for private/confidential, not just a compatible policy string -- found broken here by
-            # POLICY itself (a file it does not own): without this, EVERY candidate was treated as a violation
-            # for those two data classes, so next_model silently returned None instead of a real switch target.
-            verified_at = row.get("data_policy_verified_at") or (providers.get(provider) or {}).get(
-                "data_policy_verified_at")
+            # round 19 (package STOPGATES, PROVIDERS.md finding): effective_policy resolves the row's OWN
+            # data_policy and verified_at TOGETHER, so a row-level policy with no row-level verification date
+            # is never quietly "verified" by the date recorded for the provider's own, different policy (the
+            # bug this replaces: row.get(...) or provider.get(...) picked the two independently).
+            declared, verified_at = policy.effective_policy(models_config, provider, model)
             try:
                 policy.check_data_class(data_class, provider, declared, verified_at=verified_at)
             except policy.DataPolicyViolation:
@@ -993,6 +997,7 @@ def _adjust(
     target = _switch_target(conn, plan.project, task.key, card_id, run_id) or next_model(
         models_config, task.role, provider, model, unhealthy=unhealthy_credentials(conn),
         data_class=project.data_class,
+        allow_paid_models=bool((project.budgets or {}).get("allow_paid_models", False)),
     )
     if target is None:
         return Decision(ACTION_FRESH_ATTEMPT, (

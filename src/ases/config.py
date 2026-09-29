@@ -250,6 +250,27 @@ def _validate_verification_source_field(providers: dict) -> None:
             )
 
 
+def _validate_paid_field(models: list) -> None:
+    """ASES-DOC-04 (round 19, package STOPGATES, STOPDOC.md item 8, stop condition category 1 'spends
+    money'): the optional models[].paid field is shape-checked the same way data_policy_verified_at is above
+    -- a real bool, never a truthy-but-wrong string a YAML typo like `paid: "false"` would produce (an
+    unquoted `false` parses as Python False; a QUOTED one is a non-empty string, which bool() reads as True).
+    Every caller that reads this field (policy.is_paid_model) does a plain bool(row.get("paid")) cast, so a
+    malformed value here would otherwise be silently misread as "paid" or "free" rather than caught at load
+    time."""
+    if not isinstance(models, list):
+        return
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        paid = entry.get("paid")
+        if paid is not None and not isinstance(paid, bool):
+            raise ConfigError(
+                f"config/models.yaml: models[].paid must be true or false, got {paid!r} for "
+                f"{entry.get('provider')}/{entry.get('model')}"
+            )
+
+
 def load_models_config(path: str | pathlib.Path) -> dict:
     path = pathlib.Path(path)
     if not path.exists():
@@ -259,6 +280,7 @@ def load_models_config(path: str | pathlib.Path) -> dict:
         raise ConfigError("config/models.yaml must have top-level 'providers' and 'models' keys")
     _validate_data_policy_verification_fields(raw["providers"])
     _validate_verification_source_field(raw["providers"])
+    _validate_paid_field(raw["models"])
     return raw
 
 

@@ -324,9 +324,12 @@ class RoleDef:
 #
 # - The Lead has NO terminal. The work order for this module listed `terminal` for the Lead ("planning and
 #   inspection"), but blueprint ASES-ROL-06 says "The Lead may read the repository and write planning artifacts; only
-#   implementation roles edit product code and run commands", and where the two disagree the blueprint wins. It costs
-#   nothing today: `swarm plan` runs the Lead with `-t file,terminal` itself, whatever the profile lists. To give the
-#   Lead a terminal, add "terminal" to _LEAD_TOOLSETS (and expect the doctor to stop flagging it).
+#   implementation roles edit product code and run commands", and where the two disagree the blueprint wins. Round 19
+#   (package STOPGATES) made this true end to end, not just on paper: `swarm plan`'s own oneshot call to the Lead
+#   (cli._run_lead) used to pass `-t file,terminal` regardless of what this profile declares, which is exactly the
+#   host shell ASES-ROL-06 forbids; it now passes `-t file` only, so the profile's declared toolset and the actual
+#   call finally agree. To give the Lead a terminal, add "terminal" to _LEAD_TOOLSETS AND to cli._run_lead's own
+#   argv (and expect the doctor to stop flagging it).
 # - The Reviewer keeps the combined `file` toolset, because Hermes has no read-only one (see RESIDUAL_RISKS).
 _LEAD_WHY = (
     "ASES-ROL-06: the Lead reads the repository and writes plans (file, kanban, skills, todo, session_search); no "
@@ -1478,6 +1481,11 @@ def apply_init(
 
 _ROUTER_NAMES = frozenset({"auto", "free", "router"})
 _ROUTER_PREFIXES = ("xkiro", "openrouter", "unorouter")
+# PROVIDERS.md finding (round 19, package STOPGATES, ASES-ROL-05 diversity): Cloudflare Workers AI and Hugging
+# Face both prefix a model id with an "@vendor" namespace tag rather than a router name (for example
+# "@cf/qwen/qwen3-30b-a3b-fp8"), so without stripping it too, _family below read "@cf" as the whole family and
+# never recognised it as the same qwen family as a bare "qwen/..." id elsewhere in config/models.yaml.
+_VENDOR_TAG_PREFIXES = ("@cf", "@hf")
 
 
 def _is_router_model(model_id: str | None) -> bool:
@@ -1492,11 +1500,14 @@ def _is_router_model(model_id: str | None) -> bool:
 
 def _family(model_id: str | None) -> str | None:
     """The vendor family of a model id: qwen/qwen3.8-max:free is qwen, openai/gpt-5.6-terra is openai. A router prefix
-    (xkiro/openai/gpt-5.6-terra) is skipped; an id with no slash gives its leading letters (gpt-5 is gpt)."""
+    (xkiro/openai/gpt-5.6-terra) is skipped, and so (round 19, package STOPGATES) is a leading vendor-tag prefix
+    such as "@cf" or "@hf" (_VENDOR_TAG_PREFIXES): "@cf/qwen/qwen3-30b-a3b-fp8" reads as qwen, the same family as
+    a bare "qwen/..." id, instead of "@cf" itself. An id with no slash gives its leading letters (gpt-5 is gpt)."""
     if not model_id:
         return None
     parts = [part for part in model_id.strip().lower().split(":", 1)[0].split("/") if part]
-    while len(parts) > 1 and parts[0] in _ROUTER_PREFIXES:
+    strippable = _ROUTER_PREFIXES + _VENDOR_TAG_PREFIXES
+    while len(parts) > 1 and parts[0] in strippable:
         parts.pop(0)
     if not parts:
         return None

@@ -535,6 +535,32 @@ def test_report_refuses_an_out_directory_inside_the_repository(world, monkeypatc
     assert not (world.repo / "reports").exists()
 
 
+def test_report_out_refuses_to_overwrite_existing_files_without_force(world, monkeypatch, capsys):
+    """STOPDOC.md item 7 (round 19, package STOPGATES, ASES-DOC-04 stop-condition category 3 'overwrites')."""
+    calls = _report_stub(monkeypatch)
+    target = world.tmp / "elsewhere" / "r2"
+    target.mkdir(parents=True)
+    (target / "report.html").write_text("old", encoding="utf-8")
+
+    assert cli.main(["report", "--repo", str(world.repo), "--out", str(target)]) == 1
+
+    out, err = _console(capsys)
+    assert "REFUSED" in err and "report.html" in err and "--force" in err
+    assert calls.build == [] and calls.written == []  # refused before any work was done
+    assert (target / "report.html").read_text(encoding="utf-8") == "old"  # untouched
+
+
+def test_report_out_force_overwrites_existing_files(world, monkeypatch):
+    calls = _report_stub(monkeypatch)
+    target = world.tmp / "elsewhere" / "r3"
+    target.mkdir(parents=True)
+    (target / "report.json").write_text("old", encoding="utf-8")
+
+    assert cli.main(["report", "--repo", str(world.repo), "--out", str(target), "--force"]) == 0
+
+    assert calls.written == [target]
+
+
 def test_report_and_status_need_a_plan_that_passes_gate_0(world, monkeypatch, capsys):
     calls = _report_stub(monkeypatch)
     world.plan_file.unlink()
@@ -576,7 +602,10 @@ class _Completed:
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
-def test_run_lead_calls_hermes_with_the_lead_profile_and_the_file_and_terminal_toolsets(monkeypatch):
+def test_run_lead_calls_hermes_with_the_lead_profile_and_the_file_toolset_only(monkeypatch):
+    """Round 19 (package STOPGATES, ASES-ROL-06): this used to assert `-t file,terminal`, the bug itself --
+    the Lead's oneshot call must never carry a host terminal (profiles.py: "The Lead has NO terminal"), so
+    the fix is to change what this test asserts, not to work around it."""
     seen = {}
     monkeypatch.setattr(cli.hermes_mod, "hermes_path", lambda: "hermes")
 
@@ -588,7 +617,7 @@ def test_run_lead_calls_hermes_with_the_lead_profile_and_the_file_and_terminal_t
 
     result = cli._run_lead(pathlib.Path("r"), "the prompt")
 
-    assert seen["argv"] == ["hermes", "-p", "lead", "-z", "the prompt", "-t", "file,terminal"]
+    assert seen["argv"] == ["hermes", "-p", "lead", "-z", "the prompt", "-t", "file"]
     assert seen["kwargs"]["timeout"] == 1800 and seen["kwargs"]["encoding"] == "utf-8"
     assert result == cli._LeadResult(True, 0, "done")
 
@@ -809,6 +838,76 @@ def test_plan_never_touches_a_repository_that_already_has_real_history(world, mo
     out, _ = _console(capsys)
     assert "bootstrapped" not in out
     assert _events(world.conn, "repo_bootstrapped") == []
+
+
+def test_plan_refuses_before_the_lead_is_invoked_for_a_data_class_the_leads_provider_does_not_allow(
+    world, monkeypatch, capsys,
+):
+    """Round 19 (package STOPGATES, STOPDOC.md/PROVIDERS.md item 2, ASES-PRV-01): `swarm plan` used to have
+    NO data-class check at all before handing the whole repository to the Lead. This also proves the refusal
+    lands before ensure_repo_bootstrapped's own side effect: an empty repo must not be bootstrapped for a plan
+    that is about to be refused."""
+    project = _project(world.tmp, data_class="private")
+    monkeypatch.setattr(cli, "_load_project", lambda: project)
+    unsafe_lead_config = copy.deepcopy(MODELS_CONFIG)
+    unsafe_lead_config["models"].append(
+        {"provider": "openrouter", "model": "lead-model", "role_class": "lead", "pinned": True}
+    )  # openrouter declares no data_policy in MODELS_CONFIG at all -> not confirmed safe for private
+    monkeypatch.setattr(cli, "_load_models_config", lambda: unsafe_lead_config)
+    monkeypatch.setattr(cli, "_run_lead", lambda repo, prompt: pytest.fail("the Lead must not be run"))
+    empty_repo = world.tmp / "empty_repo"
+    empty_repo.mkdir()
+
+    assert cli.main(["plan", "--repo", str(empty_repo), "--request", "Build a todo app"]) == 1
+
+    out, err = _console(capsys)
+    assert "swarm plan REFUSED (ASES-PRV-01)" in err
+    assert "bootstrapped" not in out
+    assert not (empty_repo / ".git").exists()  # ensure_repo_bootstrapped never ran either
+
+
+def test_plan_refuses_before_the_lead_is_invoked_when_the_lead_is_a_paid_model(world, monkeypatch, capsys):
+    """Fix round 1 on package STOPGATES (ASES-DOC-04): a paid, pinned Lead model was refused nowhere at all --
+    policy.is_paid_model has exactly two call sites (cli._estimate_lines's per-task loop and
+    controller._affordable_now), both scoped to plan.tasks roles, and 'lead' is never a plan.tasks role (the
+    Lead authors tasks, it is not one). data_class is left at the world fixture's default ('public') to
+    isolate the paid-model gap from the already-correct data-class refusal proven by the sibling test above."""
+    paid_lead_config = copy.deepcopy(MODELS_CONFIG)
+    paid_lead_config["models"].append(
+        {"provider": "xkiro", "model": "lead-model-paid", "role_class": "lead", "pinned": True, "paid": True}
+    )
+    monkeypatch.setattr(cli, "_load_models_config", lambda: paid_lead_config)
+    monkeypatch.setattr(cli, "_run_lead", lambda repo, prompt: pytest.fail("the Lead must not be run"))
+    empty_repo = world.tmp / "empty_repo_paid"
+    empty_repo.mkdir()
+
+    assert cli.main(["plan", "--repo", str(empty_repo), "--request", "Build a todo app"]) == 1
+
+    out, err = _console(capsys)
+    assert "swarm plan REFUSED (ASES-DOC-04)" in err
+    assert "lead-model-paid" in err and "allow_paid_models" in err
+    assert "bootstrapped" not in out
+    assert not (empty_repo / ".git").exists()  # ensure_repo_bootstrapped never ran either
+
+
+def test_plan_runs_the_lead_when_the_pinned_model_is_paid_and_allow_paid_models_is_set(world, monkeypatch, capsys):
+    """The refusal above is lifted the same way _estimate_lines's own paid-model gate is: config/swarm.yaml's
+    budgets.allow_paid_models: true."""
+    project = _project(world.tmp, budgets={**world.project.budgets, "allow_paid_models": True})
+    monkeypatch.setattr(cli, "_load_project", lambda: project)
+    paid_lead_config = copy.deepcopy(MODELS_CONFIG)
+    paid_lead_config["models"].append(
+        {"provider": "xkiro", "model": "lead-model-paid", "role_class": "lead", "pinned": True, "paid": True}
+    )
+    monkeypatch.setattr(cli, "_load_models_config", lambda: paid_lead_config)
+
+    def lead(repo, prompt):
+        world.plan_file.write_text("{}", encoding="utf-8")
+        return cli._LeadResult(True, 0, "done")
+
+    monkeypatch.setattr(cli, "_run_lead", lead)
+
+    assert cli.main(["plan", "--repo", str(world.repo), "--request", "Build a todo app"]) == 0
 
 
 def test_plan_prompt_tells_the_lead_to_plan_a_scaffold_task_first_when_the_repo_is_empty(world, monkeypatch):
@@ -1128,15 +1227,47 @@ def test_critique_auto_replan_stops_when_the_rewritten_plan_fails_gate_0(world, 
     assert "Gate 0 FAILED:" in _console(capsys)[0] and len(reviewer.calls) == 1
 
 
-def test_critique_notes_when_approve_would_refuse_the_plan_anyway(world, monkeypatch, capsys):
+def test_critique_refuses_a_reviewer_the_data_class_does_not_allow(world, monkeypatch, capsys):
+    """Round 19 (package STOPGATES, STOPDOC.md/PROVIDERS.md item 2): this used to be
+    test_critique_notes_when_approve_would_refuse_the_plan_anyway, and it asserted the bug itself -- exit 0,
+    with the reviewer actually dispatched (`reviewer.calls` non-empty) even though Gate P would refuse the
+    plan for a data-policy reason. That is precisely "swarm critique still sends the plan to a reviewer whose
+    provider the data class refuses" (STOPDOC.md finding 2 / PROVIDERS.md finding 3). It now refuses outright,
+    before the reviewer is ever asked."""
     project = _project(world.tmp, data_class="private")  # openrouter declares no data policy
     monkeypatch.setattr(cli, "_load_project", lambda: project)
+    _no_lead(monkeypatch)
     reviewer = _Reviewer(monkeypatch, [_critique("PASS")])
 
-    assert cli.main(_critique_argv(world)) == 0
+    assert cli.main(_critique_argv(world)) == 1
 
-    assert "swarm approve would currently refuse this plan" in _console(capsys)[0]
-    assert "Gate P would REFUSE this plan (data policy, ASES-PRV-01)" in reviewer.calls[0]["estimate_text"]
+    assert reviewer.calls == []  # the reviewer was never dispatched
+    err = _console(capsys)[1]
+    assert "swarm critique REFUSED (ASES-PRV-01)" in err
+
+
+def test_critique_auto_replan_refuses_before_ever_calling_the_lead_when_it_is_a_paid_model(
+    world, monkeypatch, capsys,
+):
+    """Fix round 1 on package STOPGATES (ASES-DOC-04): swarm critique --auto-replan calls _run_lead directly
+    (the re-plan path) with no paid-model check of its own; _estimate_lines is what now refuses the Lead's own
+    paid status, before the reviewer is ever asked and so before any re-plan this same cycle could otherwise
+    trigger. data_class is left at the world fixture's default ('public') to isolate this from the
+    already-refused data-class case just above."""
+    paid_lead_config = copy.deepcopy(MODELS_CONFIG)
+    paid_lead_config["models"].append(
+        {"provider": "xkiro", "model": "lead-model-paid", "role_class": "lead", "pinned": True, "paid": True}
+    )
+    monkeypatch.setattr(cli, "_load_models_config", lambda: paid_lead_config)
+    _no_lead(monkeypatch)
+    reviewer = _Reviewer(monkeypatch, [_critique("CHANGES_REQUIRED")])
+
+    assert cli.main(_critique_argv(world, "--auto-replan")) == 1
+
+    assert reviewer.calls == []  # the reviewer was never dispatched either
+    err = _console(capsys)[1]
+    assert "swarm critique REFUSED (ASES-DOC-04)" in err
+    assert "lead-model-paid" in err and "allow_paid_models" in err
 
 
 def test_critique_output_is_ascii_for_reviewer_text(world, monkeypatch, capsys):
@@ -1275,6 +1406,26 @@ def test_approve_refuses_a_plan_whose_pinned_model_the_controller_rejects_and_cr
     err = _console(capsys)[1]
     assert "Gate P REFUSED (ASES-MOD-02)" in err
     assert "coder-model" in err and "rejected too small" in err and "16000" in err
+
+
+def test_approve_refuses_a_plan_whose_pinned_model_is_paid_and_creates_nothing(world, monkeypatch, capsys):
+    """Fix round 1 on package STOPGATES (ASES-DOC-04): _estimate_lines has always computed paid_model_refused
+    correctly (test_estimate_refuses_a_paid_model_unless_allow_paid_models_is_set), but cmd_approve never read
+    it -- unlike model_rejected and policy_violation from the exact same Estimate, checked immediately above.
+    A recorded critic PASS is present (_record_pass) to prove Gate P refuses even then, rather than publishing
+    the plan and creating cards here for controller._affordable_now to park silently much later at dispatch."""
+    calls = _approve_world(world, monkeypatch)
+    paid_config = copy.deepcopy(MODELS_CONFIG)
+    paid_config["models"][0]["paid"] = True  # the coder's own pinned model, now billed
+    monkeypatch.setattr(cli, "_load_models_config", lambda: paid_config)
+    _record_pass(world)
+
+    assert cli.main(_approve_argv(world, "--yes")) == 1
+
+    assert calls == []
+    err = _console(capsys)[1]
+    assert "Gate P REFUSED (ASES-DOC-04)" in err
+    assert "coder-model" in err and "allow_paid_models" in err
 
 
 def test_approve_with_a_critic_pass_and_yes_publishes_pins_and_creates_the_cards(world, monkeypatch, capsys):
@@ -1494,6 +1645,14 @@ def test_approve_refuses_a_private_plan_whose_provider_has_a_policy_but_no_verif
     calls = _approve_world(world, monkeypatch)
     project = _project(world.tmp, data_class="private")
     monkeypatch.setattr(cli, "_load_project", lambda: project)
+    # Round 19 (package STOPGATES): _estimate_lines now also checks the reviewer role up front (before the
+    # per-task loop this test isolates), so the reviewer needs its own safe, verified policy here, or its
+    # separate, unrelated problem (MODELS_CONFIG's openrouter has no data_policy at all) would be reported
+    # first instead of the specific "no recorded verification date" case this test is about.
+    models_config = copy.deepcopy(MODELS_CONFIG)
+    models_config["providers"]["openrouter"]["data_policy"] = "no_training"
+    models_config["providers"]["openrouter"]["data_policy_verified_at"] = "2026-09-01"
+    monkeypatch.setattr(cli, "_load_models_config", lambda: models_config)
     _record_pass(world)
 
     assert cli.main(_approve_argv(world, "--yes")) == 1
@@ -3301,6 +3460,53 @@ def test_a_plan_role_with_no_pinned_model_adds_nothing_to_the_estimate(world, mo
 
     assert [line.split(":")[0] for line in estimate.budget_lines] == ["  budget[xkiro]"]  # the reviewer task has none
     assert estimate.policy_violation is None and estimate.unaffordable == ()
+
+
+def test_estimate_refuses_a_paid_model_unless_allow_paid_models_is_set(world, monkeypatch):
+    """STOPDOC.md item 8 (round 19, package STOPGATES, ASES-DOC-04 stop-condition category 1 'spends
+    money'): nothing marked a model as paid before this; models.yaml's models[].paid: true is refused at
+    Gate P unless config/swarm.yaml's budgets.allow_paid_models is true."""
+    plan = cli.plan_mod.load_plan_file(world.plan_file, known_roles=set(ROLES), max_cards=40)
+    paid_config = copy.deepcopy(MODELS_CONFIG)
+    paid_config["models"][0]["paid"] = True  # the coder's own pinned model, now billed
+
+    refused = cli._estimate_lines(plan, world.project, paid_config, world.conn)
+    assert refused.paid_model_refused is not None
+    assert "coder" in refused.paid_model_refused and "coder-model" in refused.paid_model_refused
+    assert refused.budget_lines == () and refused.policy_violation is None
+    assert "Gate P would REFUSE this plan (paid model, ASES-DOC-04)" in refused.text()
+
+    allowed_project = dataclasses.replace(
+        world.project, budgets={**world.project.budgets, "allow_paid_models": True},
+    )
+    allowed = cli._estimate_lines(plan, allowed_project, paid_config, world.conn)
+    assert allowed.paid_model_refused is None
+
+
+def test_estimate_refuses_a_paid_lead_even_though_lead_is_never_a_plan_tasks_role(world, monkeypatch):
+    """Fix round 1 on package STOPGATES (ASES-DOC-04): the per-task loop above (and controller._affordable_now)
+    only ever resolves a plan.tasks role, and 'lead' is never one (the Lead authors the plan, it is not a task
+    in it) -- so a paid, pinned Lead model used to add nothing to the estimate at all, meaning Gate P
+    (cmd_approve, which reads this same field) never refused it either. Checked the same way the lead/reviewer
+    data-class safety just above it is: before the per-task loop, so there is nothing to budget for a plan
+    whose own author is an unapproved paid model."""
+    plan = cli.plan_mod.load_plan_file(world.plan_file, known_roles=set(ROLES), max_cards=40)
+    paid_lead_config = copy.deepcopy(MODELS_CONFIG)
+    paid_lead_config["models"].append(
+        {"provider": "xkiro", "model": "lead-model-paid", "role_class": "lead", "pinned": True, "paid": True}
+    )
+
+    refused = cli._estimate_lines(plan, world.project, paid_lead_config, world.conn)
+    assert refused.paid_model_refused is not None
+    assert "lead" in refused.paid_model_refused and "lead-model-paid" in refused.paid_model_refused
+    assert refused.budget_lines == () and refused.policy_violation is None
+    assert "Gate P would REFUSE this plan (paid model, ASES-DOC-04)" in refused.text()
+
+    allowed_project = dataclasses.replace(
+        world.project, budgets={**world.project.budgets, "allow_paid_models": True},
+    )
+    allowed = cli._estimate_lines(plan, allowed_project, paid_lead_config, world.conn)
+    assert allowed.paid_model_refused is None
 
 
 def test_estimate_lines_stops_at_the_first_rejected_model_before_any_budget_line(world, monkeypatch):

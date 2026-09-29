@@ -2309,6 +2309,46 @@ def test_unpark_does_not_resume_a_budget_park_that_has_since_become_data_class_u
     assert w.board.cards[w.work()]["status"] == "scheduled"
 
 
+def test_affordable_now_parks_a_committing_task_when_only_the_reviewer_is_data_class_unsafe(tmp_path, monkeypatch):
+    """STOPDOC.md/PROVIDERS.md item 2 (round 19, package STOPGATES): a coder's own provider can be perfectly
+    safe while the REVIEWER its finished work will go to next is not -- _affordable_now must catch that too,
+    since every committing task ends up reviewed (ASES-PRV-01, 'enforced before any other routing rule')."""
+    w = make_world(tmp_path, monkeypatch)
+    private_project = dataclasses.replace(w.project, data_class="private")
+    models = {
+        "providers": {
+            "xkiro": {"data_policy": "no_training", "data_policy_verified_at": "2026-09-01"},
+            "openrouter": {"data_policy": "some_free_endpoints_train"},
+        },
+        "models": [
+            {"provider": "xkiro", "model": "coder-m", "role_class": "coder", "pinned": True},
+            {"provider": "openrouter", "model": "rev-m", "role_class": "reviewer", "pinned": True},
+        ],
+    }
+
+    ok, reason = controller._affordable_now(w.conn, coder_task(w), models, {}, None, private_project)
+
+    assert ok is False
+    assert reason.startswith("data class: ") and "openrouter" in reason
+
+
+def test_affordable_now_refuses_a_paid_model_unless_allow_paid_models_is_set(tmp_path, monkeypatch):
+    """STOPDOC.md item 8 (ASES-DOC-04, stop condition category 1 'spends money'): a paid models.yaml row must
+    be refused here exactly like an unaffordable or data-class-unsafe one, unless the project's own
+    swarm.yaml opts in with budgets.allow_paid_models: true."""
+    w = make_world(tmp_path, monkeypatch)
+    models = {
+        "providers": MODELS["providers"],
+        "models": [{"provider": "xkiro", "model": "coder-m", "role_class": "coder", "pinned": True, "paid": True}],
+    }
+
+    ok, reason = controller._affordable_now(w.conn, coder_task(w), models, {})
+    assert ok is False and reason.startswith("paid model: ") and "coder-m" in reason
+
+    ok, reason = controller._affordable_now(w.conn, coder_task(w), models, {"allow_paid_models": True})
+    assert ok is True
+
+
 # =============================================================================================================
 # process_bounds and pause_and_report
 # =============================================================================================================
