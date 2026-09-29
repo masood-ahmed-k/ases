@@ -14,7 +14,7 @@ import types
 
 import pytest
 
-from ases import db, events, hermes, plan as plan_mod, questions
+from ases import db, events, hermes, plan as plan_mod, questions, reviewcontract
 from ases.questions import OpenQuestion, Question, QuestionError
 
 ROLES = {"lead": "lead", "coder": "coder-1", "reviewer": "reviewer"}
@@ -732,6 +732,84 @@ def test_open_question_is_none_for_a_card_with_no_status_and_for_something_that_
         assert questions.open_question(junk) is None
 
 
+# ---------------------------------------------------------------------------------------------------------
+# _review_lane_question / _provenance_broken_card_ids / list_questions (round 19 fix round 1, reviewer
+# finding, blocker): a card a reviewer-contract PROTOCOL stop marked provenance_broken is stuck in "review"
+# forever (Hermes's own block_task accepts only "ready"/"running"), which open_question's own status gate
+# always excludes -- these are the narrow, separate path that still makes such a card's question visible to
+# `swarm questions` without loosening what open_question or answer_question accept.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def test_review_lane_question_reads_only_the_ases_comment_signal():
+    """Deliberately narrower than open_question: a genuine Hermes-native blocked/gave_up/block_loop_detected
+    event is not a shape Hermes produces on a card that is not blocked or in triage, so only the ases_comment
+    signal is ever looked at here."""
+    card = _card("w_1", "T1: a", status="review",
+                  events=[_blocked("ignored", 100), _gave_up(at=100), _loop("ignored", 100)],
+                  comments=[_asked("reviewer stopped", 200)])
+
+    assert questions._review_lane_question(card) == OpenQuestion("reviewer stopped", 200, "ases_comment")
+
+
+def test_review_lane_question_respects_an_answer_like_open_question_does():
+    card = _card("w_1", "T1: a", status="review", comments=[_asked("q1", 100), _answer(at=200)])
+
+    assert questions._review_lane_question(card) is None
+
+
+def test_provenance_broken_card_ids_reads_back_the_events_scoped_by_project(conn):
+    events.record(conn, reviewcontract.EVENT_PROVENANCE_BROKEN, {
+        "project": "p1", "task_key": "T1", "card_id": "w_1", "run_id": 2,
+    }, project="p1")
+    events.record(conn, reviewcontract.EVENT_PROVENANCE_BROKEN, {
+        "project": "p2", "task_key": "T9", "card_id": "w_9", "run_id": 3,
+    }, project="p2")
+
+    assert questions._provenance_broken_card_ids(conn, "p1") == {"w_1"}
+
+
+def test_a_provenance_broken_review_card_is_listed_by_its_ases_comment(conn, monkeypatch):
+    """The exact gap the independent review proved live: a card a reviewer corrupted into "review" by calling
+    kanban_request_review (D6) is stuck there forever, so without this lane `swarm questions` could never show
+    the question ASES's own controller._protocol_stop already posted as a comment on it."""
+    _seed_task(conn, "T1", "w_1", "m_1")
+    FakeBoard(monkeypatch, _card("w_1", "T1: scaffold", status="review", comments=[_asked("reviewer stopped", 1234)]))
+    events.record(conn, reviewcontract.EVENT_PROVENANCE_BROKEN, {
+        "project": "p1", "task_key": "T1", "card_id": "w_1", "run_id": 2,
+    }, project="p1")
+
+    result = _list(conn)
+
+    assert result == [Question(
+        card_id="w_1", title="T1: scaffold", task_key="T1", card_kind="work", assignee="coder-1",
+        question="reviewer stopped", asked_at=1234, source="ases_comment",
+    )]
+
+
+def test_a_provenance_broken_card_that_moved_off_review_is_not_listed_by_the_new_lane(conn, monkeypatch):
+    _seed_task(conn, "T1", "w_1", "m_1")
+    FakeBoard(monkeypatch, _card("w_1", "T1: scaffold", status="done", comments=[_asked("reviewer stopped", 1234)]))
+    events.record(conn, reviewcontract.EVENT_PROVENANCE_BROKEN, {
+        "project": "p1", "task_key": "T1", "card_id": "w_1", "run_id": 2,
+    }, project="p1")
+
+    assert _list(conn) == []
+
+
+def test_a_provenance_broken_review_card_is_never_answerable(conn, monkeypatch):
+    """The visibility fix above must never widen what `swarm answer` accepts: design step 6, "never unblocked
+    or reopened by ASES"."""
+    _seed_task(conn, "T1", "w_1", "m_1")
+    FakeBoard(monkeypatch, _card("w_1", "T1: scaffold", status="review", comments=[_asked("reviewer stopped", 1234)]))
+    events.record(conn, reviewcontract.EVENT_PROVENANCE_BROKEN, {
+        "project": "p1", "task_key": "T1", "card_id": "w_1", "run_id": 2,
+    }, project="p1")
+
+    with pytest.raises(QuestionError, match="review"):
+        questions.answer_question("b", "w_1", "use candidate B", conn=conn)
+
+
 @pytest.mark.parametrize("status, events_list, comments, expected", [
     ("blocked", [_blocked("Which database?", 1111)], [], OpenQuestion("Which database?", 1111, "blocked")),
     ("blocked", [_gave_up(3, "boom", 1200)], [], OpenQuestion("gave up after 3 failure(s): boom", 1200, "gave_up")),
@@ -1084,6 +1162,27 @@ def test_an_identical_question_that_is_still_open_is_not_asked_again(
     assert result == "already_asked"
     assert board.calls == []                  # nothing posted, nothing blocked
     assert events.recent(conn) == []          # and nothing logged: a pass that repeats must not spam either
+
+
+@pytest.mark.parametrize("status", ["review", "ready"])
+def test_an_ases_comment_question_is_not_repeated_on_a_card_status_hides_from_open_question(
+    conn, monkeypatch, status,
+):
+    """Round 19 fix round 2 (reviewer finding, major): open_question's own status gate (_QUESTION_STATUSES,
+    "blocked"/"triage" only) means it can never see the "ASES QUESTION:" comment ask_user itself already posted
+    on a card stuck outside those two statuses -- a reviewer-contract PROTOCOL stop's card (status "review",
+    forever, by design: controller._protocol_stop) or an EVIDENCE changes_requested stop's card at the moment it
+    is read (status "ready", Hermes's own routing to the implementer, not a block). Before this fix,
+    `already = open_question(card)` always came back None here, so ask_user's own dedup below never engaged and
+    a second call for the exact same question posted a brand-new comment every time -- confirmed live by the
+    independent reviewer against a copy of the source (two distinct run_ids, two "ASES QUESTION:" comments)."""
+    board = FakeBoard(monkeypatch, _card("w_1", "T1: a", status=status, comments=[_asked("Which database?", 100)]))
+
+    result = questions.ask_user("b", _shown(board), "Which database?", conn=conn)
+
+    assert result == "already_asked"
+    assert board.calls == []                  # nothing posted, nothing blocked
+    assert events.recent(conn) == []
 
 
 def test_a_different_question_is_asked_even_while_another_is_open(monkeypatch):

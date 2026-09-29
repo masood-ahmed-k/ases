@@ -43,10 +43,12 @@ from . import leases as leases_mod
 from . import mergeq
 from . import plan as plan_mod
 from . import policy
+from . import profiles as profiles_mod
 from . import questions as questions_mod
 from . import recovery as recovery_mod
 from . import report as report_mod
 from . import review as review_mod
+from . import reviewcontract as reviewcontract_mod
 from . import sandbox as sandbox_mod
 from . import usage as usage_mod
 
@@ -480,12 +482,23 @@ def _completing_profile(work_card: dict) -> str | None:
 _COMMIT_SHA = re.compile(r"[0-9a-fA-F]{7,40}")
 
 
-def _handoff_commit(work_card: dict) -> str | None:
+def _handoff_commit(work_card: dict, reviewer_profiles: frozenset[str] = frozenset()) -> str | None:
     """The commit SHA the coder named in its latest review hand-off (a run whose outcome is "review_requested";
     its metadata carries `commit_sha`, which the work-card body asks for), or None. The reviewer's own verdict
     often omits the commit (the Hermes review skill's shape has no such field), so this is what the approval is
-    bound to when the verdict does not say (ASES-GIT-03)."""
-    handoffs = [run for run in work_card.get("_runs", []) if run.get("outcome") == "review_requested"]
+    bound to when the verdict does not say (ASES-GIT-03).
+
+    Round 19 (package REVIEWLADDER, fix D4): a review_requested run whose profile is IN `reviewer_profiles` is
+    skipped. Hermes's own request_review takes the implementer from the CURRENT assignee (kanban_db.py:
+    3209-3219), so a reviewer profile calling it by mistake (research report finding D6) leaves a
+    review_requested run that is the REVIEWER's own words, not the coder's original hand-off; trusting it here
+    would bind an approval to whatever commit a broken-contract run happened to name (which the same run 31 the
+    research report traced HAPPENED to get right, but that is luck, not a guarantee). `reviewer_profiles`
+    defaults to empty (no filtering), so a caller that has not been updated keeps its exact previous behaviour."""
+    handoffs = [
+        run for run in work_card.get("_runs", [])
+        if run.get("outcome") == "review_requested" and str(run.get("profile") or "") not in reviewer_profiles
+    ]
     if not handoffs:
         return None
     metadata = handoffs[-1].get("metadata")
@@ -770,7 +783,16 @@ def process_review_lane(
 
     Round 16 (ASES-QG-01, ASES-REV-05): review.gate_before_review itself now posts what it decided to the card
     as a comment (a reviewer has no other way to see the controller's own gate record), so this function makes
-    no separate call for that; see gate_before_review's own docstring."""
+    no separate call for that; see gate_before_review's own docstring.
+
+    Round 19 fix round 1 (reviewer finding, blocker): a card process_reviewer_contract's _protocol_stop has
+    marked provenance_broken (a reviewer profile called kanban_request_review, D6) never reaches this function's
+    gate_before_review call, whatever its Kanban status. Such a card is stuck in "review" forever -- Hermes's
+    own block_task only accepts a "ready" or "running" card (research report finding F2), so ASES can never
+    Hermes-block it either -- and without this check this loop would re-run Gate 1 on it every single pass and,
+    on a red result, call hermes.kanban_reopen_review, routing the card straight back to the reviewer profile as
+    implementer: the exact corruption that put t_4ae270eb in triage, and the one thing design step 6's own words
+    ("never unblocked or reopened by ASES") forbid."""
     sent_back = []
     for card in hermes_mod.kanban_list(board, status="review"):
         row = conn.execute(
@@ -780,6 +802,8 @@ def process_review_lane(
         if row is None:
             continue
         task_key = row["task_key"]
+        if _provenance_broken(conn, plan.project, card["id"]):
+            continue
         task = plan.task(task_key)
         gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
         branch = card.get("branch_name") or f"swarm/{task_key}-{task.role}"
@@ -1023,7 +1047,8 @@ def process_merge_queue(
             try:
                 check = review_mod.check_branch_for_merge(
                     repo, branch, plan.integration_branch, gate_cmds, list(task.touches), conn=conn, task_key=key,
-                    require_binding=True, reviewed_commit=verdict.commit or _handoff_commit(work_card),
+                    require_binding=True,
+                    reviewed_commit=verdict.commit or _handoff_commit(work_card, frozenset({reviewer_profile})),
                     allow_gate_config_changes=task.allow_gate_config_changes,
                     project_config=project, task=task,
                 )
@@ -1298,18 +1323,28 @@ def _number(value) -> float:
         return 0.0
 
 
+def _event_exists(conn, kind: str, payload: dict, *, match: tuple[str, ...]) -> bool:
+    """Read-only half of _record_once: whether an event of `kind` already carries the same values in the payload
+    fields named by `match`, with no insert either way. Split out (round 19 fix round 1, reviewer finding,
+    major) so a caller whose OWN work is expensive (_evidence_blocked's review_mod.record_gate1 call, a real
+    Gate 1 run) can check this FIRST and skip that work entirely once its run_id has already been decided,
+    instead of doing the expensive work anyway and only then finding _record_once refuses the insert -- which
+    used to rerun the whole Gate 1 suite on every single controller pass for as long as an ask-owner card sat
+    unresolved (by design, that can be hours or days: "never unblock, never retry")."""
+    safe = events.redact(payload)
+    clauses = "".join(f" AND json_extract(payload, '$.{name}') IS ?" for name in match)
+    return conn.execute(
+        f"SELECT 1 FROM events WHERE kind = ?{clauses} LIMIT 1", (kind, *(safe.get(name) for name in match)),
+    ).fetchone() is not None
+
+
 def _record_once(conn, kind: str, payload: dict, *, match: tuple[str, ...]) -> bool:
     """Record the event unless one of the same kind already carries the same values in the payload fields named by
     `match`; True when it was recorded. A pass repeats every few seconds, and a step that fails the same way each time
     would otherwise add an identical event per pass for as long as the fault lasts (the reasoning of _refuse_once).
     The field names are literals of this module (they are spliced into the SQL), and the values are compared after the
     redaction the event itself goes through, so a payload with a secret-shaped value finds its own earlier copy."""
-    safe = events.redact(payload)
-    clauses = "".join(f" AND json_extract(payload, '$.{name}') IS ?" for name in match)
-    seen = conn.execute(
-        f"SELECT 1 FROM events WHERE kind = ?{clauses} LIMIT 1", (kind, *(safe.get(name) for name in match)),
-    ).fetchone()
-    if seen is not None:
+    if _event_exists(conn, kind, payload, match=match):
         return False
     # No project parameter here either: every caller's payload carries "project" (not always one of the match
     # fields above, since a card_id is already globally unique on its own), so events.record's own
@@ -1441,7 +1476,9 @@ def process_recovery(
 
     Each part is idempotent, and a failing Hermes call is recorded (retry_card_error, replan_error) and retried on
     the next pass; it never stops the other tasks."""
-    recovery_mod.refresh_review_rounds(board, plan, conn=conn)
+    recovery_mod.refresh_review_rounds(
+        board, plan, conn=conn, reviewer_profiles=profiles_mod.active_reviewer_profiles(project, models_config),
+    )
     decisions = recovery_mod.process_failures(board, plan, project, models_config, conn=conn, now=now)
     rows = []
     attempted = set()
@@ -1871,6 +1908,445 @@ def _escalate_spent_budgets(board: str, plan: plan_mod.Plan, project: ases_confi
             continue
         if done:
             rows.append(_recovery_row(task.key, decision.action, "review_rounds"))
+    return rows
+
+
+# --- reviewer contract ladder (round 19, package REVIEWLADDER; design (a) of
+#     C:/Users/masoo/ases-wt/_research/r19/REVIEWER.md) ------------------------------------------------------------
+
+# The same broad tuple recovery.py catches per card around its own kanban_show (recovery._HERMES_ERRORS): a non-zero
+# exit, no hermes on PATH, a hung command, or output that is not JSON. One unreadable card must not stop every other
+# task's card from being checked this pass.
+_REVIEWER_CONTRACT_HERMES_ERRORS = (
+    hermes_mod.HermesCommandError, hermes_mod.HermesNotFound, subprocess.TimeoutExpired, OSError, ValueError,
+)
+
+# A far-future sentinel, never a real gate1_record_posted event's `ts`: used when a run's own started_at cannot be
+# read, so "was a gate record posted before this run started" defaults to the SAFE answer (yes, assume it might have
+# been) rather than the unsafe one (assume nothing existed yet, which is what unlocks ANSWER_ONCE).
+_FAR_FUTURE_TS = "9999-12-31T23:59:59+00:00"
+
+
+def _reviewer_contract_call(conn, project: str, task_key: str, card_id: str, action: str, fn, *args, **kwargs) -> bool:
+    """One hermes call for the reviewer-contract ladder (the same shape as recovery._call). False, after
+    recording a `reviewer_contract_call_error` once, when it failed: the decision itself is already recorded by
+    the time this runs (it is only the comment/unblock that failed), so the next pass never retries the decision
+    -- a human notices the recorded error event instead of the call silently never happening."""
+    try:
+        fn(*args, **kwargs)
+    except _REVIEWER_CONTRACT_HERMES_ERRORS as exc:
+        _record_once(conn, "reviewer_contract_call_error", {
+            "project": project, "task_key": task_key, "card_id": card_id, "action": action,
+            "error": _clean(f"{type(exc).__name__}: {exc}"),
+        }, match=("task_key", "card_id", "action", "error"))
+        return False
+    return True
+
+
+def _already_answered_once(conn, project: str, task_key: str, commit: str) -> bool:
+    """True when EVENT_ANSWERED already exists for this exact (task_key, commit): design (a)'s "it is the first
+    stop for (task, C)" ANSWER_ONCE condition, and what makes it never fire twice for the same commit."""
+    return conn.execute(
+        f"SELECT 1 FROM events WHERE kind = ? AND {events.PROJECT_SCOPE_SQL} "
+        "AND json_extract(payload, '$.task_key') = ? AND json_extract(payload, '$.commit') = ? LIMIT 1",
+        (reviewcontract_mod.EVENT_ANSWERED, project, task_key, commit),
+    ).fetchone() is not None
+
+
+def _provenance_broken(conn, project: str, card_id: str) -> bool:
+    """True once a PROTOCOL stop (_protocol_stop) has marked `card_id` provenance_broken
+    (reviewcontract.EVENT_PROVENANCE_BROKEN): a reviewer profile called kanban_request_review (D6), corrupting
+    Hermes's own implementer field for the card's whole lifetime. Design step 6, verbatim: such a card is "never
+    unblocked or reopened by ASES". Checked by every step that could otherwise move or redispatch it (round 19
+    fix round 1, reviewer finding: process_review_lane is the one this package already had; see its own
+    docstring for why re-running Gate 1 and reopening review would hand the card straight back to the reviewer
+    profile as implementer)."""
+    return conn.execute(
+        f"SELECT 1 FROM events WHERE kind = ? AND {events.PROJECT_SCOPE_SQL} "
+        "AND json_extract(payload, '$.card_id') = ? LIMIT 1",
+        (reviewcontract_mod.EVENT_PROVENANCE_BROKEN, project, card_id),
+    ).fetchone() is not None
+
+
+def _latest_contract_run(card: dict) -> dict | None:
+    """The card's latest run that has an outcome, or None -- the same rule as recovery._latest_run and
+    controller._latest_run_id (Hermes lists runs oldest first; a run with no outcome yet is still open, never
+    "latest" for this purpose). Whatever its outcome is: reviewcontract.classify_reviewer_run itself decides
+    whether the profile and outcome are ones this ladder acts on."""
+    for run in reversed(card.get("_runs") or []):
+        if isinstance(run, dict) and str(run.get("outcome") or "").strip():
+            return run
+    return None
+
+
+def _event_for_run(card: dict, kind: str, run_id) -> dict | None:
+    """The card event of `kind` whose own `run_id` matches `run_id` (how Hermes ties a `claimed`, `blocked` or
+    `changes_requested` event to the run it belongs to; hermes.kanban_show's own docstring: "events are [{kind,
+    payload, created_at, run_id}]"), or None. Compared as strings on both sides: both values came off the same
+    JSON round trip in practice, but this never assumes one particular numeric/string type survived it."""
+    target = str(run_id) if run_id is not None else None
+    if target is None:
+        return None
+    for event in card.get("_events") or []:
+        if isinstance(event, dict) and event.get("kind") == kind and str(event.get("run_id")) == target:
+            return event
+    return None
+
+
+def _claimed_source_status(card: dict, run_id) -> str | None:
+    """The `source_status` ("review" or "ready") the run named by `run_id` was claimed from (kanban_db.py:3082
+    `_retry_status_for_run`), or None when there is no matching `claimed` event to read it from."""
+    payload = _event_payload(_event_for_run(card, "claimed", run_id))
+    value = payload.get("source_status")
+    return value if isinstance(value, str) else None
+
+
+def _block_recurrences(card: dict, run_id) -> int | None:
+    """The `recurrences` Hermes recorded on the `blocked` (or `block_loop_detected`, had the card reached triage)
+    event of the run named by `run_id` (kanban_db.py:3116-3140 `_route_block`; NOT a task-dict field, since
+    hermes_cli/kanban_output.py's `_TASK_DICT_FIELDS` does not include block_kind or block_recurrences, so this
+    must be read from the event that block_task itself wrote), or None when there is no matching event."""
+    for kind in ("blocked", "block_loop_detected"):
+        event = _event_for_run(card, kind, run_id)
+        if event is not None:
+            value = _event_payload(event).get("recurrences")
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+    return None
+
+
+def _run_started_iso(run: dict) -> str:
+    """`run["started_at"]` (an epoch integer) as the same ISO 8601 UTC string events.record stamps a row with, so
+    it compares correctly against a `gate1_record_posted` event's own `ts`. _FAR_FUTURE_TS (never before anything
+    real) when it cannot be read: see that constant's own comment for why unknown timing must fail safe."""
+    try:
+        return datetime.fromtimestamp(int(float(run.get("started_at"))), timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return _FAR_FUTURE_TS
+
+
+def _earliest_gate_record_ts(conn, project: str, task_key: str, head: str) -> str | None:
+    """The earliest `ts` of a `gate1_record_posted` event for this exact (task_key, head), or None when there is
+    none yet. Used only to answer "did a gate record already exist before this run started" (design (a)'s
+    `gate_record_before_run`); review.record_gate1 itself is what actually ensures one exists now.
+
+    Round 19 fix round 1 (reviewer finding, minor): compared with a prefix match, case-insensitive, like
+    review.check_branch_for_merge's own established pattern for the same kind of commit-identity comparison
+    ("A prefix compare, case-insensitive, because a quoted SHA may be short"). `head` here is the CODER's own
+    hand-off commit_sha (controller._handoff_commit's `_COMMIT_SHA` regex accepts 7-40 hex characters), while a
+    gate1_record_posted event's own `head` field is always the FULL SHA check_branch resolved (its
+    result.head). An exact string match would silently miss an already-posted record whenever the coder quoted
+    a short SHA, reading as "no prior record" (loosening, never tightening, the ANSWER_ONCE eligibility gate
+    this feeds via _answer_once_eligible's caller, _evidence_blocked) even though one genuinely exists. Every
+    existing test fixture uses full 40-character SHAs, for which a prefix match and an exact match agree
+    exactly (X.startswith(X) is True), so this changes no currently-tested behaviour."""
+    if not head:
+        return None
+    rows = conn.execute(
+        f"SELECT ts, json_extract(payload, '$.head') AS head FROM events WHERE kind = 'gate1_record_posted' "
+        f"AND {events.PROJECT_SCOPE_SQL} AND json_extract(payload, '$.task_key') = ?",
+        (project, task_key),
+    ).fetchall()
+    head_norm = head.lower()
+    matching = [row["ts"] for row in rows if isinstance(row["head"], str) and row["head"].lower().startswith(head_norm)]
+    return min(matching) if matching else None
+
+
+def _answer_once_eligible(card: dict, run: dict) -> bool:
+    """The four card/run-shaped conditions of design (a)'s ANSWER_ONCE (the fifth, "not gate_record_before_run",
+    and the sixth, "no switch target exists" -- always true, switching is DEFERRED -- are the caller's job):
+    the card is `blocked` with exactly one recurrence of this block kind, and the run was claimed from `review`
+    (not `ready`, which is what a card corrupted by a PROTOCOL stop, D6, would show)."""
+    return (
+        card.get("status") == "blocked"
+        and _block_recurrences(card, run.get("id")) == 1
+        and _claimed_source_status(card, run.get("id")) == "review"
+    )
+
+
+def _reviewer_stop_question(task: plan_mod.PlanTask, card: dict, stop, *, commit: str | None, gate_result=None) -> str:
+    """The ONE owner question for a reviewer-contract stop the ladder cannot resolve itself (design (a) step 5,
+    adapted): automatic reviewer-model switching and the archive-and-recreate replacement route are DEFERRED by
+    the architect (no eligible second reviewer model is configured under ASES-ROL-05 today), so this never names
+    a specific candidate provider/model/key the way the design's own template does -- doing so without actually
+    computing next_reviewer_model would be a guess, and this codebase never puts a guessed value in a question.
+    The three choices are kept: add and configure a second reviewer model and re-review, stop the task, or let
+    the Lead decide (blueprint table 20, "Reviewer and worker disagree twice")."""
+    card_id = card.get("id")
+    if stop.kind == reviewcontract_mod.KIND_PROTOCOL:
+        what = f"reviewer profile {stop.profile} called kanban_request_review instead of giving a verdict"
+    else:
+        where = f" on commit {commit[:12]}" if commit else ""
+        gate_note = ""
+        if gate_result is not None:
+            gate_note = f" The controller's Gate 1 record ({'PASS' if gate_result.ok else 'FAIL'}) was on the card."
+        what = (
+            f"reviewer profile {stop.profile} stopped{where} asking the controller to run tests instead of "
+            f"giving a code verdict.{gate_note}"
+        )
+    return (
+        f"{task.key} (card {card_id}): {what} Automatic reviewer-model switching is not built yet: no other "
+        "reviewer model in config/models.yaml is eligible under ASES-ROL-05 today. Which should ASES do: (1) add "
+        "and configure a second reviewer model and re-review this commit on it, (2) stop the task, or (3) let "
+        "the Lead decide per table 20 'Reviewer and worker disagree twice'?"
+    )
+
+
+def _reviewer_contract_row(task_key: str, card_id: str, kind: str, action: str, **extra) -> dict:
+    return {"task_key": task_key, "card_id": card_id, "kind": kind, "action": action, **extra}
+
+
+def _protocol_stop(board: str, plan: plan_mod.Plan, task: plan_mod.PlanTask, card: dict, stop, *, conn) -> dict:
+    """Design (a) step 6: a reviewer calling kanban_request_review is a capability failure at once (no second
+    chance the way an EVIDENCE stop gets), and the card is marked provenance_broken so nothing else in ASES ever
+    unblocks or reopens it: Hermes would hand it straight back to the reviewer profile as implementer (D6), the
+    exact corruption that got t_4ae270eb into triage. process_review_lane's own provenance_broken check is what
+    makes that hold; this function only marks the card and asks.
+
+    The card's real Kanban status here is "review" (Hermes's own effect of the reviewer's kanban_request_review
+    call), which questions_mod.ask_user cannot turn into a Hermes block (block_task only accepts "ready" or
+    "running", research report F2): ask_user falls back to a plain "ASES QUESTION:" comment, `answered ==
+    "commented"`. Round 19 fix round 1 (reviewer finding, blocker): that comment used to be invisible to `swarm
+    questions` (list_questions/open_question only ever looked at "blocked"/"triage" cards), which broke
+    ASES-REC-05 for exactly this stop -- questions.list_questions now also finds a provenance_broken card's own
+    unanswered comment regardless of its Kanban status (see questions._provenance_broken_card_ids and
+    _review_lane_question), so the question this call posts is listed without ASES ever touching the card's
+    status to do it. Its next step is the owner's answer, or (once an eligible reviewer model exists) the
+    replacement route -- neither built in this package."""
+    key, card_id = task.key, card["id"]
+    events.record(conn, reviewcontract_mod.EVENT_FAILURE, {
+        "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id, "kind": stop.kind,
+        "profile": stop.profile,
+    }, project=plan.project)
+    events.record(conn, reviewcontract_mod.EVENT_PROVENANCE_BROKEN, {
+        "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id,
+    }, project=plan.project)
+    text = _reviewer_stop_question(task, card, stop, commit=None)
+    answered = questions_mod.ask_user(board, card, text, conn=conn)
+    return _reviewer_contract_row(key, card_id, stop.kind, "protocol", answered=answered)
+
+
+def _evidence_changes_requested(
+    board: str, plan: plan_mod.Plan, task: plan_mod.PlanTask, card: dict, stop, *, conn,
+) -> dict:
+    """Design (a) step 7 (fix D5): Hermes has already sent the card back to its implementer by the time ASES
+    sees this -- the request-changes already happened, and there is no "send back" left to do. The review-round
+    exclusion itself is recovery.refresh_review_rounds' own job (it classifies the run directly, so it is correct
+    even though that step runs BEFORE this one in run_pass); this records the failure, posts a plain comment so
+    the NEXT review round sees why the previous one does not count, and asks the owner (never a retry: pinning an
+    override needs an eligible reviewer model, DEFERRED)."""
+    key, card_id = task.key, card["id"]
+    if not _record_once(conn, reviewcontract_mod.EVENT_DECISION, {
+        "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id, "kind": stop.kind,
+        "profile": stop.profile, "commit": None, "action": "evidence_changes_requested",
+    }, match=("task_key", "card_id", "run_id")):
+        return _reviewer_contract_row(key, card_id, stop.kind, "already_decided")
+    events.record(conn, reviewcontract_mod.EVENT_FAILURE, {
+        "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id, "kind": stop.kind,
+        "profile": stop.profile,
+    }, project=plan.project)
+    note = (
+        "ANSWER: the previous changes-request asked the controller to run tests instead of giving a code "
+        "verdict (ASES-REV-05: running tests is the controller's job; see the 'ASES gate record' comment on "
+        "this card). It was not counted as a review round. Please judge the code and give PASS or "
+        "CHANGES_REQUIRED with concrete findings this time."
+    )
+    _reviewer_contract_call(conn, plan.project, key, card_id, "answer_comment", hermes_mod.kanban_comment,
+                             board, card_id, note, author="ases")
+    commit = _handoff_commit(card, frozenset({stop.profile}))
+    text = _reviewer_stop_question(task, card, stop, commit=commit)
+    answered = questions_mod.ask_user(board, card, text, conn=conn)
+    return _reviewer_contract_row(key, card_id, stop.kind, "evidence_changes_requested", answered=answered)
+
+
+def _evidence_blocked(
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig, task: plan_mod.PlanTask,
+    card: dict, run: dict, stop, *, conn,
+) -> dict:
+    """Design (a) steps 0-2 and 5: the reviewer blocked the card asking the controller to run tests. Ensures a
+    Gate 1 record for the coder's hand-off commit exists (review.record_gate1: this runs gates, never a model),
+    then ANSWER_ONCE if every one of design (a)'s conditions holds, else asks the owner. A gate that is not a
+    confirmed PASS (red, tamper, an unresolvable branch, or no hand-off commit to check at all) stops here with
+    nothing further: ASES-REV-05 already put the true result on the card as a comment, and telling the reviewer
+    "judge the code, it is proven to pass" would be false.
+
+    Round 19 fix round 1 (reviewer finding, major): the run_id dedup check (the same "has reviewer_contract_
+    decision already got this run_id" question _record_once's own insert would refuse on) is checked FIRST, as
+    a read-only peek (_event_exists), before review_mod.record_gate1 is ever called. Design (a) step 5 leaves an
+    ask-owner card blocked indefinitely ("never unblock, never retry" -- a human may take hours or days), and
+    _latest_contract_run keeps returning this SAME already-decided run for as long as no NEW reviewer run
+    starts, so without this peek every single controller pass (every ~20s, cli.py's --sleep-seconds) reran the
+    ENTIRE Gate 1 suite on a card with nothing new to decide, for zero benefit: the fresh gate result was thrown
+    away by the _record_once check that used to come after it, every time."""
+    key, card_id = task.key, card["id"]
+    if _event_exists(conn, reviewcontract_mod.EVENT_DECISION, {
+        "task_key": key, "card_id": card_id, "run_id": stop.run_id,
+    }, match=("task_key", "card_id", "run_id")):
+        return _reviewer_contract_row(key, card_id, stop.kind, "already_decided")
+
+    reviewer_profiles = frozenset({stop.profile})
+    commit = _handoff_commit(card, reviewer_profiles)
+    gate_result = None
+    gate_record_before_run = True   # the safe default: see _run_started_iso and _FAR_FUTURE_TS
+    if commit:
+        existing_ts = _earliest_gate_record_ts(conn, plan.project, key, commit)
+        gate_record_before_run = existing_ts is not None and existing_ts < _run_started_iso(run)
+        task_touches = list(task.touches)
+        gate_cmds = plan.gate_profiles.get(task.gate_profile, [])
+        branch = card.get("branch_name") or f"swarm/{key}-{task.role}"
+        try:
+            gate_result = review_mod.record_gate1(
+                board, card_id, repo, branch, plan.integration_branch, gate_cmds, task_touches, conn=conn,
+                task_key=key, allow_gate_config_changes=task.allow_gate_config_changes, project_config=project,
+                task=task, project=plan.project,
+            )
+        except (sandbox_mod.SandboxInfrastructureError, gates_mod.GateCheckoutError) as exc:
+            # Gate 1 could not even run (Docker down, the image missing, no checkout): that says nothing about the
+            # commit, so nothing is decided for this run yet. The error is recorded once and NO decision event is
+            # written, so the next pass retries, exactly as process_review_lane leaves a card where it is on the
+            # same two exceptions (round 19 architect fix of the reviewer's last major finding: deciding here froze
+            # the ladder for this run_id for good on a transient outage).
+            _record_once(conn, "reviewer_contract_gate_error", {
+                "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id,
+                "error": _clean(str(exc), 300),
+            }, match=("task_key", "card_id", "run_id"))
+            return _reviewer_contract_row(key, card_id, stop.kind, "gate_infrastructure_retry")
+
+    action = "ask_owner"
+    if commit and gate_result is None:
+        action = "gate_unknown_stop"
+    elif commit and not gate_result.ok:
+        action = "gate_red_stop"
+    elif (commit and gate_result.ok and not gate_record_before_run and _answer_once_eligible(card, run)
+          and not _already_answered_once(conn, plan.project, key, commit)):
+        action = "answer_once"
+
+    if not _record_once(conn, reviewcontract_mod.EVENT_DECISION, {
+        "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id, "kind": stop.kind,
+        "profile": stop.profile, "commit": commit, "action": action,
+    }, match=("task_key", "card_id", "run_id")):
+        # The peek above found nothing, so this is a race against another pass over the SAME run_id (never seen
+        # in practice: run_pass is not concurrent with itself), not the ordinary "already decided" case -- still
+        # correct to treat exactly the same way: whatever that other pass decided stands, and this one predates
+        # this one's own gate result and comment, which are simply discarded here rather than acted on twice.
+        return _reviewer_contract_row(key, card_id, stop.kind, "already_decided")
+
+    events.record(conn, reviewcontract_mod.EVENT_FAILURE, {
+        "project": plan.project, "task_key": key, "card_id": card_id, "run_id": stop.run_id, "kind": stop.kind,
+        "profile": stop.profile, "commit": commit,
+    }, project=plan.project)
+
+    if action in ("gate_red_stop", "gate_unknown_stop"):
+        return _reviewer_contract_row(key, card_id, stop.kind, action)
+
+    if action == "answer_once":
+        events.record(conn, reviewcontract_mod.EVENT_ANSWERED, {
+            "project": plan.project, "task_key": key, "commit": commit,
+        }, project=plan.project)
+        tail = _clean(gate_result.detail, 300) if gate_result.detail else ""
+        # <ts>: design (a) line 198's own template, verbatim, quotes this (round 19 fix round 1, reviewer
+        # finding, minor). The freshly-posted (or already-existing) gate1_record_posted event's own ts is used
+        # rather than "now": it is the time Gate 1 actually ran/was recorded for this commit, not the time this
+        # comment happens to be posted, and record_gate1 just above guarantees one exists for a passing commit
+        # unless the comment post itself failed (_post_gate_record's own docstring), the one case this falls
+        # back to the current time for.
+        ts = (_earliest_gate_record_ts(conn, plan.project, key, commit)
+              or datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        text = (
+            f"ANSWER: The controller ran Gate 1 on commit {commit} at {ts}: PASS"
+            + (f", {tail}" if tail else "") + ". "
+            "It is on this card under 'ASES gate record'. Running tests is the controller's job; give your "
+            "verdict on the code."
+        )
+        _reviewer_contract_call(conn, plan.project, key, card_id, "answer_comment", hermes_mod.kanban_comment,
+                                 board, card_id, text, author="ases")
+        _reviewer_contract_call(conn, plan.project, key, card_id, "answer_unblock", hermes_mod.kanban_unblock,
+                                 board, card_id, "ASES: test evidence is on the card; see the ANSWER comment")
+        return _reviewer_contract_row(key, card_id, stop.kind, action)
+
+    text = _reviewer_stop_question(task, card, stop, commit=commit, gate_result=gate_result)
+    answered = questions_mod.ask_user(board, card, text, conn=conn)
+    return _reviewer_contract_row(key, card_id, stop.kind, action, answered=answered)
+
+
+def process_reviewer_contract(
+    board: str, repo: pathlib.Path, plan: plan_mod.Plan, project: ases_config.ProjectConfig,
+    models_config: dict | None = None, *, conn,
+) -> list[dict]:
+    """Layer 2 of the reviewer contract (round 19, package REVIEWLADDER; design (a) of
+    C:/Users/masoo/ases-wt/_research/r19/REVIEWER.md). Called from run_pass right after process_recovery, inside
+    _isolated: a reviewer-profile run that stops instead of giving a verdict is invisible to recovery.py (its
+    outcomes -- blocked, changes_requested, review_requested -- all classify as FailureKind.NONE, research
+    report finding D1), so this is a second, narrower ladder over the same board, looking only for a reviewer
+    profile's own contract failures. Returns one row per run acted on this pass: {"task_key", "card_id", "kind"
+    (PROTOCOL or EVIDENCE), "action", ...}.
+
+    One work card per plan task, oldest run first is never reconsidered: only the LATEST run with an outcome is
+    classified (reviewcontract.classify_reviewer_run), and acted on ONCE per run_id (deduplicated by the
+    reviewer_contract_decision event, exactly like recovery's own recovery_decision) -- a pass runs every ~20s,
+    so without this the same stop would be re-answered, re-asked or re-failed every single pass forever.
+
+    `models_config` (optional: `active_reviewer_profiles` never actually reads its content, only whether a
+    profile is active, so a caller with none on hand may pass or leave it None) decides which profiles count as
+    "a reviewer profile" here: every ACTIVE, kanban_lifecycle_only profile (profiles.active_reviewer_profiles),
+    not just the literal reviewer role -- round 19 fix round 2 (reviewer finding, major): before this, a
+    configured "security" specialisation (kanban_lifecycle_only, played_by "reviewer") got Layer 1's hooks but
+    was invisible here, so a security-profile run that broke the contract was never classified, answered or
+    counted.
+
+    kind PROTOCOL (a reviewer profile called kanban_request_review): a capability failure at once, plus
+    provenance_broken (_protocol_stop) -- never unblocked or reopened by ASES afterward.
+
+    kind EVIDENCE, outcome blocked (_evidence_blocked): ANSWER_ONCE (post the Gate 1 result as evidence and
+    unblock) when every one of design (a)'s conditions holds, a gate that is not a confirmed PASS stops with
+    nothing further (ASES-REV-05 already posted the true result), otherwise ONE owner question.
+
+    kind EVIDENCE, outcome changes_requested (_evidence_changes_requested, fix D5): Hermes already routed the
+    card back to its implementer; the review-round exclusion is recovery.refresh_review_rounds' own job (so it
+    is correct even though that step runs first), this only records the failure, comments and asks the owner.
+
+    DEFERRED by the architect, not built here: automatic reviewer-model switching (kanban set-model or a second
+    reviewer profile) and the archive-and-recreate replacement route. Both need an eligible second reviewer
+    model (config/models.yaml pins only one reviewer-class row today, on the Lead's own provider); until one is
+    configured every stop this function cannot answer once ends in a single owner question, never a retry --
+    see profiles.RESIDUAL_RISKS' own note on this. A reviewer_failures lineage counter is not added: nothing in
+    this package reads or bounds it yet (no schema migration in this package; the ledger package owns migration
+    10), so it would be a column nobody consults. Every stop is still counted, per (task_key, commit, model),
+    through the reviewer_contract_failure event -- "record counts as events instead," per the architect."""
+    reviewer_profiles = profiles_mod.active_reviewer_profiles(project, models_config)
+    rows: list[dict] = []
+    for task in plan.tasks:
+        row = conn.execute(
+            "SELECT work_card_id FROM plan_tasks WHERE project = ? AND task_key = ?", (plan.project, task.key),
+        ).fetchone()
+        if row is None or not row["work_card_id"]:
+            continue
+        card_id = row["work_card_id"]
+        try:
+            card = hermes_mod.kanban_show(board, card_id)
+        except _REVIEWER_CONTRACT_HERMES_ERRORS as exc:
+            _record_once(conn, "reviewer_contract_error", {
+                "project": plan.project, "task_key": task.key, "card_id": card_id,
+                "error": _clean(f"{type(exc).__name__}: {exc}"),
+            }, match=("task_key", "card_id", "error"))
+            continue
+        run = _latest_contract_run(card)
+        if run is None:
+            continue
+        stop = reviewcontract_mod.classify_reviewer_run(run, reviewer_profiles)
+        if stop is None:
+            continue
+        if stop.kind == reviewcontract_mod.KIND_PROTOCOL:
+            if not _record_once(conn, reviewcontract_mod.EVENT_DECISION, {
+                "project": plan.project, "task_key": task.key, "card_id": card_id, "run_id": stop.run_id,
+                "kind": stop.kind, "profile": stop.profile, "action": "protocol",
+            }, match=("task_key", "card_id", "run_id")):
+                rows.append(_reviewer_contract_row(task.key, card_id, stop.kind, "already_decided"))
+                continue
+            rows.append(_protocol_stop(board, plan, task, card, stop, conn=conn))
+        elif run.get("outcome") == "changes_requested":
+            rows.append(_evidence_changes_requested(board, plan, task, card, stop, conn=conn))
+        else:
+            rows.append(_evidence_blocked(board, repo, plan, project, task, card, run, stop, conn=conn))
     return rows
 
 
@@ -2401,23 +2877,26 @@ def run_pass(
     """One full controller iteration (loop version 2), in the order of blueprint section 9.2, which a bounded
     `swarm run` calls repeatedly, sleeping between calls to respect provider pacing. Returns a summary with every one
     of these keys, always: parked, dispatch, sent_back, merged, unreviewed, usage_sessions, integrity (a non-empty
-    list halts the run), warnings (never halt), recovery, unparked, provisioned, stopped, stop_reason, final (None, or
-    the status finalgates.finalize returned) and finished (True only when bounds says the project is finished).
+    list halts the run), warnings (never halt), recovery, reviewer_contract (round 19, package REVIEWLADDER: rows
+    from process_reviewer_contract), unparked, provisioned, stopped, stop_reason, final (None, or the status
+    finalgates.finalize returned) and finished (True only when bounds says the project is finished).
 
       0. halted (a stopped or paused project): return at once, `stopped` True, doing nothing else
       1. the primary-checkout guard (ASES-GIT-12): a violation returns with `integrity` set
       2. idle worktrees (warnings)                    3. usage ingest into the ledger (ASES-CAP-03)
-      4. failure recovery and spent budgets           5. bounds: a project-stopping bound pauses and returns
+      4. failure recovery and spent budgets,          5. bounds: a project-stopping bound pauses and returns
+         then the reviewer contract ladder
       6. the budget gate, then unpark                 7. review-lane policing (Gate 1 re-check)
       8. dispatch, then the base-commit check          9. the merge queue (halt checks inside; ASES-GIT-05: a
          (ASES-GIT-01/16, warnings), then provisioning     post-merge revert that cannot repair the branch also
                                                            returns with `integrity` set)
      10. the final gates, once every merge card is done
 
-    Steps 2 to 5, unpark, provisioning and the final gates are not safety-critical for the pass: an exception in one is
-    recorded as a `pass_step_error` event naming the step (and a warning), and the pass goes on. An exception in the
-    guard, the budget gate, the review lane, dispatch or the merge queue propagates: the caller counts it, and every
-    step is idempotent, so the next pass simply retries.
+    Steps 2 to 5 (recovery and the reviewer contract ladder included), unpark, provisioning and the final gates
+    are not safety-critical for the pass: an exception in one is recorded as a `pass_step_error` event naming the
+    step (and a warning), and the pass goes on. An exception in the guard, the budget gate, the review lane,
+    dispatch or the merge queue propagates: the caller counts it, and every step is idempotent, so the next pass
+    simply retries.
 
     Review-lane policing runs BEFORE dispatch (2026-09-19), as in the blueprint's loop, which re-runs Gate 1
     for cards that entered review first. `kanban_dispatch` also claims cards waiting in `review` and spawns
@@ -2427,8 +2906,8 @@ def run_pass(
     the backstop for that."""
     summary = {
         "parked": [], "dispatch": {}, "sent_back": [], "merged": [], "unreviewed": [], "usage_sessions": 0,
-        "integrity": [], "warnings": [], "recovery": [], "unparked": [], "provisioned": [], "stopped": False,
-        "stop_reason": None, "final": None, "finished": False,
+        "integrity": [], "warnings": [], "recovery": [], "reviewer_contract": [], "unparked": [], "provisioned": [],
+        "stopped": False, "stop_reason": None, "final": None, "finished": False,
     }
     halted, why = _halted(conn, plan.project)
     if halted:
@@ -2475,6 +2954,16 @@ def run_pass(
     summary["recovery"] = _isolated(
         conn, summary, "recovery",
         lambda: process_recovery(board, repo, plan, project, models_config, conn=conn, now=now), [],
+        plan.project,
+    )
+    # Round 19, package REVIEWLADDER: right after recovery, same reasoning as recovery itself (ASES-REC-01/19.1) --
+    # a reviewer-profile run that stops instead of giving a verdict is invisible to recovery.py's own
+    # classify_run (its outcomes all read as FailureKind.NONE), so this is a second, narrower ladder over the
+    # same board. Not safety-critical for the pass (an unreadable card here must not stop bounds, dispatch or the
+    # merge queue below), so _isolated exactly like recovery.
+    summary["reviewer_contract"] = _isolated(
+        conn, summary, "reviewer_contract",
+        lambda: process_reviewer_contract(board, repo, plan, project, models_config, conn=conn), [],
         plan.project,
     )
     stopped, why = _isolated(

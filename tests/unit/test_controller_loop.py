@@ -940,6 +940,26 @@ def test_record_once_finds_its_own_earlier_copy_when_the_value_is_redacted_in_st
     assert not controller._record_once(conn, "some_error", payload, match=("card_id", "error"))
 
 
+def test_earliest_gate_record_ts_matches_a_short_sha_by_prefix(tmp_path):
+    """Round 19 fix round 1 (reviewer finding, minor): a gate1_record_posted event's own `head` is always the
+    FULL SHA review.check_branch resolved, but the coder's own hand-off commit_sha (what _evidence_blocked
+    passes in here as `head`) may be a short one -- an exact string match would silently read an existing
+    record as "none yet", exactly the loosening review.check_branch_for_merge's own established prefix-compare
+    ("a prefix compare, case-insensitive, because a quoted SHA may be short") avoids for the same kind of
+    commit-identity comparison."""
+    conn = db.connect(tmp_path / "ases.db")
+    full = "a" * 40
+    events.record(conn, "gate1_record_posted", {
+        "task_key": "T1", "head": full, "outcome": "pass", "card_id": "w_1",
+    }, project="t3")
+
+    assert controller._earliest_gate_record_ts(conn, "t3", "T1", full) is not None            # exact, as before
+    assert controller._earliest_gate_record_ts(conn, "t3", "T1", full[:12]) is not None        # short SHA: fixed
+    assert controller._earliest_gate_record_ts(conn, "t3", "T1", full.upper()[:12]) is not None  # case-insensitive
+    assert controller._earliest_gate_record_ts(conn, "t3", "T1", "b" * 12) is None              # a different commit
+    assert controller._earliest_gate_record_ts(conn, "t3", "T1", "") is None
+
+
 def test_as_datetime_accepts_a_datetime_epoch_seconds_or_an_iso_string():
     moment = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
@@ -961,14 +981,20 @@ def test_process_recovery_refreshes_review_rounds_then_decides_with_the_pass_arg
     w = make_world(tmp_path, monkeypatch)
     seen = []
     monkeypatch.setattr(recovery, "refresh_review_rounds",
-                        lambda board, plan, *, conn: seen.append(("refresh", board, plan, conn)) or {})
+                        lambda board, plan, *, conn, reviewer_profiles=frozenset(): (
+                            seen.append(("refresh", board, plan, conn, reviewer_profiles)) or {}))
     monkeypatch.setattr(recovery, "process_failures", lambda board, plan, project, models, *, conn, now=None: (
         seen.append(("failures", board, plan, project, models, conn, now)) or []))
     moment = datetime(2026, 9, 21, tzinfo=timezone.utc)
 
     assert controller.process_recovery("b", w.repo, w.plan, w.project, MODELS, conn=w.conn, now=moment) == []
 
-    assert seen == [("refresh", "b", w.plan, w.conn), ("failures", "b", w.plan, w.project, MODELS, w.conn, moment)]
+    # Round 19, package REVIEWLADDER, fix D5: process_recovery resolves and passes the reviewer profile(s) so
+    # refresh_review_rounds can exclude an evidence-stalling changes_requested from the count itself.
+    assert seen == [
+        ("refresh", "b", w.plan, w.conn, frozenset({"reviewer"})),
+        ("failures", "b", w.plan, w.project, MODELS, w.conn, moment),
+    ]
 
 
 def test_process_recovery_carries_out_the_three_controller_actions_and_reports_every_decision(tmp_path, monkeypatch):
@@ -1348,6 +1374,26 @@ def test_latest_run_id_follows_the_rule_recovery_uses_for_a_decision(tmp_path):
     runs = [{"id": 3, "outcome": "crashed"}, {"id": 4, "outcome": "completed"}, {"id": 5, "outcome": None}]
     assert controller._latest_run_id({"_runs": runs}) == 4                       # a run with no outcome is still open
     assert controller._latest_run_id({"_runs": [{"outcome": "crashed"}, {"outcome": "timed_out"}]}) == "#1"
+
+
+def test_handoff_commit_skips_a_review_requested_run_by_a_reviewer_profile(tmp_path):
+    """Round 19, package REVIEWLADDER, fix D4 (research report finding D6): request_review takes the implementer
+    from the CURRENT assignee, so a reviewer profile calling it by mistake leaves a review_requested run that is
+    the REVIEWER's own words, not the coder's hand-off. Without the `reviewer_profiles` filter this returns the
+    reviewer's own (here, deliberately wrong) commit; with it, the coder's real hand-off commit."""
+    coder_sha = "a" * 40
+    reviewer_sha = "b" * 40
+    card = {"_runs": [
+        {"id": 1, "profile": "coder-1", "outcome": "review_requested", "metadata": {"commit_sha": coder_sha}},
+        {"id": 2, "profile": "reviewer", "outcome": "blocked"},
+        {"id": 3, "profile": "reviewer", "outcome": "review_requested", "metadata": {"commit_sha": reviewer_sha}},
+    ]}
+    assert controller._handoff_commit(card) == reviewer_sha  # unchanged default: no filtering, old behaviour
+    assert controller._handoff_commit(card, frozenset({"reviewer"})) == coder_sha
+    # A card with ONLY a reviewer-authored review_requested run (the D6 case in isolation, e.g. right after the
+    # PROTOCOL stop before anything else happens) has no coder hand-off to fall back to: None, not a guess.
+    only_reviewer = {"_runs": [card["_runs"][2]]}
+    assert controller._handoff_commit(only_reviewer, frozenset({"reviewer"})) is None
 
 
 def test_last_error_prefers_the_newest_failed_run_then_the_newest_review_send_back(tmp_path):
@@ -1815,6 +1861,428 @@ def test_one_task_that_cannot_be_escalated_does_not_stop_the_others(tmp_path, mo
     assert rows == [{"task_key": "T2", "action": "replan", "kind": "review_rounds"}]
     assert "gone" in payloads(w.conn, "recovery_action_error")[0]["error"]
     assert [cid for cid, _ in asker.asked] == [w.work("T2")]
+
+
+# =============================================================================================================
+# process_reviewer_contract (round 19, package REVIEWLADDER; ASES-ROL-05, ASES-ROL-06, ASES-REV-05, ASES-REC-01,
+# ASES-REC-05)
+# =============================================================================================================
+
+REVIEWER_LADDER_PLAN = {
+    "project": "t3", "integration_branch": "integration",
+    "gate_profiles": {"trivial": ["echo ok"]},
+    "tasks": [
+        {"key": "T1", "title": "scaffold", "role": "coder", "depends_on": [], "touches": ["new.txt"],
+         "acceptance": ["exists"], "gate_profile": "trivial", "estimated_requests": 10},
+    ],
+}
+
+EVIDENCE_REASON = (
+    "I cannot run the test suite myself to verify these changes work. Please provide test evidence or "
+    "execution output showing the tests pass."
+)
+GENUINE_QUESTION_REASON = "Should slugify keep underscores? The spec says letters or digits."
+
+
+def _reviewer_world(tmp_path, monkeypatch):
+    """A world whose repository is a REAL one (git_repo: integration plus swarm/T1-coder holding one commit that
+    adds new.txt) and whose only plan task's touches match it -- the only tests in this file that let a real
+    review.record_gate1 reach gates_mod.run_gate (stubbed PASS by the autouse _post_merge_check_passes fixture
+    unless a test overrides it)."""
+    w = make_world(tmp_path, monkeypatch, plan_raw=REVIEWER_LADDER_PLAN)
+    git_repo(tmp_path)  # tmp_path / "repo" == w.repo
+    return w
+
+
+def _stub_gate1_result(monkeypatch, *, passed, detail="gate1 output"):
+    """gates_mod.run_gate, accepting **kwargs so it tolerates self_contained_checkout and anything else
+    gates.resolve_runner/_run_gate1 may pass -- unlike the autouse _post_merge_check_passes fixture's own
+    `lenient`, which this replaces for the length of one test."""
+    calls = []
+
+    def fake(repo, commit_sha, gate_name, commands, **kwargs):
+        calls.append((commit_sha, gate_name))
+        return gates_mod.GateResult(gate_name, commit_sha, passed, detail)
+
+    monkeypatch.setattr(gates_mod, "run_gate", fake)
+    return calls
+
+
+def _coder_handoff_run(commit_sha, run_id=1):
+    return {"id": run_id, "profile": "coder-1", "outcome": "review_requested", "status": "review_requested",
+            "summary": "ready for review", "error": None,
+            "metadata": {"commit_sha": commit_sha, "changed_files": ["new.txt"], "residual_risk": "none"},
+            "started_at": 1000, "ended_at": 1010}
+
+
+def _reviewer_run(run_id, *, outcome, reason, started_at=2000, ended_at=2010, metadata=None):
+    return {"id": run_id, "profile": "reviewer", "outcome": outcome, "status": outcome, "summary": reason,
+            "error": None, "metadata": metadata or {}, "started_at": started_at, "ended_at": ended_at}
+
+
+def _put_reviewer_stop(
+    w, *, key="T1", coder_commit=None, reviewer_run, claimed_source_status="review", block_recurrences=1,
+    card_status=None,
+):
+    """A work card carrying a coder hand-off (unless `coder_commit` is False) followed by one reviewer-profile
+    run, with the `claimed`/`blocked`/`changes_requested` events a real Hermes run_id-correlates to it (see
+    controller._event_for_run, _claimed_source_status, _block_recurrences)."""
+    card_id = w.work(key)
+    runs = [] if coder_commit is False else [_coder_handoff_run(coder_commit or "a" * 40)]
+    runs.append(reviewer_run)
+    card = w.board.cards[card_id]
+    card["_runs"] = runs
+    card["status"] = card_status or {"blocked": "blocked", "changes_requested": "ready",
+                                      "review_requested": "review"}[reviewer_run["outcome"]]
+    card["branch_name"] = "swarm/T1-coder"
+    w.board.add_event(card_id, "claimed", {"source_status": claimed_source_status}, run_id=reviewer_run["id"])
+    if reviewer_run["outcome"] == "blocked":
+        w.board.add_event(card_id, "blocked", {
+            "reason": reviewer_run["summary"], "kind": "needs_input", "recurrences": block_recurrences,
+            "source_status": claimed_source_status,
+        }, run_id=reviewer_run["id"])
+    elif reviewer_run["outcome"] == "changes_requested":
+        w.board.add_event(card_id, "changes_requested", {
+            "reason": reviewer_run["summary"], "implementer": "coder-1", "reviewer": "reviewer", "status": "ready",
+        }, run_id=reviewer_run["id"])
+    return card
+
+
+def test_protocol_stop_is_a_capability_failure_and_provenance_broken_never_unblocked(tmp_path, monkeypatch):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    asker = Asker(monkeypatch)
+    _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="review_requested", reason="handing off"))
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows == [{"task_key": "T1", "card_id": w.work(), "kind": "PROTOCOL", "action": "protocol",
+                      "answered": "commented"}]
+    assert payloads(w.conn, "reviewer_contract_failure")[0]["kind"] == "PROTOCOL"
+    assert payloads(w.conn, "provenance_broken") and asker.asked
+    assert w.board.cards[w.work()]["status"] == "review"  # never unblocked or reopened
+    assert "unblock" not in w.board.writes() and "kanban_comment" not in [c[0] for c in w.board.calls]
+
+    # A second pass takes no new action: the dedup event already exists for this exact run_id.
+    asker.asked.clear()
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "PROTOCOL", "action": "already_decided"}]
+    assert asker.asked == []
+    assert len(payloads(w.conn, "reviewer_contract_failure")) == 1
+
+
+def test_a_second_distinct_protocol_stop_on_the_still_broken_card_is_not_asked_again(tmp_path, monkeypatch):
+    """Round 19 fix round 2 (reviewer finding, major, with a live repro): a PROTOCOL card's status stays "review"
+    forever by design (_protocol_stop never unblocks or reopens it), so Hermes redispatching the SAME reviewer
+    profile onto the SAME still-broken card over time (the real t_4ae270eb incident: runs 33 to 40 all landed
+    back on the reviewer profile) produces further, genuinely NEW run_ids on ONE unresolved situation. Unlike the
+    sibling test above, no Asker stub is installed: this drives the REAL questions.ask_user for both stops. Before
+    this fix, ask_user's own dedup (`open_question(card)`, which never sees a "review"-status card) missed the
+    repeat, and the independent reviewer confirmed live that two distinct run_ids produced two "ASES QUESTION:"
+    comments and two provenance_broken events -- this pins the comment side of that (the provenance_broken and
+    reviewer_contract_failure counts are deliberately NOT deduped across run_ids: each is a genuinely new stop,
+    counted as one, exactly like the existing dedup test above already shows for a repeat of the SAME run_id)."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="review_requested", reason="handing off"))
+
+    rows1 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows1[0]["answered"] == "commented"
+
+    # Hermes redispatches the same broken card under a brand-new run_id: same profile, same card, still "review".
+    card = w.board.cards[w.work()]
+    card["_runs"].append(_reviewer_run(3, outcome="review_requested", reason="handing off"))
+    w.board.add_event(w.work(), "claimed", {"source_status": "review"}, run_id=3)
+
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "PROTOCOL", "action": "protocol",
+                       "answered": "already_asked"}]
+    assert w.board.cards[w.work()]["status"] == "review"
+    questions_posted = [a[2] for n, a, kw in w.board.calls if n == "kanban_comment" and a[2].startswith("ASES QUESTION:")]
+    assert len(questions_posted) == 1
+
+
+def test_a_security_specialisation_reviewer_run_is_classified_like_the_reviewer_role(tmp_path, monkeypatch):
+    """Round 19 fix round 2 (reviewer finding, major): Layer 1's hooks already cover every active
+    kanban_lifecycle_only profile (profiles.reviewer_hook_problems), including the built-in "security"
+    specialisation (RoleDef.played_by "reviewer") once config/swarm.yaml roles: maps it -- but before this fix,
+    Layer 2 (process_reviewer_contract's own reviewer_profiles) only ever built
+    frozenset({controller._reviewer_profile(project)}), the literal reviewer role, so a security-profile run
+    that broke the contract was invisible here. project.roles is a plain dict on a frozen ProjectConfig, so it is
+    mutated in place, the same shape config/swarm.yaml's roles: map would take for a project that configures the
+    security specialisation."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    w.project.roles["security"] = "security-1"
+    run = dict(_reviewer_run(2, outcome="review_requested", reason="handing off"), profile="security-1")
+    _put_reviewer_stop(w, reviewer_run=run)
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows == [{"task_key": "T1", "card_id": w.work(), "kind": "PROTOCOL", "action": "protocol",
+                      "answered": "commented"}]
+    assert payloads(w.conn, "reviewer_contract_failure")[0]["profile"] == "security-1"
+    assert payloads(w.conn, "provenance_broken")
+
+
+def test_process_recovery_excludes_a_security_profiles_evidence_changes_requested_too(tmp_path, monkeypatch):
+    """The sibling call site of the same fix (round 19 fix round 2, reviewer finding, major):
+    process_recovery's own call to recovery.refresh_review_rounds built the identical single-literal-name
+    frozenset, so the D5 exclusion (fix D5: an evidence-only changes_requested is not a review round) silently
+    stopped applying whenever the reviewer-class run doing the evidence-stalling was a "security" specialisation
+    rather than the literal reviewer profile. Gate 1 is stubbed PASS so process_recovery's OTHER steps (which
+    also read the branch) find nothing to act on; only the review-rounds count is under test here."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    w.project.roles["security"] = "security-1"
+    _stub_gate1_result(monkeypatch, passed=True, detail="1 passed")
+    commit = git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    run = dict(_reviewer_run(2, outcome="changes_requested", reason=EVIDENCE_REASON), profile="security-1")
+    _put_reviewer_stop(w, coder_commit=commit, reviewer_run=run)
+
+    controller.process_recovery("b", w.repo, w.plan, w.project, MODELS, conn=w.conn)
+
+    assert recovery.load_lineage(w.conn, w.plan.project, "T1").review_rounds == 0
+
+
+def test_swarm_questions_lists_a_protocol_stop_although_the_card_stays_in_review(tmp_path, monkeypatch):
+    """Round 19 fix round 1 (reviewer finding, blocker): ASES-REC-05 ("swarm questions lists open questions with
+    their cards") must hold even for a PROTOCOL stop, whose card Hermes leaves in "review" forever (block_task
+    accepts only "ready"/"running", research report finding F2 -- ASES can never Hermes-block it either). Unlike
+    the sibling test above, no Asker stub is installed here: this drives the REAL questions.ask_user, so it
+    actually reaches the "commented, not blocked" fallback the mocked test cannot see, and the real
+    questions.list_questions/open_question/answer_question afterward -- the exact gap the independent review
+    proved live against a copy of the source (ask_user returned "commented" and a later open_question on the
+    same card returned None)."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="review_requested", reason="handing off"))
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows[0]["answered"] == "commented"   # the real ask_user: status "review" cannot be Hermes-blocked
+
+    found = questions.list_questions("b", w.plan, conn=w.conn)
+
+    assert [q.card_id for q in found] == [w.work()]
+    assert found[0].source == "ases_comment" and found[0].task_key == "T1"
+
+    # Still never answerable through the ordinary path: design step 6, "never unblocked or reopened by ASES".
+    with pytest.raises(questions.QuestionError, match="review"):
+        questions.answer_question("b", w.work(), "use candidate B", conn=w.conn)
+    assert w.board.cards[w.work()]["status"] == "review"  # the refusal above never touched the card
+
+
+def test_evidence_blocked_never_reruns_gate1_for_an_already_decided_run(tmp_path, monkeypatch):
+    """Round 19 fix round 1 (reviewer finding, major): design step 5 leaves an ask-owner card blocked
+    indefinitely ("never unblock, never retry" -- the human may take hours or days to answer), and
+    _latest_contract_run keeps returning the SAME already-decided run for as long as nothing new happens on the
+    card, so a controller pass (every ~20s) with nothing new to decide for this run_id must do NO gate work at
+    all. Before this fix the run_id dedup check ran AFTER review_mod.record_gate1, so the whole Gate 1 suite
+    reran on every single pass regardless, with the fresh result thrown away by the dedup check moments later."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    calls = _stub_gate1_result(monkeypatch, passed=True, detail="1 passed")
+    Asker(monkeypatch)
+    # recurrences=2 makes _answer_once_eligible False, so this always resolves to "ask_owner" and stays
+    # unresolved: a stop the ladder can never answer, exactly the shape that used to rerun Gate 1 forever.
+    _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON),
+                        block_recurrences=2)
+
+    rows1 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows1 == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "ask_owner",
+                       "answered": "commented"}]
+    assert len(calls) == 1   # Gate 1 ran once, to produce the gate record the ANSWER/ask-owner text cites
+
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "already_decided"}]
+    assert len(calls) == 1   # NOT rerun on a second pass over the exact same, still-unresolved run_id
+
+
+def test_evidence_blocked_retries_after_a_gate_infrastructure_error_instead_of_freezing(tmp_path, monkeypatch):
+    """Round 19 architect fix (the reviewer's last major finding): Gate 1 that could not even run (Docker down, the
+    image missing) says nothing about the commit, so nothing may be decided for that run: the error is recorded
+    once, and the next pass, with the sandbox back, decides normally. Before the fix the decision event was written
+    on the failed pass ("gate_unknown_stop"), so that run_id was never looked at again."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    commit = git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    _put_reviewer_stop(w, coder_commit=commit, reviewer_run=_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON))
+    outage = {"down": True}
+
+    def gate(repo, commit_sha, gate_name, commands, **kwargs):
+        if outage["down"]:
+            raise sandbox_mod.SandboxInfrastructureError("the sandbox is enabled but docker CLI not found on PATH")
+        return gates_mod.GateResult(gate_name, commit_sha, True, "1 passed")
+
+    monkeypatch.setattr(gates_mod, "run_gate", gate)
+
+    rows1 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    rows1b = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows1 == rows1b == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE",
+                                "action": "gate_infrastructure_retry"}]
+    assert payloads(w.conn, "reviewer_contract_decision") == []
+    assert len(payloads(w.conn, "reviewer_contract_gate_error")) == 1   # recorded once, not every pass
+
+    outage["down"] = False
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "answer_once"}]
+    assert w.board.cards[w.work()]["status"] == "ready"
+
+
+def test_evidence_blocked_answer_once_posts_the_gate_pass_and_unblocks(tmp_path, monkeypatch):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    _stub_gate1_result(monkeypatch, passed=True, detail="1 passed")
+    commit = git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    _put_reviewer_stop(w, coder_commit=commit, reviewer_run=_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON))
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "answer_once"}]
+    assert payloads(w.conn, "reviewer_evidence_answered") == [{"project": "t3", "task_key": "T1", "commit": commit}]
+    comments = [c for n, a, kw in w.board.calls if n == "kanban_comment" for c in [a[2]]]
+    assert any(c.startswith("ANSWER:") and commit in c for c in comments)
+    # Round 19 fix round 1 (reviewer finding, minor): design (a) line 198's own template quotes "at <ts>".
+    assert any(f"commit {commit} at " in c and c.split(f"commit {commit} at ", 1)[1][:4].isdigit()
+               for c in comments)
+    assert any("ASES gate record" in c for c in comments)  # review.record_gate1's own comment
+    assert w.board.cards[w.work()]["status"] == "ready"  # unblocked
+
+    # Never twice for the same commit: unblock it again with a second same-kind block on the SAME commit.
+    w.board.cards[w.work()]["status"] = "blocked"
+    _put_reviewer_stop(w, coder_commit=commit, reviewer_run=_reviewer_run(3, outcome="blocked", reason=EVIDENCE_REASON),
+                       block_recurrences=1)
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "ask_owner",
+                       "answered": "commented"}]
+    assert len(payloads(w.conn, "reviewer_evidence_answered")) == 1
+
+
+def test_evidence_blocked_red_gate_stops_with_no_unblock_and_no_extra_question(tmp_path, monkeypatch):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    _stub_gate1_result(monkeypatch, passed=False, detail="1 failed")
+    asker = Asker(monkeypatch)
+    commit = git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    _put_reviewer_stop(w, coder_commit=commit, reviewer_run=_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON))
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "gate_red_stop"}]
+    assert asker.asked == []
+    assert w.board.cards[w.work()]["status"] == "blocked"  # untouched: the ordinary gate record comment is on it
+    comments = [a[2] for n, a, kw in w.board.calls if n == "kanban_comment"]
+    assert any("ASES gate record" in c and "fail" in c.lower() for c in comments)
+
+
+@pytest.mark.parametrize("bad", ["recurrences", "source_status", "no_commit"])
+def test_evidence_blocked_asks_the_owner_instead_of_answering_once_when_ineligible(tmp_path, monkeypatch, bad):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    _stub_gate1_result(monkeypatch, passed=True, detail="1 passed")
+    asker = Asker(monkeypatch)
+    commit = None if bad == "no_commit" else git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    kwargs = {"coder_commit": False if bad == "no_commit" else commit,
+              "block_recurrences": 2 if bad == "recurrences" else 1,
+              "claimed_source_status": "ready" if bad == "source_status" else "review"}
+    _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON), **kwargs)
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "ask_owner",
+                      "answered": "commented"}]
+    assert len(asker.asked) == 1 and asker.asked[0][0] == w.work()
+    assert payloads(w.conn, "reviewer_evidence_answered") == []
+
+
+def test_evidence_changes_requested_comments_and_asks_never_unblocks(tmp_path, monkeypatch):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    asker = Asker(monkeypatch)
+    commit = git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    _put_reviewer_stop(w, coder_commit=commit,
+                        reviewer_run=_reviewer_run(2, outcome="changes_requested", reason=EVIDENCE_REASON))
+
+    rows = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "evidence_changes_requested",
+                      "answered": "commented"}]
+    comments = [a[2] for n, a, kw in w.board.calls if n == "kanban_comment"]
+    assert any(c.startswith("ANSWER:") and "not counted as a review round" in c for c in comments)
+    assert "kanban_unblock" not in [n for n, a, kw in w.board.calls]
+    assert payloads(w.conn, "reviewer_contract_failure")[0]["kind"] == "EVIDENCE"
+    assert asker.asked and asker.asked[0][0] == w.work()
+
+    # A second pass over the SAME run_id (the card still shows the identical changes_requested run: nothing
+    # about it changes just because ASES looked at it) comments and asks nothing new.
+    asker.asked.clear()
+    comment_calls_before = sum(1 for n, a, kw in w.board.calls if n == "kanban_comment")
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "already_decided"}]
+    assert asker.asked == []
+    assert sum(1 for n, a, kw in w.board.calls if n == "kanban_comment") == comment_calls_before
+    assert len(payloads(w.conn, "reviewer_contract_failure")) == 1
+
+
+def test_a_second_distinct_evidence_changes_requested_stop_on_the_same_commit_is_not_asked_again(
+    tmp_path, monkeypatch,
+):
+    """The same ask_user dedup gap as the PROTOCOL test above, for the sibling EVIDENCE/changes_requested branch
+    (round 19 fix round 2, reviewer finding, major): this card is "ready", not "blocked", the moment it is read,
+    also outside open_question's status gate. Real ask_user, no Asker stub: kanban_block is made to fail once
+    (a race where Hermes has already moved the card on by the time the controller's own block call lands is
+    exactly the shape that leaves a comment-only question sitting on a "ready" card), so the first stop falls
+    back to the comment ask_user's docstring describes, and the card is never actually blocked. A second,
+    genuinely new run_id on the SAME commit must still produce only ONE "ASES QUESTION:" comment -- the
+    "ANSWER: ... not counted" note is deliberately posted every time (design (a) step 7) and is not part of this
+    dedup, so it is not asserted on here."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    commit = git("rev-parse", "swarm/T1-coder", cwd=w.repo).strip()
+    w.board.fail["kanban_block"] = hermes.HermesCommandError(["kanban", "block"], 1, "card moved on")
+    _put_reviewer_stop(w, coder_commit=commit,
+                        reviewer_run=_reviewer_run(2, outcome="changes_requested", reason=EVIDENCE_REASON))
+
+    rows1 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+    assert rows1[0]["answered"] == "commented"
+
+    card = w.board.cards[w.work()]
+    card["_runs"].append(_reviewer_run(3, outcome="changes_requested", reason=EVIDENCE_REASON))
+    w.board.add_event(w.work(), "changes_requested", {
+        "reason": EVIDENCE_REASON, "implementer": "coder-1", "reviewer": "reviewer", "status": "ready",
+    }, run_id=3)
+
+    rows2 = controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn)
+
+    assert rows2 == [{"task_key": "T1", "card_id": w.work(), "kind": "EVIDENCE", "action": "evidence_changes_requested",
+                       "answered": "already_asked"}]
+    questions_posted = [a[2] for n, a, kw in w.board.calls if n == "kanban_comment" and a[2].startswith("ASES QUESTION:")]
+    assert len(questions_posted) == 1
+
+
+def test_a_genuine_question_block_is_not_a_reviewer_contract_stop(tmp_path, monkeypatch):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    asker = Asker(monkeypatch)
+    _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="blocked", reason=GENUINE_QUESTION_REASON))
+    before = kinds(w.conn)
+
+    assert controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn) == []
+    assert asker.asked == [] and kinds(w.conn) == before
+
+
+def test_a_non_reviewer_profiles_block_is_never_classified_even_with_evidence_shaped_text(tmp_path, monkeypatch):
+    w = _reviewer_world(tmp_path, monkeypatch)
+    asker = Asker(monkeypatch)
+    run = dict(_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON), profile="coder-1")
+    _put_reviewer_stop(w, reviewer_run=run)
+    before = kinds(w.conn)
+
+    assert controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn) == []
+    assert asker.asked == [] and kinds(w.conn) == before
+
+
+def test_a_completed_reviewer_run_after_a_stop_is_not_reconsidered(tmp_path, monkeypatch):
+    """The LATEST run decides, not any earlier one: once a fresh reviewer run completes normally, an older
+    blocked run of the same card must never be re-classified."""
+    w = _reviewer_world(tmp_path, monkeypatch)
+    asker = Asker(monkeypatch)
+    card = _put_reviewer_stop(w, reviewer_run=_reviewer_run(2, outcome="blocked", reason=EVIDENCE_REASON))
+    card["_runs"].append({"id": 3, "profile": "reviewer", "outcome": "completed", "status": "completed",
+                           "summary": "PASS", "error": None, "metadata": {"review_outcome": "approved"},
+                           "started_at": 3000, "ended_at": 3010})
+    card["status"] = "done"
+
+    assert controller.process_reviewer_contract("b", w.repo, w.plan, w.project, conn=w.conn) == []
+    assert asker.asked == []
 
 
 # =============================================================================================================
@@ -2929,10 +3397,11 @@ def test_the_final_gates_module_is_imported_lazily():
 # run_pass
 # =============================================================================================================
 
-STEPS = ["guard", "idle_worktrees", "usage", "recovery", "bounds", "budget", "unpark", "review", "dispatch",
-         "card_base", "provision", "merge", "finalize"]
+STEPS = ["guard", "idle_worktrees", "usage", "recovery", "reviewer_contract", "bounds", "budget", "unpark", "review",
+         "dispatch", "card_base", "provision", "merge", "finalize"]
 SUMMARY_KEYS = {"parked", "dispatch", "sent_back", "merged", "unreviewed", "usage_sessions", "integrity", "warnings",
-                "recovery", "unparked", "provisioned", "stopped", "stop_reason", "final", "finished"}
+                "recovery", "reviewer_contract", "unparked", "provisioned", "stopped", "stop_reason", "final",
+                "finished"}
 
 
 class PassRig:
@@ -2943,9 +3412,10 @@ class PassRig:
         self.order = []
         self.args = {}
         self.raises = {}
-        self.results = {"idle_worktrees": [], "usage": ["s1", "s2"], "recovery": [], "bounds": (False, None),
-                        "budget": ["T9"], "unpark": [], "review": [], "dispatch": {"spawned": 1}, "card_base": [],
-                        "provision": [], "merge": ["T1"], "finalize": None}
+        self.results = {"idle_worktrees": [], "usage": ["s1", "s2"], "recovery": [], "reviewer_contract": [],
+                        "bounds": (False, None), "budget": ["T9"], "unpark": [], "review": [],
+                        "dispatch": {"spawned": 1}, "card_base": [], "provision": [], "merge": ["T1"],
+                        "finalize": None}
         self.conn = db.connect(tmp_path / "ases.db")
         self.plan = types.SimpleNamespace(project="p", integration_branch="integration")
         self.project = types.SimpleNamespace(budgets={"k": 1})
@@ -2984,6 +3454,7 @@ class PassRig:
 
         monkeypatch.setattr(guards, "check_primary_checkout", guard)
         for name, target in (("idle_worktrees", "process_idle_worktrees"), ("recovery", "process_recovery"),
+                             ("reviewer_contract", "process_reviewer_contract"),
                              ("bounds", "process_bounds"), ("budget", "process_budget_gate"),
                              ("unpark", "process_unpark"), ("review", "process_review_lane"),
                              ("card_base", "process_card_base_checks"),
@@ -3032,6 +3503,10 @@ def test_run_pass_hands_each_step_what_it_needs(tmp_path, monkeypatch):
     assert rig.args["unpark"] == (("b", rig.plan, rig.models),
                                   {"conn": rig.conn, "budgets": rig.project.budgets, "project": rig.project,
                                    "now": moment, "repo": "the-repo"})
+    # Round 19 fix round 2 (reviewer finding, major): models_config now reaches process_reviewer_contract too,
+    # so profiles.active_reviewer_profiles can resolve every active kanban_lifecycle_only profile, not just the
+    # literal reviewer role.
+    assert rig.args["reviewer_contract"] == (everything, {"conn": rig.conn})
     assert rig.args["review"] == (("b", "the-repo", rig.plan, rig.project), {"conn": rig.conn})
     assert rig.args["card_base"] == (("b", "the-repo", rig.plan), {"conn": rig.conn})
     assert rig.args["provision"] == (("b", rig.plan, rig.project), {"conn": rig.conn})
@@ -3073,7 +3548,7 @@ def test_a_bound_that_stops_the_project_ends_the_pass_before_anything_is_dispatc
 
     summary = rig.run()
 
-    assert rig.order == ["guard", "idle_worktrees", "usage", "recovery", "bounds"]
+    assert rig.order == ["guard", "idle_worktrees", "usage", "recovery", "reviewer_contract", "bounds"]
     assert summary["stopped"] is True and summary["stop_reason"].startswith("replans_per_project reached")
     assert set(summary) == SUMMARY_KEYS and summary["usage_sessions"] == 2
     assert summary["recovery"] == rig.results["recovery"]            # what was done before the stop is still reported

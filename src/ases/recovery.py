@@ -68,6 +68,7 @@ from . import models as models_mod
 from . import plan as plan_mod
 from . import policy
 from . import questions as questions_mod
+from . import reviewcontract as reviewcontract_mod
 from . import usage as usage_mod
 
 
@@ -310,7 +311,38 @@ _HERMES_ERRORS = (
 )
 
 
-def refresh_review_rounds(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Connection) -> dict[str, int]:
+def _evidence_run_ids(card: dict, reviewer_profiles: frozenset[str]) -> frozenset:
+    """The run ids (Hermes's own values, whatever type they are) of this card's runs that
+    reviewcontract.classify_reviewer_run classifies as EVIDENCE. This is refresh_review_rounds' own half of the
+    D5 fix: a `changes_requested` board EVENT carries the `run_id` of the run it closed (hermes.kanban_show's own
+    docstring; kanban_db.py:3343-3345 `_end_run` then `_append_event(..., run_id=run_id)`), so correlating an
+    event to its run needs no lookup beyond the same `card` dict this function is already given -- in particular
+    no dependency on controller.process_reviewer_contract having recorded anything yet, which matters because
+    that step runs AFTER this one in run_pass (process_recovery calls this function first): a `changes_requested`
+    event this SAME pass must already be excludable, or the round is charged before anything downstream ever
+    gets a chance to say it should not be.
+
+    Ids are returned as strings, never compared to a raw `run.get("id")` (round 19 fix round 2, reviewer
+    finding, minor): controller._event_for_run's own docstring already gives the reason ("both values came off
+    the same JSON round trip in practice, but this never assumes one particular numeric/string type survived
+    it") -- refresh_review_rounds' own containment check against `event.get("run_id")` follows the same
+    convention. A run with no `id` at all is never added: turning a missing id into the literal string "None"
+    would risk matching a differently-malformed event that also has no `run_id`, for no benefit."""
+    if not reviewer_profiles:
+        return frozenset()
+    ids = set()
+    for run in card.get("_runs") or []:
+        if not isinstance(run, dict) or run.get("id") is None:
+            continue
+        stop = reviewcontract_mod.classify_reviewer_run(run, reviewer_profiles)
+        if stop is not None and stop.kind == reviewcontract_mod.KIND_EVIDENCE:
+            ids.add(str(run.get("id")))
+    return frozenset(ids)
+
+
+def refresh_review_rounds(
+    board: str, plan: plan_mod.Plan, *, conn: sqlite3.Connection, reviewer_profiles: frozenset[str] = frozenset(),
+) -> dict[str, int]:
     """Count review rounds per plan task from the board (ASES-REC-02: "review rounds ... across the original card
     and everything it spawned"). Returns {task_key: rounds added by this call} for every task whose current work
     card could be read, 0 for a task with nothing new.
@@ -320,7 +352,13 @@ def refresh_review_rounds(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Conn
     card those events were counted for (seen_card) and how many (seen_events): only the difference is added, so
     the call is idempotent, and when a fix card has taken over (seen_card differs) its own events count from zero
     while the rounds already counted stay in review_rounds. A card that cannot be read is skipped, with a
-    `recovery_error` event, and the other tasks carry on."""
+    `recovery_error` event, and the other tasks carry on.
+
+    Round 19 (package REVIEWLADDER, fix D5): a `changes_requested` event is EXCLUDED from the count when
+    _evidence_run_ids says the run it closed was the reviewer asking the controller to run tests instead of
+    judging the code (ASES-REV-05) -- not a real review round. `reviewer_profiles` defaults to empty (no
+    exclusion at all), so every caller that predates this fix (every test in this module) keeps its exact
+    previous behaviour; process_recovery passes the resolved reviewer profile(s)."""
     added: dict[str, int] = {}
     for task in plan.tasks:
         row = conn.execute(
@@ -334,9 +372,11 @@ def refresh_review_rounds(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Conn
         except _HERMES_ERRORS as exc:
             _record_error_once(conn, plan.project, task.key, card_id, "refresh_review_rounds", exc)
             continue
+        excluded_run_ids = _evidence_run_ids(card, reviewer_profiles)
         count = sum(
             1 for event in card.get("_events") or []
             if isinstance(event, dict) and event.get("kind") in _REVIEW_EVENT_KINDS
+            and not (event.get("kind") == "changes_requested" and str(event.get("run_id")) in excluded_run_ids)
         )
         stored = conn.execute(
             "SELECT seen_card, seen_events FROM lineage WHERE project = ? AND task_key = ?",

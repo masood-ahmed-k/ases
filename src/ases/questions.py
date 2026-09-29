@@ -42,6 +42,7 @@ from . import events
 from . import gates as gates_mod
 from . import hermes as hermes_mod
 from . import plan as plan_mod
+from . import reviewcontract as reviewcontract_mod
 
 # Every fix card is titled "<task key>: fix (round N)" (controller.process_merge_queue).
 _FIX_MARKER = ": fix (round"
@@ -315,6 +316,20 @@ def _answered_at(card: dict) -> tuple[int, int, int] | None:
     return latest
 
 
+def _newest_open_signal(card: dict, signals: list[_Signal]) -> OpenQuestion | None:
+    """The newest of `signals` that is still open on `card`, or None (`signals` empty, or its newest entry is
+    older than the newest sign of an answer). Split out of open_question (round 19 fix round 1) so a caller that
+    already knows WHICH signals it wants to look at (_review_lane_question, below) can reuse the exact same
+    "newest wins, unless answered" rule without also taking on open_question's own status gate."""
+    if not signals:
+        return None
+    newest = max(signals, key=lambda signal: signal.key)
+    answered = _answered_at(card)
+    if answered is not None and newest.key < answered:
+        return None
+    return OpenQuestion(reason=newest.reason, asked_at=newest.at, source=newest.source)
+
+
 def open_question(card: dict) -> OpenQuestion | None:
     """ASES-REC-05: what a card is asking a person right now, or None. `card` is a hermes.kanban_show dict.
 
@@ -326,17 +341,62 @@ def open_question(card: dict) -> OpenQuestion | None:
     something newer blocked it without saying why (a merge card is created blocked and is not asking anything).
 
     This is the one rule for whether a card asks a question, so `swarm questions`, `swarm answer`, the recovery
-    loop's "already asked" test and the report cannot drift apart. Pure: the dict is only read."""
+    loop's "already asked" test and the report cannot drift apart. Pure: the dict is only read.
+
+    Deliberately does NOT cover a card a reviewer-contract PROTOCOL stop marked provenance_broken (round 19,
+    package REVIEWLADDER): such a card's real Kanban status is "review" forever (Hermes's own block_task accepts
+    only "ready"/"running", so ASES can never Hermes-block it either), which this function's status gate always
+    excludes, by design -- `answer_question` relies on that same gate to refuse ever unblocking such a card (see
+    its own docstring). list_questions's own _review_lane_question is the narrow, separate path that still makes
+    such a card's question visible to `swarm questions` without loosening what open_question or answer_question
+    accept."""
     if not isinstance(card, dict) or card.get("status") not in _QUESTION_STATUSES:
         return None
-    signals = _signals(card)
-    if not signals:
+    return _newest_open_signal(card, _signals(card))
+
+
+def _review_lane_question(card: dict) -> OpenQuestion | None:
+    """The `ases_comment` question still open on `card`, for a card open_question itself will never surface
+    because of its status alone -- the narrow, status-blind half of "is this already asked". Two callers, for
+    the same underlying reason:
+
+      - list_questions, for exactly the cards questions._provenance_broken_card_ids names (a reviewer-contract
+        PROTOCOL stop, controller._protocol_stop) and ONLY while they are still, in fact, sitting in `review`
+        (list_questions checks that itself: a card that has moved on is not this function's business);
+      - ask_user (round 19 fix round 2, reviewer finding, major), as its own dedup's fallback for any card whose
+        status is not `blocked` or `triage` at the moment it is asked again, whatever put it there.
+
+    Round 19 fix round 1 (reviewer finding, blocker): Hermes's block_task accepts only a `ready` or `running`
+    card (research report F2), so a card a reviewer corrupted into `review` by calling kanban_request_review (D6)
+    can never be Hermes-blocked and so never reaches `blocked` or `triage`, the two statuses open_question (and
+    _QUESTION_STATUSES) require. ASES-REC-05 ("swarm questions lists open questions with their cards") still has
+    to hold for it, so list_questions calls this instead of open_question for those cards.
+
+    Only the `ases_comment` signal is looked at, deliberately: a genuine Hermes-native `blocked`/`gave_up`/
+    `block_loop_detected` event on a card that is not `blocked` or `triage` is not a shape Hermes produces (real
+    Hermes writes those only alongside the status change that goes with them), so widening this to every source
+    the way open_question does would not add a real case, only risk one that looks like it means something it
+    does not. This never changes what `swarm answer` will accept (answer_question keeps its own, unchanged
+    `status not in _QUESTION_STATUSES` refusal), so a provenance_broken card becomes visible without ever
+    becoming answerable through the ordinary path -- matching design step 6's "never unblocked or reopened by
+    ASES" exactly: the card is seen, not touched."""
+    if not isinstance(card, dict):
         return None
-    newest = max(signals, key=lambda signal: signal.key)
-    answered = _answered_at(card)
-    if answered is not None and newest.key < answered:
-        return None
-    return OpenQuestion(reason=newest.reason, asked_at=newest.at, source=newest.source)
+    signals = [signal for signal in _signals(card) if signal.source == "ases_comment"]
+    return _newest_open_signal(card, signals)
+
+
+def _provenance_broken_card_ids(conn: sqlite3.Connection, project: str) -> set[str]:
+    """Every card id a reviewer-contract PROTOCOL stop (controller._protocol_stop) has ever marked
+    provenance_broken for `project` (reviewcontract.EVENT_PROVENANCE_BROKEN, read back by its own `card_id`
+    field). list_questions uses this to find the one shape of card open_question can never see on its own --
+    see _review_lane_question's own docstring for why."""
+    rows = conn.execute(
+        f"SELECT DISTINCT json_extract(payload, '$.card_id') AS card_id FROM events "
+        f"WHERE kind = ? AND {events.PROJECT_SCOPE_SQL}",
+        (reviewcontract_mod.EVENT_PROVENANCE_BROKEN, project),
+    ).fetchall()
+    return {row["card_id"] for row in rows if row["card_id"]}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -361,9 +421,10 @@ def ask_user(
     """ASES-REC-05: "A worker or the controller blocks the card with the question as the reason." Puts `text` to the
     person as a question on `card` (a hermes.kanban_show dict) and returns how it went:
 
-      "already_asked"  an identical question is already open on the card (open_question): nothing is posted and no
-                       event is written, so a pass that repeats every few seconds neither piles up comments nor
-                       spams the log
+      "already_asked"  an identical question is already open on the card (open_question, or, on a card whose status
+                       will never be "blocked" or "triage" -- see the note below -- _review_lane_question): nothing
+                       is posted and no event is written, so a pass that repeats every few seconds neither piles up
+                       comments nor spams the log
       "blocked"        the card was `ready` or `running`, and `hermes kanban block --kind needs_input` took it: the
                        reason is the question, and it is the kind Hermes reserves for "a question for a human"
       "commented"      the question is a comment "ASES QUESTION: <text>" by `author`. Hermes's block_task accepts only
@@ -379,6 +440,22 @@ def ask_user(
     `block_loop_detected` event, and `hermes kanban block` still exits 0: the answer is still "blocked", and
     open_question finds it there. Nothing here unblocks anything, and nothing ever times a question out into a guess.
 
+    Round 19 fix round 2 (reviewer finding, major): open_question's own dedup is gated on `card`'s status being
+    `blocked` or `triage` (_QUESTION_STATUSES), which a card a reviewer-contract PROTOCOL stop marked
+    provenance_broken never reaches (its status stays "review" forever, by design: see controller._protocol_stop)
+    and a card an EVIDENCE changes_requested stop is asking about may not have reached yet at the moment this is
+    called (Hermes's own request_changes routing leaves it "ready", not "blocked", until the block above actually
+    lands, if it lands at all). Before this fix, `already = open_question(card)` always came back None for both,
+    so a second, distinct call for the exact same still-unresolved situation (a new run_id on a card nothing has
+    answered) was invisible to the check just below and posted a brand-new comment every time -- confirmed live
+    against a real board copy: two distinct PROTOCOL runs on one card produced two "ASES QUESTION:" comments.
+    _review_lane_question is the same narrow, status-blind check list_questions already uses for the same reason
+    (round 19 fix round 1): only the `ases_comment` signal, because a genuine Hermes-native blocked/gave_up/
+    block_loop_detected event is not a shape Hermes ever leaves on a card outside `blocked`/`triage`. It is tried
+    only as a fallback, when open_question itself found nothing BECAUSE of that status gate (not when it found
+    nothing because there is genuinely no open question on a blocked/triage card), so this never changes what
+    ask_user does for the ordinary case the docstring above already describes.
+
     `text` is redacted with events.redact_text and cut to QUESTION_LIMIT characters before anything is posted; a
     blank one raises ValueError. When `conn` is given a `question_asked` event records the card, how it was asked and
     the length, with the first 300 characters of the question. Only the default author `ases` is recognised by
@@ -392,6 +469,9 @@ def ask_user(
         raise ValueError("card must be a hermes.kanban_show dict with an id")
     clean = _prepare(text)
     already = open_question(card)
+    if already is None and card.get("status") not in _QUESTION_STATUSES:
+        # Round 19 fix round 2 (reviewer finding, major): see this function's own docstring above.
+        already = _review_lane_question(card)
     if already is not None and _same(already.reason, clean):
         return ASKED_ALREADY
 
@@ -520,7 +600,13 @@ def list_questions(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Connection)
     skipped and the rest are still listed, because one unreadable card must not hide every other question. The
     skip is not silent: a question_read_failed event records the card and Hermes's error. Any other failure,
     and a failure of either list, propagates: a Hermes that cannot answer at all must not look like an
-    empty inbox."""
+    empty inbox.
+
+    Round 19 fix round 1 (reviewer finding, blocker): a card a reviewer-contract PROTOCOL stop marked
+    provenance_broken is ALSO listed here, whatever its Kanban status, using _review_lane_question instead of
+    open_question -- see that function's own docstring for why such a card (stuck in "review", which Hermes's
+    block_task will never accept) would otherwise be permanently invisible to `swarm questions`, breaking
+    ASES-REC-05 for exactly the one stop this violates it for today."""
     cards, foreign, keys = _card_index(conn, plan.project)
     keys = keys | {task.key for task in plan.tasks}
     listed = [
@@ -554,6 +640,30 @@ def list_questions(board: str, plan: plan_mod.Plan, *, conn: sqlite3.Connection)
         found.append(Question(
             card_id=card_id, title=title, task_key=task_key, card_kind=_kind(kind_by_id, title),
             assignee=card.get("assignee") or entry.get("assignee") or None,
+            question=asked.reason, asked_at=asked.asked_at, source=asked.source,
+        ))
+    for card_id in _provenance_broken_card_ids(conn, plan.project):
+        if not card_id or card_id in seen or (card_id in foreign and card_id not in cards):
+            continue
+        seen.add(card_id)
+        try:
+            card = hermes_mod.kanban_show(board, card_id)
+        except hermes_mod.HermesCommandError as exc:
+            events.record(conn, "question_read_failed", {
+                "card_id": card_id, "error": f"{type(exc).__name__}: {exc}"[:300],
+            }, project=plan.project)
+            continue
+        if card.get("status") != "review":
+            continue  # moved on since the marker was written (e.g. archived): not this function's business
+        title = card.get("title") or ""
+        owner = _owner(card_id, title, _parent_ids(card), cards, foreign, keys)
+        asked = _review_lane_question(card)
+        if owner is None or asked is None:
+            continue
+        task_key, kind_by_id = owner
+        found.append(Question(
+            card_id=card_id, title=title, task_key=task_key, card_kind=_kind(kind_by_id, title),
+            assignee=card.get("assignee") or None,
             question=asked.reason, asked_at=asked.asked_at, source=asked.source,
         ))
     found.sort(key=lambda question: (question.asked_at, question.card_id))

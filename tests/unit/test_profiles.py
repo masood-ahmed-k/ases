@@ -147,6 +147,12 @@ def _matching_config(name, *, sandbox_on=False):
         cfg["providers"] = {"xkiro": {"base_url": XKIRO_URL, "key_env": "XKIRO_API_KEY"}}
     if sandbox_on and "terminal" in TOOLSETS[name]:
         cfg["terminal"] = sandbox.terminal_block(POLICY)
+    if name == "reviewer":
+        # Round 19, package REVIEWLADDER: the two pre_tool_call hooks are part of a "fully matching" reviewer
+        # profile now (ASES-ROL-05, ASES-ROL-06, ASES-REV-05). Read from profiles._reviewer_hook_entries() itself
+        # (never hand-written here) so this fixture cannot drift from what plan_init actually asks for.
+        cfg["hooks"] = {"pre_tool_call": profiles._reviewer_hook_entries()}
+        cfg["hooks_auto_accept"] = True
     return cfg
 
 
@@ -689,6 +695,8 @@ def test_plan_init_on_an_empty_home_creates_every_active_profile_and_no_inactive
         ("create_profile", "profiles/reviewer"), ("write_soul", "SOUL.md"), ("set_config", "platform_toolsets.cli"),
         ("set_config", "memory.memory_enabled"), ("set_config", "memory.user_profile_enabled"),
         ("set_config", "model.default"), ("set_config", "model.provider"), ("set_config", "worktree_sync"),
+        # Round 19, package REVIEWLADDER: ASES-ROL-05/ASES-ROL-06/ASES-REV-05 pre_tool_call hooks.
+        ("set_config", "hooks.pre_tool_call"), ("set_config", "hooks_auto_accept"),
         ("warning", ".env"),
     }
     creates = [c for c in plan if c.kind == "create_profile"]
@@ -1606,6 +1614,133 @@ def test_verify_state_a_reviewer_with_terminal_or_no_explicit_toolsets(tmp_path)
     _write_profile(home, "reviewer", cfg=cfg)
     problems = _verify(project, home)
     assert _has(problems, "profile reviewer has no platform_toolsets.cli list", "every tool")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Reviewer pre_tool_call hooks (round 19, package REVIEWLADDER; ASES-ROL-05, ASES-ROL-06, ASES-REV-05)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_reviewer_hook_entries_name_sys_executable_and_existing_scripts():
+    import sys as _sys
+
+    entries = profiles._reviewer_hook_entries()
+    assert [e["matcher"] for e in entries] == [profiles.reviewcontract_mod.DENY_MATCHER,
+                                                profiles.reviewcontract_mod.EVIDENCE_MATCHER]
+    assert [e["fail_closed"] for e in entries] == [True, False]
+    assert all(e["timeout"] == profiles.reviewcontract_mod.HOOK_TIMEOUT_SECONDS for e in entries)
+    for entry in entries:
+        assert entry["command"].startswith(f'"{_sys.executable}" "')
+        path = pathlib.Path(entry["command"].split('" "', 1)[1].rstrip('"'))
+        assert path.is_file(), path
+
+
+def test_reviewer_hook_entries_matchers_fullmatch_exactly_their_own_denied_tools():
+    """Hermes's matcher is re.fullmatch (agent/shell_hooks.py) -- R1's matcher must fullmatch every DENIED_TOOLS
+    name and no EVIDENCE_TOOLS name (and vice versa for R2), or the wrong hook would fire for a given tool."""
+    deny, evidence = profiles._reviewer_hook_entries()
+    deny_re = re.compile(deny["matcher"])
+    evidence_re = re.compile(evidence["matcher"])
+    for tool in profiles.reviewcontract_mod.DENIED_TOOLS:
+        assert deny_re.fullmatch(tool), tool
+        assert not evidence_re.fullmatch(tool), tool
+    for tool in profiles.reviewcontract_mod.EVIDENCE_TOOLS:
+        assert evidence_re.fullmatch(tool), tool
+        assert not deny_re.fullmatch(tool), tool
+    assert not deny_re.fullmatch("kanban_complete") and not evidence_re.fullmatch("kanban_complete")
+
+
+def test_reviewer_hook_rows_preserve_an_unrelated_existing_hook():
+    extra = {"matcher": "some_other_tool", "command": "echo hi", "timeout": 5, "fail_closed": False}
+    cfg = {"hooks": {"pre_tool_call": [extra]}}
+    rows = {target: (before, after, why) for target, before, after, why in profiles._reviewer_hook_rows(cfg)}
+    before, after, _why = rows["hooks.pre_tool_call"]
+    assert before == [extra]
+    assert after[:2] == profiles._reviewer_hook_entries()
+    assert after[2] == extra  # appended, not dropped
+    assert rows["hooks_auto_accept"] == (None, True, rows["hooks_auto_accept"][2])
+
+
+def test_reviewer_hook_rows_is_empty_when_already_matching():
+    entries = profiles._reviewer_hook_entries()
+    cfg = {"hooks": {"pre_tool_call": entries}, "hooks_auto_accept": True}
+    assert profiles._reviewer_hook_rows(cfg) == []
+
+
+def test_check_reviewer_hooks_flags_a_missing_hooks_block(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("reviewer")
+    del cfg["hooks"]
+    _write_profile(home, "reviewer", cfg=cfg)
+    problems = _verify(project, home)
+    assert _has(problems, "profile reviewer has no hooks.pre_tool_call list", "ASES-ROL-05")
+
+
+def test_check_reviewer_hooks_flags_a_narrowed_matcher_wrong_fail_closed_and_a_bad_script_path(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("reviewer")
+    entries = cfg["hooks"]["pre_tool_call"]
+    entries[0] = dict(entries[0], matcher="(?:write_file|patch)")  # drops skill_manage and the three kanban tools
+    entries[1] = dict(entries[1], fail_closed=True)  # R2 must be False
+    _write_profile(home, "reviewer", cfg=cfg)
+    problems = _verify(project, home)
+    assert _has(problems, "R1 (deny_tool)", "matcher does not cover every tool")
+    assert _has(problems, "R2 (reviewer_evidence_guard)", "fail_closed=True, not False")
+
+    cfg2 = _matching_config("reviewer")
+    # A stale absolute path (an old checkout location): still identified as R1 by its script FILENAME, so this
+    # is reported as "does not exist", never as "missing" outright.
+    cfg2["hooks"]["pre_tool_call"][0] = dict(
+        cfg2["hooks"]["pre_tool_call"][0], command='"python" "C:/nonexistent/wherever/deny_tool.py"',
+    )
+    _write_profile(home, "reviewer", cfg=cfg2)
+    problems2 = _verify(project, home)
+    assert _has(problems2, "R1 (deny_tool)", "does not point at an existing script")
+
+
+def test_check_reviewer_hooks_flags_hooks_auto_accept_off(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project)
+    cfg = _matching_config("reviewer")
+    cfg["hooks_auto_accept"] = False
+    _write_profile(home, "reviewer", cfg=cfg)
+    problems = _verify(project, home)
+    assert _has(problems, "hooks_auto_accept off")
+
+
+def test_reviewer_hook_problems_reports_per_profile_and_skips_inactive_or_absent(tmp_path):
+    project = _project(tmp_path)
+    home = _matching_home(tmp_path, project, names=["lead", "coder-1", "reviewer"])
+    by_profile = profiles.reviewer_hook_problems(project, MODELS, home)
+    assert by_profile == {"reviewer": []}  # lead/coder-1 are not kanban_lifecycle_only; tester is inactive+absent
+
+    cfg = _matching_config("reviewer")
+    del cfg["hooks_auto_accept"]
+    _write_profile(home, "reviewer", cfg=cfg)
+    by_profile2 = profiles.reviewer_hook_problems(project, MODELS, home)
+    assert _has(by_profile2["reviewer"], "hooks_auto_accept off")
+
+
+def test_active_reviewer_profiles_includes_every_active_kanban_lifecycle_only_profile(tmp_path):
+    """Round 19 fix round 2 (reviewer finding, major): this is the same filter reviewer_hook_problems already
+    uses (spec.active and spec.kanban_lifecycle_only over desired_profiles), so Layer 1's hook coverage and
+    Layer 2's contract-ladder coverage can never disagree about which profiles are "the reviewer"."""
+    project = _project(tmp_path)
+    assert profiles.active_reviewer_profiles(project, MODELS) == frozenset({"reviewer"})
+    assert profiles.active_reviewer_profiles(project) == frozenset({"reviewer"})  # models_config is optional
+    assert profiles.active_reviewer_profiles(project, None) == frozenset({"reviewer"})
+
+    with_security = _project(tmp_path, roles={
+        "lead": "lead", "coder": "coder-1", "reviewer": "reviewer", "security": "security-1",
+    })
+    assert profiles.active_reviewer_profiles(with_security, MODELS) == frozenset({"reviewer", "security-1"})
+
+    # coder-1 (worker, not kanban_lifecycle_only) and tester (kanban_lifecycle_only but inactive by default,
+    # since "tester" is not in roles) are never included.
+    assert "coder-1" not in profiles.active_reviewer_profiles(with_security, MODELS)
+    assert "tester" not in profiles.active_reviewer_profiles(with_security, MODELS)
 
 
 def test_verify_state_reports_toolsets_a_role_does_not_need_or_lacks(tmp_path):
