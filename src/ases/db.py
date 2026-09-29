@@ -440,6 +440,68 @@ def _apply_v7(conn: sqlite3.Connection) -> None:
     _run_script(conn, _V7_SQL)
 
 
+# Version 10 (round 19, package LEDGER; ASES-CAP-02 [p132], ASES-CAP-03 [p133], ASES-RTE-01 [p222], ASES-MOD-05
+# [p126]). The ledger's unit becomes the Hermes SESSION, counted once and topped up monotonically, instead of a
+# run's worker_session_id metadata alone: a run whose worker never got to stamp it (kanban_block,
+# kanban_request_changes, a crash, a hard kill) was invisible to usage_ingested before this, and a run's own
+# ended_at is only the hand-off, not the end of the session that keeps running past it (r19 LEDGER.md).
+#
+# usage_ingested gains: `board` and `run_id` (which run a session is attributed to, for lineage and reporting;
+# ASES-REC-02 -- attribution never decides whether a session is counted, so both are nullable and the existing
+# primary key, session_id, is untouched); `mapped_by` ('metadata' | 'window' | 'list' | 'lineage', how the session
+# was found); `settled` (1 once a session's count is known final -- NOT NULL DEFAULT 0, so every legacy row this
+# migration finds starts unsettled and is topped up the first time settle_open_sessions looks at it, since an old
+# row's session may have kept running past what it was ingested at); `last_check_at`/`last_check_count` (settling's
+# own stability check); `billing_provider` (carried straight from the session export, alongside the existing
+# provider/model columns that ASES-RTE-01's own mismatch logic derives).
+#
+# usage_runs is one row per (board, run_id): the run's own window and the state of counting its session(s) --
+# 'open' (still being watched), 'closed' (every counted session settled) or 'no_session' (a spawned worker whose
+# session could not be found even after the list fallback, ASES-CAP-02's "fed by Hermes run records" half). Rows
+# are inserted (state 'open') for every worker run usage.py sees, whether or not a session is ever attributed.
+#
+# usage_orphans is the exactly-once key for two events the window path can raise without ever double counting a
+# session: a session already counted for a DIFFERENT card (usage_session_conflict, keyed by session_id so the
+# same conflict is never reported twice), and a session that matches no run of any card at all
+# (usage_session_unattributed, same table, same reason -- one row per session id either way).
+_USAGE_V10_COLUMNS = (
+    ("usage_ingested", "board", "TEXT"),
+    ("usage_ingested", "run_id", "INTEGER"),
+    ("usage_ingested", "mapped_by", "TEXT"),
+    ("usage_ingested", "settled", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage_ingested", "last_check_at", "INTEGER"),
+    ("usage_ingested", "last_check_count", "INTEGER"),
+    ("usage_ingested", "billing_provider", "TEXT"),
+)
+_V10_SQL = """
+CREATE TABLE IF NOT EXISTS usage_runs (
+    board TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    card_id TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    project TEXT,
+    task_key TEXT,
+    run_started_at INTEGER NOT NULL,
+    run_ended_at INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open','closed','no_session')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (board, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS usage_orphans (
+    session_id TEXT PRIMARY KEY,
+    card_id TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+"""
+
+
+def _apply_v10(conn: sqlite3.Connection) -> None:
+    for table, column, declaration in _USAGE_V10_COLUMNS:
+        _add_column(conn, table, column, declaration)
+    _run_script(conn, _V10_SQL)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: schema_migrations, requests_ledger, model_registry, events", _V1_SQL),
     Migration(2, "phase 3: plan_tasks, gate_runs, merge_records", _V2_SQL),
@@ -452,6 +514,9 @@ MIGRATIONS: list[Migration] = [
                  "plan_tasks where unambiguous", _apply_v8),
     Migration(9, "integrity_heads: the full history of primary-checkout HEADs ASES has written, for the "
                  "base-commit check (ASES-GIT-01, ASES-GIT-16), backfilled from integrity_state", _apply_v9),
+    Migration(10, "usage_ingested gains board/run_id/mapped_by/settled/last_check_at/last_check_count/"
+                  "billing_provider; usage_runs and usage_orphans, for the session-as-unit ledger ingest "
+                  "(ASES-CAP-02, ASES-CAP-03, ASES-RTE-01, ASES-MOD-05)", _apply_v10),
 ]
 
 

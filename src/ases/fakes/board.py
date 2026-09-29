@@ -491,6 +491,7 @@ class FakeHermes:
         self._spawn_failures: list[_SpawnFailure] = []
         self._session_usage: dict[str, dict | None] = {}
         self._issued_sessions: set[str] = set()
+        self._sessions: dict[str, dict] = {}
         self._task_seq = 0
         self._run_seq = 0
         self._event_seq = 0
@@ -595,6 +596,7 @@ class FakeHermes:
                 "procs": {rid: dataclasses.asdict(p) for rid, p in self._procs.items()},
                 "deferred": [(d.at, d.task_id, d.run_id) for d in self._deferred],
                 "sessions": sorted(self._issued_sessions),
+                "added_sessions": {sid: dict(s) for sid, s in self._sessions.items()},
                 "counters": [
                     self._task_seq, self._run_seq, self._event_seq, self._comment_seq, self._pid_seq,
                     self._claim_seq,
@@ -707,6 +709,48 @@ class FakeHermes:
         """Make session_usage return None for this session (the export failed): usage.py must record nothing for it."""
         with self._lock:
             self._session_usage[session_id] = None
+
+    def add_session(
+        self, profile: str, session_id: str, *, card_id: str, started_at: float, ended_at: float | None = None,
+        last_activity_at: float | None = None, api_call_count: int = 0, model: str = "",
+        first_prompt: str | None = None, parent_session_id: str | None = None,
+    ) -> None:
+        """Add a Hermes session to `profile`'s own store, exactly as `kanban_sessions`, `kanban_session_ids` and
+        `session_usage` would see a real one (r19 LEDGER.md): the window-path and list-fallback matching tests
+        build their fixtures with this, never with `set_session_usage` (which only ever fakes the OLD, id-only
+        export `session_usage` used before this round). `card_id` is never returned by any of the three real
+        calls -- Hermes has no such field, and usage.py derives it from `first_prompt` alone -- it is used here
+        only to default `first_prompt` to the literal kanban worker prompt Hermes's dispatcher gives every
+        worker (kanban_db_dispatch.py:2463) when the caller does not pass one of its own. `last_activity_at`
+        defaults to `ended_at` (or `started_at` while still open), matching a session that made no calls after
+        its last one landed."""
+        with self._lock:
+            self._sessions[session_id] = {
+                "profile": _canonical(profile), "id": session_id, "card_id": card_id, "started_at": started_at,
+                "ended_at": ended_at,
+                "last_activity_at": last_activity_at if last_activity_at is not None else (ended_at if ended_at is not None else started_at),
+                "api_call_count": api_call_count, "model": model,
+                "first_prompt": first_prompt if first_prompt is not None else f"work kanban task {card_id}",
+                "parent_session_id": parent_session_id,
+            }
+
+    def _public_session(self, session: dict, *, with_source_and_end_reason: bool) -> dict:
+        """`session` (this fake's own internal shape, `add_session`'s fields plus `profile`/`card_id`) reduced to
+        what the real `hermes.kanban_sessions`/`hermes.session_usage` return: never `profile` or `card_id` (real
+        Hermes has neither), zero for the token counts and "" for billing_provider (this fake never models them,
+        since no test built so far reads either back), and `source`/`end_reason` only for `kanban_sessions`
+        (`session_usage` drops both, exactly as the real function does)."""
+        common = {
+            "id": session["id"], "started_at": session["started_at"], "ended_at": session["ended_at"],
+            "last_activity_at": session["last_activity_at"], "model": session["model"],
+            "billing_provider": "", "api_call_count": session["api_call_count"], "input_tokens": 0,
+            "output_tokens": 0, "parent_session_id": session["parent_session_id"],
+            "first_prompt": session["first_prompt"],
+        }
+        if with_source_and_end_reason:
+            common["source"] = "kanban"
+            common["end_reason"] = "cli_close" if session["ended_at"] is not None else ""
+        return common
 
     # ---------------------------------------------------------------------------------------
     # Plumbing: the board check, armed failures, CLI-style refusals
@@ -2322,8 +2366,12 @@ class FakeHermes:
 
     @_controller_call
     def session_usage(self, profile: str, session_id: str, timeout: int = 60) -> dict | None:
-        """What `hermes sessions export` reports for a worker session: the numbers set with set_session_usage, else
-        default_session_requests calls for a session a worker of this fake really had, else None (unknown)."""
+        """What `hermes sessions export` reports for a worker session: a session built with `add_session`, else
+        the numbers set with set_session_usage, else default_session_requests calls for a session a worker of
+        this fake really had, else None (unknown). Works whether or not the session has ended, like the real
+        `--session-id` export (hermes_cli/sessions_cmd.py:335-343)."""
+        if session_id in self._sessions:
+            return self._public_session(self._sessions[session_id], with_source_and_end_reason=False)
         if session_id in self._session_usage:
             usage = self._session_usage[session_id]
             return copy.deepcopy(usage) if usage is not None else None
@@ -2333,6 +2381,32 @@ class FakeHermes:
                 "input_tokens": 1000, "output_tokens": 200,
             }
         return None
+
+    @_controller_call
+    def kanban_sessions(
+        self, profile: str, started_after: int, started_before: int | None = None, timeout: int = 120,
+    ) -> list[dict] | None:
+        """Every session `add_session` gave this profile that has ENDED (real Hermes's filtered export never
+        returns an open session, hermes_state_maintenance.py:187) and started in `[started_after,
+        started_before)`, oldest first -- the fake counterpart of `hermes.kanban_sessions` (r19 LEDGER.md)."""
+        canonical = _canonical(profile)
+        out = [
+            self._public_session(s, with_source_and_end_reason=True) for s in self._sessions.values()
+            if s["profile"] == canonical and s["ended_at"] is not None and s["started_at"] >= started_after
+            and (started_before is None or s["started_at"] < started_before)
+        ]
+        out.sort(key=lambda d: d["started_at"])
+        return out
+
+    @_controller_call
+    def kanban_session_ids(self, profile: str, limit: int = 100, timeout: int = 60) -> list[str] | None:
+        """The ids `add_session` gave this profile, oldest first, open or ended (real `sessions list` has no
+        ended-only filter) -- the fake counterpart of `hermes.kanban_session_ids` (r19 LEDGER.md)."""
+        canonical = _canonical(profile)
+        matches = sorted(
+            (s for s in self._sessions.values() if s["profile"] == canonical), key=lambda s: s["started_at"],
+        )
+        return [s["id"] for s in matches[:limit]]
 
     # ---------------------------------------------------------------------------------------
     # The worker side: what a dispatched worker's kanban tools do (tools/kanban_tools.py). A worker names its own

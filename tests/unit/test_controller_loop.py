@@ -904,7 +904,7 @@ def test_a_failing_completion_leaves_the_intent_open_and_the_expected_head_alrea
 
 
 # =============================================================================================================
-# helpers: _clean, _record_once, _as_datetime
+# helpers: _clean, _record_once, _as_datetime, _as_epoch
 # =============================================================================================================
 
 def test_clean_redacts_collapses_escapes_and_cuts():
@@ -951,6 +951,24 @@ def test_as_datetime_accepts_a_datetime_epoch_seconds_or_an_iso_string():
     for bad in (True, object(), [1]):
         with pytest.raises(ValueError):
             controller._as_datetime(bad)
+
+
+def test_as_epoch_normalizes_a_naive_datetime_or_iso_string_to_utc_before_converting():
+    """Round 19 fix round 2 (reviewer major): _as_epoch used to feed _as_datetime's result straight to
+    `.timestamp()`. Python reads a naive (tzinfo-less) datetime's `.timestamp()` in the process's LOCAL
+    timezone, not UTC, though `_as_datetime`'s own docstring says naive means UTC, and a naive ISO-8601 string
+    (no trailing offset) produces a naive datetime the same way. usage.py's session-as-unit windows compare
+    this value directly against run_started_at/run_ended_at, always UTC epoch seconds, so the mismatch quietly
+    shifted every one of those comparisons, and `_charge_time`'s ledger-day attribution, by the host's own UTC
+    offset. recovery.py's own `_epoch` helper already normalizes naive to UTC first; `_as_epoch` now mirrors it."""
+    naive = datetime(2026, 9, 28, 2, 10, 6)
+    aware = naive.replace(tzinfo=timezone.utc)
+
+    assert controller._as_epoch(naive) == aware.timestamp()
+    assert controller._as_epoch("2026-09-28T02:10:06") == aware.timestamp()   # a naive ISO string too
+    assert controller._as_epoch(aware) == aware.timestamp()                  # already tzinfo-aware: unaffected
+    assert controller._as_epoch(aware.timestamp()) == aware.timestamp()      # epoch seconds in, epoch seconds out
+    assert controller._as_epoch(None) is None
 
 
 # =============================================================================================================

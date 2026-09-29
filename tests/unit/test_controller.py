@@ -2372,6 +2372,62 @@ def test_run_pass_survives_a_usage_ingest_failure(tmp_path, monkeypatch):
     assert "card vanished" in event["error"]
 
 
+def test_run_pass_runs_ingest_then_resolve_then_settle_inside_one_usage_step(tmp_path, monkeypatch):
+    """Round 19 (package LEDGER): the per-pass usage step is ingest_run_usage, then resolve_open_runs, then
+    settle_open_sessions, in that order (PROPOSED DESIGN section D)."""
+    import types
+
+    conn = db.connect(tmp_path / "ases.db")
+    order = []
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: order.append("ingest") or ["s1"])
+    monkeypatch.setattr(usage_mod, "resolve_open_runs", lambda *a, **kw: order.append("resolve") or ["s2"])
+    monkeypatch.setattr(usage_mod, "settle_open_sessions", lambda *a, **kw: order.append("settle") or ["s3"])
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: {})
+    monkeypatch.setattr(controller, "process_merge_queue", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "all_merge_cards_done", lambda *a, **kw: False)
+    _guard_ok(monkeypatch)
+    plan = types.SimpleNamespace(project="p", integration_branch="integration")
+
+    summary = controller.run_pass("b", None, plan, types.SimpleNamespace(budgets={}), {}, conn=conn)
+
+    assert order == ["ingest", "resolve", "settle"]
+    assert summary["usage_sessions"] == 3   # one id from each of the three
+    assert [e["kind"] for e in events.recent(conn) if e["kind"].startswith("usage_ingest_error")] == []
+
+
+def test_run_pass_records_one_usage_ingest_error_when_settling_fails(tmp_path, monkeypatch):
+    """A failure in settle_open_sessions (the LAST of the three) is still caught by the same step, so dispatch
+    and the merge queue still run this pass -- the try/except wraps all three calls, not just the first."""
+    import types
+
+    conn = db.connect(tmp_path / "ases.db")
+    order = []
+    monkeypatch.setattr(usage_mod, "ingest_run_usage", lambda *a, **kw: order.append("ingest") or [])
+    monkeypatch.setattr(usage_mod, "resolve_open_runs", lambda *a, **kw: order.append("resolve") or [])
+
+    def boom(*a, **kw):
+        order.append("settle")
+        raise RuntimeError("settle exploded")
+
+    monkeypatch.setattr(usage_mod, "settle_open_sessions", boom)
+    monkeypatch.setattr(controller, "process_budget_gate", lambda *a, **kw: order.append("budget") or [])
+    monkeypatch.setattr(controller, "process_review_lane", lambda *a, **kw: order.append("review") or [])
+    monkeypatch.setattr(hermes, "kanban_dispatch", lambda board, **kw: order.append("dispatch") or {})
+    monkeypatch.setattr(controller, "process_merge_queue", lambda *a, **kw: order.append("merge") or [])
+    monkeypatch.setattr(controller, "all_merge_cards_done", lambda *a, **kw: False)
+    _guard_ok(monkeypatch)
+    plan = types.SimpleNamespace(project="p", integration_branch="integration")
+
+    summary = controller.run_pass("b", None, plan, types.SimpleNamespace(budgets={}), {}, conn=conn)
+
+    assert order == ["ingest", "resolve", "settle", "budget", "review", "dispatch", "merge"]
+    assert summary["usage_sessions"] == 0
+    (event,) = [json.loads(e["payload"]) for e in events.recent(conn) if e["kind"] == "usage_ingest_error"]
+    assert "settle exploded" in event["error"]
+
+
 REVIEW_MODELS_CONFIG = {
     "providers": {
         "xkiro": {"limits": {}},  # no known daily cap: the coder's own provider never runs dry
