@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from ases import events, ledger, report
+from ases import events, ledger, recovery, report
 from ases.fakes import worker as fw
 
 CAPPED_PROVIDER = "fake-capped"
@@ -183,3 +183,128 @@ def test_22_9_process_budget_gate_never_parks_a_card_that_is_not_ready(world_fac
         world.fake.tick(20)
         world.one_pass()
     assert len(_payloads(conn, "card_parked_for_budget")) == 1
+
+
+# --- the REACTIVE half (round 18): a worker's own run fails with quota-shaped text ----------------------------------
+#
+# Everything above is the PROACTIVE half (process_budget_gate parks a card it can never afford to dispatch). This
+# module's own docstring is explicit that recovery.py's REACTIVE QUOTA classification, a worker that actually ran
+# and failed with quota-shaped output, is different territory (package AC-A's 22.3), and is not covered above. It is
+# covered here: the real stage C run of 2026-09-29 found that such a park (recovery.decide's ACTION_PARK, reason
+# recovery.QUOTA_PARK_PREFIX) was never released, because controller.process_unpark only recognised the budget
+# gate's own "budget:"/"review budget" reasons (bug: card S1 stayed scheduled through the reset for 30 passes). This
+# scenario reproduces the shape of that bug end to end through the real run_pass -> process_recovery ->
+# recovery.decide path, then through run_pass -> process_unpark for the release.
+
+REACTIVE_PROVIDER = "fake-reactive"
+REACTIVE_CODER_MODEL = "fake-reactive-coder"
+REACTIVE_REVIEWER_MODEL = "fake-reactive-reviewer"
+
+# No provider here declares a daily cap: _affordable_now (and so process_unpark's own affordability re-check) is
+# trivially True throughout, so the only thing that can hold this card parked, or release it, is
+# recovery.quota_reset_passed. That isolates the scenario to the park/unpark mechanism this round's bug is in,
+# never the budget arithmetic the scenario above already covers.
+REACTIVE_MODELS_CONFIG = {
+    "providers": {REACTIVE_PROVIDER: {"limits": {}}},
+    "models": [
+        {"provider": REACTIVE_PROVIDER, "model": REACTIVE_CODER_MODEL, "role_class": "coder", "pinned": True},
+        {"provider": REACTIVE_PROVIDER, "model": REACTIVE_REVIEWER_MODEL, "role_class": "reviewer", "pinned": True},
+    ],
+}
+
+# recovery.py's own docstring, verbatim: "OpenAI's 429 says 'You exceeded your current quota'" (the QUOTA text rule:
+# "quota|daily|exceeded your current|per[-_]?day|\btpd\b"). It also contains the word "quota", which is exactly what
+# FakeHermes's _RESPAWN_BLOCKER_RE (board.py, mirroring kanban_db_dispatch's real one) matches, so after ONE crash
+# the card is respawn-guarded in 'ready' forever, never 'blocked': the same shape the real S1 card was parked in,
+# and the reason recovery._recover_task widens past 'blocked' for a QUOTA- or AUTH-shaped 'ready' card at all
+# (round 7): Hermes's own breaker never gets a second consecutive failure to trip on.
+QUOTA_FAILURE_TEXT = "You exceeded your current quota, please check your plan and billing details."
+
+A_PY = "def add(x, y):\n    return x + y\n"
+
+
+def test_22_9_b_a_workers_quota_failure_is_parked_by_recovery_and_released_after_the_reset(
+    world_factory, one_task_plan, run_until, git, monkeypatch,
+):
+    """Blueprint 19.1's table ("Daily quota exhausted ... park the card until the reset time"); round 18; the
+    REACTIVE half of ASES-CAP-03 this file's own module docstring says the scenario above does not cover.
+
+    The fake board clock is pinned to a fixed noon UTC moment right after the world is built (FakeHermes.now is a
+    plain public attribute; nothing else in this rig lets a world start at a chosen moment) instead of left at the
+    real wall clock, because run_pass threads THIS clock into process_recovery/process_unpark as `now` (unlike
+    ledger.default_now, the separate clock the budget arithmetic itself reads): the reset boundary this test
+    crosses must sit a fixed, generous distance from the park moment, never however close the real wall clock
+    happens to be to a real UTC midnight whenever the suite is actually run.
+    """
+    park_moment = datetime(2027, 3, 3, 12, 0, tzinfo=timezone.utc)          # noon: far from either UTC midnight
+    after_reset_moment = datetime(2027, 3, 4, 0, 5, tzinfo=timezone.utc)   # 5 minutes into the next UTC day
+    monkeypatch.setattr(ledger, "default_now", lambda: park_moment)
+
+    world = world_factory(plan_raw=one_task_plan, models_config=REACTIVE_MODELS_CONFIG)
+    conn = world.conn
+    fake = world.fake
+    fake.now = int(park_moment.timestamp())   # see the docstring: pinned, not left at the real wall clock
+
+    # The card's first run crashes with quota-shaped text; its second (after the reset unparks it) writes a.py and
+    # hands off for review, the same file and message one_task_plan's T1 acceptance criterion asks for.
+    fake.register_worker(
+        "coder-1", fw.crasher(1, error=QUOTA_FAILURE_TEXT, then=fw.good_coder({"a.py": A_PY}, "add a.py")),
+    )
+    t1 = world.create_cards()["T1"]
+    work = t1.work_card_id
+
+    # --- the worker's run fails with quota-shaped text; recovery parks the SAME card (never a fresh one:
+    # ASES-REC-01's fresh-attempt/switch-model restart is for CAPABILITY, not QUOTA) through the real
+    # run_pass -> process_recovery -> recovery.decide path. Getting there takes a couple of passes: recovery only
+    # widens past 'blocked' for a QUOTA-shaped 'ready' card once a settle window has passed since the crash
+    # (recovery.READY_RESPAWN_SETTLE_SECONDS, 30 s), which run_until's own 20 s polling supplies, the same way it
+    # supplies an infrastructure backoff in test_22_3_failure.py.
+    run_until(world, lambda w: w.card(work)["status"] == "scheduled")
+    assert world.card(work)["status"] == "scheduled"
+    quota_decisions = [d for d in _payloads(conn, "recovery_decision") if d["kind"] == "quota"]
+    assert len(quota_decisions) == 1
+    assert quota_decisions[0]["action"] == "park" and quota_decisions[0]["card_id"] == work
+    assert quota_decisions[0]["reason"].startswith(recovery.QUOTA_PARK_PREFIX)
+    assert _payloads(conn, "card_parked_for_budget") == []   # this is recovery's own park, never the budget gate's
+
+    # --- stay idle without thrashing: several more passes the SAME UTC day. A scheduled card is never in the
+    # 'ready' lane kanban_dispatch reads, so there is no new run to start, and quota_reset_passed stays false all
+    # day (the provider already said no today, whatever the ledger thinks is left).
+    runs_before = len(world.card(work)["_runs"])
+    for _ in range(5):
+        world.fake.tick(20)
+        world.one_pass()
+    assert world.card(work)["status"] == "scheduled"
+    assert len(world.card(work)["_runs"]) == runs_before
+    assert _payloads(conn, "card_unparked") == []
+
+    # --- simulate the reset: past the next UTC midnight, the fake clock and ledger.default_now moved together (the
+    # scenario above's own pairing: ledger.default_now is what this package's budget arithmetic itself reads for
+    # "today"; the fake clock is what run_pass threads into process_unpark's own `now` for quota_reset_passed).
+    monkeypatch.setattr(ledger, "default_now", lambda: after_reset_moment)
+    world.fake.tick(int(after_reset_moment.timestamp()) - world.fake.now)
+
+    run_until(world, lambda w: w.card(work)["status"] != "scheduled")
+    # Unparked and straight back to work, all in the one pass that crossed the reset: kanban_dispatch (which runs
+    # later in the same run_pass than process_unpark) picks the now-unguarded ready card up before run_until's
+    # predicate is even checked, so the status seen here is already past 'ready' (the coder's second, successful
+    # run hands off for review at once). What matters is that it left 'scheduled' via the unpark call below, not
+    # by some other path.
+    assert world.card(work)["status"] in ("ready", "running", "review", "done")
+    assert _payloads(conn, "card_unparked") == [{"task_key": "T1", "card_id": work}]
+    unblocks = [c for c in fake.calls if c.name == "kanban_unblock" and c.args[1] == work]
+    assert unblocks and unblocks[-1].kwargs.get("reason") == "the provider's daily quota has reset"
+
+    # --- resumes with all state intact: the SAME card runs to completion and merges (QUOTA never spawns a fresh
+    # card the way a capability failure does, so there is nothing else here to lose or duplicate).
+    run_until(world, lambda w: w.all_merge_cards_done())
+    assert git(world, "show", "integration:a.py") == A_PY.strip()
+    still = conn.execute(
+        "SELECT work_card_id, merge_card_id FROM plan_tasks WHERE project = ? AND task_key = 'T1'",
+        (world.plan.project,),
+    ).fetchone()
+    assert (still["work_card_id"], still["merge_card_id"]) == (t1.work_card_id, t1.merge_card_id)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM merge_records WHERE task_key = 'T1'"
+    ).fetchone()[0] == 1
+    assert len(fake.cards()) == 2   # just T1's work and merge card: never duplicated, never lost by the park cycle

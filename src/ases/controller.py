@@ -1877,9 +1877,9 @@ def _escalate_spent_budgets(board: str, plan: plan_mod.Plan, project: ases_confi
 # --- parked cards ---------------------------------------------------------------------------------------------------
 
 
-def _latest_scheduled_reason(card: dict) -> str | None:
-    """The reason of the card's newest `scheduled` event (kanban_show's `_events`), or None. Newest by created_at, and
-    among equal times by position in the list."""
+def _latest_scheduled(card: dict) -> tuple[str | None, object]:
+    """(reason, created_at) of the card's newest `scheduled` event (kanban_show's `_events`), or (None, None). Newest
+    by created_at, and among equal times by position in the list. The reason is None when the event carries none."""
     best = None
     for position, event in enumerate(card.get("_events") or []):
         if not isinstance(event, dict) or event.get("kind") != "scheduled":
@@ -1888,14 +1888,19 @@ def _latest_scheduled_reason(card: dict) -> str | None:
         if best is None or stamp >= best[0]:
             best = (stamp, event)
     if best is None:
-        return None
+        return None, None
     reason = _event_payload(best[1]).get("reason")
-    return reason if isinstance(reason, str) else None
+    return (reason if isinstance(reason, str) else None), best[1].get("created_at")
+
+
+def _latest_scheduled_reason(card: dict) -> str | None:
+    """The reason of the card's newest `scheduled` event, or None (see _latest_scheduled)."""
+    return _latest_scheduled(card)[0]
 
 
 def process_unpark(
     board: str, plan: plan_mod.Plan, models_config: dict, *, conn, budgets: dict,
-    project: ases_config.ProjectConfig | None = None,
+    project: ases_config.ProjectConfig | None = None, now=None,
 ) -> list[str]:
     """ASES-CAP-03 and Table 17 ("Requests per provider per day: Park cards until the reset"); the loop's
     `for card in board.parked_past_reset(): hermes.unblock(card)`. process_budget_gate parks a card it cannot afford
@@ -1914,6 +1919,16 @@ def process_unpark(
     principle also now fail the data-class check if the project's declared data_class or the provider's policy
     changed underneath it), but the prefix check above is what actually keeps a data-class park untouched.
 
+    Round 18 (found by the real stage C run: S1 stayed parked through the reset for 30 passes): recovery's own QUOTA
+    park (a worker's run failed with quota-shaped text, recovery.decide) writes a reason starting
+    recovery.QUOTA_PARK_PREFIX, which is not one of _PARK_PREFIXES, so nothing ever released it. Blueprint table
+    19.1: "Daily quota exhausted ... park the card until the reset time", and the loop's
+    `for card in board.parked_past_reset(): hermes.unblock(card)`. Such a card is now released once
+    recovery.quota_reset_passed says the UTC day of its `scheduled` event is over, and only when it is affordable
+    by the same _affordable_now: never on the day it was parked, because the provider already said no that day,
+    whatever the ledger thinks is left. It is unblocked with the reason "the provider's daily quota has reset".
+    `now` is the pass clock (run_pass's own), the real clock when None.
+
     A card that cannot be read or unblocked is recorded (unpark_error, once per message) and the rest carry on."""
     review_afford = usage_mod.review_budget(conn, models_config, project) if project is not None else None
     unparked = []
@@ -1925,13 +1940,18 @@ def process_unpark(
             continue
         task = plan.task(row["task_key"])
         try:
-            reason = _latest_scheduled_reason(hermes_mod.kanban_show(board, card["id"]))
-            if reason is None or not reason.lstrip().startswith(_PARK_PREFIXES):
+            reason, parked_at = _latest_scheduled(hermes_mod.kanban_show(board, card["id"]))
+            text = reason.lstrip() if reason is not None else ""
+            if text and text.startswith(_PARK_PREFIXES):
+                why = "budget available again"
+            elif text.startswith(recovery_mod.QUOTA_PARK_PREFIX) and recovery_mod.quota_reset_passed(parked_at, now):
+                why = "the provider's daily quota has reset"
+            else:
                 continue
             ok, _ = _affordable_now(conn, task, models_config, budgets, review_afford, project)
             if not ok:
                 continue
-            hermes_mod.kanban_unblock(board, card["id"], reason="budget available again")
+            hermes_mod.kanban_unblock(board, card["id"], reason=why)
         except Exception as exc:  # noqa: BLE001 - one card must never stop the others
             _record_once(conn, "unpark_error", {
                 "project": plan.project, "task_key": task.key, "card_id": card["id"],
@@ -2434,7 +2454,9 @@ def run_pass(
     )
     summary["unparked"] = _isolated(
         conn, summary, "unpark",
-        lambda: process_unpark(board, plan, models_config, conn=conn, budgets=project.budgets, project=project), [],
+        lambda: process_unpark(
+            board, plan, models_config, conn=conn, budgets=project.budgets, project=project, now=now,
+        ), [],
         plan.project,
     )
     summary["sent_back"] = process_review_lane(board, repo, plan, project, conn=conn)
