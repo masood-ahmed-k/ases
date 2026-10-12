@@ -1415,6 +1415,26 @@ The architect fixed each package's last open finding with a failing-first test (
 LEDGER's cross-pass ambiguity, MERGEGUARD's missing-model case) and resolved the merges. Full suite: 6248 passed, 2 skipped.
 Register: 60 covered, 32 in progress, 8 partial, 3 not applicable, 0 not covered.
 
+## Round 20: two libc and timezone assumptions (2026-10-12)
+
+Two small fixes, zero quota, each with a failing-first test, a real-environment proof and a nemotron review.
+
+- **The network probe and musl** (merge 8e7dd09; ASES-SEC-05, SEC-07). `sandbox.exfiltration_probe` passes only when its
+  network attempt fails with a known network-failure phrase, and the phrases were glibc's and curl's. The pinned image is
+  Alpine, whose C library is musl, and musl says "Try again" (EAI_AGAIN) and "Name does not resolve" (EAI_NONAME). The probe
+  passed on that image only because busybox wget runs first and prints "bad address"; its own python3 branch printed
+  `socket.gaierror: [Errno -3] Try again` and was reported as "not a network error" on a network that really was blocked. Added:
+  `name does not resolve`, `[errno -3] try again` and `gaierror`; the bare words "try again" are deliberately not a marker.
+  Proven with the real probe forced down its python3 branch against `ases-sandbox:py311-3`: failed before, passes after.
+- **Session ids and the machine's timezone** (merge 3678da9; ASES-CAP-02, CAP-03). Found while verifying the first fix: the
+  full suite was red on master because the laptop had moved from UTC+2 to UTC+5:30. A Hermes session id carries the local time
+  it was minted at and no offset; the ledger's killed-worker fallback read it in the machine's CURRENT timezone, so ids minted
+  before the move fell 3.5 hours outside their run's window and the run's real session was discarded. The stamp is now a
+  range over every UTC offset (minus 14 hours to plus 12) and only pre-filters; the session's own start time still decides.
+  The tests pass in any process timezone (run under IST, CET, UTC, NZST and HST).
+
+Full suite: 6263 passed, 2 skipped.
+
 ## Known gaps (tracked, not hidden)
 
 - ~~`glm-5.3-thinking:free`'s context length is not declared in `config/models.yaml`... Confirm and

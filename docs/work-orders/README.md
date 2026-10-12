@@ -195,3 +195,10 @@ Specs live in the round's workflow scripts; the five research reports are in `C:
 | (workflow spec) | TESTSDOCS: real-Docker 22.11, phase exit plan, verified policies, reviewer candidates (ASES-TST-02, DOC-03, PRV-04, CAP-06) | done, reviewed PASS |
 | (workflow spec) | GIT12: attribution of changes to runs in report mode, gate_runs project (ASES-GIT-12), migration 12 | done, reviewed PASS; two minors fixed by the architect |
 | (workflow spec) | MERGEGUARD: reviewer independence at merge, paid reviewer at dispatch, LSP roster (ASES-ROL-05, DOC-04) | done, reviewed PASS; one minor fixed by the architect |
+
+## Round 20 (2026-10-12): two libc and timezone assumptions
+
+| File | Package | Status |
+| ---- | ------- | ------ |
+| (architect-built) | the sandbox network probe recognises musl's resolver errors (ASES-SEC-05, SEC-07) | done; proven on real Docker, nemotron reviewed |
+| (architect-built) | a session id's stamp read as a range over every timezone, found by a red suite after the laptop changed timezone (ASES-CAP-02, CAP-03) | done; tests pass under five timezones, nemotron reviewed |
