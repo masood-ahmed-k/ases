@@ -2167,6 +2167,39 @@ def test_the_probe_passes_when_the_call_fails_with_a_network_error(worktree, cod
     assert len(runner.runs) == 1
 
 
+@pytest.mark.parametrize("err", [
+    # Verbatim from the pinned Alpine image (ases-sandbox:py311-3, musl) run with --network none: the probe's own
+    # python3 branch, and the same failure as urllib wraps it (no "gaierror" in that one, only the errno text).
+    "socket.gaierror: [Errno -3] Try again",
+    "urllib.error.URLError: <urlopen error [Errno -3] Try again>",
+    # musl's wording for EAI_NONAME, where glibc says "Name or service not known".
+    "socket.gaierror: [Errno -2] Name does not resolve",
+    # busybox wget against an address, the same image: already covered by "unreachable", pinned here as real output.
+    "wget: can't connect to remote host (93.184.215.14): Network unreachable",
+])
+def test_the_probe_passes_on_musl_resolver_errors(worktree, err):
+    """The sandbox image is Alpine, so its C library is musl, and musl words a failed name lookup differently from
+    glibc: "Try again" (EAI_AGAIN) and "Name does not resolve" (EAI_NONAME), where glibc says "Temporary failure in
+    name resolution" and "Name or service not known". Before this the probe passed on the pinned image only because
+    busybox wget runs first and prints "bad address"; an image with python3 alone failed the probe on a network that
+    really was blocked."""
+    outcome, _ = probe(worktree, lambda argv: result(1, "", "Traceback (most recent call last):\n" + err))
+    assert outcome.passed is True and outcome.findings == []
+
+
+@pytest.mark.parametrize("text", [
+    "wget: server returned error: HTTP/1.1 503 Service Unavailable. Please try again later.",
+    "error: the request failed, try again",
+    "Try again",
+])
+def test_the_words_try_again_alone_are_not_a_network_error(worktree, text):
+    """musl's EAI_AGAIN text is just "Try again", which is also what a reachable server or any tool may say. Only
+    the form a resolver failure really takes is a marker: Python's "[Errno -3] Try again", or its gaierror class."""
+    outcome, _ = probe(worktree, lambda argv: result(1, "", text))
+    assert outcome.passed is False
+    assert "not with a network error" in outcome.findings[0]
+
+
 @pytest.mark.parametrize("usage", [
     "BusyBox v1.36 multi-call binary.\nUsage: wget [-T SEC] URL\n  -T SEC  Network read timeout is SEC seconds",
     "wget: unrecognized option '-T'\nUsage: wget [OPTION]... [URL]...\n  --timeout=SECS  set all timeout values",
