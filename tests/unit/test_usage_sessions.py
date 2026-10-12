@@ -475,6 +475,69 @@ def test_an_open_session_of_a_killed_worker_is_found_through_the_list_fallback(c
     assert conn.execute("SELECT state FROM usage_runs WHERE run_id = 600").fetchone()["state"] == "open"
 
 
+def _killed_worker_session(session_id, calls=None):
+    """hermes.session_usage for the one open session of run 600 (started 1790561409, three seconds into the run)."""
+    def session_usage(profile, asked_id, timeout=60):
+        if calls is not None:
+            calls.append(asked_id)
+        if asked_id != session_id:
+            return {"id": asked_id, "model": REVIEWER_MODEL, "api_call_count": 1, "input_tokens": 1,
+                    "output_tokens": 1, "started_at": 1.0, "ended_at": None, "last_activity_at": 1.0,
+                    "billing_provider": "openrouter", "parent_session_id": None, "first_prompt": "something else"}
+        return {"id": asked_id, "model": REVIEWER_MODEL, "api_call_count": 14, "input_tokens": 100,
+                "output_tokens": 10, "started_at": 1790561409.0, "ended_at": None, "last_activity_at": 1790561430.0,
+                "billing_provider": "openrouter", "parent_session_id": None,
+                "first_prompt": "work kanban task t_aaaa0001"}
+    return session_usage
+
+
+@pytest.mark.parametrize("utc_offset_hours", [-12, -8, 0, 2, 5.5, 14])
+def test_a_killed_workers_session_is_found_whatever_timezone_stamped_its_id(
+        conn, tmp_path, monkeypatch, utc_offset_hours):
+    """Found on 2026-10-12, when this laptop had moved from Central European time (UTC+2) to IST (UTC+5:30): a
+    Hermes session id carries the LOCAL time it was minted at, and the list fallback's pre-filter read it in the
+    machine's CURRENT timezone, so an id minted elsewhere landed hours outside its own run's window and the run's
+    real session was thrown away (and the run then declared 'no_session'). The same moment, stamped in six
+    different UTC offsets, must be found whatever timezone this test process itself happens to run in."""
+    stamp = datetime.fromtimestamp(1790561409 + utc_offset_hours * 3600, timezone.utc).strftime("%Y%m%d_%H%M%S")
+    session_id = f"{stamp}_a30546"
+    card = _card_with_runs("t_aaaa0001", [_run(600, 1790561406, 1790561441)])
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, card_id: card)
+    monkeypatch.setattr(hermes, "kanban_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(hermes, "kanban_session_ids", lambda profile, limit=100, timeout=60: [session_id])
+    monkeypatch.setattr(hermes, "session_usage", _killed_worker_session(session_id))
+
+    ingested = usage.ingest_card_usage(BOARD, "t_aaaa0001", _project(tmp_path), MODELS, conn=conn, now=1790561441 + 901.0)
+
+    assert ingested == [session_id]
+    assert _count(conn, "events") == 1   # usage_ingested alone: never usage_session_missing
+
+
+def test_an_id_stamped_days_away_from_the_run_is_still_never_looked_up(conn, tmp_path, monkeypatch):
+    """The pre-filter is wider now (an id's local stamp can be up to 14 hours ahead of UTC or 12 behind), but it
+    still does its job: an id stamped days before or after the run costs no session_usage call at all."""
+    near = "20260928_041007_a30546"
+    card = _card_with_runs("t_aaaa0001", [_run(600, 1790561406, 1790561441)])
+    calls: list[str] = []
+    monkeypatch.setattr(hermes, "kanban_show", lambda board, card_id: card)
+    monkeypatch.setattr(hermes, "kanban_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(hermes, "kanban_session_ids", lambda profile, limit=100, timeout=60: [
+        "20260925_041007_bbbbbb", "20260926_230000_cccccc", near, "20260930_050000_dddddd"])
+    monkeypatch.setattr(hermes, "session_usage", _killed_worker_session(near, calls))
+
+    ingested = usage.ingest_card_usage(BOARD, "t_aaaa0001", _project(tmp_path), MODELS, conn=conn, now=1790561441 + 901.0)
+
+    assert ingested == [near]
+    assert calls == [near]
+
+
+def test_the_id_time_bounds_cover_every_utc_offset_and_nothing_parses_for_an_unknown_shape():
+    as_utc = datetime(2026, 9, 28, 4, 10, 7, tzinfo=timezone.utc).timestamp()
+    assert usage._id_time_bounds("20260928_041007_a30546") == (as_utc - 14 * 3600, as_utc + 12 * 3600)
+    assert usage._id_time_bounds("not-a-session-id") is None
+    assert usage._id_time_bounds("") is None
+
+
 # ---------------------------------------------------------------------------------------------
 # Settling: monotone top-ups, never a decrease, charged to the day the session ran.
 # ---------------------------------------------------------------------------------------------

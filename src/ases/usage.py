@@ -178,15 +178,30 @@ def _parse_utc(text) -> float | None:
     return None
 
 
-def _id_timestamp(session_id: str) -> float | None:
-    """The moment embedded in a Hermes session id (`YYYYMMDD_HHMMSS_hex6`, hermes_state_ids.py's new_session_id),
-    read as LOCAL time exactly as Hermes itself stamps it, or None when the leading 15 characters do not parse
-    (an id shape this code does not recognise is never used to pre-filter: see `_close_runs_without_sessions`)."""
+# The widest UTC offsets any place on Earth uses: UTC-12:00 and UTC+14:00.
+_MAX_UTC_OFFSET_WEST = 12 * 3600
+_MAX_UTC_OFFSET_EAST = 14 * 3600
+
+
+def _id_time_bounds(session_id: str) -> tuple[float, float] | None:
+    """The earliest and latest epoch the stamp embedded in a Hermes session id can mean (`YYYYMMDD_HHMMSS_hex6`,
+    hermes_state_ids.py's new_session_id), or None when the leading 15 characters do not parse (an id shape this
+    code does not recognise is never used to pre-filter: see `_close_runs_without_sessions`).
+
+    Hermes stamps the id with the LOCAL time of the machine at that moment and records no offset, so the stamp
+    alone does not say which instant it was: local time is UTC plus an offset somewhere between -12 and +14 hours,
+    which puts the true instant between (the stamp read as UTC) minus 14 hours and plus 12. This used to return one
+    number, the stamp read in the machine's CURRENT timezone, which is only right while the machine never changes
+    timezone: found on 2026-10-12, after this laptop moved from UTC+2 to UTC+5:30, when every id minted before the
+    move landed 3.5 hours outside its own run's window and the run's real session was discarded. A range needs no
+    such assumption, and costs nothing in correctness, because the range only pre-filters: the session's own
+    started_at (a true epoch, from hermes.session_usage) is what decides."""
     try:
         naive = datetime.strptime(session_id[:15], "%Y%m%d_%H%M%S")
     except ValueError:
         return None
-    return naive.timestamp()
+    as_utc = naive.replace(tzinfo=timezone.utc).timestamp()
+    return as_utc - _MAX_UTC_OFFSET_EAST, as_utc + _MAX_UTC_OFFSET_WEST
 
 
 def _charge_time(usage: dict, now: float) -> float:
@@ -522,12 +537,13 @@ def _close_runs_without_sessions(
         for session_id in ids:
             if conn.execute("SELECT 1 FROM usage_ingested WHERE session_id = ?", (session_id,)).fetchone():
                 continue
-            timestamp = _id_timestamp(session_id)
-            if timestamp is not None and not (
-                run["run_started_at"] - 60 <= timestamp <= run["run_ended_at"] + 60
+            bounds = _id_time_bounds(session_id)
+            if bounds is not None and (
+                bounds[1] < run["run_started_at"] - 60 or bounds[0] > run["run_ended_at"] + 60
             ):
-                continue    # a parseable id outside the window is not this run's: an unparseable one is
-                            # never pre-filtered, and falls through to the real check below instead
+                continue    # a parseable id that cannot fall in the window in ANY timezone is not this run's:
+                            # an unparseable one is never pre-filtered, and anything kept here still has to
+                            # pass the real check below (the session's own started_at and first prompt)
             candidate = hermes_mod.session_usage(run["profile"], session_id)
             if candidate is None:
                 uncertain = True    # unknown, the same contract as the ids-is-None guard above: this id might
