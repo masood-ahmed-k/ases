@@ -1541,10 +1541,22 @@ _EXFIL_COMMAND = (
 # Phrases a client prints when it cannot reach the network. Deliberately not the bare words "timeout" or "resolve":
 # a client that rejects an option prints its usage text ("-T SEC  Network read timeout"), and that must not read as
 # a blocked network.
+#
+# The last three are for musl, the C library of the pinned Alpine image (docker/sandbox/Dockerfile), which words a
+# failed name lookup differently from glibc: EAI_NONAME is "Name does not resolve" (glibc: "Name or service not
+# known") and EAI_AGAIN is just "Try again" (glibc: "Temporary failure in name resolution"). The bare words "try
+# again" are no more a marker than "timeout" is, since a reachable server or any tool may say them, so the marker is
+# the form a resolver failure really takes: Python's "[Errno -3] Try again" (-3 is EAI_AGAIN on both libcs; urllib
+# wraps it as "<urlopen error [Errno -3] Try again>"), and "gaierror", the exception CPython raises for a failed
+# getaddrinfo whatever the libc says. Captured from ases-sandbox:py311-3 with --network none: the probe's own python3
+# branch prints "socket.gaierror: [Errno -3] Try again". Until these were added the probe passed on that image only
+# because busybox wget runs first and prints "bad address"; an image with python3 alone failed it on a network that
+# really was blocked.
 _NETWORK_FAILURE_MARKERS = (
     "could not resolve", "unable to resolve", "cannot resolve", "name resolution", "name or service not known",
     "nodename nor servname", "bad address", "unreachable", "no route to host", "refused", "timed out",
     "network is down", "could not connect", "failed to connect",
+    "name does not resolve", "[errno -3] try again", "gaierror",
 )
 
 

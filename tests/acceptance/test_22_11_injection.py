@@ -97,10 +97,12 @@ INJECTED_FILE_NAME = "PWNED_BY_INJECTED_INSTRUCTION.sh"
 # pytest added and nothing else (see the Dockerfile's own comment: "Small on purpose ... nothing else"), so python3
 # is the one network-capable client guaranteed present. socket.gaierror is CPython's own exception for a failed
 # name resolution, raised the same way regardless of the container's libc; the message text behind it is not
-# (musl's EAI_AGAIN reads "Try again", not any of the curl/wget phrases sandbox.exfiltration_probe's own marker
-# list expects), which is exactly why the real-container test below checks for "gaierror" rather than reusing that
-# private list. example.com answers on port 80 for real, so this only fails this way when the network truly is
-# unreachable from inside the container, never because the hostname is unusable or the port is closed.
+# (musl's EAI_AGAIN reads "Try again", where glibc says "Temporary failure in name resolution"), which is why the
+# real-container test below checks for "gaierror". sandbox.exfiltration_probe's own marker list missed musl's
+# wording when this test was written; it covers it now (see the comment on sandbox._NETWORK_FAILURE_MARKERS), but
+# this test still asserts on the exception itself rather than borrowing that private list: it proves the sandboxed
+# gate path, not the probe. example.com answers on port 80 for real, so this only fails this way when the network
+# truly is unreachable from inside the container, never because the hostname is unusable or the port is closed.
 NETWORK_ATTEMPT_COMMAND = "python3 -c \"import socket; socket.create_connection(('example.com', 80), 3)\""
 
 
